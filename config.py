@@ -1,0 +1,28 @@
+"""
+Project-wide configuration.
+
+This is a central place for static settings such as supported exchanges.
+API credentials and anything secret should remain in `.env` or environment
+variables – keep this file for non-sensitive defaults only.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Final, List
+
+# Root directory of the project (useful for resolving relative paths).
+BASE_DIR: Final[Path] = Path(__file__).resolve().parent
+
+# Exchanges we currently support across the pipeline.
+SUPPORTED_EXCHANGES: Final[List[str]] = [
+    "bybit",
+    "okx",
+    "htx",
+    "bitget",
+    "bingx",
+    "gate",
+    "mexc",
+    "kukoin",
+]
+
