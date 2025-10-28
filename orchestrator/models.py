@@ -35,3 +35,24 @@ class ValidationResult:
     long_next_funding: datetime | None
     short_next_funding: datetime | None
 
+
+@dataclass(slots=True)
+class FundingOpportunity:
+    """Highest long vs lowest short funding combination across exchanges."""
+
+    symbol: str
+    long_exchange: str
+    short_exchange: str
+    long_rate: float
+    short_rate: float
+    spread: float
+    long_mark: float | None
+    short_mark: float | None
+    long_bid: float | None
+    long_ask: float | None
+    short_bid: float | None
+    short_ask: float | None
+    long_next_funding: datetime | None
+    short_next_funding: datetime | None
+    participants: int
+
