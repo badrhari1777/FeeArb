@@ -65,6 +65,15 @@ def compute_opportunities(
         if spread <= min_spread:
             continue
 
+        long_buy_price = _preferred_price(
+            long_snap.ask, long_snap.mark_price, long_snap.bid
+        )
+        short_sell_price = _preferred_price(
+            short_snap.bid, short_snap.mark_price, short_snap.ask
+        )
+        price_diff, price_diff_pct = _price_metrics(long_buy_price, short_sell_price)
+        effective_spread = spread - price_diff_pct
+
         opportunities.append(
             FundingOpportunity(
                 symbol=symbol,
@@ -81,6 +90,9 @@ def compute_opportunities(
                 short_ask=short_snap.ask,
                 long_next_funding=long_snap.next_funding_time,
                 short_next_funding=short_snap.next_funding_time,
+                price_diff=price_diff,
+                price_diff_pct=price_diff_pct,
+                effective_spread=effective_spread,
                 participants=len(available),
             )
         )
@@ -92,7 +104,7 @@ def compute_opportunities(
 def format_opportunity_table(rows: Sequence[FundingOpportunity]) -> str:
     header = (
         f"{'Symbol':<10} {'Long':>12} {'LongRate%':>10} {'Short':>12} "
-        f"{'ShortRate%':>11} {'Spread%':>9} {'T+ (hrs)':>9}"
+        f"{'ShortRate%':>11} {'Spread%':>9} {'PxGap%':>8} {'Eff%':>8} {'T+ (hrs)':>9}"
     )
     lines = [header, "-" * len(header)]
     for row in rows:
@@ -100,7 +112,8 @@ def format_opportunity_table(rows: Sequence[FundingOpportunity]) -> str:
         lines.append(
             f"{row.symbol:<10} {row.long_exchange:>12} {row.long_rate * 100:>9.3f}% "
             f"{row.short_exchange:>12} {row.short_rate * 100:>10.3f}% "
-            f"{row.spread * 100:>8.3f}% {hours_to_funding:>9.2f}"
+            f"{row.spread * 100:>8.3f}% {row.price_diff_pct * 100:>7.3f}% "
+            f"{row.effective_spread * 100:>7.3f}% {hours_to_funding:>9.2f}"
         )
     return "\n".join(lines)
 
@@ -117,3 +130,19 @@ def _hours_until(*times: datetime | None) -> float:
     if not positive:
         return 0.0
     return min(positive)
+
+
+def _preferred_price(*candidates: float | None) -> float | None:
+    for value in candidates:
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _price_metrics(long_price: float | None, short_price: float | None) -> tuple[float, float]:
+    if long_price is None or short_price is None:
+        return 0.0, 0.0
+    price_diff = long_price - short_price
+    avg = (long_price + short_price) / 2.0 or 1.0
+    price_diff_pct = price_diff / avg
+    return price_diff, price_diff_pct

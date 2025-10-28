@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Funding Arbitrage Monitor</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}" />
+  <script>
+    window.__INITIAL_STATE__ = {{ snapshot_payload | tojson | safe }};
+    window.__REFRESH_INTERVAL__ = {{ refresh_interval }};
+  </script>
+  <script defer src="{{ url_for('static', path='/app.js') }}"></script>
+</head>
+<body class="page">
+  <header class="masthead">
+    <div>
+      <h1>Funding Arbitrage Monitor</h1>
+      <p class="subtitle">Live view of cross-exchange funding opportunities</p>
+    </div>
+    <div class="status-block">
+      <dl>
+        <div>
+          <dt>Generated (UTC)</dt>
+          <dd id="generated-at">{{ snapshot.generated_at.isoformat() }}</dd>
+        </div>
+        <div>
+          <dt>Screener source</dt>
+          <dd id="screener-source">
+            {% if snapshot.screener_from_cache %}
+              cache
+            {% else %}
+              fresh
+            {% endif %}
+          </dd>
+        </div>
+        <div>
+          <dt>Coinglass source</dt>
+          <dd id="coinglass-source">
+            {% if snapshot.coinglass_from_cache %}
+              cache
+            {% else %}
+              fresh
+            {% endif %}
+          </dd>
+        </div>
+        <div>
+          <dt>Opportunities</dt>
+          <dd id="opportunity-count">{{ opportunity_rows | length }}</dd>
+        </div>
+      </dl>
+      <button id="refresh-button" class="button" type="button">Manual refresh</button>
+      <p class="hint">Auto refresh every {{ refresh_interval }} seconds</p>
+    </div>
+  </header>
+
+  <main class="content">
+    {% if snapshot.messages %}
+      <section class="panel panel--alert" id="messages">
+        <h2>Status Messages</h2>
+        <ul>
+          {% for message in snapshot.messages %}
+            <li>{{ message }}</li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
+
+    <section class="panel" id="overview">
+      <h2>Data Overview</h2>
+      <div class="overview-grid">
+        <div>
+          <h3>ArbitrageScanner Top 10</h3>
+          <table class="data-table" id="screener-table">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Spread %</th>
+                <th>Long</th>
+                <th>Long Fee %</th>
+                <th>Short</th>
+                <th>Short Fee %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in screener_rows %}
+                <tr>
+                  <td>{{ row.symbol }}</td>
+                  <td>{{ (row.spread or 0) | float | round(4) }}</td>
+                  <td>{{ row.long_exchange }}</td>
+                  <td>{{ (row.long_fee or 0) | float | round(4) }}</td>
+                  <td>{{ row.short_exchange }}</td>
+                  <td>{{ (row.short_fee or 0) | float | round(4) }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div>
+          <h3>Coinglass Top 10</h3>
+          <table class="data-table" id="coinglass-table">
+            <thead>
+              <tr>
+                <th>Rank</th>
+                <th>Symbol</th>
+                <th>Pair</th>
+                <th>Long</th>
+                <th>Short</th>
+                <th>Net %</th>
+                <th>APR %</th>
+                <th>Spread %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in coinglass_rows %}
+                <tr>
+                  <td>{{ row.ranking }}</td>
+                  <td>{{ row.symbol }}</td>
+                  <td>{{ row.pair }}</td>
+                  <td>{{ row.long_exchange }}</td>
+                  <td>{{ row.short_exchange }}</td>
+                  <td>{{ (row.net_funding_rate * 100) | round(3) }}</td>
+                  <td>{{ (row.apr * 100) | round(2) }}</td>
+                  <td>{{ (row.spread_rate * 100) | round(3) }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="symbol-universe">
+      <h2>Monitored Symbols</h2>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Sources</th>
+          </tr>
+        </thead>
+        <tbody id="universe-table-body">
+          {% for row in universe_rows %}
+            <tr>
+              <td>{{ row.symbol }}</td>
+              <td>{{ row.sources }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="opportunities">
+      <h2>Funding Opportunities</h2>
+      <table class="data-table data-table--wide">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Long</th>
+            <th>Long Rate %</th>
+            <th>Long Bid</th>
+            <th>Long Ask</th>
+            <th>Next Funding (Long)</th>
+            <th>Short</th>
+            <th>Short Rate %</th>
+            <th>Short Bid</th>
+            <th>Short Ask</th>
+            <th>Next Funding (Short)</th>
+            <th>Spread %</th>
+            <th>Price Gap %</th>
+            <th>Effective Spread %</th>
+            <th>Participants</th>
+          </tr>
+        </thead>
+        <tbody id="opportunity-table-body">
+          {% for row in opportunity_rows %}
+            <tr>
+              <td>{{ row.symbol }}</td>
+              <td>{{ row.long_exchange }}</td>
+              <td>{{ (row.long_rate * 100) | round(3) }}</td>
+              <td>{{ row.long_bid if row.long_bid is not none else "-" }}</td>
+              <td>{{ row.long_ask if row.long_ask is not none else "-" }}</td>
+              <td>{{ row.long_next_funding.isoformat() if row.long_next_funding else "-" }}</td>
+              <td>{{ row.short_exchange }}</td>
+              <td>{{ (row.short_rate * 100) | round(3) }}</td>
+              <td>{{ row.short_bid if row.short_bid is not none else "-" }}</td>
+              <td>{{ row.short_ask if row.short_ask is not none else "-" }}</td>
+              <td>{{ row.short_next_funding.isoformat() if row.short_next_funding else "-" }}</td>
+              <td>{{ (row.spread * 100) | round(3) }}</td>
+              <td>{{ (row.price_diff_pct * 100) | round(3) }}</td>
+              <td>{{ (row.effective_spread * 100) | round(3) }}</td>
+              <td>{{ row.participants }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if opportunity_rows | length == 0 %}
+        <p class="muted">No opportunities detected for the current snapshot.</p>
+      {% endif %}
+    </section>
+  </main>
+</body>
+</html>

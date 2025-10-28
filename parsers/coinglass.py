@@ -1,11 +1,33 @@
 from __future__ import annotations
 
 import os
+import asyncio
+import os
 from dataclasses import dataclass
 from typing import List, Sequence
 
+os.environ.setdefault("PYPPETEER_NO_SIGNAL_HANDLERS", "1")
+
 from bs4 import BeautifulSoup
 from requests_html import HTMLSession
+
+try:
+    from pyppeteer import launcher as _pyppeteer_launcher
+except ImportError:  # pragma: no cover - optional dependency already handled above
+    _pyppeteer_launcher = None
+else:
+    if not getattr(_pyppeteer_launcher.launch, "_fee_arb_patched", False):
+        _original_launch = _pyppeteer_launcher.launch
+
+        async def _patched_launch(options: dict | None = None, **kwargs):
+            params = dict(options or {})
+            params.setdefault("handleSIGINT", False)
+            params.setdefault("handleSIGTERM", False)
+            params.setdefault("handleSIGHUP", False)
+            return await _original_launch(params, **kwargs)
+
+        _patched_launch._fee_arb_patched = True  # type: ignore[attr-defined]
+        _pyppeteer_launcher.launch = _patched_launch
 
 COINGLASS_URL = "https://www.coinglass.com/FrArbitrage"
 DEFAULT_HEADERS = {
@@ -98,6 +120,7 @@ def fetch_rows(limit: int = 20) -> List[CoinglassRow]:
 
     session = HTMLSession()
     response = session.get(COINGLASS_URL, headers=DEFAULT_HEADERS)
+    _ensure_event_loop()
     response.html.render(timeout=120, sleep=3, scrolldown=3)
     soup = BeautifulSoup(response.html.html, "html.parser")
     session.close()
@@ -204,3 +227,11 @@ def _parse_percent(value: str) -> float:
         return float(value) / 100.0
     except ValueError:
         return 0.0
+def _ensure_event_loop() -> None:
+    """Guarantee an asyncio event loop exists for pyppeteer rendering."""
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)

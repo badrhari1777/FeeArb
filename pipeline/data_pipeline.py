@@ -1,0 +1,256 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Iterable, List, Sequence
+
+from config import PARSE_CACHE_TTL_SECONDS, SUPPORTED_EXCHANGES
+from exchanges import get_adapter, normalize_exchange_name
+from orchestrator.models import FundingOpportunity
+from orchestrator.opportunities import compute_opportunities, format_opportunity_table
+from parsers import arbitragescanner, coinglass
+from utils import load_cache, save_cache
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DataSnapshot:
+    generated_at: datetime
+    screener_rows: List[dict]
+    coinglass_rows: List[coinglass.CoinglassRow]
+    universe: List[dict[str, object]]
+    opportunities: List[FundingOpportunity]
+    raw_payloads: dict[str, list[dict]]
+    screener_from_cache: bool = False
+    coinglass_from_cache: bool = False
+    messages: List[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "generated_at": self.generated_at.isoformat(),
+            "screener_rows": self.screener_rows,
+            "coinglass_rows": [row.to_dict() for row in self.coinglass_rows],
+            "universe": self.universe,
+            "opportunities": [
+                _opportunity_dict(item) for item in self.opportunities
+            ],
+            "raw_payloads": self.raw_payloads,
+            "messages": self.messages,
+            "screener_from_cache": self.screener_from_cache,
+            "coinglass_from_cache": self.coinglass_from_cache,
+        }
+
+
+def collect_snapshot() -> DataSnapshot:
+    timestamp = datetime.now(timezone.utc)
+    ts_label = timestamp.strftime("%Y%m%d_%H%M%S")
+
+    screener_rows, screener_from_cache = _load_screener_snapshot()
+    coinglass_rows, coinglass_from_cache = _load_coinglass_snapshot()
+
+    universe = _build_symbol_universe(screener_rows, coinglass_rows)
+
+    symbols = [entry["symbol"] for entry in universe]
+
+    adapters = _active_adapters()
+    opportunities, raw_payloads = compute_opportunities(symbols, adapters)
+
+    return DataSnapshot(
+        generated_at=timestamp,
+        screener_rows=screener_rows,
+        coinglass_rows=coinglass_rows,
+        universe=universe,
+        opportunities=opportunities,
+        raw_payloads=raw_payloads,
+        screener_from_cache=screener_from_cache,
+        coinglass_from_cache=coinglass_from_cache,
+    )
+
+
+def format_screener_table(rows: Sequence[dict]) -> str:
+    header = (
+        f"{'Symbol':<10} {'Spread':>10} "
+        f"{'Long':>18} {'LongFee':>10} {'Short':>18} {'ShortFee':>10}"
+    )
+    lines = [header, "-" * len(header)]
+    for item in rows:
+        lines.append(
+            f"{item['symbol']:<10} {item['spread']:>10.6f} "
+            f"{item['long_exchange']:>18} {item['long_fee']:>10.6f} "
+            f"{item['short_exchange']:>18} {item['short_fee']:>10.6f}"
+        )
+    return "\n".join(lines)
+
+
+def format_coinglass_table(rows: Sequence[coinglass.CoinglassRow]) -> str:
+    header = (
+        f"{'Rank':>4} {'Symbol':<8} {'Pair':<12} "
+        f"{'Long':>14} {'Short':>14} {'Net%':>8} {'APR%':>9} {'Spread%':>9}"
+    )
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        lines.append(
+            f"{row.ranking:>4} {row.symbol:<8} {row.pair:<12} "
+            f"{row.long_exchange:>14} {row.short_exchange:>14} "
+            f"{row.net_funding_rate * 100:>7.2f}% {row.apr * 100:>8.2f}% "
+            f"{row.spread_rate * 100:>8.2f}%"
+        )
+    return "\n".join(lines)
+
+
+def format_universe_table(rows: Iterable[dict[str, object]]) -> str:
+    header = f"{'Symbol':<10} {'Sources':<32}"
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        lines.append(f"{row['symbol']:<10} {row['sources']:<32}")
+    return "\n".join(lines)
+
+
+def format_opportunities(rows: Sequence[FundingOpportunity]) -> str:
+    return format_opportunity_table(rows)
+
+
+def _load_screener_snapshot() -> tuple[list[dict], bool]:
+    cached = load_cache("screener_latest.json", PARSE_CACHE_TTL_SECONDS)
+    if cached:
+        logger.info("Using cached ArbitrageScanner data")
+        return list(cached["data"]), True
+
+    logger.info("Fetching candidates from ArbitrageScanner...")
+    data = arbitragescanner.fetch_json()
+    rows = arbitragescanner.build_top(data, exclude=("binance",), limit=20)
+    save_cache(
+        "screener_latest.json",
+        {"data": rows, "fetched_at": datetime.now(timezone.utc).isoformat()},
+    )
+    logger.info("Screener returned %s candidates", len(rows))
+    return rows, False
+
+
+def _load_coinglass_snapshot() -> tuple[list[coinglass.CoinglassRow], bool]:
+    cached = load_cache("coinglass_latest.json", PARSE_CACHE_TTL_SECONDS)
+    if cached:
+        logger.info("Using cached Coinglass data")
+        try:
+            rows = [_coinglass_row_from_cache(item) for item in cached["data"]]
+            return rows, True
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Cached Coinglass payload invalid, refetching: %s", exc)
+
+    logger.info("Fetching candidates from Coinglass...")
+    rows = coinglass.fetch_rows(limit=20)
+    save_cache(
+        "coinglass_latest.json",
+        {
+            "data": [row.to_dict() for row in rows],
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    logger.info("Coinglass returned %s candidates", len(rows))
+    return rows, False
+
+
+def _build_symbol_universe(
+    screener_rows: Sequence[dict], coinglass_rows: Sequence[coinglass.CoinglassRow]
+) -> list[dict[str, object]]:
+    universe: dict[str, set[str]] = {}
+    for item in screener_rows:
+        universe.setdefault(item["symbol"], set()).add("arbitragescanner")
+    for row in coinglass_rows:
+        universe.setdefault(row.symbol, set()).add("coinglass")
+    return [
+        {"symbol": symbol, "sources": ", ".join(sorted(sources))}
+        for symbol, sources in sorted(universe.items())
+    ]
+
+
+def _active_adapters():
+    adapters = []
+    seen: set[str] = set()
+    for name in SUPPORTED_EXCHANGES:
+        canonical = normalize_exchange_name(name)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        try:
+            adapters.append(get_adapter(canonical))
+        except KeyError:
+            logger.warning("No adapter implemented for %s", canonical)
+    return adapters
+
+
+def _opportunity_dict(item: FundingOpportunity) -> dict[str, object]:
+    def fmt(dt: datetime | None) -> str:
+        return dt.isoformat() if dt else ""
+
+    return {
+        "symbol": item.symbol,
+        "long_exchange": item.long_exchange,
+        "long_rate": item.long_rate,
+        "long_mark": item.long_mark,
+        "long_bid": item.long_bid,
+        "long_ask": item.long_ask,
+        "short_exchange": item.short_exchange,
+        "short_rate": item.short_rate,
+        "short_mark": item.short_mark,
+        "short_bid": item.short_bid,
+        "short_ask": item.short_ask,
+        "spread": item.spread,
+        "price_diff": item.price_diff,
+        "price_diff_pct": item.price_diff_pct,
+        "effective_spread": item.effective_spread,
+        "long_next_funding": fmt(item.long_next_funding),
+        "short_next_funding": fmt(item.short_next_funding),
+        "participants": item.participants,
+    }
+
+
+def _coinglass_row_from_cache(item: dict) -> coinglass.CoinglassRow:
+    return coinglass.CoinglassRow(
+        ranking=int(item.get("ranking", 0)),
+        symbol=str(item.get("symbol") or ""),
+        pair=str(item.get("pair") or ""),
+        long_exchange=str(item.get("long_exchange") or ""),
+        short_exchange=str(item.get("short_exchange") or ""),
+        apr=_percent_to_decimal(item, "apr"),
+        net_funding_rate=_percent_to_decimal(item, "net_funding_rate"),
+        spread_rate=_percent_to_decimal(item, "spread_rate"),
+        open_interest=_open_interest_from_cache(item),
+        settlement=str(item.get("settlement") or ""),
+        trade_links=_trade_links_from_cache(item),
+    )
+
+
+def _percent_to_decimal(payload: dict, key: str) -> float:
+    if f"{key}_percent" in payload:
+        return _safe_float(payload.get(f"{key}_percent")) / 100.0
+    return _safe_float(payload.get(key))
+
+
+def _safe_float(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _open_interest_from_cache(item: dict) -> list[str]:
+    if "open_interest" in item and isinstance(item["open_interest"], list):
+        return [str(entry) for entry in item["open_interest"] if entry]
+    entries: list[str] = []
+    if item.get("open_interest_long"):
+        entries.append(str(item["open_interest_long"]))
+    if item.get("open_interest_short"):
+        entries.append(str(item["open_interest_short"]))
+    return entries
+
+
+def _trade_links_from_cache(item: dict) -> list[str]:
+    links = item.get("trade_links")
+    if isinstance(links, list):
+        return [str(link) for link in links if link]
+    if isinstance(links, str):
+        return [part for part in links.split(";") if part]
+    return []

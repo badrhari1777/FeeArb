@@ -54,5 +54,8 @@ class FundingOpportunity:
     short_ask: float | None
     long_next_funding: datetime | None
     short_next_funding: datetime | None
+    price_diff: float
+    price_diff_pct: float
+    effective_spread: float
     participants: int
 
