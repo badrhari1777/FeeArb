@@ -4,9 +4,19 @@
   <meta charset="utf-8" />
   <title>Funding Arbitrage Monitor</title>
   <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}" />
+  {% set raw_snapshot = state.get('snapshot') %}
+  {% set snapshot = raw_snapshot or {} %}
+  {% set has_snapshot = raw_snapshot is not none %}
+  {% set screener_rows = snapshot.get('screener_rows', []) %}
+  {% set coinglass_rows = snapshot.get('coinglass_rows', []) %}
+  {% set universe_rows = snapshot.get('universe', []) %}
+  {% set opportunity_rows = snapshot.get('opportunities', []) %}
+  {% set messages = snapshot.get('messages', []) %}
+  {% set status = state.get('status', 'idle') %}
+  {% set status_class = status|lower|replace(' ', '-') %}
+  {% set refresh_interval = state.get('refresh_interval', 300) %}
   <script>
-    window.__INITIAL_STATE__ = {{ snapshot_payload | tojson | safe }};
-    window.__REFRESH_INTERVAL__ = {{ refresh_interval }};
+    window.__INITIAL_STATE__ = {{ state | tojson | safe }};
   </script>
   <script defer src="{{ url_for('static', path='/app.js') }}"></script>
 </head>
@@ -19,13 +29,25 @@
     <div class="status-block">
       <dl>
         <div>
+          <dt>Status</dt>
+          <dd>
+            <span id="status-pill" class="status-pill status-pill--{{ status_class }}">{{ status }}</span>
+          </dd>
+        </div>
+        <div>
           <dt>Generated (UTC)</dt>
-          <dd id="generated-at">{{ snapshot.generated_at.isoformat() }}</dd>
+          <dd id="generated-at">{{ snapshot.get('generated_at') or "-" }}</dd>
+        </div>
+        <div>
+          <dt>Last Updated</dt>
+          <dd id="last-updated">{{ state.get('last_updated') or "-" }}</dd>
         </div>
         <div>
           <dt>Screener source</dt>
           <dd id="screener-source">
-            {% if snapshot.screener_from_cache %}
+            {% if snapshot.get('screener_from_cache') is none %}
+              -
+            {% elif snapshot.get('screener_from_cache') %}
               cache
             {% else %}
               fresh
@@ -35,7 +57,9 @@
         <div>
           <dt>Coinglass source</dt>
           <dd id="coinglass-source">
-            {% if snapshot.coinglass_from_cache %}
+            {% if snapshot.get('coinglass_from_cache') is none %}
+              -
+            {% elif snapshot.get('coinglass_from_cache') %}
               cache
             {% else %}
               fresh
@@ -46,6 +70,11 @@
           <dt>Opportunities</dt>
           <dd id="opportunity-count">{{ opportunity_rows | length }}</dd>
         </div>
+        <div>
+          <dt>Last error</dt>
+          {% set last_error = state.get('last_error') %}
+          <dd id="last-error" title="{{ last_error or '' }}">{{ last_error or "None" }}</dd>
+        </div>
       </dl>
       <button id="refresh-button" class="button" type="button">Manual refresh</button>
       <p class="hint">Auto refresh every {{ refresh_interval }} seconds</p>
@@ -53,11 +82,18 @@
   </header>
 
   <main class="content">
-    {% if snapshot.messages %}
+    <section class="panel panel--muted" id="empty-state"{% if has_snapshot %} style="display: none;"{% endif %}>
+      <h2>Preparing snapshot</h2>
+      <p class="muted">
+        We are collecting the latest market data. Tables will populate automatically once the snapshot is ready.
+      </p>
+    </section>
+
+    {% if messages %}
       <section class="panel panel--alert" id="messages">
         <h2>Status Messages</h2>
         <ul>
-          {% for message in snapshot.messages %}
+          {% for message in messages %}
             <li>{{ message }}</li>
           {% endfor %}
         </ul>
@@ -68,7 +104,7 @@
       <h2>Data Overview</h2>
       <div class="overview-grid">
         <div>
-          <h3>ArbitrageScanner Top 10</h3>
+          <h3>ArbitrageScanner Top Entries</h3>
           <table class="data-table" id="screener-table">
             <thead>
               <tr>
@@ -84,18 +120,18 @@
               {% for row in screener_rows %}
                 <tr>
                   <td>{{ row.symbol }}</td>
-                  <td>{{ (row.spread or 0) | float | round(4) }}</td>
+                  <td>{{ ((row.spread or 0) * 100) | round(4) }}</td>
                   <td>{{ row.long_exchange }}</td>
-                  <td>{{ (row.long_fee or 0) | float | round(4) }}</td>
+                  <td>{{ ((row.long_fee or 0) * 100) | round(4) }}</td>
                   <td>{{ row.short_exchange }}</td>
-                  <td>{{ (row.short_fee or 0) | float | round(4) }}</td>
+                  <td>{{ ((row.short_fee or 0) * 100) | round(4) }}</td>
                 </tr>
               {% endfor %}
             </tbody>
           </table>
         </div>
         <div>
-          <h3>Coinglass Top 10</h3>
+          <h3>Coinglass Top Entries</h3>
           <table class="data-table" id="coinglass-table">
             <thead>
               <tr>
@@ -117,9 +153,9 @@
                   <td>{{ row.pair }}</td>
                   <td>{{ row.long_exchange }}</td>
                   <td>{{ row.short_exchange }}</td>
-                  <td>{{ (row.net_funding_rate * 100) | round(3) }}</td>
-                  <td>{{ (row.apr * 100) | round(2) }}</td>
-                  <td>{{ (row.spread_rate * 100) | round(3) }}</td>
+                  <td>{{ (row.net_funding_rate_percent or 0) | round(3) }}</td>
+                  <td>{{ (row.apr_percent or 0) | round(2) }}</td>
+                  <td>{{ (row.spread_rate_percent or 0) | round(3) }}</td>
                 </tr>
               {% endfor %}
             </tbody>
@@ -175,18 +211,18 @@
             <tr>
               <td>{{ row.symbol }}</td>
               <td>{{ row.long_exchange }}</td>
-              <td>{{ (row.long_rate * 100) | round(3) }}</td>
+              <td>{{ ((row.long_rate or 0) * 100) | round(3) }}</td>
               <td>{{ row.long_bid if row.long_bid is not none else "-" }}</td>
               <td>{{ row.long_ask if row.long_ask is not none else "-" }}</td>
-              <td>{{ row.long_next_funding.isoformat() if row.long_next_funding else "-" }}</td>
+              <td>{{ row.long_next_funding or "-" }}</td>
               <td>{{ row.short_exchange }}</td>
-              <td>{{ (row.short_rate * 100) | round(3) }}</td>
+              <td>{{ ((row.short_rate or 0) * 100) | round(3) }}</td>
               <td>{{ row.short_bid if row.short_bid is not none else "-" }}</td>
               <td>{{ row.short_ask if row.short_ask is not none else "-" }}</td>
-              <td>{{ row.short_next_funding.isoformat() if row.short_next_funding else "-" }}</td>
-              <td>{{ (row.spread * 100) | round(3) }}</td>
-              <td>{{ (row.price_diff_pct * 100) | round(3) }}</td>
-              <td>{{ (row.effective_spread * 100) | round(3) }}</td>
+              <td>{{ row.short_next_funding or "-" }}</td>
+              <td>{{ ((row.spread or 0) * 100) | round(3) }}</td>
+              <td>{{ ((row.price_diff_pct or 0) * 100) | round(3) }}</td>
+              <td>{{ ((row.effective_spread or 0) * 100) | round(3) }}</td>
               <td>{{ row.participants }}</td>
             </tr>
           {% endfor %}

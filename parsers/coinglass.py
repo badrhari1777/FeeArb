@@ -29,6 +29,24 @@ else:
         _patched_launch._fee_arb_patched = True  # type: ignore[attr-defined]
         _pyppeteer_launcher.launch = _patched_launch
 
+    try:  # Ensure top-level pyppeteer.launch also respects the signal settings
+        import pyppeteer
+    except ImportError:  # pragma: no cover - optional dependency
+        pyppeteer = None  # type: ignore[assignment]
+    else:
+        if not getattr(pyppeteer.launch, "_fee_arb_patched", False):
+            _original_launch_fn = pyppeteer.launch
+
+            async def _patched_top_level_launch(options: dict | None = None, **kwargs):
+                params = dict(options or {})
+                params.setdefault("handleSIGINT", False)
+                params.setdefault("handleSIGTERM", False)
+                params.setdefault("handleSIGHUP", False)
+                return await _original_launch_fn(params, **kwargs)
+
+            _patched_top_level_launch._fee_arb_patched = True  # type: ignore[attr-defined]
+            pyppeteer.launch = _patched_top_level_launch
+
 COINGLASS_URL = "https://www.coinglass.com/FrArbitrage"
 DEFAULT_HEADERS = {
     "User-Agent": (

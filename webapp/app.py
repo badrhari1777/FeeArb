@@ -30,39 +30,23 @@ async def shutdown_event() -> None:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
-    snapshot = service.latest_snapshot()
-    if snapshot is None:
-        return templates.TemplateResponse(
-            "loading.html",
-            {"request": request},
-        )
-
-    snapshot_payload = snapshot.as_dict()
+    state = service.state_payload()
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
-            "snapshot": snapshot,
-            "snapshot_payload": snapshot_payload,
-            "screener_rows": snapshot.screener_rows[:10],
-            "coinglass_rows": snapshot.coinglass_rows[:10],
-            "universe_rows": snapshot.universe,
-            "opportunity_rows": snapshot.opportunities,
-            "refresh_interval": service.refresh_interval,
+            "state": state,
         },
     )
 
 
 @app.get("/api/snapshot")
 async def snapshot_api() -> JSONResponse:
-    payload = service.latest_snapshot_dict()
-    if payload is None:
-        return JSONResponse({"status": "pending"})
-    return JSONResponse(payload)
+    return JSONResponse(service.state_payload())
 
 
 @app.post("/api/refresh")
 async def refresh_snapshot() -> JSONResponse:
-    await service.refresh_snapshot()
-    return JSONResponse({"status": "refreshed"})
+    result = await service.refresh_snapshot()
+    return JSONResponse({"status": result, "state": service.state_payload()})
 
