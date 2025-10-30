@@ -259,13 +259,13 @@
             <th>Symbol</th>
             <th>Long</th>
             <th>Long Rate %</th>
-            <th>Long Bid</th>
             <th>Long Ask</th>
+            <th>Long Liquidity (USDT)</th>
             <th>Next Funding (Long)</th>
             <th>Short</th>
             <th>Short Rate %</th>
             <th>Short Bid</th>
-            <th>Short Ask</th>
+            <th>Short Liquidity (USDT)</th>
             <th>Next Funding (Short)</th>
             <th>Spread %</th>
             <th>Price Gap %</th>
@@ -279,13 +279,13 @@
               <td>{{ row.symbol }}</td>
               <td>{{ row.long_exchange }}</td>
               <td>{{ ((row.long_rate or 0) * 100) | round(3) }}</td>
-              <td>{{ row.long_bid if row.long_bid is not none else "-" }}</td>
               <td>{{ row.long_ask if row.long_ask is not none else "-" }}</td>
+              <td>{{ row.long_liquidity_usd if row.long_liquidity_usd is not none else "-" }}</td>
               <td>{{ row.long_next_funding or "-" }}</td>
               <td>{{ row.short_exchange }}</td>
               <td>{{ ((row.short_rate or 0) * 100) | round(3) }}</td>
               <td>{{ row.short_bid if row.short_bid is not none else "-" }}</td>
-              <td>{{ row.short_ask if row.short_ask is not none else "-" }}</td>
+              <td>{{ row.short_liquidity_usd if row.short_liquidity_usd is not none else "-" }}</td>
               <td>{{ row.short_next_funding or "-" }}</td>
               <td>{{ ((row.spread or 0) * 100) | round(3) }}</td>
               <td>{{ ((row.price_diff_pct or 0) * 100) | round(3) }}</td>

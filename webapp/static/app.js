@@ -193,13 +193,13 @@
             <td>${escapeHtml(row.symbol)}</td>
             <td>${escapeHtml(row.long_exchange)}</td>
             <td>${formatPercent(row.long_rate, 3)}</td>
-            <td>${formatNumber(row.long_bid, 4)}</td>
             <td>${formatNumber(row.long_ask, 4)}</td>
+            <td>${formatNumber(row.long_liquidity_usd, 2)}</td>
             <td>${escapeHtml(formatTime(row.long_next_funding))}</td>
             <td>${escapeHtml(row.short_exchange)}</td>
             <td>${formatPercent(row.short_rate, 3)}</td>
             <td>${formatNumber(row.short_bid, 4)}</td>
-            <td>${formatNumber(row.short_ask, 4)}</td>
+            <td>${formatNumber(row.short_liquidity_usd, 2)}</td>
             <td>${escapeHtml(formatTime(row.short_next_funding))}</td>
             <td>${formatPercent(row.spread, 3)}</td>
             <td>${formatPercent(row.price_diff_pct, 3)}</td>

@@ -18,6 +18,8 @@ class MarketSnapshot:
     bid: float | None
     ask: float | None
     raw: dict[str, Any]
+    bid_size: float | None = None
+    ask_size: float | None = None
 
 
 @dataclass(slots=True)
@@ -48,14 +50,16 @@ class FundingOpportunity:
     spread: float
     long_mark: float | None
     short_mark: float | None
-    long_bid: float | None
-    long_ask: float | None
-    short_bid: float | None
-    short_ask: float | None
     long_next_funding: datetime | None
     short_next_funding: datetime | None
     price_diff: float
     price_diff_pct: float
     effective_spread: float
     participants: int
+    long_ask: float | None = None
+    long_liquidity: float | None = None
+    long_liquidity_usd: float | None = None
+    short_bid: float | None = None
+    short_liquidity: float | None = None
+    short_liquidity_usd: float | None = None
 

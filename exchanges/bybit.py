@@ -22,11 +22,15 @@ class BybitAdapter(ExchangeAdapter):
 
     def map_symbol(self, symbol: str) -> str | None:
         symbol = symbol.upper().strip()
+        if not symbol:
+            return None
         if symbol.endswith("USDT"):
             return symbol
         if symbol.endswith("USD"):
-            return symbol
-        return None
+            # Enforce USDT contracts going forward.
+            base = symbol[:-3]
+            return f"{base}USDT"
+        return f"{symbol}USDT"
 
     def fetch_market_snapshots(self, symbols: Iterable[str]) -> List[MarketSnapshot]:
         snapshots: list[MarketSnapshot] = []
@@ -72,6 +76,8 @@ class BybitAdapter(ExchangeAdapter):
                     mark_price=_to_float(item.get("markPrice")),
                     bid=_to_float(item.get("bid1Price")),
                     ask=_to_float(item.get("ask1Price")),
+                    bid_size=_to_float(item.get("bid1Size")),
+                    ask_size=_to_float(item.get("ask1Size")),
                     raw=item,
                 )
             )
@@ -102,4 +108,3 @@ def _to_datetime(value: object) -> datetime | None:
     except (TypeError, ValueError):
         return None
     return datetime.fromtimestamp(millis / 1000, tz=timezone.utc)
-

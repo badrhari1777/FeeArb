@@ -17,13 +17,8 @@ BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 # Exchanges we currently support across the pipeline.
 SUPPORTED_EXCHANGES: Final[List[str]] = [
     "bybit",
-    "okx",
-    "htx",
-    "bitget",
-    "bingx",
-    "gate",
     "mexc",
-    "kucoin",
+    # Remaining adapters stay registered but are inactive by default.
 ]
 
 # Cached scraper payloads remain valid for this many seconds.
