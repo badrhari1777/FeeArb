@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional
 
 from pipeline import collect_snapshot, DataSnapshot
+from project_settings import SettingsManager
 
 RefreshResult = Literal["completed", "in_progress", "failed"]
 
@@ -13,8 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 class DataService:
-    def __init__(self, refresh_interval: int = 300) -> None:
-        self.refresh_interval = refresh_interval
+    def __init__(self, settings_manager: SettingsManager | None = None) -> None:
+        self._settings_manager = settings_manager or SettingsManager()
+        self._parser_interval = self._settings_manager.current.parser_refresh_seconds
         self._snapshot: Optional[DataSnapshot] = None
         self._lock = asyncio.Lock()
         self._task: Optional[asyncio.Task] = None
@@ -27,12 +29,14 @@ class DataService:
         self._events: List[dict[str, Any]] = []
         self._exchange_status: Dict[str, dict[str, Any]] = {}
 
+
     async def startup(self) -> None:
         self._loop = asyncio.get_running_loop()
         async with self._lock:
             self._status = "pending"
+            self._parser_interval = self._settings_manager.current.parser_refresh_seconds
         if self._task is None:
-            self._task = asyncio.create_task(self._scheduler())
+            await self._restart_scheduler()
         if self._bootstrap_task is None or self._bootstrap_task.done():
             self._bootstrap_task = asyncio.create_task(self.refresh_snapshot())
 
@@ -55,7 +59,8 @@ class DataService:
     async def _scheduler(self) -> None:
         try:
             while True:
-                await asyncio.sleep(self.refresh_interval)
+                interval = max(self._parser_interval, 1)
+                await asyncio.sleep(interval)
                 result = await self.refresh_snapshot()
                 if result == "failed":
                     logger.warning(
@@ -63,6 +68,18 @@ class DataService:
                     )
         except asyncio.CancelledError:
             raise
+
+    async def _restart_scheduler(self) -> None:
+        if self._loop is None or self._loop.is_closed():
+            return
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        self._task = asyncio.create_task(self._scheduler())
 
     async def refresh_snapshot(self) -> RefreshResult:
         async with self._lock:
@@ -81,8 +98,16 @@ class DataService:
         outcome: RefreshResult = "completed"
         loop = self._loop or asyncio.get_running_loop()
         progress_cb = self._make_progress_callback(loop)
+        current_settings = self._settings_manager.current
+        source_flags = dict(current_settings.sources)
+        exchange_flags = dict(current_settings.exchanges)
         try:
-            snapshot = await asyncio.to_thread(collect_snapshot, progress_cb)
+            snapshot = await asyncio.to_thread(
+                collect_snapshot,
+                progress_cb,
+                source_settings=source_flags,
+                exchange_settings=exchange_flags,
+            )
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception("Snapshot refresh raised an error")
             outcome = "failed"
@@ -106,6 +131,7 @@ class DataService:
                 self._status = "ready"
                 self._last_error = None
                 self._last_refreshed = datetime.now(timezone.utc)
+                self._parser_interval = current_settings.parser_refresh_seconds
                 self._exchange_status = {
                     entry.get("exchange", f"exchange-{idx}"): entry
                     for idx, entry in enumerate(snapshot.exchange_status)
@@ -115,6 +141,11 @@ class DataService:
                 self._in_progress = False
 
         return outcome
+
+    async def on_settings_updated(self) -> None:
+        async with self._lock:
+            self._parser_interval = self._settings_manager.current.parser_refresh_seconds
+        await self._restart_scheduler()
 
     def latest_snapshot(self) -> Optional[DataSnapshot]:
         return self._snapshot
@@ -129,9 +160,17 @@ class DataService:
         status = self._status
         if status == "idle" and snapshot_dict:
             status = "ready"
+        settings_payload = self._settings_manager.as_dict()
+        parser_interval = int(
+            settings_payload.get("parser_refresh_seconds", self._parser_interval)
+        )
+        table_interval = int(
+            settings_payload.get("table_refresh_seconds", parser_interval)
+        )
         return {
             "status": status,
-            "refresh_interval": self.refresh_interval,
+            "refresh_interval": table_interval,
+            "parser_refresh_interval": parser_interval,
             "last_error": self._last_error,
             "last_updated": (
                 self._last_refreshed.isoformat() if self._last_refreshed else None
@@ -140,7 +179,9 @@ class DataService:
             "refresh_in_progress": self._in_progress,
             "events": list(self._events),
             "exchange_status": list(self._exchange_status.values()),
+            "settings": settings_payload,
         }
+
 
     def _make_progress_callback(
         self, loop: asyncio.AbstractEventLoop

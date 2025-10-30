@@ -11,6 +11,7 @@ Research tooling for cross-exchange funding-rate arbitrage. The project now ship
   - Empty-state placeholders instead of hard waits during initial loads.
   - Status pill, activity timeline, and exchange response grid that update as soon as each stage completes.
   - Manual refresh button that triggers backend refreshes without freezing the page.
+  - A configuration panel for toggling sources/exchanges and tuning independent parser/UI refresh cadences (saved to disk).
 
 ## Project Layout
 ```
@@ -24,6 +25,7 @@ Research tooling for cross-exchange funding-rate arbitrage. The project now ship
 |   `-- opportunities.py       # Exchange polling + opportunity builder
 |-- parsers/                   # ArbitrageScanner & Coinglass scrapers
 |-- exchanges/                 # Adapter implementations (Bybit, MEXC active; others stubbed)
+|-- project_settings.py        # JSON-backed settings loader/saver
 |-- scripts/
 |   `-- exchange_probe.py      # Diagnostics script for raw exchange payloads
 |-- webapp/
@@ -48,6 +50,14 @@ pip install -r requirements.txt
 copy .env.example .env          # adjust if private endpoints are needed later
 ```
 
+## Configuration
+
+Project settings are stored in `data/settings.json`. The file is created on first run with both ArbitrageScanner and Coinglass enabled, plus Bybit and MEXC exchanges. You can edit it manually or use the dashboard's **Configuration** panel to toggle sources/exchanges and adjust two refresh timers:
+
+- `parser_refresh_seconds` - cadence for the backend snapshot scheduler.
+- `table_refresh_seconds` - cadence for the client-side polling loop.
+
+At least one source and one exchange must stay enabled; the UI enforces the constraint and the backend applies changes immediately without restarting Uvicorn.
 ## CLI Snapshot Runner
 ```powershell
 python .\main.py
@@ -79,6 +89,7 @@ Navigate to `http://127.0.0.1:8000/`.
 - **Progress tracking:** Each pipeline stage emits events that appear in the activity log (`screener:complete`, `exchange:error`, `snapshot:ready`, etc.).
 - **Exchange grid:** Displays every adapter with live status chips (`ok`, `pending`, `failed`, `missing`) and snapshot counts/error messages. By default only Bybit and MEXC are polled; the remaining adapters stay idle until we re-enable them.
 - **Manual refresh:** Clicking the refresh button triggers a backend refresh, disables the button during execution, and re-renders each table as soon as new data is available. Automatic polling keeps data current using the configured refresh interval.
+- **Configuration panel:** Update source/exchange toggles and tweak parser/UI refresh cadences without restarting the service.
 
 ## Failure Handling
 - Missing or failed exchanges no longer block the snapshot; partial data still renders.
@@ -102,4 +113,3 @@ Navigate to `http://127.0.0.1:8000/`.
 2. Add WebSocket streaming for exchanges that provide live funding updates.
 3. Surface opportunity deltas (compare with previous snapshot) and alert thresholds.
 4. Package the dashboard for container deployment with optional HTTPS termination.
-

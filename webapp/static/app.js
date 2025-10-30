@@ -1,13 +1,28 @@
 (() => {
+  const MIN_REFRESH_SECONDS = 30;
+  const MAX_REFRESH_SECONDS = 86400;
+  const defaultSettings = {
+    sources: { arbitragescanner: true, coinglass: true },
+    exchanges: { bybit: true, mexc: true },
+    parser_refresh_seconds: 300,
+    table_refresh_seconds: 300,
+  };
+
   const defaultState = {
     status: "idle",
-    refresh_interval: 300,
+    refresh_interval: defaultSettings.table_refresh_seconds,
+    parser_refresh_interval: defaultSettings.parser_refresh_seconds,
     last_error: null,
     last_updated: null,
     snapshot: null,
     refresh_in_progress: false,
     events: [],
     exchange_status: [],
+    settings: {
+      ...defaultSettings,
+      sources: { ...defaultSettings.sources },
+      exchanges: { ...defaultSettings.exchanges },
+    },
   };
 
   const initialState = {
@@ -15,15 +30,54 @@
     ...(window.__INITIAL_STATE__ || {}),
   };
 
+  if (!initialState.settings) {
+    initialState.settings = {
+      ...defaultSettings,
+      sources: { ...defaultSettings.sources },
+      exchanges: { ...defaultSettings.exchanges },
+    };
+  } else {
+    initialState.settings = {
+      ...defaultSettings,
+      ...initialState.settings,
+      sources: {
+        ...defaultSettings.sources,
+        ...(initialState.settings.sources || {}),
+      },
+      exchanges: {
+        ...defaultSettings.exchanges,
+        ...(initialState.settings.exchanges || {}),
+      },
+    };
+  }
+
+  if (!initialState.parser_refresh_interval) {
+    initialState.parser_refresh_interval =
+      initialState.settings.parser_refresh_seconds ??
+      initialState.refresh_interval ??
+      defaultSettings.parser_refresh_seconds;
+  }
+
+  if (!initialState.refresh_interval) {
+    initialState.refresh_interval =
+      initialState.settings.table_refresh_seconds ??
+      defaultSettings.table_refresh_seconds;
+  }
+
   let currentState = initialState;
   let pollIntervalSeconds = Math.max(
-    Number(initialState.refresh_interval) || 300,
-    30,
+    Number(
+      initialState.settings?.table_refresh_seconds ??
+        initialState.refresh_interval ??
+        defaultSettings.table_refresh_seconds,
+    ) || defaultSettings.table_refresh_seconds,
+    MIN_REFRESH_SECONDS,
   );
   let pollingTimer = null;
   let pollingInFlight = false;
 
   const elements = {
+
     generatedAt: document.getElementById("generated-at"),
     lastUpdated: document.getElementById("last-updated"),
     screenerSource: document.getElementById("screener-source"),
@@ -38,6 +92,11 @@
     universeTable: document.getElementById("universe-table-body"),
     opportunityTable: document.getElementById("opportunity-table-body"),
     messagesPanel: document.getElementById("messages"),
+    settingsForm: document.getElementById("settings-form"),
+    parserInput: document.getElementById("parser-interval"),
+    tableInput: document.getElementById("table-interval"),
+    settingsStatus: document.getElementById("settings-status"),
+    settingsSubmit: document.getElementById("settings-submit"),
     refreshButton: document.getElementById("refresh-button"),
     hint: document.querySelector(".hint"),
     emptyState: document.getElementById("empty-state"),
@@ -109,7 +168,7 @@
     if (text.length <= limit) {
       return text;
     }
-    return `${text.slice(0, limit - 1)}…`;
+    return `${text.slice(0, Math.max(0, limit - 3))}...`;
   };
 
   const updateStatusPill = (statusText) => {
@@ -128,6 +187,40 @@
     }
     elements.emptyState.style.display = show ? "" : "none";
   };
+  const cloneSettings = (settings = defaultSettings) => ({
+    ...settings,
+    sources: { ...(settings.sources || {}) },
+    exchanges: { ...(settings.exchanges || {}) },
+  });
+
+  const normalizeSettings = (settings = undefined) => {
+    const base = cloneSettings(defaultSettings);
+    if (!settings) {
+      return cloneSettings(base);
+    }
+    const normalized = cloneSettings({
+      ...settings,
+      sources: { ...(settings.sources || {}) },
+      exchanges: { ...(settings.exchanges || {}) },
+    });
+    return {
+      ...base,
+      ...normalized,
+      sources: Object.entries(normalized.sources || {}).reduce(
+        (acc, [key, value]) => ({ ...acc, [key]: Boolean(value) }),
+        { ...base.sources },
+      ),
+      exchanges: Object.entries(normalized.exchanges || {}).reduce(
+        (acc, [key, value]) => ({ ...acc, [key]: Boolean(value) }),
+        { ...base.exchanges },
+      ),
+      parser_refresh_seconds:
+        Number(normalized.parser_refresh_seconds) || base.parser_refresh_seconds,
+      table_refresh_seconds:
+        Number(normalized.table_refresh_seconds) || base.table_refresh_seconds,
+    };
+  };
+
 
   const renderScreener = (rows = []) => {
     if (!elements.screenerTable) {
@@ -417,8 +510,21 @@
       }
     }
 
+    const parserInterval =
+      Number(
+        state.parser_refresh_interval ??
+          state.settings?.parser_refresh_seconds ??
+          defaultSettings.parser_refresh_seconds,
+      ) || defaultSettings.parser_refresh_seconds;
+    const tableInterval =
+      Number(
+        state.settings?.table_refresh_seconds ??
+          state.refresh_interval ??
+          defaultSettings.table_refresh_seconds,
+      ) || defaultSettings.table_refresh_seconds;
+
     if (elements.hint) {
-      elements.hint.textContent = `Auto refresh every ${pollIntervalSeconds} seconds`;
+      elements.hint.textContent = `UI refresh: ${tableInterval} s | Parser: ${parserInterval} s`;
     }
   };
 
@@ -432,6 +538,156 @@
       ? "Refreshing..."
       : "Manual refresh";
   };
+  const setSettingsStatus = (message = "", variant = "info") => {
+    if (!elements.settingsStatus) {
+      return;
+    }
+    const baseClass = "settings-status";
+    if (!message) {
+      elements.settingsStatus.textContent = "";
+      elements.settingsStatus.className = baseClass;
+      return;
+    }
+    elements.settingsStatus.textContent = message;
+    elements.settingsStatus.className = `${baseClass} ${baseClass}--${variant}`;
+  };
+
+  const syncSettingsForm = (settings = defaultSettings) => {
+    if (!elements.settingsForm) {
+      return;
+    }
+    const data = normalizeSettings(settings);
+    const sourceInputs = elements.settingsForm.querySelectorAll('input[name="sources"]');
+    sourceInputs.forEach((input) => {
+      const key = input.value;
+      input.checked = Boolean(data.sources[key]);
+    });
+    const exchangeInputs = elements.settingsForm.querySelectorAll('input[name="exchanges"]');
+    exchangeInputs.forEach((input) => {
+      const key = input.value;
+      input.checked = Boolean(data.exchanges[key]);
+    });
+    if (elements.parserInput) {
+      elements.parserInput.value =
+        data.parser_refresh_seconds ||
+        currentState.parser_refresh_interval ||
+        defaultSettings.parser_refresh_seconds;
+    }
+    if (elements.tableInput) {
+      elements.tableInput.value =
+        data.table_refresh_seconds ||
+        currentState.refresh_interval ||
+        defaultSettings.table_refresh_seconds;
+    }
+  };
+
+  const collectSettingsPayload = () => {
+    if (!elements.settingsForm) {
+      return null;
+    }
+    const payload = {
+      sources: {},
+      exchanges: {},
+      parser_refresh_seconds:
+        Number.parseInt(elements.parserInput?.value ?? "", 10) ||
+        defaultSettings.parser_refresh_seconds,
+      table_refresh_seconds:
+        Number.parseInt(elements.tableInput?.value ?? "", 10) ||
+        defaultSettings.table_refresh_seconds,
+    };
+    elements.settingsForm.querySelectorAll('input[name="sources"]').forEach((input) => {
+      payload.sources[input.value] = Boolean(input.checked);
+    });
+    elements.settingsForm.querySelectorAll('input[name="exchanges"]').forEach((input) => {
+      payload.exchanges[input.value] = Boolean(input.checked);
+    });
+    return payload;
+  };
+
+  const validateSettingsPayload = (payload) => {
+    const errors = [];
+    if (!payload) {
+      errors.push("Settings form is unavailable.");
+      return errors;
+    }
+    const hasEnabled = (record) =>
+      Object.values(record || {}).some((value) => Boolean(value));
+    if (!hasEnabled(payload.sources)) {
+      errors.push("Enable at least one data source.");
+    }
+    if (!hasEnabled(payload.exchanges)) {
+      errors.push("Enable at least one exchange.");
+    }
+    const withinRange = (value) =>
+      value >= MIN_REFRESH_SECONDS && value <= MAX_REFRESH_SECONDS;
+    if (!withinRange(payload.parser_refresh_seconds)) {
+      errors.push(
+        `Parser refresh must be between ${MIN_REFRESH_SECONDS} and ${MAX_REFRESH_SECONDS} seconds.`,
+      );
+    }
+    if (!withinRange(payload.table_refresh_seconds)) {
+      errors.push(
+        `UI refresh must be between ${MIN_REFRESH_SECONDS} and ${MAX_REFRESH_SECONDS} seconds.`,
+      );
+    }
+    return errors;
+  };
+
+  const handleSettingsSubmit = async (event) => {
+    event.preventDefault();
+    if (!elements.settingsForm) {
+      return;
+    }
+    const payload = collectSettingsPayload();
+    const errors = validateSettingsPayload(payload);
+    if (errors.length) {
+      setSettingsStatus(errors.join(" "), "error");
+      return;
+    }
+    try {
+      setSettingsStatus("Saving settings...");
+      if (elements.settingsSubmit) {
+        elements.settingsSubmit.disabled = true;
+      }
+      const response = await fetch("/api/settings", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) {
+        let detail = response.statusText;
+        try {
+          const errorPayload = await response.json();
+          detail = errorPayload?.detail || detail;
+        } catch {
+          /* ignore */
+        }
+        throw new Error(detail || "Request failed");
+      }
+      const data = await response.json();
+      if (data.state) {
+        renderState(data.state);
+      } else if (data.settings) {
+        mergeState({ settings: data.settings });
+        updateMetadata(currentState);
+      }
+      syncSettingsForm(currentState.settings ?? defaultSettings);
+      setSettingsStatus("Settings updated.", "success");
+    } catch (error) {
+      console.error(error);
+      setSettingsStatus(
+        `Failed to save settings: ${error.message || "Unknown error"}`,
+        "error",
+      );
+    } finally {
+      if (elements.settingsSubmit) {
+        elements.settingsSubmit.disabled = false;
+      }
+    }
+  };
+
 
   const mergeState = (next = {}) => {
     const mergedSnapshot =
@@ -447,14 +703,38 @@
         ? mergedSnapshot.exchange_status
         : null;
 
+    const nextSettings =
+      next.settings !== undefined
+        ? normalizeSettings(next.settings)
+        : currentState.settings
+        ? normalizeSettings(currentState.settings)
+        : normalizeSettings();
+
+    const parserIntervalValue =
+      Number(
+        next.parser_refresh_interval ??
+          nextSettings.parser_refresh_seconds ??
+          currentState.parser_refresh_interval ??
+          defaultSettings.parser_refresh_seconds,
+      ) || defaultSettings.parser_refresh_seconds;
+
+    const tableIntervalValue =
+      Number(
+        next.refresh_interval ??
+          nextSettings.table_refresh_seconds ??
+          currentState.refresh_interval ??
+          defaultSettings.table_refresh_seconds,
+      ) || defaultSettings.table_refresh_seconds;
+
     currentState = {
       ...currentState,
       ...next,
       snapshot: mergedSnapshot,
       events: mergedEvents,
       exchange_status: snapshotExchangeStatus ?? mergedExchangeStatus,
-      refresh_interval:
-        next.refresh_interval ?? currentState.refresh_interval,
+      settings: cloneSettings(nextSettings),
+      parser_refresh_interval: parserIntervalValue,
+      refresh_interval: tableIntervalValue,
       refresh_in_progress:
         next.refresh_in_progress ?? currentState.refresh_in_progress,
     };
@@ -462,8 +742,12 @@
 
   const ensurePolling = () => {
     const desired = Math.max(
-      Number(currentState.refresh_interval) || 300,
-      30,
+      Number(
+        currentState.settings?.table_refresh_seconds ??
+          currentState.refresh_interval ??
+          defaultSettings.table_refresh_seconds,
+      ) || defaultSettings.table_refresh_seconds,
+      MIN_REFRESH_SECONDS,
     );
     if (desired !== pollIntervalSeconds) {
       pollIntervalSeconds = desired;
@@ -473,6 +757,7 @@
 
   const renderState = (state) => {
     mergeState(state);
+    syncSettingsForm(currentState.settings ?? defaultSettings);
     ensurePolling();
     updateStatusPill(currentState.status);
     updateMetadata(currentState);
@@ -566,6 +851,11 @@
     elements.refreshButton.addEventListener("click", triggerManualRefresh);
   }
 
+  if (elements.settingsForm) {
+    elements.settingsForm.addEventListener("submit", handleSettingsSubmit);
+  }
+
+  syncSettingsForm(initialState.settings ?? defaultSettings);
   renderState(initialState);
   schedulePolling();
 

@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
-from typing import Any, Callable, Iterable, List, Sequence
+from typing import Any, Callable, Iterable, List, Mapping, Sequence
 
 from config import PARSE_CACHE_TTL_SECONDS, SUPPORTED_EXCHANGES
+from project_settings import DEFAULT_SOURCES
 from exchanges import get_adapter, normalize_exchange_name
 from orchestrator.models import FundingOpportunity
 from orchestrator.opportunities import (
@@ -51,7 +52,12 @@ class DataSnapshot:
 ProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
-def collect_snapshot(progress_cb: ProgressCallback | None = None) -> DataSnapshot:
+def collect_snapshot(
+    progress_cb: ProgressCallback | None = None,
+    *,
+    source_settings: Mapping[str, bool] | None = None,
+    exchange_settings: Mapping[str, bool] | None = None,
+) -> DataSnapshot:
     timestamp = datetime.now(timezone.utc)
 
     def _emit(event: str, payload: dict[str, Any] | None = None) -> None:
@@ -59,90 +65,136 @@ def collect_snapshot(progress_cb: ProgressCallback | None = None) -> DataSnapsho
             progress_cb(event, payload or {})
 
     messages: list[str] = []
+    sources = _effective_sources(source_settings)
+    exchanges = _effective_exchanges(exchange_settings)
 
-    _emit(
-        "screener:start",
-        {
-            "message": "Fetching ArbitrageScanner candidates…",
-        },
-    )
-    screener_rows, screener_from_cache = _load_screener_snapshot()
-    _emit(
-        "screener:complete",
-        {
-            "message": f"ArbitrageScanner returned {len(screener_rows)} rows",
-            "count": len(screener_rows),
-            "from_cache": screener_from_cache,
-        },
-    )
-    if not screener_rows:
-        messages.append("ArbitrageScanner returned no candidates.")
+    if sources.get('arbitragescanner', True):
+        _emit(
+            'screener:start',
+            {
+                'message': 'Fetching ArbitrageScanner candidates...',
+            },
+        )
+        screener_rows, screener_from_cache = _load_screener_snapshot()
+        _emit(
+            'screener:complete',
+            {
+                'message': f'ArbitrageScanner returned {len(screener_rows)} rows',
+                'count': len(screener_rows),
+                'from_cache': screener_from_cache,
+            },
+        )
+        if not screener_rows:
+            messages.append('ArbitrageScanner returned no candidates.')
+    else:
+        screener_rows = []
+        screener_from_cache = True
+        messages.append('ArbitrageScanner fetch disabled via settings.')
+        _emit(
+            'screener:skipped',
+            {
+                'message': 'ArbitrageScanner polling skipped (disabled in settings).',
+            },
+        )
 
-    _emit(
-        "coinglass:start",
-        {
-            "message": "Fetching Coinglass arbitrage table…",
-        },
-    )
-    coinglass_rows, coinglass_from_cache = _load_coinglass_snapshot()
-    _emit(
-        "coinglass:complete",
-        {
-            "message": f"Coinglass returned {len(coinglass_rows)} rows",
-            "count": len(coinglass_rows),
-            "from_cache": coinglass_from_cache,
-        },
-    )
-    if not coinglass_rows:
-        messages.append("Coinglass returned no rows.")
+    if sources.get('coinglass', True):
+        _emit(
+            'coinglass:start',
+            {
+                'message': 'Fetching Coinglass arbitrage table...',
+            },
+        )
+        coinglass_rows, coinglass_from_cache = _load_coinglass_snapshot()
+        _emit(
+            'coinglass:complete',
+            {
+                'message': f'Coinglass returned {len(coinglass_rows)} rows',
+                'count': len(coinglass_rows),
+                'from_cache': coinglass_from_cache,
+            },
+        )
+        if not coinglass_rows:
+            messages.append('Coinglass returned no rows.')
+    else:
+        coinglass_rows = []
+        coinglass_from_cache = True
+        messages.append('Coinglass fetch disabled via settings.')
+        _emit(
+            'coinglass:skipped',
+            {
+                'message': 'Coinglass polling skipped (disabled in settings).',
+            },
+        )
 
     universe = _build_symbol_universe(screener_rows, coinglass_rows)
     _emit(
-        "universe:ready",
+        'universe:ready',
         {
-            "message": f"Symbol universe built with {len(universe)} items",
-            "count": len(universe),
+            'message': f'Symbol universe built with {len(universe)} items',
+            'count': len(universe),
         },
     )
+    if not universe:
+        messages.append('Symbol universe is empty. Enable at least one data source.')
 
-    symbols = [entry["symbol"] for entry in universe]
+    symbols = [entry['symbol'] for entry in universe]
 
-    adapters = _active_adapters()
-    _emit(
-        "exchanges:start",
-        {
-            "message": f"Fetching exchange snapshots for {len(symbols)} symbols…",
-            "symbol_count": len(symbols),
-            "exchange_count": len(adapters),
-        },
-    )
-    opportunities, raw_payloads, exchange_status = compute_opportunities(
-        symbols, adapters, progress_cb=progress_cb
-    )
-    _emit(
-        "opportunities:complete",
-        {
-            "message": f"Computed {len(opportunities)} funding opportunities",
-            "count": len(opportunities),
-        },
-    )
+    adapters = _active_adapters(exchanges)
+    if adapters and symbols:
+        _emit(
+            'exchanges:start',
+            {
+                'message': f'Fetching exchange snapshots for {len(symbols)} symbols...',
+                'symbol_count': len(symbols),
+                'exchange_count': len(adapters),
+            },
+        )
+        opportunities, raw_payloads, exchange_status = compute_opportunities(
+            symbols, adapters, progress_cb=progress_cb
+        )
+        _emit(
+            'opportunities:complete',
+            {
+                'message': f'Computed {len(opportunities)} funding opportunities',
+                'count': len(opportunities),
+            },
+        )
+    else:
+        opportunities = []
+        raw_payloads = {}
+        exchange_status = []
+        if not adapters:
+            messages.append('Exchange polling skipped - all exchanges disabled.')
+            _emit(
+                'exchanges:skipped',
+                {
+                    'message': 'Exchange polling skipped (no exchanges enabled).',
+                },
+            )
+        if not symbols:
+            _emit(
+                'opportunities:skipped',
+                {
+                    'message': 'Opportunity scan skipped (no symbols available).',
+                },
+            )
 
     failed_exchanges = [
-        entry["exchange"]
+        entry['exchange']
         for entry in exchange_status
-        if entry.get("status") != "ok"
+        if entry.get('status') != 'ok'
     ]
     if failed_exchanges:
         messages.append(
-            "Missing data from exchanges: " + ", ".join(sorted(failed_exchanges))
+            'Missing data from exchanges: ' + ', '.join(sorted(failed_exchanges))
         )
 
     _emit(
-        "snapshot:ready",
+        'snapshot:ready',
         {
-            "message": "Snapshot assembled successfully",
-            "opportunity_count": len(opportunities),
-            "failed_exchanges": failed_exchanges,
+            'message': 'Snapshot assembled successfully',
+            'opportunity_count': len(opportunities),
+            'failed_exchanges': failed_exchanges,
         },
     )
 
@@ -274,10 +326,33 @@ def _build_symbol_universe(
     ]
 
 
-def _active_adapters():
+def _effective_sources(settings: Mapping[str, bool] | None) -> dict[str, bool]:
+    if not settings:
+        return dict(DEFAULT_SOURCES)
+    result = dict(DEFAULT_SOURCES)
+    for key, value in settings.items():
+        result[key] = bool(value)
+    return result
+
+
+def _effective_exchanges(settings: Mapping[str, bool] | None) -> list[str]:
+    if not settings:
+        return list(SUPPORTED_EXCHANGES)
+    active: list[str] = []
+    for name, enabled in settings.items():
+        if not enabled:
+            continue
+        canonical = normalize_exchange_name(name)
+        if canonical not in active:
+            active.append(canonical)
+    return active
+
+
+def _active_adapters(enabled: Iterable[str] | None = None):
     adapters = []
     seen: set[str] = set()
-    for name in SUPPORTED_EXCHANGES:
+    candidates = list(enabled) if enabled is not None else list(SUPPORTED_EXCHANGES)
+    for name in candidates:
         canonical = normalize_exchange_name(name)
         if canonical in seen:
             continue
@@ -285,7 +360,7 @@ def _active_adapters():
         try:
             adapters.append(get_adapter(canonical))
         except KeyError:
-            logger.warning("No adapter implemented for %s", canonical)
+            logger.warning('No adapter implemented for %s', canonical)
     return adapters
 
 
