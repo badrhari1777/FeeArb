@@ -183,6 +183,8 @@ def compute_opportunities(
                 short_liquidity_usd=short_liquidity_usd,
                 long_next_funding=long_snap.next_funding_time,
                 short_next_funding=short_snap.next_funding_time,
+                long_funding_interval_hours=long_snap.funding_interval_hours,
+                short_funding_interval_hours=short_snap.funding_interval_hours,
                 price_diff=price_diff,
                 price_diff_pct=price_diff_pct,
                 effective_spread=effective_spread,
@@ -196,8 +198,8 @@ def compute_opportunities(
 
 def format_opportunity_table(rows: Sequence[FundingOpportunity]) -> str:
     header = (
-        f"{'Symbol':<10} {'Long':>10} {'LongRate%':>10} {'LongAsk':>10} {'LongUSDT':>12} {'LongNext':>20} "
-        f"{'Short':>10} {'ShortRate%':>11} {'ShortBid':>10} {'ShortUSDT':>12} {'ShortNext':>20} "
+        f"{'Symbol':<10} {'Long':>10} {'LongRate%':>10} {'LongAsk':>10} {'LongUSDT':>12} {'LongNext':>20} {'LongInt(h)':>12} "
+        f"{'Short':>10} {'ShortRate%':>11} {'ShortBid':>10} {'ShortUSDT':>12} {'ShortNext':>20} {'ShortInt(h)':>13} "
         f"{'Spread%':>9} {'PxGap%':>8} {'Eff%':>8} {'Parts':>6}"
     )
     lines = [header, "-" * len(header)]
@@ -208,11 +210,13 @@ def format_opportunity_table(rows: Sequence[FundingOpportunity]) -> str:
         long_liq = _fmt_numeric(row.long_liquidity_usd, decimals=2, width=12)
         short_bid = _fmt_numeric(row.short_bid, decimals=4, width=10)
         short_liq = _fmt_numeric(row.short_liquidity_usd, decimals=2, width=12)
+        long_interval = _fmt_numeric(row.long_funding_interval_hours, decimals=2, width=12)
+        short_interval = _fmt_numeric(row.short_funding_interval_hours, decimals=2, width=13)
         lines.append(
             f"{row.symbol:<10} {row.long_exchange:>10} {row.long_rate * 100:>10.3f}% "
-            f"{long_ask} {long_liq} {long_next:>20} "
+            f"{long_ask} {long_liq} {long_next:>20} {long_interval} "
             f"{row.short_exchange:>10} {row.short_rate * 100:>11.3f}% "
-            f"{short_bid} {short_liq} {short_next:>20} "
+            f"{short_bid} {short_liq} {short_next:>20} {short_interval} "
             f"{row.spread * 100:>9.3f}% {row.price_diff_pct * 100:>7.3f}% "
             f"{row.effective_spread * 100:>7.3f}% {row.participants:>6}"
         )

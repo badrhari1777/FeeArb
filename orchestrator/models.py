@@ -20,6 +20,7 @@ class MarketSnapshot:
     raw: dict[str, Any]
     bid_size: float | None = None
     ask_size: float | None = None
+    funding_interval_hours: float | None = None
 
 
 @dataclass(slots=True)
@@ -56,6 +57,8 @@ class FundingOpportunity:
     price_diff_pct: float
     effective_spread: float
     participants: int
+    long_funding_interval_hours: float | None = None
+    short_funding_interval_hours: float | None = None
     long_ask: float | None = None
     long_liquidity: float | None = None
     long_liquidity_usd: float | None = None

@@ -74,6 +74,7 @@ def _snapshot_to_dict(snapshot: MarketSnapshot) -> dict[str, object]:
         "next_funding_time": (
             snapshot.next_funding_time.isoformat() if snapshot.next_funding_time else None
         ),
+        "funding_interval_hours": snapshot.funding_interval_hours,
         "mark_price": snapshot.mark_price,
         "bid": snapshot.bid,
         "ask": snapshot.ask,

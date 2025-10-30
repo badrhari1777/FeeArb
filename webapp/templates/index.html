@@ -306,11 +306,13 @@
             <th>Long Ask</th>
             <th>Long Liquidity (USDT)</th>
             <th>Next Funding (Long)</th>
+            <th>Funding Interval (Long, h)</th>
             <th>Short</th>
             <th>Short Rate %</th>
             <th>Short Bid</th>
             <th>Short Liquidity (USDT)</th>
             <th>Next Funding (Short)</th>
+            <th>Funding Interval (Short, h)</th>
             <th>Spread %</th>
             <th>Price Gap %</th>
             <th>Effective Spread %</th>
@@ -326,11 +328,13 @@
               <td>{{ row.long_ask if row.long_ask is not none else "-" }}</td>
               <td>{{ row.long_liquidity_usd if row.long_liquidity_usd is not none else "-" }}</td>
               <td>{{ row.long_next_funding or "-" }}</td>
+              <td>{{ row.long_funding_interval_hours if row.long_funding_interval_hours is not none else "-" }}</td>
               <td>{{ row.short_exchange }}</td>
               <td>{{ ((row.short_rate or 0) * 100) | round(3) }}</td>
               <td>{{ row.short_bid if row.short_bid is not none else "-" }}</td>
               <td>{{ row.short_liquidity_usd if row.short_liquidity_usd is not none else "-" }}</td>
               <td>{{ row.short_next_funding or "-" }}</td>
+              <td>{{ row.short_funding_interval_hours if row.short_funding_interval_hours is not none else "-" }}</td>
               <td>{{ ((row.spread or 0) * 100) | round(3) }}</td>
               <td>{{ ((row.price_diff_pct or 0) * 100) | round(3) }}</td>
               <td>{{ ((row.effective_spread or 0) * 100) | round(3) }}</td>

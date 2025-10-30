@@ -72,6 +72,9 @@ class MexcAdapter(ExchangeAdapter):
                     next_funding_time=_to_datetime(
                         (funding_item or {}).get("nextSettleTime")
                     ),
+                    funding_interval_hours=_to_float(
+                        (funding_item or {}).get("collectCycle")
+                    ),
                     mark_price=_to_float(item.get("fairPrice")) or _to_float(item.get("lastPrice")),
                     bid=_to_float(item.get("bid1")),
                     ask=_to_float(item.get("ask1")),

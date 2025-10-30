@@ -388,6 +388,8 @@ def _opportunity_dict(item: FundingOpportunity) -> dict[str, object]:
         "effective_spread": item.effective_spread,
         "long_next_funding": fmt(item.long_next_funding),
         "short_next_funding": fmt(item.short_next_funding),
+        "long_funding_interval_hours": item.long_funding_interval_hours,
+        "short_funding_interval_hours": item.short_funding_interval_hours,
         "participants": item.participants,
     }
 

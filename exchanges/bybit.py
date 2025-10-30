@@ -73,6 +73,7 @@ class BybitAdapter(ExchangeAdapter):
                     exchange_symbol=exchange_symbol,
                     funding_rate=_to_float(item.get("fundingRate")),
                     next_funding_time=_to_datetime(item.get("nextFundingTime")),
+                    funding_interval_hours=_to_float(item.get("fundingIntervalHour")),
                     mark_price=_to_float(item.get("markPrice")),
                     bid=_to_float(item.get("bid1Price")),
                     ask=_to_float(item.get("ask1Price")),
