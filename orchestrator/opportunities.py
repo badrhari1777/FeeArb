@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Iterable, List, Sequence
+from typing import Any, Callable, Iterable, List, Sequence
 
 from orchestrator.models import FundingOpportunity, MarketSnapshot
 
@@ -11,32 +11,114 @@ from exchanges.base import ExchangeAdapter
 logger = logging.getLogger(__name__)
 
 
+ProgressCallback = Callable[[str, dict[str, Any]], None]
+
+
+def _emit(progress_cb: ProgressCallback | None, event: str, payload: dict[str, Any]) -> None:
+    if progress_cb:
+        progress_cb(event, payload)
+
+
 def gather_snapshots(
-    adapters: Sequence[ExchangeAdapter], symbols: Iterable[str]
-) -> tuple[dict[str, dict[str, MarketSnapshot]], dict[str, list[dict]]]:
+    adapters: Sequence[ExchangeAdapter],
+    symbols: Iterable[str],
+    progress_cb: ProgressCallback | None = None,
+) -> tuple[dict[str, dict[str, MarketSnapshot]], dict[str, list[dict]], List[dict[str, Any]]]:
     snapshots_by_exchange: dict[str, dict[str, MarketSnapshot]] = {}
     raw_payloads: dict[str, list[dict]] = {}
+    status_entries: list[dict[str, Any]] = []
 
     for adapter in adapters:
+        _emit(
+            progress_cb,
+            "exchange:start",
+            {
+                "exchange": adapter.name,
+                "message": f"Querying {adapter.name}…",
+            },
+        )
         try:
             snapshots = adapter.fetch_market_snapshots(symbols)
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception("%s adapter failed: %s", adapter.name, exc)
+            status = {
+                "exchange": adapter.name,
+                "status": "failed",
+                "error": str(exc),
+            }
+            status_entries.append(status)
+            _emit(
+                progress_cb,
+                "exchange:error",
+                {
+                    "exchange": adapter.name,
+                    "message": f"{adapter.name} failed: {exc}",
+                    "error": str(exc),
+                },
+            )
             continue
 
         snapshots_by_exchange[adapter.name] = {snap.symbol: snap for snap in snapshots}
         raw_payloads[adapter.name] = [snap.raw for snap in snapshots]
+        status = {
+            "exchange": adapter.name,
+            "status": "ok",
+            "count": len(snapshots),
+        }
+        status_entries.append(status)
         logger.info("%s: fetched %s snapshots", adapter.name, len(snapshots))
+        _emit(
+            progress_cb,
+            "exchange:success",
+            {
+                "exchange": adapter.name,
+                "message": f"{adapter.name}: fetched {len(snapshots)} snapshots",
+                "count": len(snapshots),
+            },
+        )
 
-    return snapshots_by_exchange, raw_payloads
+    missing = [
+        {
+            "exchange": adapter.name,
+            "status": "missing",
+            "error": "no data returned",
+        }
+        for adapter in adapters
+        if adapter.name not in {entry["exchange"] for entry in status_entries}
+    ]
+    if missing:
+        status_entries.extend(missing)
+        for entry in missing:
+            _emit(
+                progress_cb,
+                "exchange:missing",
+                {
+                    "exchange": entry["exchange"],
+                    "message": f"{entry['exchange']}: no data returned",
+                },
+            )
+
+    _emit(
+        progress_cb,
+        "exchange:complete",
+        {
+            "message": "Exchange polling finished",
+            "summary": status_entries,
+        },
+    )
+
+    return snapshots_by_exchange, raw_payloads, status_entries
 
 
 def compute_opportunities(
     symbols: Iterable[str],
     adapters: Sequence[ExchangeAdapter],
     min_spread: float = 0.0,
-) -> tuple[List[FundingOpportunity], dict[str, list[dict]]]:
-    snapshots_by_exchange, raw_payloads = gather_snapshots(adapters, symbols)
+    progress_cb: ProgressCallback | None = None,
+) -> tuple[List[FundingOpportunity], dict[str, list[dict]], List[dict[str, Any]]]:
+    snapshots_by_exchange, raw_payloads, status_entries = gather_snapshots(
+        adapters, symbols, progress_cb=progress_cb
+    )
 
     opportunities: list[FundingOpportunity] = []
 
@@ -98,7 +180,7 @@ def compute_opportunities(
         )
 
     opportunities.sort(key=lambda item: item.spread, reverse=True)
-    return opportunities, raw_payloads
+    return opportunities, raw_payloads, status_entries
 
 
 def format_opportunity_table(rows: Sequence[FundingOpportunity]) -> str:

@@ -6,6 +6,17 @@ from urllib.request import Request, urlopen
 
 
 URL = "https://screener.arbitragescanner.io/api/funding-table?fid=arbitragescanner"
+QUOTE_SUFFIXES = ("USDT",)
+
+
+def normalize_symbol(value: object) -> str:
+    """Return a normalized base symbol without common quote suffixes."""
+    symbol = str(value or "").strip().upper()
+    for suffix in QUOTE_SUFFIXES:
+        if symbol.endswith(suffix):
+            symbol = symbol[: -len(suffix)]
+            break
+    return symbol
 
 
 def fetch_json(url: str = URL, timeout: int = 20) -> list[dict]:
@@ -37,7 +48,7 @@ def build_top(
     for row in rows:
         if not isinstance(row, dict):
             continue
-        symbol = str(row.get("symbol") or "").strip().upper()
+        symbol = normalize_symbol(row.get("symbol"))
         rates = row.get("rates") or []
         filtered = [
             item
@@ -79,4 +90,3 @@ def format_table(items: list[dict]) -> str:
             f"{item['short_exchange']:>18} {item['short_fee']:>10.6f}"
         )
     return "\n".join(lines)
-

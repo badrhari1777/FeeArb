@@ -15,6 +15,9 @@
   {% set status = state.get('status', 'idle') %}
   {% set status_class = status|lower|replace(' ', '-') %}
   {% set refresh_interval = state.get('refresh_interval', 300) %}
+  {% set exchange_status_rows = state.get('exchange_status', []) %}
+  {% set events = state.get('events', []) %}
+  {% set last_event = events[-1] if events %}
   <script>
     window.__INITIAL_STATE__ = {{ state | tojson | safe }};
   </script>
@@ -75,6 +78,26 @@
           {% set last_error = state.get('last_error') %}
           <dd id="last-error" title="{{ last_error or '' }}">{{ last_error or "None" }}</dd>
         </div>
+        <div>
+          <dt>Last progress</dt>
+          <dd id="last-progress">
+            {% if last_event %}
+              {{ last_event.payload.message or last_event.event }}
+            {% else %}
+              -
+            {% endif %}
+          </dd>
+        </div>
+        <div>
+          <dt>Exchange responses</dt>
+          <dd id="exchange-summary">
+            {% if exchange_status_rows %}
+              {{ exchange_status_rows | length }} tracked
+            {% else %}
+              -
+            {% endif %}
+          </dd>
+        </div>
       </dl>
       <button id="refresh-button" class="button" type="button">Manual refresh</button>
       <p class="hint">Auto refresh every {{ refresh_interval }} seconds</p>
@@ -99,6 +122,50 @@
         </ul>
       </section>
     {% endif %}
+
+    <section class="panel" id="exchange-status">
+      <h2>Exchange Responses</h2>
+      <table class="data-table" id="exchange-status-table">
+        <thead>
+          <tr>
+            <th>Exchange</th>
+            <th>Status</th>
+            <th>Snapshots</th>
+            <th>Message</th>
+          </tr>
+        </thead>
+        <tbody id="exchange-status-body">
+          {% for row in exchange_status_rows %}
+            {% set status_slug = (row.status or 'unknown') | lower | replace(' ', '-') %}
+            <tr>
+              <td>{{ row.exchange }}</td>
+              <td>
+                <span class="status-chip status-chip--{{ status_slug }}">{{ row.status or "unknown" }}</span>
+              </td>
+              <td>{{ row.count if row.count is not none else "-" }}</td>
+              <td>{{ row.message or row.error or "-" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel panel--compact" id="activity-log">
+      <h2>Activity</h2>
+      <ul class="event-log" id="event-log">
+        {% for event in events %}
+          <li class="event-log__item">
+            <span class="event-log__time">{{ event.timestamp }}</span>
+            <span class="event-log__message">
+              {{ event.payload.message or event.event }}
+            </span>
+          </li>
+        {% endfor %}
+      </ul>
+      <p class="muted" id="event-empty"{% if events %} style="display: none;"{% endif %}>
+        Progress updates will appear here as the refresh runs.
+      </p>
+    </section>
 
     <section class="panel" id="overview">
       <h2>Data Overview</h2>

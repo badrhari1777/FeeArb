@@ -6,6 +6,8 @@
     last_updated: null,
     snapshot: null,
     refresh_in_progress: false,
+    events: [],
+    exchange_status: [],
   };
 
   const initialState = {
@@ -29,6 +31,8 @@
     opportunityCount: document.getElementById("opportunity-count"),
     statusPill: document.getElementById("status-pill"),
     lastError: document.getElementById("last-error"),
+    lastProgress: document.getElementById("last-progress"),
+    exchangeSummary: document.getElementById("exchange-summary"),
     screenerTable: document.getElementById("screener-table")?.querySelector("tbody"),
     coinglassTable: document.getElementById("coinglass-table")?.querySelector("tbody"),
     universeTable: document.getElementById("universe-table-body"),
@@ -37,6 +41,9 @@
     refreshButton: document.getElementById("refresh-button"),
     hint: document.querySelector(".hint"),
     emptyState: document.getElementById("empty-state"),
+    exchangeTable: document.getElementById("exchange-status-body"),
+    eventLog: document.getElementById("event-log"),
+    eventEmpty: document.getElementById("event-empty"),
   };
 
   const escapeHtml = (value) => {
@@ -208,6 +215,63 @@
     }
   };
 
+  const renderExchangeStatus = (rows = []) => {
+    if (!elements.exchangeTable) {
+      return;
+    }
+    if (!rows || rows.length === 0) {
+      elements.exchangeTable.innerHTML =
+        '<tr><td colspan="4" class="muted">No exchange data yet.</td></tr>';
+      return;
+    }
+    elements.exchangeTable.innerHTML = rows
+      .map((row) => {
+        const exchange = escapeHtml(row.exchange ?? row.name ?? "-");
+        const statusValue = (row.status ?? "unknown").toString();
+        const slug = statusValue.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+        const count = row.count ?? "-";
+        const message = row.message || row.error || "";
+        return `
+          <tr>
+            <td>${exchange}</td>
+            <td><span class="status-chip status-chip--${slug}">${escapeHtml(statusValue)}</span></td>
+            <td>${escapeHtml(count)}</td>
+            <td>${escapeHtml(message || "-")}</td>
+          </tr>
+        `;
+      })
+      .join("");
+  };
+
+  const renderEvents = (events = []) => {
+    if (!elements.eventLog) {
+      return;
+    }
+    if (!events || events.length === 0) {
+      elements.eventLog.innerHTML = "";
+      if (elements.eventEmpty) {
+        elements.eventEmpty.style.display = "";
+      }
+      return;
+    }
+    const items = events.slice(-50);
+    elements.eventLog.innerHTML = items
+      .map((event) => {
+        const timestamp = formatTime(event.timestamp);
+        const message = event.payload?.message || event.event;
+        return `
+          <li class="event-log__item">
+            <span class="event-log__time">${escapeHtml(timestamp)}</span>
+            <span class="event-log__message">${escapeHtml(message)}</span>
+          </li>
+        `;
+      })
+      .join("");
+    if (elements.eventEmpty) {
+      elements.eventEmpty.style.display = "none";
+    }
+  };
+
   const ensureMessagesPanel = () => {
     if (elements.messagesPanel) {
       return elements.messagesPanel;
@@ -303,6 +367,45 @@
       }
     }
 
+    if (elements.lastProgress) {
+      const events = Array.isArray(state.events) ? state.events : [];
+      const lastEvent = events.length ? events[events.length - 1] : null;
+      const message = lastEvent?.payload?.message || lastEvent?.event || "-";
+      elements.lastProgress.textContent = message || "-";
+      if (lastEvent?.payload?.message) {
+        elements.lastProgress.setAttribute("title", lastEvent.payload.message);
+      } else {
+        elements.lastProgress.removeAttribute("title");
+      }
+    }
+
+    if (elements.exchangeSummary) {
+      const entries =
+        (state.snapshot?.exchange_status &&
+        Array.isArray(state.snapshot.exchange_status)
+          ? state.snapshot.exchange_status
+          : null) ??
+        (Array.isArray(state.exchange_status) ? state.exchange_status : []);
+      if (!entries || entries.length === 0) {
+        elements.exchangeSummary.textContent = "-";
+      } else {
+        const counts = entries.reduce((acc, entry) => {
+          const key = (entry.status || "unknown").toString().toLowerCase();
+          acc[key] = (acc[key] || 0) + 1;
+          return acc;
+        }, {});
+        const parts = [];
+        if (counts.ok) parts.push(`${counts.ok} ok`);
+        if (counts.pending) parts.push(`${counts.pending} pending`);
+        if (counts.failed) parts.push(`${counts.failed} failed`);
+        if (counts.missing) parts.push(`${counts.missing} missing`);
+        if (counts.error) parts.push(`${counts.error} error`);
+        elements.exchangeSummary.textContent = parts.length
+          ? parts.join(", ")
+          : `${entries.length} exchanges`;
+      }
+    }
+
     if (elements.hint) {
       elements.hint.textContent = `Auto refresh every ${pollIntervalSeconds} seconds`;
     }
@@ -320,11 +423,25 @@
   };
 
   const mergeState = (next = {}) => {
+    const mergedSnapshot =
+      next.snapshot !== undefined ? next.snapshot : currentState.snapshot;
+    const mergedEvents = Array.isArray(next.events)
+      ? next.events
+      : currentState.events ?? [];
+    const mergedExchangeStatus = Array.isArray(next.exchange_status)
+      ? next.exchange_status
+      : currentState.exchange_status ?? [];
+    const snapshotExchangeStatus =
+      mergedSnapshot && Array.isArray(mergedSnapshot.exchange_status)
+        ? mergedSnapshot.exchange_status
+        : null;
+
     currentState = {
       ...currentState,
       ...next,
-      snapshot:
-        next.snapshot !== undefined ? next.snapshot : currentState.snapshot,
+      snapshot: mergedSnapshot,
+      events: mergedEvents,
+      exchange_status: snapshotExchangeStatus ?? mergedExchangeStatus,
       refresh_interval:
         next.refresh_interval ?? currentState.refresh_interval,
       refresh_in_progress:
@@ -349,6 +466,14 @@
     updateStatusPill(currentState.status);
     updateMetadata(currentState);
     renderSnapshotData(currentState.snapshot);
+    const exchangeEntries =
+      (currentState.snapshot &&
+      Array.isArray(currentState.snapshot.exchange_status)
+        ? currentState.snapshot.exchange_status
+        : null) ?? currentState.exchange_status ?? [];
+    renderExchangeStatus(exchangeEntries);
+    currentState.exchange_status = exchangeEntries;
+    renderEvents(currentState.events ?? []);
     toggleEmptyState(!currentState.snapshot);
     renderMessages(buildMessages(currentState));
     updateRefreshButton();

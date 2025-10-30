@@ -3,12 +3,15 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Iterable, List, Sequence
+from typing import Any, Callable, Iterable, List, Sequence
 
 from config import PARSE_CACHE_TTL_SECONDS, SUPPORTED_EXCHANGES
 from exchanges import get_adapter, normalize_exchange_name
 from orchestrator.models import FundingOpportunity
-from orchestrator.opportunities import compute_opportunities, format_opportunity_table
+from orchestrator.opportunities import (
+    compute_opportunities,
+    format_opportunity_table,
+)
 from parsers import arbitragescanner, coinglass
 from utils import load_cache, save_cache
 
@@ -25,6 +28,7 @@ class DataSnapshot:
     raw_payloads: dict[str, list[dict]]
     screener_from_cache: bool = False
     coinglass_from_cache: bool = False
+    exchange_status: List[dict[str, object]] = field(default_factory=list)
     messages: List[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
@@ -40,22 +44,107 @@ class DataSnapshot:
             "messages": self.messages,
             "screener_from_cache": self.screener_from_cache,
             "coinglass_from_cache": self.coinglass_from_cache,
+            "exchange_status": self.exchange_status,
         }
 
 
-def collect_snapshot() -> DataSnapshot:
-    timestamp = datetime.now(timezone.utc)
-    ts_label = timestamp.strftime("%Y%m%d_%H%M%S")
+ProgressCallback = Callable[[str, dict[str, Any]], None]
 
+
+def collect_snapshot(progress_cb: ProgressCallback | None = None) -> DataSnapshot:
+    timestamp = datetime.now(timezone.utc)
+
+    def _emit(event: str, payload: dict[str, Any] | None = None) -> None:
+        if progress_cb:
+            progress_cb(event, payload or {})
+
+    messages: list[str] = []
+
+    _emit(
+        "screener:start",
+        {
+            "message": "Fetching ArbitrageScanner candidates…",
+        },
+    )
     screener_rows, screener_from_cache = _load_screener_snapshot()
+    _emit(
+        "screener:complete",
+        {
+            "message": f"ArbitrageScanner returned {len(screener_rows)} rows",
+            "count": len(screener_rows),
+            "from_cache": screener_from_cache,
+        },
+    )
+    if not screener_rows:
+        messages.append("ArbitrageScanner returned no candidates.")
+
+    _emit(
+        "coinglass:start",
+        {
+            "message": "Fetching Coinglass arbitrage table…",
+        },
+    )
     coinglass_rows, coinglass_from_cache = _load_coinglass_snapshot()
+    _emit(
+        "coinglass:complete",
+        {
+            "message": f"Coinglass returned {len(coinglass_rows)} rows",
+            "count": len(coinglass_rows),
+            "from_cache": coinglass_from_cache,
+        },
+    )
+    if not coinglass_rows:
+        messages.append("Coinglass returned no rows.")
 
     universe = _build_symbol_universe(screener_rows, coinglass_rows)
+    _emit(
+        "universe:ready",
+        {
+            "message": f"Symbol universe built with {len(universe)} items",
+            "count": len(universe),
+        },
+    )
 
     symbols = [entry["symbol"] for entry in universe]
 
     adapters = _active_adapters()
-    opportunities, raw_payloads = compute_opportunities(symbols, adapters)
+    _emit(
+        "exchanges:start",
+        {
+            "message": f"Fetching exchange snapshots for {len(symbols)} symbols…",
+            "symbol_count": len(symbols),
+            "exchange_count": len(adapters),
+        },
+    )
+    opportunities, raw_payloads, exchange_status = compute_opportunities(
+        symbols, adapters, progress_cb=progress_cb
+    )
+    _emit(
+        "opportunities:complete",
+        {
+            "message": f"Computed {len(opportunities)} funding opportunities",
+            "count": len(opportunities),
+        },
+    )
+
+    failed_exchanges = [
+        entry["exchange"]
+        for entry in exchange_status
+        if entry.get("status") != "ok"
+    ]
+    if failed_exchanges:
+        messages.append(
+            "Missing data from exchanges: " + ", ".join(sorted(failed_exchanges))
+        )
+
+    _emit(
+        "snapshot:ready",
+        {
+            "message": "Snapshot assembled successfully",
+            "opportunity_count": len(opportunities),
+            "failed_exchanges": failed_exchanges,
+        },
+    )
 
     return DataSnapshot(
         generated_at=timestamp,
@@ -64,8 +153,10 @@ def collect_snapshot() -> DataSnapshot:
         universe=universe,
         opportunities=opportunities,
         raw_payloads=raw_payloads,
+        exchange_status=exchange_status,
         screener_from_cache=screener_from_cache,
         coinglass_from_cache=coinglass_from_cache,
+        messages=messages,
     )
 
 
@@ -112,15 +203,32 @@ def format_opportunities(rows: Sequence[FundingOpportunity]) -> str:
     return format_opportunity_table(rows)
 
 
+def _normalize_screener_rows(rows: Iterable[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = arbitragescanner.normalize_symbol(row.get("symbol"))
+        if not symbol:
+            continue
+        normalized_row = dict(row)
+        normalized_row["symbol"] = symbol
+        normalized.append(normalized_row)
+    return normalized
+
+
 def _load_screener_snapshot() -> tuple[list[dict], bool]:
     cached = load_cache("screener_latest.json", PARSE_CACHE_TTL_SECONDS)
     if cached:
         logger.info("Using cached ArbitrageScanner data")
-        return list(cached["data"]), True
+        rows = _normalize_screener_rows(cached.get("data", []))
+        return rows, True
 
     logger.info("Fetching candidates from ArbitrageScanner...")
     data = arbitragescanner.fetch_json()
-    rows = arbitragescanner.build_top(data, exclude=("binance",), limit=20)
+    rows = _normalize_screener_rows(
+        arbitragescanner.build_top(data, exclude=("binance",), limit=20)
+    )
     save_cache(
         "screener_latest.json",
         {"data": rows, "fetched_at": datetime.now(timezone.utc).isoformat()},

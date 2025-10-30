@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from pipeline import collect_snapshot, DataSnapshot
 
@@ -23,8 +23,12 @@ class DataService:
         self._last_error: Optional[str] = None
         self._last_refreshed: Optional[datetime] = None
         self._in_progress: bool = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._events: List[dict[str, Any]] = []
+        self._exchange_status: Dict[str, dict[str, Any]] = {}
 
     async def startup(self) -> None:
+        self._loop = asyncio.get_running_loop()
         async with self._lock:
             self._status = "pending"
         if self._task is None:
@@ -67,22 +71,45 @@ class DataService:
             self._in_progress = True
             self._status = "pending"
             self._last_error = None
+            self._events = []
+            self._exchange_status = {}
+        self._record_event(
+            "refresh:start",
+            {"message": "Snapshot refresh started"},
+        )
 
         outcome: RefreshResult = "completed"
+        loop = self._loop or asyncio.get_running_loop()
+        progress_cb = self._make_progress_callback(loop)
         try:
-            snapshot = await asyncio.to_thread(collect_snapshot)
+            snapshot = await asyncio.to_thread(collect_snapshot, progress_cb)
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception("Snapshot refresh raised an error")
             outcome = "failed"
+            self._record_event(
+                "refresh:failed",
+                {"message": "Snapshot refresh failed", "error": str(exc)},
+            )
             async with self._lock:
                 self._last_error = str(exc)
                 self._status = "error"
         else:
+            self._record_event(
+                "refresh:completed",
+                {
+                    "message": "Snapshot refresh completed successfully",
+                    "opportunity_count": len(snapshot.opportunities),
+                },
+            )
             async with self._lock:
                 self._snapshot = snapshot
                 self._status = "ready"
                 self._last_error = None
                 self._last_refreshed = datetime.now(timezone.utc)
+                self._exchange_status = {
+                    entry.get("exchange", f"exchange-{idx}"): entry
+                    for idx, entry in enumerate(snapshot.exchange_status)
+                }
         finally:
             async with self._lock:
                 self._in_progress = False
@@ -111,4 +138,54 @@ class DataService:
             ),
             "snapshot": snapshot_dict,
             "refresh_in_progress": self._in_progress,
+            "events": list(self._events),
+            "exchange_status": list(self._exchange_status.values()),
         }
+
+    def _make_progress_callback(
+        self, loop: asyncio.AbstractEventLoop
+    ) -> Callable[[str, dict[str, Any] | None], None]:
+        def _callback(event: str, payload: dict[str, Any] | None = None) -> None:
+            data = dict(payload or {})
+            loop.call_soon_threadsafe(self._record_event, event, data)
+            if event.startswith("exchange:") and data:
+                exchange = data.get("exchange")
+                if exchange:
+                    loop.call_soon_threadsafe(
+                        self._update_exchange_status,
+                        exchange,
+                        event,
+                        data,
+                    )
+
+        return _callback
+
+    def _record_event(self, event: str, payload: dict[str, Any]) -> None:
+        entry = {
+            "event": event,
+            "payload": payload,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._events.append(entry)
+        if len(self._events) > 200:
+            del self._events[:-200]
+
+    def _update_exchange_status(
+        self, exchange: str, event: str, payload: dict[str, Any]
+    ) -> None:
+        status_map = {
+            "exchange:success": "ok",
+            "exchange:error": "failed",
+            "exchange:missing": "missing",
+            "exchange:start": "pending",
+        }
+        status = status_map.get(event, payload.get("status"))
+        entry = {
+            "exchange": exchange,
+            "status": status or payload.get("status") or "unknown",
+            "message": payload.get("message"),
+            "count": payload.get("count"),
+            "error": payload.get("error"),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._exchange_status[exchange] = entry
