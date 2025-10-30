@@ -17,7 +17,7 @@ class MexcAdapter(ExchangeAdapter):
 
     name = "mexc"
     ticker_url = "https://contract.mexc.com/api/v1/contract/ticker"
-    funding_url_tpl = "https://contract.mexc.com/api/v1/contract/fundingRate/{symbol}"
+    funding_url_tpl = "https://contract.mexc.com/api/v1/contract/funding_rate/{symbol}"
 
     def map_symbol(self, symbol: str) -> str | None:
         symbol = symbol.upper().strip()
@@ -65,14 +65,19 @@ class MexcAdapter(ExchangeAdapter):
                     exchange=self.name,
                     symbol=canonical,
                     exchange_symbol=exchange_symbol,
-                    funding_rate=_to_float(item.get("fundingRate")),
-                    next_funding_time=_to_datetime(funding_item.get("nextFundingTime")),
+                    funding_rate=_to_float(
+                        (funding_item or {}).get("fundingRate")
+                    )
+                    or _to_float(item.get("fundingRate")),
+                    next_funding_time=_to_datetime(
+                        (funding_item or {}).get("nextSettleTime")
+                    ),
                     mark_price=_to_float(item.get("fairPrice")) or _to_float(item.get("lastPrice")),
                     bid=_to_float(item.get("bid1")),
                     ask=_to_float(item.get("ask1")),
                     bid_size=_to_float(item.get("bid1Size") or item.get("bid1Qty")),
                     ask_size=_to_float(item.get("ask1Size") or item.get("ask1Qty")),
-                    raw=item,
+                    raw={"ticker": item, "funding": funding_item} if funding_item else {"ticker": item},
                 )
             )
 
@@ -115,8 +120,11 @@ def _to_datetime(value: object):
         seconds = int(value)
     except (TypeError, ValueError):
         return None
-    from datetime import datetime, timezone
-
     if seconds <= 0:
         return None
+    # API may return milliseconds; normalize to seconds.
+    if seconds > 10_000_000_000:  # > ~Sat Nov 20 2286 (ms threshold)
+        seconds /= 1000.0
+    from datetime import datetime, timezone
+
     return datetime.fromtimestamp(seconds, tz=timezone.utc)

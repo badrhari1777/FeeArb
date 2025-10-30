@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pipeline import (
@@ -12,6 +12,14 @@ from pipeline import (
     format_universe_table,
 )
 from utils import save_csv, save_json, setup_logging
+
+_GMT_PLUS_3 = timezone(timedelta(hours=3))
+
+
+def _format_time_gmt3(value: datetime | None) -> str:
+    if value is None:
+        return ""
+    return value.astimezone(_GMT_PLUS_3).strftime("%Y-%m-%d %H:%M:%S GMT+3")
 
 
 def main() -> None:
@@ -59,7 +67,7 @@ def main() -> None:
 
 def _opportunity_to_dict(item) -> dict[str, object]:
     def fmt(value: datetime | None) -> str:
-        return value.isoformat() if value else ""
+        return _format_time_gmt3(value)
 
     return {
         "symbol": item.symbol,

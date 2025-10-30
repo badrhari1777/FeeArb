@@ -79,12 +79,23 @@
     if (!value) {
       return "-";
     }
+    if (typeof value === "string" && value.includes("GMT+3")) {
+      return value;
+    }
     try {
       const date = new Date(value);
       if (Number.isNaN(date.getTime())) {
         return value;
       }
-      return date.toISOString().replace("T", " ").replace("Z", " UTC");
+      const gmt3 = new Date(date.getTime() + 3 * 60 * 60 * 1000);
+      const pad = (num) => String(num).padStart(2, "0");
+      const year = gmt3.getUTCFullYear();
+      const month = pad(gmt3.getUTCMonth() + 1);
+      const day = pad(gmt3.getUTCDate());
+      const hour = pad(gmt3.getUTCHours());
+      const minute = pad(gmt3.getUTCMinutes());
+      const second = pad(gmt3.getUTCSeconds());
+      return `${year}-${month}-${day} ${hour}:${minute}:${second} GMT+3`;
     } catch {
       return value;
     }

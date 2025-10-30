@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Iterable, List, Sequence
 
 from config import PARSE_CACHE_TTL_SECONDS, SUPPORTED_EXCHANGES
@@ -291,7 +291,7 @@ def _active_adapters():
 
 def _opportunity_dict(item: FundingOpportunity) -> dict[str, object]:
     def fmt(dt: datetime | None) -> str:
-        return dt.isoformat() if dt else ""
+        return _format_time_gmt3(dt)
 
     return {
         "symbol": item.symbol,
@@ -364,3 +364,12 @@ def _trade_links_from_cache(item: dict) -> list[str]:
     if isinstance(links, str):
         return [part for part in links.split(";") if part]
     return []
+
+
+_GMT_PLUS_3 = timezone(timedelta(hours=3))
+
+
+def _format_time_gmt3(dt: datetime | None) -> str:
+    if dt is None:
+        return ""
+    return dt.astimezone(_GMT_PLUS_3).strftime("%Y-%m-%d %H:%M:%S GMT+3")

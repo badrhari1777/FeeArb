@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, List, Sequence
 
 from orchestrator.models import FundingOpportunity, MarketSnapshot
@@ -137,14 +137,20 @@ def compute_opportunities(
         if len(longs) < 2:
             continue
 
-        long_snap = max(longs, key=lambda s: s.funding_rate or float("-inf"))
-        short_snap = min(shorts, key=lambda s: s.funding_rate or float("inf"))
+        long_snap = min(
+            longs,
+            key=lambda s: s.funding_rate if s.funding_rate is not None else float("inf"),
+        )
+        short_snap = max(
+            shorts,
+            key=lambda s: s.funding_rate if s.funding_rate is not None else float("-inf"),
+        )
 
         if long_snap.funding_rate is None or short_snap.funding_rate is None:
             continue
 
-        spread = long_snap.funding_rate - short_snap.funding_rate
-        if spread <= min_spread:
+        spread = short_snap.funding_rate - long_snap.funding_rate
+        if spread < min_spread:
             continue
 
         long_buy_price = _preferred_price(
@@ -154,7 +160,7 @@ def compute_opportunities(
             short_snap.bid, short_snap.mark_price, short_snap.ask
         )
         price_diff, price_diff_pct = _price_metrics(long_buy_price, short_sell_price)
-        effective_spread = spread - price_diff_pct
+        effective_spread = spread + price_diff_pct
 
         long_liquidity_usd = _liquidity_in_usd(long_snap.ask_size, long_snap.ask)
         short_liquidity_usd = _liquidity_in_usd(short_snap.bid_size, short_snap.bid)
@@ -190,23 +196,25 @@ def compute_opportunities(
 
 def format_opportunity_table(rows: Sequence[FundingOpportunity]) -> str:
     header = (
-        f"{'Symbol':<10} {'Long':>10} {'LongAsk':>10} {'LongUSDT':>12} "
-        f"{'Short':>10} {'ShortBid':>10} {'ShortUSDT':>12} "
-        f"{'Spread%':>9} {'PxGap%':>8} {'Eff%':>8} {'T+ (hrs)':>9}"
+        f"{'Symbol':<10} {'Long':>10} {'LongRate%':>10} {'LongAsk':>10} {'LongUSDT':>12} {'LongNext':>20} "
+        f"{'Short':>10} {'ShortRate%':>11} {'ShortBid':>10} {'ShortUSDT':>12} {'ShortNext':>20} "
+        f"{'Spread%':>9} {'PxGap%':>8} {'Eff%':>8} {'Parts':>6}"
     )
     lines = [header, "-" * len(header)]
     for row in rows:
-        hours_to_funding = _hours_until(row.long_next_funding, row.short_next_funding)
+        long_next = _format_next_funding(row.long_next_funding)
+        short_next = _format_next_funding(row.short_next_funding)
         long_ask = _fmt_numeric(row.long_ask, decimals=4, width=10)
         long_liq = _fmt_numeric(row.long_liquidity_usd, decimals=2, width=12)
         short_bid = _fmt_numeric(row.short_bid, decimals=4, width=10)
         short_liq = _fmt_numeric(row.short_liquidity_usd, decimals=2, width=12)
         lines.append(
-            f"{row.symbol:<10} {row.long_exchange:>10} {long_ask} "
-            f"{long_liq} {row.short_exchange:>10} "
-            f"{short_bid} {short_liq} "
+            f"{row.symbol:<10} {row.long_exchange:>10} {row.long_rate * 100:>10.3f}% "
+            f"{long_ask} {long_liq} {long_next:>20} "
+            f"{row.short_exchange:>10} {row.short_rate * 100:>11.3f}% "
+            f"{short_bid} {short_liq} {short_next:>20} "
             f"{row.spread * 100:>9.3f}% {row.price_diff_pct * 100:>7.3f}% "
-            f"{row.effective_spread * 100:>7.3f}% {hours_to_funding:>9.2f}"
+            f"{row.effective_spread * 100:>7.3f}% {row.participants:>6}"
         )
     return "\n".join(lines)
 
@@ -235,10 +243,19 @@ def _preferred_price(*candidates: float | None) -> float | None:
 def _price_metrics(long_price: float | None, short_price: float | None) -> tuple[float, float]:
     if long_price is None or short_price is None:
         return 0.0, 0.0
-    price_diff = long_price - short_price
+    price_diff = short_price - long_price
     avg = (long_price + short_price) / 2.0 or 1.0
     price_diff_pct = price_diff / avg
     return price_diff, price_diff_pct
+
+
+_GMT_PLUS_3 = timezone(timedelta(hours=3))
+
+
+def _format_next_funding(dt: datetime | None) -> str:
+    if dt is None:
+        return "-"
+    return dt.astimezone(_GMT_PLUS_3).strftime("%Y-%m-%d %H:%M:%S GMT+3")
 
 
 def _liquidity_in_usd(size: float | None, price: float | None) -> float | None:
