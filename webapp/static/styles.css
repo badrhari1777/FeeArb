@@ -175,6 +175,10 @@ a {
   white-space: nowrap;
 }
 
+.data-table th {
+  white-space: normal;
+}
+
 .data-table tbody tr:nth-child(even) {
   background: rgba(19, 24, 33, 0.6);
 }
@@ -190,6 +194,10 @@ a {
 .data-table--wide th,
 .data-table--wide td {
   white-space: nowrap;
+}
+
+.data-table--wide th {
+  white-space: normal;
 }
 
 .muted {

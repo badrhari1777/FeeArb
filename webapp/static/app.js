@@ -384,10 +384,27 @@
     if (!elements.opportunityTable) {
       return;
     }
+    var dataset = Array.isArray(rows) ? rows.slice() : [];
+    dataset.sort(function (a, b) {
+      var av = typeof a === 'object' && a !== null && typeof a.effective_spread === 'number'
+        ? a.effective_spread
+        : Number.NEGATIVE_INFINITY;
+      var bv = typeof b === 'object' && b !== null && typeof b.effective_spread === 'number'
+        ? b.effective_spread
+        : Number.NEGATIVE_INFINITY;
+      if (bv < av) {
+        return -1;
+      }
+      if (bv > av) {
+        return 1;
+      }
+      return 0;
+    });
+
     var html = '';
     var i;
-    for (i = 0; i < (rows && rows.length ? rows.length : 0); i += 1) {
-      var row = rows[i] || {};
+    for (i = 0; i < dataset.length; i += 1) {
+      var row = dataset[i] || {};
       html += '<tr>' +
         '<td>' + escapeHtml(row.symbol) + '</td>' +
         '<td>' + escapeHtml(row.long_exchange) + '</td>' +
