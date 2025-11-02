@@ -1,5 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, List, Sequence
@@ -19,7 +20,7 @@ def _emit(progress_cb: ProgressCallback | None, event: str, payload: dict[str, A
         progress_cb(event, payload)
 
 
-def gather_snapshots(
+async def gather_snapshots(
     adapters: Sequence[ExchangeAdapter],
     symbols: Iterable[str],
     progress_cb: ProgressCallback | None = None,
@@ -28,17 +29,17 @@ def gather_snapshots(
     raw_payloads: dict[str, list[dict]] = {}
     status_entries: list[dict[str, Any]] = []
 
-    for adapter in adapters:
+    async def _run_adapter(adapter: ExchangeAdapter) -> None:
         _emit(
             progress_cb,
             "exchange:start",
             {
                 "exchange": adapter.name,
-                "message": f"Querying {adapter.name}…",
+                "message": f"Querying {adapter.name}...",
             },
         )
         try:
-            snapshots = adapter.fetch_market_snapshots(symbols)
+            snapshots = await adapter.fetch_market_snapshots_async(symbols)
         except Exception as exc:  # pylint: disable=broad-except
             logger.exception("%s adapter failed: %s", adapter.name, exc)
             status = {
@@ -56,7 +57,7 @@ def gather_snapshots(
                     "error": str(exc),
                 },
             )
-            continue
+            return
 
         snapshots_by_exchange[adapter.name] = {snap.symbol: snap for snap in snapshots}
         raw_payloads[adapter.name] = [snap.raw for snap in snapshots]
@@ -76,6 +77,8 @@ def gather_snapshots(
                 "count": len(snapshots),
             },
         )
+
+    await asyncio.gather(*(_run_adapter(adapter) for adapter in adapters))
 
     missing = [
         {
@@ -110,13 +113,13 @@ def gather_snapshots(
     return snapshots_by_exchange, raw_payloads, status_entries
 
 
-def compute_opportunities(
+async def compute_opportunities(
     symbols: Iterable[str],
     adapters: Sequence[ExchangeAdapter],
     min_spread: float = 0.0,
     progress_cb: ProgressCallback | None = None,
 ) -> tuple[List[FundingOpportunity], dict[str, list[dict]], List[dict[str, Any]]]:
-    snapshots_by_exchange, raw_payloads, status_entries = gather_snapshots(
+    snapshots_by_exchange, raw_payloads, status_entries = await gather_snapshots(
         adapters, symbols, progress_cb=progress_cb
     )
 
@@ -126,25 +129,16 @@ def compute_opportunities(
         available: list[MarketSnapshot] = []
         for exchange_snapshots in snapshots_by_exchange.values():
             snap = exchange_snapshots.get(symbol)
-            if snap is not None:
-                available.append(snap)
+            if snap is None:
+                continue
+            available.append(snap)
 
         if len(available) < 2:
             continue
 
-        longs = [s for s in available if s.funding_rate is not None]
-        shorts = longs  # same list for reuse
-        if len(longs) < 2:
-            continue
-
-        long_snap = min(
-            longs,
-            key=lambda s: s.funding_rate if s.funding_rate is not None else float("inf"),
-        )
-        short_snap = max(
-            shorts,
-            key=lambda s: s.funding_rate if s.funding_rate is not None else float("-inf"),
-        )
+        available.sort(key=lambda item: item.funding_rate or 0.0, reverse=True)
+        short_snap = available[0]
+        long_snap = available[-1]
 
         if long_snap.funding_rate is None or short_snap.funding_rate is None:
             continue

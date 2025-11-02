@@ -19,3 +19,11 @@ class ExchangeAdapter(ABC):
     def fetch_market_snapshots(self, symbols: Iterable[str]) -> list[MarketSnapshot]:
         """Return funding/mark-price snapshots for the provided symbols."""
 
+    async def fetch_market_snapshots_async(
+        self, symbols: Iterable[str]
+    ) -> list[MarketSnapshot]:
+        """Async wrapper to preserve compatibility with legacy sync adapters."""
+
+        import asyncio
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.fetch_market_snapshots, list(symbols))

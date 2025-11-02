@@ -182,8 +182,7 @@ async def collect_snapshot_async(
                 "exchange_count": len(adapters),
             },
         )
-        opportunities, raw_payloads, exchange_status = await asyncio.to_thread(
-            compute_opportunities,
+        opportunities, raw_payloads, exchange_status = await compute_opportunities(
             symbols,
             adapters,
             0.0,
