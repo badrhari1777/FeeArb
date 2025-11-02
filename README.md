@@ -1,115 +1,142 @@
 # FeeArb
 
-Research tooling for cross-exchange funding-rate arbitrage. The project now ships with a FastAPI-powered dashboard that streams progress from every upstream source, so long-running scrapes and partial exchange data no longer block the UI. The live pipeline currently targets Bybit and MEXC USDT perpetuals by default; other adapters remain registered as stubs for future expansion.
+Research tooling for cross-exchange funding-rate arbitrage. The latest architecture is fully asynchronous end-to-end: data ingestion, signal generation, execution, and telemetry all run on asyncio primitives, while a FastAPI dashboard streams progress (and fills) to the browser over WebSockets. Bybit and MEXC USDT perpetuals remain the default active venues, with additional adapters scaffolded for future expansion.
 
-## Feature Highlights
-- Parse ArbitrageScanner and Coinglass leaderboards (with caching) to build a combined symbol universe.
-- Poll exchange adapters sequentially, assemble synthetic funding opportunities, and emit structured progress events (`exchange:start`, `exchange:success`, `exchange:error`, etc.).
-- Focus live opportunity detection on Bybit and MEXC USDT perpetuals while keeping the remaining adapters scaffolded for future activation.
-- Persist rich `DataSnapshot` objects that include opportunities, universe membership, raw payloads, exchange status, and pipeline messages.
-- Serve a reactive frontend (FastAPI + vanilla JS) with:
-  - Empty-state placeholders instead of hard waits during initial loads.
-  - Status pill, activity timeline, and exchange response grid that update as soon as each stage completes.
-  - Manual refresh button that triggers backend refreshes without freezing the page.
-  - A configuration panel for toggling sources/exchanges and tuning independent parser/UI refresh cadences (saved to disk).
+## Highlights
+- **Async ingestion** – `pipeline/data_pipeline.py` fetches ArbitrageScanner and Coinglass concurrently via `aiohttp`, merges caches, and emits granular progress events.
+- **Execution layer** – `execution/` houses wallet/reservation services, position lifecycle management, an extensible `ExecutionEngine`, trading clients (simulated for now), and a fill simulator that estimates slippage/orphan risk.
+- **Risk & telemetry** – risk guard enforces leverage/orphan/slippage policies and emits telemetry (`risk:*` events). The `TelemetryClient` is asynchronous, persisting JSONL logs and broadcasting events to subscribers.
+- **Real-time dashboard** – FastAPI serves the state, while a WebSocket feed (`/ws/telemetry`) streams live activity into the UI (execution log, risk alerts, etc.). Manual refresh remains available but no longer blocks the page.
+- **Testing** – unit tests cover async snapshot collection, trading engine, orchestrator, telemetry, and other subsystems (`python -m unittest discover -s tests`).
+
+## Architecture Overview
+```
+ArbitrageScanner  ┐
+Coinglass         │  (async fetch via aiohttp)        ┌─> SignalEngine ┐
+Exchange adapters ┘ ─> collect_snapshot_async -> DataSnapshot -> .. -> ExecutionEngine -> TradingClient(s) -> Fill telemetry
+                                                                               │
+                                            LifecycleController <--------------┘
+                                                                    │
+                                            TelemetryClient (async queue => JSONL + WebSocket broadcast)
+```
 
 ## Project Layout
 ```
 .
-|-- main.py                    # CLI pipeline runner
+|-- main.py                      # CLI snapshot runner (blocking wrapper around async collector)
 |-- pipeline/
-|   |-- __init__.py
-|   `-- data_pipeline.py       # Snapshot assembly + progress hooks
+|   `-- data_pipeline.py         # Async aggregation of sources + exchange opportunities
 |-- orchestrator/
-|   |-- models.py              # Dataclasses used across the pipeline
-|   `-- opportunities.py       # Exchange polling + opportunity builder
-|-- parsers/                   # ArbitrageScanner & Coinglass scrapers
-|-- exchanges/                 # Adapter implementations (Bybit, MEXC active; others stubbed)
-|-- project_settings.py        # JSON-backed settings loader/saver
-|-- scripts/
-|   `-- exchange_probe.py      # Diagnostics script for raw exchange payloads
+|   |-- models.py                # Dataclasses shared across systems
+|   `-- opportunities.py         # Exchange polling + opportunity builder
+|-- execution/
+|   |-- adapters.py              # Trading client interfaces (simulated + stubs for real exchange APIs)
+|   |-- allocator.py             # Wallet reservations, cooldown tracking
+|   |-- engine.py                # Strategy execution, order submission, position updates
+|   |-- fills.py                 # Fill simulator (slippage/orphan estimation)
+|   |-- lifecycle.py             # Position observation + exit rules
+|   |-- market.py                # Websocket-ready market gateway / derived metrics
+|   |-- orders.py                # Order/Fills dataclasses
+|   |-- orchestrator.py          # Glue: snapshot -> decisions -> execution
+|   |-- risk.py                  # Risk guard emitting telemetry
+|   `-- telemetry.py             # Async telemetry queue + JSONL writer
+|-- parsers/                     # ArbitrageScanner & Coinglass scrapers
+|-- exchanges/                   # Funding snapshot adapters (Bybit + MEXC active)
 |-- webapp/
-|   |-- app.py                 # FastAPI routing + templates
-|   |-- services.py            # Async scheduler & event tracking
-|   |-- templates/index.html   # Dashboard layout
-|   `-- static/                # Frontend JS/CSS
-|-- utils/                     # Logging, caching, I/O helpers
-|-- .env.example               # Environment template
+|   |-- app.py                   # FastAPI routes + WebSocket endpoint
+|   |-- services.py              # Data service (async scheduler, telemetry bridge)
+|   |-- realtime.py              # WebSocket connection manager
+|   |-- templates/index.html     # Dashboard
+|   `-- static/app.js            # Vanilla JS frontend (polling + websocket)
+|-- tests/                       # pytest/unittest suite (async-friendly)
+|-- project_settings.py          # JSON-backed settings manager
+|-- requirements.txt             # Runtime dependencies
+|-- scripts/exchange_probe.py    # Diagnostics for raw exchange snapshots
 `-- README.md
 
-# Runtime artifacts (ignored by Git)
-# |-- data/                    # Cached screener/coinglass + raw exchange payloads
-# `-- logs/                    # Application logs
+# Runtime artifacts (ignored)
+# |-- data/                      # Cached source data + raw payloads
+# `-- logs/                      # Application + execution logs
 ```
 
 ## Setup
-```powershell
-python -m venv .\.venv
-.\.venv\Scripts\Activate.ps1
+```bash
+python -m venv .venv
+# Windows PowerShell
+.\\.venv\\Scripts\\Activate.ps1
+# Linux/macOS
+source .venv/bin/activate
+
 pip install -r requirements.txt
-copy .env.example .env          # adjust if private endpoints are needed later
+cp .env.example .env  # customise if private endpoints/keys needed later
 ```
 
 ## Configuration
+`data/settings.json` is created on first run. Toggle sources/exchanges or adjust refresh timers via the dashboard's **Configuration** panel or by editing the file manually.
 
-Project settings are stored in `data/settings.json`. The file is created on first run with both ArbitrageScanner and Coinglass enabled, plus Bybit and MEXC exchanges. You can edit it manually or use the dashboard's **Configuration** panel to toggle sources/exchanges and adjust two refresh timers:
+- `parser_refresh_seconds`: backend orchestration loop interval (snapshot + orchestrator).
+- `table_refresh_seconds`: client polling cadence (still used for REST refreshes).
+- At least one source and exchange must remain enabled.
 
-- `parser_refresh_seconds` - cadence for the backend snapshot scheduler.
-- `table_refresh_seconds` - cadence for the client-side polling loop.
+Execution settings live in `data/execution_settings.json` (auto-generated). They hold wallet balances, allocation brackets, risk thresholds, telemetry paths, etc. You can edit them before launching for different paper balances or allocation heuristics.
 
-At least one source and one exchange must stay enabled; the UI enforces the constraint and the backend applies changes immediately without restarting Uvicorn.
 ## CLI Snapshot Runner
-```powershell
-python .\main.py
+```bash
+python main.py
 ```
-Outputs: terminal tables plus timestamped CSV/JSON in `data/` and logs in `logs/app.log`.
+Outputs formatted tables plus timestamped CSV/JSON in `data/` and logs under `logs/`.
 
 ### Exchange Probe (ad-hoc diagnostics)
-Use the helper script to hit each enabled exchange and capture raw payloads for spot-checking liquidity, funding, and mapping logic. Example for BTC on the default roster (Bybit + MEXC):
-```powershell
-python .\scripts\exchange_probe.py --symbol BTC --exchanges bybit mexc
+```bash
+python scripts/exchange_probe.py --symbol BTC --exchanges bybit mexc
 ```
-The command writes `data/debug/exchange_probe_<symbol>_<timestamp>.json` with the computed snapshots, including bid/ask sizes and raw API responses.
+Writes `data/debug/exchange_probe_<symbol>_<timestamp>.json` with normalized snapshots, depth, and raw API payloads.
 
-## Pre-populating Cache (optional)
-If the first web request would spend time downloading Chromium (pyppeteer) or populating caches, run:
-```powershell
+### Optional: Prime caches
+If first run would spend time downloading Chromium (pyppeteer) or populating caches:
+```bash
 python -m webapp.manual_refresh
 ```
-This performs a one-off snapshot so the dashboard renders immediately on its first load.
 
-## Running the Web Dashboard
-```powershell
-.\.venv\Scripts\uvicorn webapp.app:app --reload
+## Running the Dashboard
+```bash
+uvicorn webapp.app:app --reload
+# or with explicit venv python:
+python -m uvicorn webapp.app:app --reload
 ```
-Navigate to `http://127.0.0.1:8000/`.
+Visit `http://127.0.0.1:8000/`.
 
-### Dashboard Behavior
-- **Immediate render:** The page shows a muted placeholder section until data arrives; no blocking while the backend works.
-- **Progress tracking:** Each pipeline stage emits events that appear in the activity log (`screener:complete`, `exchange:error`, `snapshot:ready`, etc.).
-- **Exchange grid:** Displays every adapter with live status chips (`ok`, `pending`, `failed`, `missing`) and snapshot counts/error messages. By default only Bybit and MEXC are polled; the remaining adapters stay idle until we re-enable them.
-- **Manual refresh:** Clicking the refresh button triggers a backend refresh, disables the button during execution, and re-renders each table as soon as new data is available. Automatic polling keeps data current using the configured refresh interval.
-- **Configuration panel:** Update source/exchange toggles and tweak parser/UI refresh cadences without restarting the service.
+### Dashboard Behaviour
+- **Immediate render**: placeholders fade as soon as async events arrive; no blocking UI.
+- **Activity log**: backend events (`screener:start`, `exchange:error`, `execution_success`, `risk:pause`, etc.) stream in over the WebSocket feed.
+- **Exchange grid**: status chips per adapter (`ok`, `pending`, `failed`, `missing`) and message/last count.
+- **Execution panel**: paper balances, reservations, open positions, and live execution log driven by telemetry.
+- **Manual refresh**: runs an async snapshot/execute cycle and refreshes tables immediately; scheduled polling keeps REST data in sync.
 
 ## Failure Handling
-- Missing or failed exchanges no longer block the snapshot; partial data still renders.
-- The dashboard highlights exchanges with issues and surfaces the latest error message.
-- Pipeline messages also note when scraping sources (ArbitrageScanner, Coinglass) return empty results.
+- Missing dependencies or network errors are surfaced as status messages; pipeline continues with partial data.
+- Risk guard emits telemetry when tripwires fire (`risk:blocked`, `risk:pause`, `risk:resume`).
+- Telemetry queue is resilient: if WebSocket clients drop, they reconnect and receive the backlog.
+
+## Tests
+```bash
+python -m unittest discover -s tests
+```
+(Skips async snapshot test if `aiohttp` is unavailable.) Includes orchestrator, trading engine, telemetry, and realtime connection coverage.
 
 ## Operational Notes
-- Logs: see `logs/app.log` for detailed trace output, including any stack traces during adapter failures.
-- Pyppeteer: Coinglass scraping may download Chromium on first run. Progress events keep the UI informed during this stage.
-- Cache: Screener and Coinglass responses persist under `data/` with TTL enforcement to avoid repeated heavy scrapes.
-- Symbols: ArbitrageScanner tickers are normalized to the base asset and every adapter request is coerced to `<BASE>USDT`; supplying other quotes is unnecessary.
-- Liquidity columns: the opportunities table shows long ask / short bid plus the approximate executable notional (size * price) in USDT to guide position sizing.
+- Logs: see `logs/app.log` and `state/execution_events.jsonl` (path configurable) for full trace of execution and telemetry events.
+- Coinglass scraping still relies on `requests-html`/pyppeteer; Chromium download progress is visible via the telemetry stream.
+- Wallet/position state persists under `state/` so the paper balances survive restarts.
 
 ## Contributing
-- `pipeline/data_pipeline.py` exposes a `progress_cb` hook; new stages should emit structured events for the UI.
-- New exchange adapters should subclass `exchanges.base.ExchangeAdapter` and return `MarketSnapshot` instances populated with funding rates, bid/ask, mark, next funding times, and depth where available.
-- Frontend additions should stick to vanilla JS and sanitize DOM output with the existing helper functions.
+- Emit telemetry for any new subsystem; the UI and WebSocket feed rely on structured events.
+- New exchange adapters should subclass `exchanges.base.ExchangeAdapter` and populate `MarketSnapshot` with funding, depth, and next funding timestamps.
+- Trading clients should implement the async `TradingClient` interface (`execution/adapters.py`).
+- Frontend additions should stick to vanilla JS, use the escape helpers, and extend the telemetry renderers where applicable.
 
 ## Roadmap Ideas
-1. Parallelize exchange polling with per-adapter timeouts to shorten refresh windows.
-2. Add WebSocket streaming for exchanges that provide live funding updates.
-3. Surface opportunity deltas (compare with previous snapshot) and alert thresholds.
-4. Package the dashboard for container deployment with optional HTTPS termination.
+1. Plug real Bybit/MEXC REST/WebSocket trading clients into `execution/adapters.py`.
+2. Persist telemetry/events to a time-series store for historical analysis.
+3. Add strategy-level analytics (P&L curves, funding capture) to the dashboard.
+4. Package orchestrator/uvicorn in Docker with configurable env overrides.

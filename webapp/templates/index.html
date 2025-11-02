@@ -150,22 +150,20 @@
       </form>
     </section>
     <section class="panel panel--muted" id="empty-state"{% if has_snapshot %} style="display: none;"{% endif %}>
-      <h2>Preparing snapshot</h2>
-      <p class="muted">
-        We are collecting the latest market data. Tables will populate automatically once the snapshot is ready.
-      </p>
-    </section>
+        <h2>Preparing snapshot</h2>
+        <p class="muted">
+          We are collecting the latest market data. Tables will populate automatically once the snapshot is ready.
+        </p>
+      </section>
 
-    {% if messages %}
-      <section class="panel panel--alert" id="messages">
+      <section class="panel panel--alert" id="messages"{% if not messages %} style="display: none;"{% endif %}>
         <h2>Status Messages</h2>
-        <ul>
+        <ul id="messages-list">
           {% for message in messages %}
             <li>{{ message }}</li>
           {% endfor %}
         </ul>
       </section>
-    {% endif %}
 
     <section class="panel" id="exchange-status">
       <h2>Exchange Responses</h2>
@@ -346,6 +344,60 @@
       {% if opportunity_rows | length == 0 %}
         <p class="muted">No opportunities detected for the current snapshot.</p>
       {% endif %}
+    </section>
+
+    <section class="panel" id="execution-balances">
+      <h2>Exchange Balances</h2>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Exchange</th>
+            <th>Total (USDT)</th>
+            <th>Available</th>
+            <th>Reserved</th>
+            <th>In Positions</th>
+          </tr>
+        </thead>
+        <tbody id="wallet-table-body"></tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="execution-reservations">
+      <h2>Active Reservations</h2>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Exchanges</th>
+            <th>Notional</th>
+            <th>Created</th>
+            <th>Reservation</th>
+          </tr>
+        </thead>
+        <tbody id="reservation-table-body"></tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="execution-positions">
+      <h2>Open Positions</h2>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Strategy</th>
+            <th>Status</th>
+            <th>Notional</th>
+            <th>Hedged At</th>
+            <th>Position</th>
+          </tr>
+        </thead>
+        <tbody id="positions-table-body"></tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="execution-activity-panel">
+      <h2>Execution Activity</h2>
+      <ul class="event-log" id="execution-activity"></ul>
     </section>
   </main>
 </body>

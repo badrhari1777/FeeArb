@@ -5,8 +5,18 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional
 
-from pipeline import collect_snapshot, DataSnapshot
+from pipeline import DataSnapshot, collect_snapshot_async
 from project_settings import SettingsManager
+from execution import (
+    ExecutionSettingsManager,
+    WalletService,
+    PositionManager,
+    TelemetryClient,
+)
+from execution.allocator import Allocator
+from execution.lifecycle import LifecycleController
+from execution.settings import ExecutionSettings
+from .realtime import ConnectionManager
 
 RefreshResult = Literal["completed", "in_progress", "failed"]
 
@@ -28,6 +38,16 @@ class DataService:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._events: List[dict[str, Any]] = []
         self._exchange_status: Dict[str, dict[str, Any]] = {}
+        self._exec_settings_manager = ExecutionSettingsManager()
+        self._execution_settings: ExecutionSettings = self._exec_settings_manager.current
+        self._wallet = WalletService(self._execution_settings.balance.initial_balances)
+        self._positions = PositionManager(self._wallet)
+        self._allocator = Allocator(self._wallet, self._positions, self._execution_settings)
+        self._lifecycle = LifecycleController(self._execution_settings, self._positions, self._allocator)
+        self._telemetry = TelemetryClient(self._execution_settings)
+        self._telemetry_events: List[dict[str, Any]] = []
+        self._realtime: ConnectionManager | None = None
+        self._telemetry.register_listener(self._handle_telemetry_event)
 
 
     async def startup(self) -> None:
@@ -39,6 +59,7 @@ class DataService:
             await self._restart_scheduler()
         if self._bootstrap_task is None or self._bootstrap_task.done():
             self._bootstrap_task = asyncio.create_task(self.refresh_snapshot())
+        await self._telemetry.start()
 
     async def shutdown(self) -> None:
         if self._task:
@@ -55,6 +76,10 @@ class DataService:
             except asyncio.CancelledError:
                 pass
             self._bootstrap_task = None
+        await self._telemetry.stop()
+
+    def attach_realtime(self, manager: ConnectionManager) -> None:
+        self._realtime = manager
 
     async def _scheduler(self) -> None:
         try:
@@ -102,8 +127,7 @@ class DataService:
         source_flags = dict(current_settings.sources)
         exchange_flags = dict(current_settings.exchanges)
         try:
-            snapshot = await asyncio.to_thread(
-                collect_snapshot,
+            snapshot = await collect_snapshot_async(
                 progress_cb,
                 source_settings=source_flags,
                 exchange_settings=exchange_flags,
@@ -180,6 +204,49 @@ class DataService:
             "events": list(self._events),
             "exchange_status": list(self._exchange_status.values()),
             "settings": settings_payload,
+            "execution": self._execution_state(),
+        }
+
+    def telemetry_backlog(self, limit: int = 50) -> List[dict[str, Any]]:
+        return list(self._telemetry_events[-limit:])
+
+    def _execution_state(self) -> dict[str, object]:
+        return {
+            "wallets": [
+                {
+                    "exchange": account.exchange,
+                    "total": account.total_balance,
+                    "available": account.available,
+                    "reserved": account.reserved,
+                    "in_positions": account.in_positions,
+                }
+                for account in self._wallet.accounts()
+            ],
+            "reservations": [
+                {
+                    "allocation_id": allocation.allocation_id,
+                    "symbol": allocation.symbol,
+                    "long_exchange": allocation.long_exchange,
+                    "short_exchange": allocation.short_exchange,
+                    "notional": allocation.notional,
+                    "created_at": _fmt_ts(allocation.created_at),
+                }
+                for allocation in self._allocator.pending_allocations()
+            ],
+            "positions": [
+                {
+                    "position_id": position.position_id,
+                    "symbol": position.symbol,
+                    "strategy": position.strategy,
+                    "status": position.status,
+                    "notional": position.legs["long"].target_amount,
+                    "hedged_at": _fmt_ts(position.hedged_at),
+                    "observation_started": _fmt_ts(position.observation_started_at),
+                    "exit_started": _fmt_ts(position.exit_started_at),
+                }
+                for position in self._positions.active_positions()
+            ],
+            "telemetry": list(self._telemetry_events),
         }
 
 
@@ -230,3 +297,16 @@ class DataService:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         self._exchange_status[exchange] = entry
+
+    async def _handle_telemetry_event(self, entry: dict[str, Any]) -> None:
+        self._telemetry_events.append(entry)
+        if len(self._telemetry_events) > 200:
+            self._telemetry_events = self._telemetry_events[-200:]
+        if self._realtime is not None:
+            await self._realtime.broadcast(entry)
+
+
+def _fmt_ts(ts: float | None) -> str | None:
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()

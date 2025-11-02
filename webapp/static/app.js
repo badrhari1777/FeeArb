@@ -1,15 +1,32 @@
-(() => {
-  const MIN_REFRESH_SECONDS = 30;
-  const MAX_REFRESH_SECONDS = 86400;
-  const defaultSettings = {
+﻿/**
+ * Lightweight dashboard runtime with broad browser compatibility.
+ * Avoids modern language features (optional chaining, fetch, etc.)
+ * so the page keeps working on older Chromium / Edge builds.
+ */
+(function () {
+  'use strict';
+
+  var MIN_REFRESH_SECONDS = 30;
+  var MAX_REFRESH_SECONDS = 86400;
+  var MAX_RENDERED_EVENTS = 50;
+  var MAX_TELEMETRY = 200;
+
+  var defaultSettings = {
     sources: { arbitragescanner: true, coinglass: true },
     exchanges: { bybit: true, mexc: true },
     parser_refresh_seconds: 300,
-    table_refresh_seconds: 300,
+    table_refresh_seconds: 300
   };
 
-  const defaultState = {
-    status: "idle",
+  var defaultExecution = {
+    wallets: [],
+    reservations: [],
+    positions: [],
+    telemetry: []
+  };
+
+  var defaultState = {
+    status: 'idle',
     refresh_interval: defaultSettings.table_refresh_seconds,
     parser_refresh_interval: defaultSettings.parser_refresh_seconds,
     last_error: null,
@@ -18,850 +35,931 @@
     refresh_in_progress: false,
     events: [],
     exchange_status: [],
-    settings: {
-      ...defaultSettings,
-      sources: { ...defaultSettings.sources },
-      exchanges: { ...defaultSettings.exchanges },
-    },
+    settings: clone(defaultSettings),
+    execution: clone(defaultExecution)
   };
 
-  const initialState = {
-    ...defaultState,
-    ...(window.__INITIAL_STATE__ || {}),
+  var globalState = normalizeState(window.__INITIAL_STATE__);
+  var pollingTimer = null;
+  var currentPollInterval = 0;
+  var pollingInFlight = false;
+  var telemetrySocket = null;
+
+  var elements = {
+    generatedAt: document.getElementById('generated-at'),
+    lastUpdated: document.getElementById('last-updated'),
+    screenerSource: document.getElementById('screener-source'),
+    coinglassSource: document.getElementById('coinglass-source'),
+    opportunityCount: document.getElementById('opportunity-count'),
+    statusPill: document.getElementById('status-pill'),
+    lastError: document.getElementById('last-error'),
+    lastProgress: document.getElementById('last-progress'),
+    exchangeSummary: document.getElementById('exchange-summary'),
+    screenerTable: document.getElementById('screener-table'),
+    coinglassTable: document.getElementById('coinglass-table'),
+    universeTable: document.getElementById('universe-table-body'),
+    opportunityTable: document.getElementById('opportunity-table-body'),
+    messagesPanel: document.getElementById('messages'),
+    messagesList: document.getElementById('messages-list'),
+    settingsForm: document.getElementById('settings-form'),
+    parserInput: document.getElementById('parser-interval'),
+    tableInput: document.getElementById('table-interval'),
+    settingsStatus: document.getElementById('settings-status'),
+    settingsSubmit: document.getElementById('settings-submit'),
+    refreshButton: document.getElementById('refresh-button'),
+    hint: document.querySelector('.hint'),
+    emptyState: document.getElementById('empty-state'),
+    exchangeTable: document.getElementById('exchange-status-body'),
+    eventLog: document.getElementById('event-log'),
+    eventEmpty: document.getElementById('event-empty'),
+    walletTable: document.getElementById('wallet-table-body'),
+    reservationTable: document.getElementById('reservation-table-body'),
+    positionTable: document.getElementById('positions-table-body'),
+    executionLog: document.getElementById('execution-activity')
   };
 
-  if (!initialState.settings) {
-    initialState.settings = {
-      ...defaultSettings,
-      sources: { ...defaultSettings.sources },
-      exchanges: { ...defaultSettings.exchanges },
-    };
-  } else {
-    initialState.settings = {
-      ...defaultSettings,
-      ...initialState.settings,
-      sources: {
-        ...defaultSettings.sources,
-        ...(initialState.settings.sources || {}),
-      },
-      exchanges: {
-        ...defaultSettings.exchanges,
-        ...(initialState.settings.exchanges || {}),
-      },
-    };
-  }
-
-  if (!initialState.parser_refresh_interval) {
-    initialState.parser_refresh_interval =
-      initialState.settings.parser_refresh_seconds ??
-      initialState.refresh_interval ??
-      defaultSettings.parser_refresh_seconds;
-  }
-
-  if (!initialState.refresh_interval) {
-    initialState.refresh_interval =
-      initialState.settings.table_refresh_seconds ??
-      defaultSettings.table_refresh_seconds;
-  }
-
-  let currentState = initialState;
-  let pollIntervalSeconds = Math.max(
-    Number(
-      initialState.settings?.table_refresh_seconds ??
-        initialState.refresh_interval ??
-        defaultSettings.table_refresh_seconds,
-    ) || defaultSettings.table_refresh_seconds,
-    MIN_REFRESH_SECONDS,
-  );
-  let pollingTimer = null;
-  let pollingInFlight = false;
-
-  const elements = {
-
-    generatedAt: document.getElementById("generated-at"),
-    lastUpdated: document.getElementById("last-updated"),
-    screenerSource: document.getElementById("screener-source"),
-    coinglassSource: document.getElementById("coinglass-source"),
-    opportunityCount: document.getElementById("opportunity-count"),
-    statusPill: document.getElementById("status-pill"),
-    lastError: document.getElementById("last-error"),
-    lastProgress: document.getElementById("last-progress"),
-    exchangeSummary: document.getElementById("exchange-summary"),
-    screenerTable: document.getElementById("screener-table")?.querySelector("tbody"),
-    coinglassTable: document.getElementById("coinglass-table")?.querySelector("tbody"),
-    universeTable: document.getElementById("universe-table-body"),
-    opportunityTable: document.getElementById("opportunity-table-body"),
-    messagesPanel: document.getElementById("messages"),
-    settingsForm: document.getElementById("settings-form"),
-    parserInput: document.getElementById("parser-interval"),
-    tableInput: document.getElementById("table-interval"),
-    settingsStatus: document.getElementById("settings-status"),
-    settingsSubmit: document.getElementById("settings-submit"),
-    refreshButton: document.getElementById("refresh-button"),
-    hint: document.querySelector(".hint"),
-    emptyState: document.getElementById("empty-state"),
-    exchangeTable: document.getElementById("exchange-status-body"),
-    eventLog: document.getElementById("event-log"),
-    eventEmpty: document.getElementById("event-empty"),
-  };
-
-  const escapeHtml = (value) => {
+  function clone(value) {
     if (value === null || value === undefined) {
-      return "";
+      return null;
     }
-    return String(value)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
-  };
-
-  const formatPercent = (value, digits = 2) => {
-    if (value === null || value === undefined || Number.isNaN(value)) {
-      return "-";
-    }
-    return (value * 100).toFixed(digits);
-  };
-
-  const formatNumber = (value, digits = 4) => {
-    if (value === null || value === undefined || Number.isNaN(value)) {
-      return "-";
-    }
-    if (Math.abs(value) >= 1000) {
-      return value.toLocaleString(undefined, { maximumFractionDigits: digits });
-    }
-    return Number(value).toFixed(digits);
-  };
-
-  const formatTime = (value) => {
-    if (!value) {
-      return "-";
-    }
-    if (typeof value === "string" && value.includes("GMT+3")) {
+    if (typeof value !== 'object') {
       return value;
     }
     try {
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) {
-        return value;
+      return JSON.parse(JSON.stringify(value));
+    } catch (_err) {
+      var copy = {};
+      var key;
+      for (key in value) {
+        if (Object.prototype.hasOwnProperty.call(value, key)) {
+          copy[key] = clone(value[key]);
+        }
       }
-      const gmt3 = new Date(date.getTime() + 3 * 60 * 60 * 1000);
-      const pad = (num) => String(num).padStart(2, "0");
-      const year = gmt3.getUTCFullYear();
-      const month = pad(gmt3.getUTCMonth() + 1);
-      const day = pad(gmt3.getUTCDate());
-      const hour = pad(gmt3.getUTCHours());
-      const minute = pad(gmt3.getUTCMinutes());
-      const second = pad(gmt3.getUTCSeconds());
-      return `${year}-${month}-${day} ${hour}:${minute}:${second} GMT+3`;
-    } catch {
-      return value;
+      return copy;
     }
-  };
+  }
 
-  const truncate = (value, limit = 96) => {
+  function normalizeSettings(settings) {
+    var normalized = clone(defaultSettings) || {};
+    var key;
+    var parsed;
+    if (settings && typeof settings === 'object') {
+      if (settings.sources) {
+        for (key in normalized.sources) {
+          if (Object.prototype.hasOwnProperty.call(normalized.sources, key)) {
+            normalized.sources[key] = !!settings.sources[key];
+          }
+        }
+        for (key in settings.sources) {
+          if (Object.prototype.hasOwnProperty.call(settings.sources, key)) {
+            normalized.sources[key] = !!settings.sources[key];
+          }
+        }
+      }
+      if (settings.exchanges) {
+        for (key in normalized.exchanges) {
+          if (Object.prototype.hasOwnProperty.call(normalized.exchanges, key)) {
+            normalized.exchanges[key] = !!settings.exchanges[key];
+          }
+        }
+        for (key in settings.exchanges) {
+          if (Object.prototype.hasOwnProperty.call(settings.exchanges, key)) {
+            normalized.exchanges[key] = !!settings.exchanges[key];
+          }
+        }
+      }
+      parsed = parseInt(settings.parser_refresh_seconds, 10);
+      if (!isNaN(parsed)) {
+        normalized.parser_refresh_seconds = clamp(parsed, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+      }
+      parsed = parseInt(settings.table_refresh_seconds, 10);
+      if (!isNaN(parsed)) {
+        normalized.table_refresh_seconds = clamp(parsed, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+      }
+    }
+    return normalized;
+  }
+
+  function normalizeExecution(execution) {
+    var normalized = clone(defaultExecution) || {
+      wallets: [],
+      reservations: [],
+      positions: [],
+      telemetry: []
+    };
+    if (!execution || typeof execution !== 'object') {
+      return normalized;
+    }
+    if (Array.isArray(execution.wallets)) {
+      normalized.wallets = clone(execution.wallets) || [];
+    }
+    if (Array.isArray(execution.reservations)) {
+      normalized.reservations = clone(execution.reservations) || [];
+    }
+    if (Array.isArray(execution.positions)) {
+      normalized.positions = clone(execution.positions) || [];
+    }
+    if (Array.isArray(execution.telemetry)) {
+      normalized.telemetry = clone(execution.telemetry) || [];
+    }
+    return normalized;
+  }
+
+  function normalizeState(source) {
+    var state = clone(defaultState) || defaultState;
+    if (source && typeof source === 'object') {
+      if (typeof source.status === 'string') {
+        state.status = source.status;
+      }
+      if (typeof source.refresh_interval === 'number') {
+        state.refresh_interval = source.refresh_interval;
+      }
+      if (typeof source.parser_refresh_interval === 'number') {
+        state.parser_refresh_interval = source.parser_refresh_interval;
+      }
+      state.last_error = source.last_error || null;
+      state.last_updated = source.last_updated || null;
+      state.refresh_in_progress = !!source.refresh_in_progress;
+      state.snapshot = source.snapshot ? clone(source.snapshot) : null;
+      if (Array.isArray(source.events)) {
+        state.events = source.events.slice(-MAX_RENDERED_EVENTS);
+      }
+      if (Array.isArray(source.exchange_status)) {
+        state.exchange_status = source.exchange_status.slice();
+      }
+    }
+    state.settings = normalizeSettings(source ? source.settings : null);
+    state.execution = normalizeExecution(source ? source.execution : null);
+    return state;
+  }
+
+  function clamp(value, minimum, maximum) {
+    var result = value;
+    if (result < minimum) {
+      result = minimum;
+    }
+    if (result > maximum) {
+      result = maximum;
+    }
+    return result;
+  }
+
+  function escapeHtml(value) {
+    if (value === null || value === undefined) {
+      return '';
+    }
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function formatPercent(value, digits) {
+    var number = typeof value === 'number' ? value : parseFloat(value);
+    if (isNaN(number)) {
+      return '-';
+    }
+    var multiplier = 100;
+    var places = typeof digits === 'number' ? digits : 2;
+    return number * multiplier < 0 ? '-' + Math.abs(number * multiplier).toFixed(places) + '%' : (number * multiplier).toFixed(places) + '%';
+  }
+
+  function formatNumber(value, digits) {
+    var number = typeof value === 'number' ? value : parseFloat(value);
+    if (isNaN(number)) {
+      return '-';
+    }
+    var places = typeof digits === 'number' ? digits : 2;
+    return number.toFixed(places);
+  }
+
+  function formatDate(value) {
     if (!value) {
-      return "";
+      return '-';
     }
-    const text = String(value);
-    if (text.length <= limit) {
-      return text;
+    try {
+      var date = new Date(value);
+      if (isNaN(date.getTime())) {
+        return '-';
+      }
+      return date.toLocaleString();
+    } catch (_err) {
+      return '-';
     }
-    return `${text.slice(0, Math.max(0, limit - 3))}...`;
-  };
+  }
 
-  const updateStatusPill = (statusText) => {
+  function setText(element, text) {
+    if (!element) {
+      return;
+    }
+    element.textContent = text || '';
+  }
+
+  function updateStatusPill(status) {
     if (!elements.statusPill) {
       return;
     }
-    const text = statusText || "idle";
-    elements.statusPill.textContent = text;
-    const slug = text.toString().toLowerCase().replace(/[^a-z0-9]+/g, "-");
-    elements.statusPill.className = `status-pill status-pill--${slug}`;
-  };
-
-  const toggleEmptyState = (show) => {
-    if (!elements.emptyState) {
-      return;
+    var className = 'status-pill';
+    var label = status || 'unknown';
+    if (status && typeof status === 'string') {
+      className += ' status-pill--' + status.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    } else {
+      className += ' status-pill--unknown';
     }
-    elements.emptyState.style.display = show ? "" : "none";
-  };
-  const cloneSettings = (settings = defaultSettings) => ({
-    ...settings,
-    sources: { ...(settings.sources || {}) },
-    exchanges: { ...(settings.exchanges || {}) },
-  });
+    elements.statusPill.className = className;
+    elements.statusPill.textContent = label;
+  }
 
-  const normalizeSettings = (settings = undefined) => {
-    const base = cloneSettings(defaultSettings);
-    if (!settings) {
-      return cloneSettings(base);
+  function updateMetadata(state) {
+    var snapshot = state.snapshot || null;
+    setText(elements.generatedAt, formatDate(snapshot && snapshot.generated_at));
+    var lastUpdated = state.last_updated ? formatDate(state.last_updated) : '-';
+    setText(elements.lastUpdated, lastUpdated);
+    setText(elements.opportunityCount, snapshot && snapshot.opportunities ? String(snapshot.opportunities.length) : '0');
+    setText(elements.lastError, state.last_error || 'None');
+
+    if (elements.screenerSource) {
+      if (!snapshot) {
+        setText(elements.screenerSource, '-');
+      } else if (snapshot.screener_from_cache) {
+        setText(elements.screenerSource, 'cache');
+      } else {
+        setText(elements.screenerSource, 'fresh');
+      }
     }
-    const normalized = cloneSettings({
-      ...settings,
-      sources: { ...(settings.sources || {}) },
-      exchanges: { ...(settings.exchanges || {}) },
-    });
-    return {
-      ...base,
-      ...normalized,
-      sources: Object.entries(normalized.sources || {}).reduce(
-        (acc, [key, value]) => ({ ...acc, [key]: Boolean(value) }),
-        { ...base.sources },
-      ),
-      exchanges: Object.entries(normalized.exchanges || {}).reduce(
-        (acc, [key, value]) => ({ ...acc, [key]: Boolean(value) }),
-        { ...base.exchanges },
-      ),
-      parser_refresh_seconds:
-        Number(normalized.parser_refresh_seconds) || base.parser_refresh_seconds,
-      table_refresh_seconds:
-        Number(normalized.table_refresh_seconds) || base.table_refresh_seconds,
-    };
-  };
 
+    if (elements.coinglassSource) {
+      if (!snapshot) {
+        setText(elements.coinglassSource, '-');
+      } else if (snapshot.coinglass_from_cache) {
+        setText(elements.coinglassSource, 'cache');
+      } else {
+        setText(elements.coinglassSource, 'fresh');
+      }
+    }
 
-  const renderScreener = (rows = []) => {
+    var events = state.events || [];
+    if (elements.lastProgress) {
+      if (events.length === 0) {
+        elements.lastProgress.textContent = '-';
+      } else {
+        var last = events[events.length - 1];
+        var message = last.payload && last.payload.message ? last.payload.message : last.event;
+        elements.lastProgress.textContent = message || '-';
+      }
+    }
+  }
+
+  function renderScreener(rows) {
     if (!elements.screenerTable) {
       return;
     }
-    const limited = rows.slice(0, 10);
-    elements.screenerTable.innerHTML = limited
-      .map(
-        (row) => `
-          <tr>
-            <td>${escapeHtml(row.symbol)}</td>
-            <td>${formatPercent(row.spread ?? 0, 4)}</td>
-            <td>${escapeHtml(row.long_exchange)}</td>
-            <td>${formatPercent(row.long_fee ?? 0, 4)}</td>
-            <td>${escapeHtml(row.short_exchange)}</td>
-            <td>${formatPercent(row.short_fee ?? 0, 4)}</td>
-          </tr>
-        `,
-      )
-      .join("");
-  };
+    var body = elements.screenerTable.querySelector('tbody');
+    if (!body) {
+      return;
+    }
+    var html = '';
+    var limit = Math.min(rows.length || 0, 10);
+    var i;
+    for (i = 0; i < limit; i += 1) {
+      var row = rows[i] || {};
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.symbol) + '</td>' +
+        '<td>' + formatPercent(row.spread, 4) + '</td>' +
+        '<td>' + escapeHtml(row.long_exchange) + '</td>' +
+        '<td>' + formatPercent(row.long_fee, 4) + '</td>' +
+        '<td>' + escapeHtml(row.short_exchange) + '</td>' +
+        '<td>' + formatPercent(row.short_fee, 4) + '</td>' +
+      '</tr>';
+    }
+    body.innerHTML = html;
+  }
 
-  const renderCoinglass = (rows = []) => {
+  function renderCoinglass(rows) {
     if (!elements.coinglassTable) {
       return;
     }
-    const limited = rows.slice(0, 10);
-    elements.coinglassTable.innerHTML = limited
-      .map(
-        (row) => `
-          <tr>
-            <td>${escapeHtml(row.ranking)}</td>
-            <td>${escapeHtml(row.symbol)}</td>
-            <td>${escapeHtml(row.pair)}</td>
-            <td>${escapeHtml(row.long_exchange)}</td>
-            <td>${escapeHtml(row.short_exchange)}</td>
-            <td>${escapeHtml(
-              Number(row.net_funding_rate_percent ?? 0).toFixed(3),
-            )}</td>
-            <td>${escapeHtml(Number(row.apr_percent ?? 0).toFixed(2))}</td>
-            <td>${escapeHtml(
-              Number(row.spread_rate_percent ?? 0).toFixed(3),
-            )}</td>
-          </tr>
-        `,
-      )
-      .join("");
-  };
+    var body = elements.coinglassTable.querySelector('tbody');
+    if (!body) {
+      return;
+    }
+    var html = '';
+    var limit = Math.min(rows.length || 0, 10);
+    var i;
+    for (i = 0; i < limit; i += 1) {
+      var row = rows[i] || {};
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.ranking) + '</td>' +
+        '<td>' + escapeHtml(row.symbol) + '</td>' +
+        '<td>' + escapeHtml(row.pair) + '</td>' +
+        '<td>' + escapeHtml(row.long_exchange) + '</td>' +
+        '<td>' + escapeHtml(row.short_exchange) + '</td>' +
+        '<td>' + formatPercent(row.net_funding_rate, 3) + '</td>' +
+        '<td>' + formatPercent(row.apr, 2) + '</td>' +
+        '<td>' + formatPercent(row.spread_rate, 3) + '</td>' +
+      '</tr>';
+    }
+    body.innerHTML = html;
+  }
 
-  const renderUniverse = (rows = []) => {
+  function renderUniverse(rows) {
     if (!elements.universeTable) {
       return;
     }
-    elements.universeTable.innerHTML = rows
-      .map(
-        (row) => `
-          <tr>
-            <td>${escapeHtml(row.symbol)}</td>
-            <td>${escapeHtml(row.sources)}</td>
-          </tr>
-        `,
-      )
-      .join("");
-  };
+    var html = '';
+    var i;
+    for (i = 0; i < (rows && rows.length ? rows.length : 0); i += 1) {
+      var row = rows[i] || {};
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.symbol) + '</td>' +
+        '<td>' + escapeHtml(row.sources) + '</td>' +
+      '</tr>';
+    }
+    elements.universeTable.innerHTML = html;
+  }
 
-  const renderOpportunities = (rows = []) => {
+  function renderOpportunities(rows) {
     if (!elements.opportunityTable) {
       return;
     }
-    elements.opportunityTable.innerHTML = rows
-      .map(
-        (row) => `
-          <tr>
-            <td>${escapeHtml(row.symbol)}</td>
-            <td>${escapeHtml(row.long_exchange)}</td>
-            <td>${formatPercent(row.long_rate, 3)}</td>
-            <td>${formatNumber(row.long_ask, 4)}</td>
-            <td>${formatNumber(row.long_liquidity_usd, 2)}</td>
-            <td>${escapeHtml(formatTime(row.long_next_funding))}</td>
-            <td>${formatNumber(row.long_funding_interval_hours, 2)}</td>
-            <td>${escapeHtml(row.short_exchange)}</td>
-            <td>${formatPercent(row.short_rate, 3)}</td>
-            <td>${formatNumber(row.short_bid, 4)}</td>
-            <td>${formatNumber(row.short_liquidity_usd, 2)}</td>
-            <td>${escapeHtml(formatTime(row.short_next_funding))}</td>
-            <td>${formatNumber(row.short_funding_interval_hours, 2)}</td>
-            <td>${formatPercent(row.spread, 3)}</td>
-            <td>${formatPercent(row.price_diff_pct, 3)}</td>
-            <td>${formatPercent(row.effective_spread, 3)}</td>
-            <td>${escapeHtml(row.participants ?? "-")}</td>
-          </tr>
-        `,
-      )
-      .join("");
-
-    if (elements.opportunityCount) {
-      elements.opportunityCount.textContent = rows.length;
+    var html = '';
+    var i;
+    for (i = 0; i < (rows && rows.length ? rows.length : 0); i += 1) {
+      var row = rows[i] || {};
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.symbol) + '</td>' +
+        '<td>' + escapeHtml(row.long_exchange) + '</td>' +
+        '<td>' + formatPercent(row.long_rate, 3) + '</td>' +
+        '<td>' + formatNumber(row.long_ask, 4) + '</td>' +
+        '<td>' + formatNumber(row.long_liquidity_usd, 2) + '</td>' +
+        '<td>' + escapeHtml(row.long_next_funding || '-') + '</td>' +
+        '<td>' + formatNumber(row.long_funding_interval_hours, 2) + '</td>' +
+        '<td>' + escapeHtml(row.short_exchange) + '</td>' +
+        '<td>' + formatPercent(row.short_rate, 3) + '</td>' +
+        '<td>' + formatNumber(row.short_bid, 4) + '</td>' +
+        '<td>' + formatNumber(row.short_liquidity_usd, 2) + '</td>' +
+        '<td>' + escapeHtml(row.short_next_funding || '-') + '</td>' +
+        '<td>' + formatNumber(row.short_funding_interval_hours, 2) + '</td>' +
+        '<td>' + formatPercent(row.spread, 3) + '</td>' +
+        '<td>' + formatPercent(row.price_diff_pct, 3) + '</td>' +
+        '<td>' + formatPercent(row.effective_spread, 3) + '</td>' +
+        '<td>' + escapeHtml(row.participants) + '</td>' +
+      '</tr>';
     }
-  };
+    elements.opportunityTable.innerHTML = html;
+  }
 
-  const renderExchangeStatus = (rows = []) => {
+  function renderExchangeStatus(entries) {
     if (!elements.exchangeTable) {
       return;
     }
-    if (!rows || rows.length === 0) {
-      elements.exchangeTable.innerHTML =
-        '<tr><td colspan="4" class="muted">No exchange data yet.</td></tr>';
-      return;
+    var rows = entries || [];
+    var html = '';
+    var i;
+    for (i = 0; i < rows.length; i += 1) {
+      var row = rows[i] || {};
+      var status = row.status || 'unknown';
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.exchange || row.name || '-') + '</td>' +
+        '<td>' + escapeHtml(status) + '</td>' +
+        '<td>' + escapeHtml(row.count === undefined || row.count === null ? '-' : row.count) + '</td>' +
+        '<td>' + escapeHtml(row.message || row.error || '-') + '</td>' +
+      '</tr>';
     }
-    elements.exchangeTable.innerHTML = rows
-      .map((row) => {
-        const exchange = escapeHtml(row.exchange ?? row.name ?? "-");
-        const statusValue = (row.status ?? "unknown").toString();
-        const slug = statusValue.toLowerCase().replace(/[^a-z0-9]+/g, "-");
-        const count = row.count ?? "-";
-        const message = row.message || row.error || "";
-        return `
-          <tr>
-            <td>${exchange}</td>
-            <td><span class="status-chip status-chip--${slug}">${escapeHtml(statusValue)}</span></td>
-            <td>${escapeHtml(count)}</td>
-            <td>${escapeHtml(message || "-")}</td>
-          </tr>
-        `;
-      })
-      .join("");
-  };
+    if (!html) {
+      html = '<tr><td colspan="4" class="muted">No exchange updates yet.</td></tr>';
+    }
+    elements.exchangeTable.innerHTML = html;
+    if (elements.exchangeSummary) {
+      elements.exchangeSummary.textContent = rows.length ? String(rows.length) + ' tracked' : '-';
+    }
+  }
 
-  const renderEvents = (events = []) => {
+  function renderEvents(events) {
     if (!elements.eventLog) {
       return;
     }
-    if (!events || events.length === 0) {
-      elements.eventLog.innerHTML = "";
+    if (!events || !events.length) {
+      if (elements.eventLog.innerHTML !== '' && elements.eventEmpty) {
+        elements.eventLog.innerHTML = '';
+      }
       if (elements.eventEmpty) {
-        elements.eventEmpty.style.display = "";
+        elements.eventEmpty.style.display = '';
       }
       return;
     }
-    const items = events.slice(-50);
-    elements.eventLog.innerHTML = items
-      .map((event) => {
-        const timestamp = formatTime(event.timestamp);
-        const message = event.payload?.message || event.event;
-        return `
-          <li class="event-log__item">
-            <span class="event-log__time">${escapeHtml(timestamp)}</span>
-            <span class="event-log__message">${escapeHtml(message)}</span>
-          </li>
-        `;
-      })
-      .join("");
     if (elements.eventEmpty) {
-      elements.eventEmpty.style.display = "none";
+      elements.eventEmpty.style.display = 'none';
     }
-  };
-
-  const ensureMessagesPanel = () => {
-    if (elements.messagesPanel) {
-      return elements.messagesPanel;
+    var html = '';
+    var total = events.length;
+    var start = total > MAX_RENDERED_EVENTS ? total - MAX_RENDERED_EVENTS : 0;
+    var i;
+    for (i = start; i < total; i += 1) {
+      var entry = events[i] || {};
+      var timestamp = formatDate(entry.timestamp);
+      var message = entry.payload && entry.payload.message ? entry.payload.message : entry.event;
+      html = '<li class="event-log__item"><span class="event-log__time">' + escapeHtml(timestamp) + '</span><span class="event-log__message">' + escapeHtml(message || '-') + '</span></li>' + html;
     }
-    const panel = document.createElement("section");
-    panel.className = "panel panel--alert";
-    panel.id = "messages";
-    panel.innerHTML = "<h2>Status Messages</h2><ul></ul>";
-    document.querySelector(".content")?.prepend(panel);
-    elements.messagesPanel = panel;
-    return panel;
-  };
+    elements.eventLog.innerHTML = html;
+  }
 
-  const renderMessages = (messages = []) => {
-    if (!messages || messages.length === 0) {
-      if (elements.messagesPanel) {
-        elements.messagesPanel.style.display = "none";
-      }
+  function renderMessages(messages) {
+    if (!elements.messagesPanel || !elements.messagesList) {
       return;
     }
-    const panel = ensureMessagesPanel();
-    panel.style.display = "";
-    const list = panel.querySelector("ul");
-    if (list) {
-      list.innerHTML = messages
-        .map((message) => `<li>${escapeHtml(message)}</li>`)
-        .join("");
+    if (!messages || !messages.length) {
+      elements.messagesPanel.style.display = 'none';
+      elements.messagesList.innerHTML = '';
+      return;
     }
-  };
+    var html = '';
+    var i;
+    for (i = 0; i < messages.length; i += 1) {
+      html += '<li>' + escapeHtml(messages[i]) + '</li>';
+    }
+    elements.messagesList.innerHTML = html;
+    elements.messagesPanel.style.display = '';
+  }
 
-  const renderSnapshotData = (snapshot) => {
+  function renderWallets(wallets) {
+    if (!elements.walletTable) {
+      return;
+    }
+    var html = '';
+    var i;
+    for (i = 0; i < wallets.length; i += 1) {
+      var account = wallets[i] || {};
+      html += '<tr>' +
+        '<td>' + escapeHtml(account.exchange) + '</td>' +
+        '<td>' + formatNumber(account.total, 2) + '</td>' +
+        '<td>' + formatNumber(account.available, 2) + '</td>' +
+        '<td>' + formatNumber(account.reserved, 2) + '</td>' +
+        '<td>' + formatNumber(account.in_positions, 2) + '</td>' +
+      '</tr>';
+    }
+    if (!html) {
+      html = '<tr><td colspan="5" class="muted">No balances yet.</td></tr>';
+    }
+    elements.walletTable.innerHTML = html;
+  }
+
+  function renderReservations(reservations) {
+    if (!elements.reservationTable) {
+      return;
+    }
+    var html = '';
+    var i;
+    for (i = 0; i < reservations.length; i += 1) {
+      var row = reservations[i] || {};
+      var exchanges = row.long_exchange && row.short_exchange ? row.long_exchange + ' / ' + row.short_exchange : '-';
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.symbol) + '</td>' +
+        '<td>' + escapeHtml(exchanges) + '</td>' +
+        '<td>' + formatNumber(row.notional, 2) + '</td>' +
+        '<td>' + formatDate(row.created_at) + '</td>' +
+        '<td>' + escapeHtml(row.allocation_id || '-') + '</td>' +
+      '</tr>';
+    }
+    if (!html) {
+      html = '<tr><td colspan="5" class="muted">No active reservations.</td></tr>';
+    }
+    elements.reservationTable.innerHTML = html;
+  }
+
+  function renderPositions(positions) {
+    if (!elements.positionTable) {
+      return;
+    }
+    var html = '';
+    var i;
+    for (i = 0; i < positions.length; i += 1) {
+      var row = positions[i] || {};
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.symbol) + '</td>' +
+        '<td>' + escapeHtml(row.strategy || '-') + '</td>' +
+        '<td>' + escapeHtml(row.status || '-') + '</td>' +
+        '<td>' + formatNumber(row.notional, 2) + '</td>' +
+        '<td>' + formatDate(row.hedged_at) + '</td>' +
+        '<td>' + escapeHtml(row.position_id || '-') + '</td>' +
+      '</tr>';
+    }
+    if (!html) {
+      html = '<tr><td colspan="6" class="muted">No open positions.</td></tr>';
+    }
+    elements.positionTable.innerHTML = html;
+  }
+
+  function renderExecutionLog(entries) {
+    if (!elements.executionLog) {
+      return;
+    }
+    if (!entries || !entries.length) {
+      elements.executionLog.innerHTML = '<li class="muted">No execution events yet.</li>';
+      return;
+    }
+    var html = '';
+    var count = entries.length;
+    var start = count > MAX_RENDERED_EVENTS ? count - MAX_RENDERED_EVENTS : 0;
+    var i;
+    for (i = start; i < count; i += 1) {
+      var entry = entries[i] || {};
+      var payloadText = '';
+      try {
+        payloadText = JSON.stringify(entry.payload || {});
+      } catch (_err) {
+        payloadText = String(entry.payload || '');
+      }
+      html = '<li class="event-log__item"><span class="event-log__time">' + escapeHtml(formatDate(entry.timestamp)) + '</span><span class="event-log__message">' + escapeHtml(entry.event || '-') + ' ' + escapeHtml(payloadText) + '</span></li>' + html;
+    }
+    elements.executionLog.innerHTML = html;
+  }
+
+  function renderExecution(execution) {
+    var data = execution || defaultExecution;
+    renderWallets(data.wallets || []);
+    renderReservations(data.reservations || []);
+    renderPositions(data.positions || []);
+    renderExecutionLog(data.telemetry || []);
+  }
+
+  function toggleEmptyState(show) {
+    if (elements.emptyState) {
+      elements.emptyState.style.display = show ? '' : 'none';
+    }
+  }
+
+  function collectMessages(state) {
+    var messages = [];
+    if (!state.snapshot && state.status === 'pending') {
+      messages.push('Initial data is being collected. This may take a couple of minutes.');
+    }
+    if (state.last_error) {
+      messages.push('Last refresh error: ' + state.last_error);
+    }
+    if (state.snapshot && state.snapshot.messages && state.snapshot.messages.length) {
+      var i;
+      for (i = 0; i < state.snapshot.messages.length; i += 1) {
+        messages.push(state.snapshot.messages[i]);
+      }
+    }
+    return messages;
+  }
+
+  function renderSnapshotData(snapshot) {
     if (!snapshot) {
       renderScreener([]);
       renderCoinglass([]);
       renderUniverse([]);
       renderOpportunities([]);
+      renderExchangeStatus(globalState.exchange_status || []);
       return;
     }
-    renderScreener(snapshot.screener_rows ?? []);
-    renderCoinglass(snapshot.coinglass_rows ?? []);
-    renderUniverse(snapshot.universe ?? []);
-    renderOpportunities(snapshot.opportunities ?? []);
-  };
+    renderScreener(snapshot.screener_rows || []);
+    renderCoinglass(snapshot.coinglass_rows || []);
+    renderUniverse(snapshot.universe || []);
+    renderOpportunities(snapshot.opportunities || []);
+    var exchangeEntries = snapshot.exchange_status && snapshot.exchange_status.length
+      ? snapshot.exchange_status
+      : (globalState.exchange_status || []);
+    renderExchangeStatus(exchangeEntries);
+    globalState.exchange_status = exchangeEntries.slice ? exchangeEntries.slice() : exchangeEntries;
+  }
 
-  const buildMessages = (state) => {
-    const messages = [];
-    if (!state.snapshot && state.status === "pending") {
-      messages.push(
-        "Initial data is being collected. This may take a couple of minutes.",
-      );
+  function updateHint(state) {
+    if (!elements.hint) {
+      return;
     }
-    if (state.last_error) {
-      messages.push(`Last refresh error: ${state.last_error}`);
-    }
-    if (state.snapshot?.messages?.length) {
-      messages.push(...state.snapshot.messages);
-    }
-    return messages;
-  };
+    var tableSeconds = getRefreshInterval(state);
+    var parserSeconds = getParserInterval(state);
+    elements.hint.textContent = 'UI refresh: ' + tableSeconds + ' s | Parser: ' + parserSeconds + ' s';
+  }
 
-  const updateMetadata = (state) => {
-    const snapshot = state.snapshot;
-    const generated = formatTime(snapshot?.generated_at);
-    if (elements.generatedAt) {
-      elements.generatedAt.textContent = generated;
-    }
+  function renderAll() {
+    updateStatusPill(globalState.status);
+    updateMetadata(globalState);
+    renderSnapshotData(globalState.snapshot);
+    renderEvents(globalState.events || []);
+    renderExecution(globalState.execution);
+    renderMessages(collectMessages(globalState));
+    toggleEmptyState(!globalState.snapshot);
+    updateHint(globalState);
+    updateRefreshButton();
+  }
 
-    const lastUpdated =
-      formatTime(state.last_updated) || generated || "-";
-    if (elements.lastUpdated) {
-      elements.lastUpdated.textContent = lastUpdated;
+  function getRefreshInterval(state) {
+    var interval = defaultState.refresh_interval;
+    if (state.settings && typeof state.settings.table_refresh_seconds === 'number') {
+      interval = state.settings.table_refresh_seconds;
     }
-
-    if (elements.screenerSource) {
-      const value = snapshot?.screener_from_cache;
-      elements.screenerSource.textContent =
-        value === undefined || value === null ? "-" : value ? "cache" : "fresh";
+    if (typeof state.refresh_interval === 'number') {
+      interval = state.refresh_interval;
     }
+    return clamp(interval, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+  }
 
-    if (elements.coinglassSource) {
-      const value = snapshot?.coinglass_from_cache;
-      elements.coinglassSource.textContent =
-        value === undefined || value === null ? "-" : value ? "cache" : "fresh";
+  function getParserInterval(state) {
+    var interval = defaultState.parser_refresh_interval;
+    if (state.settings && typeof state.settings.parser_refresh_seconds === 'number') {
+      interval = state.settings.parser_refresh_seconds;
     }
+    if (typeof state.parser_refresh_interval === 'number') {
+      interval = state.parser_refresh_interval;
+    }
+    return clamp(interval, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+  }
 
-    if (elements.lastError) {
-      const lastError = state.last_error;
-      elements.lastError.textContent = lastError ? truncate(lastError) : "None";
-      if (lastError) {
-        elements.lastError.setAttribute("title", lastError);
-      } else {
-        elements.lastError.removeAttribute("title");
+  function ensurePolling() {
+    var interval = getRefreshInterval(globalState);
+    if (interval !== currentPollInterval) {
+      currentPollInterval = interval;
+      if (pollingTimer) {
+        window.clearInterval(pollingTimer);
       }
+      pollingTimer = window.setInterval(function () {
+        pollSnapshot(false);
+      }, interval * 1000);
     }
+  }
 
-    if (elements.lastProgress) {
-      const events = Array.isArray(state.events) ? state.events : [];
-      const lastEvent = events.length ? events[events.length - 1] : null;
-      const message = lastEvent?.payload?.message || lastEvent?.event || "-";
-      elements.lastProgress.textContent = message || "-";
-      if (lastEvent?.payload?.message) {
-        elements.lastProgress.setAttribute("title", lastEvent.payload.message);
-      } else {
-        elements.lastProgress.removeAttribute("title");
-      }
-    }
-
-    if (elements.exchangeSummary) {
-      const entries =
-        (state.snapshot?.exchange_status &&
-        Array.isArray(state.snapshot.exchange_status)
-          ? state.snapshot.exchange_status
-          : null) ??
-        (Array.isArray(state.exchange_status) ? state.exchange_status : []);
-      if (!entries || entries.length === 0) {
-        elements.exchangeSummary.textContent = "-";
-      } else {
-        const counts = entries.reduce((acc, entry) => {
-          const key = (entry.status || "unknown").toString().toLowerCase();
-          acc[key] = (acc[key] || 0) + 1;
-          return acc;
-        }, {});
-        const parts = [];
-        if (counts.ok) parts.push(`${counts.ok} ok`);
-        if (counts.pending) parts.push(`${counts.pending} pending`);
-        if (counts.failed) parts.push(`${counts.failed} failed`);
-        if (counts.missing) parts.push(`${counts.missing} missing`);
-        if (counts.error) parts.push(`${counts.error} error`);
-        elements.exchangeSummary.textContent = parts.length
-          ? parts.join(", ")
-          : `${entries.length} exchanges`;
-      }
-    }
-
-    const parserInterval =
-      Number(
-        state.parser_refresh_interval ??
-          state.settings?.parser_refresh_seconds ??
-          defaultSettings.parser_refresh_seconds,
-      ) || defaultSettings.parser_refresh_seconds;
-    const tableInterval =
-      Number(
-        state.settings?.table_refresh_seconds ??
-          state.refresh_interval ??
-          defaultSettings.table_refresh_seconds,
-      ) || defaultSettings.table_refresh_seconds;
-
-    if (elements.hint) {
-      elements.hint.textContent = `UI refresh: ${tableInterval} s | Parser: ${parserInterval} s`;
-    }
-  };
-
-  const updateRefreshButton = () => {
+  function updateRefreshButton() {
     if (!elements.refreshButton) {
       return;
     }
-    const busy = Boolean(currentState.refresh_in_progress);
-    elements.refreshButton.disabled = busy;
-    elements.refreshButton.textContent = busy
-      ? "Refreshing..."
-      : "Manual refresh";
-  };
-  const setSettingsStatus = (message = "", variant = "info") => {
-    if (!elements.settingsStatus) {
-      return;
+    if (globalState.refresh_in_progress) {
+      elements.refreshButton.disabled = true;
+      elements.refreshButton.textContent = 'Refreshing...';
+    } else {
+      elements.refreshButton.disabled = false;
+      elements.refreshButton.textContent = 'Manual refresh';
     }
-    const baseClass = "settings-status";
-    if (!message) {
-      elements.settingsStatus.textContent = "";
-      elements.settingsStatus.className = baseClass;
-      return;
-    }
-    elements.settingsStatus.textContent = message;
-    elements.settingsStatus.className = `${baseClass} ${baseClass}--${variant}`;
-  };
+  }
 
-  const syncSettingsForm = (settings = defaultSettings) => {
-    if (!elements.settingsForm) {
-      return;
-    }
-    const data = normalizeSettings(settings);
-    const sourceInputs = elements.settingsForm.querySelectorAll('input[name="sources"]');
-    sourceInputs.forEach((input) => {
-      const key = input.value;
-      input.checked = Boolean(data.sources[key]);
-    });
-    const exchangeInputs = elements.settingsForm.querySelectorAll('input[name="exchanges"]');
-    exchangeInputs.forEach((input) => {
-      const key = input.value;
-      input.checked = Boolean(data.exchanges[key]);
-    });
-    if (elements.parserInput) {
-      elements.parserInput.value =
-        data.parser_refresh_seconds ||
-        currentState.parser_refresh_interval ||
-        defaultSettings.parser_refresh_seconds;
-    }
-    if (elements.tableInput) {
-      elements.tableInput.value =
-        data.table_refresh_seconds ||
-        currentState.refresh_interval ||
-        defaultSettings.table_refresh_seconds;
-    }
-  };
-
-  const collectSettingsPayload = () => {
-    if (!elements.settingsForm) {
-      return null;
-    }
-    const payload = {
-      sources: {},
-      exchanges: {},
-      parser_refresh_seconds:
-        Number.parseInt(elements.parserInput?.value ?? "", 10) ||
-        defaultSettings.parser_refresh_seconds,
-      table_refresh_seconds:
-        Number.parseInt(elements.tableInput?.value ?? "", 10) ||
-        defaultSettings.table_refresh_seconds,
-    };
-    elements.settingsForm.querySelectorAll('input[name="sources"]').forEach((input) => {
-      payload.sources[input.value] = Boolean(input.checked);
-    });
-    elements.settingsForm.querySelectorAll('input[name="exchanges"]').forEach((input) => {
-      payload.exchanges[input.value] = Boolean(input.checked);
-    });
-    return payload;
-  };
-
-  const validateSettingsPayload = (payload) => {
-    const errors = [];
-    if (!payload) {
-      errors.push("Settings form is unavailable.");
-      return errors;
-    }
-    const hasEnabled = (record) =>
-      Object.values(record || {}).some((value) => Boolean(value));
-    if (!hasEnabled(payload.sources)) {
-      errors.push("Enable at least one data source.");
-    }
-    if (!hasEnabled(payload.exchanges)) {
-      errors.push("Enable at least one exchange.");
-    }
-    const withinRange = (value) =>
-      value >= MIN_REFRESH_SECONDS && value <= MAX_REFRESH_SECONDS;
-    if (!withinRange(payload.parser_refresh_seconds)) {
-      errors.push(
-        `Parser refresh must be between ${MIN_REFRESH_SECONDS} and ${MAX_REFRESH_SECONDS} seconds.`,
-      );
-    }
-    if (!withinRange(payload.table_refresh_seconds)) {
-      errors.push(
-        `UI refresh must be between ${MIN_REFRESH_SECONDS} and ${MAX_REFRESH_SECONDS} seconds.`,
-      );
-    }
-    return errors;
-  };
-
-  const handleSettingsSubmit = async (event) => {
-    event.preventDefault();
-    if (!elements.settingsForm) {
-      return;
-    }
-    const payload = collectSettingsPayload();
-    const errors = validateSettingsPayload(payload);
-    if (errors.length) {
-      setSettingsStatus(errors.join(" "), "error");
-      return;
-    }
-    try {
-      setSettingsStatus("Saving settings...");
-      if (elements.settingsSubmit) {
-        elements.settingsSubmit.disabled = true;
-      }
-      const response = await fetch("/api/settings", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(payload),
-      });
-      if (!response.ok) {
-        let detail = response.statusText;
-        try {
-          const errorPayload = await response.json();
-          detail = errorPayload?.detail || detail;
-        } catch {
-          /* ignore */
+  function request(method, url, payload, callback) {
+    var xhr = new XMLHttpRequest();
+    xhr.open(method, url, true);
+    xhr.onreadystatechange = function () {
+      if (xhr.readyState === 4) {
+        var error = null;
+        var data = null;
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+          } catch (err) {
+            error = err;
+          }
+        } else {
+          error = new Error('Request failed (' + xhr.status + ')');
         }
-        throw new Error(detail || "Request failed");
+        callback(error, data);
       }
-      const data = await response.json();
-      if (data.state) {
-        renderState(data.state);
-      } else if (data.settings) {
-        mergeState({ settings: data.settings });
-        updateMetadata(currentState);
-      }
-      syncSettingsForm(currentState.settings ?? defaultSettings);
-      setSettingsStatus("Settings updated.", "success");
-    } catch (error) {
-      console.error(error);
-      setSettingsStatus(
-        `Failed to save settings: ${error.message || "Unknown error"}`,
-        "error",
-      );
-    } finally {
-      if (elements.settingsSubmit) {
-        elements.settingsSubmit.disabled = false;
-      }
-    }
-  };
-
-
-  const mergeState = (next = {}) => {
-    const mergedSnapshot =
-      next.snapshot !== undefined ? next.snapshot : currentState.snapshot;
-    const mergedEvents = Array.isArray(next.events)
-      ? next.events
-      : currentState.events ?? [];
-    const mergedExchangeStatus = Array.isArray(next.exchange_status)
-      ? next.exchange_status
-      : currentState.exchange_status ?? [];
-    const snapshotExchangeStatus =
-      mergedSnapshot && Array.isArray(mergedSnapshot.exchange_status)
-        ? mergedSnapshot.exchange_status
-        : null;
-
-    const nextSettings =
-      next.settings !== undefined
-        ? normalizeSettings(next.settings)
-        : currentState.settings
-        ? normalizeSettings(currentState.settings)
-        : normalizeSettings();
-
-    const parserIntervalValue =
-      Number(
-        next.parser_refresh_interval ??
-          nextSettings.parser_refresh_seconds ??
-          currentState.parser_refresh_interval ??
-          defaultSettings.parser_refresh_seconds,
-      ) || defaultSettings.parser_refresh_seconds;
-
-    const tableIntervalValue =
-      Number(
-        next.refresh_interval ??
-          nextSettings.table_refresh_seconds ??
-          currentState.refresh_interval ??
-          defaultSettings.table_refresh_seconds,
-      ) || defaultSettings.table_refresh_seconds;
-
-    currentState = {
-      ...currentState,
-      ...next,
-      snapshot: mergedSnapshot,
-      events: mergedEvents,
-      exchange_status: snapshotExchangeStatus ?? mergedExchangeStatus,
-      settings: cloneSettings(nextSettings),
-      parser_refresh_interval: parserIntervalValue,
-      refresh_interval: tableIntervalValue,
-      refresh_in_progress:
-        next.refresh_in_progress ?? currentState.refresh_in_progress,
     };
-  };
-
-  const ensurePolling = () => {
-    const desired = Math.max(
-      Number(
-        currentState.settings?.table_refresh_seconds ??
-          currentState.refresh_interval ??
-          defaultSettings.table_refresh_seconds,
-      ) || defaultSettings.table_refresh_seconds,
-      MIN_REFRESH_SECONDS,
-    );
-    if (desired !== pollIntervalSeconds) {
-      pollIntervalSeconds = desired;
-      schedulePolling();
+    xhr.onerror = function () {
+      callback(new Error('Network error'), null);
+    };
+    xhr.setRequestHeader('Accept', 'application/json');
+    if (payload) {
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.send(JSON.stringify(payload));
+    } else {
+      xhr.send();
     }
-  };
+  }
 
-  const renderState = (state) => {
-    mergeState(state);
-    syncSettingsForm(currentState.settings ?? defaultSettings);
-    ensurePolling();
-    updateStatusPill(currentState.status);
-    updateMetadata(currentState);
-    renderSnapshotData(currentState.snapshot);
-    const exchangeEntries =
-      (currentState.snapshot &&
-      Array.isArray(currentState.snapshot.exchange_status)
-        ? currentState.snapshot.exchange_status
-        : null) ?? currentState.exchange_status ?? [];
-    renderExchangeStatus(exchangeEntries);
-    currentState.exchange_status = exchangeEntries;
-    renderEvents(currentState.events ?? []);
-    toggleEmptyState(!currentState.snapshot);
-    renderMessages(buildMessages(currentState));
-    updateRefreshButton();
-  };
-
-  const fetchSnapshot = async (force = false) => {
+  function pollSnapshot(force) {
     if (pollingInFlight) {
       return;
     }
     pollingInFlight = true;
-    try {
-      const response = await fetch("/api/snapshot", { cache: "no-store" });
-      if (!response.ok) {
-        throw new Error(`Snapshot request failed: ${response.status}`);
-      }
-      const payload = await response.json();
-      renderState(payload);
-      if (force && payload.status === "pending") {
-        setTimeout(() => fetchSnapshot(true), 2000);
-      }
-    } catch (error) {
-      console.error(error);
-      const fallbackMessages = buildMessages(currentState);
-      fallbackMessages.unshift(`Snapshot load error: ${error.message}`);
-      renderMessages(fallbackMessages);
-    } finally {
+    request('GET', '/api/snapshot', null, function (err, data) {
       pollingInFlight = false;
-    }
-  };
-
-  const triggerManualRefresh = async () => {
-    if (!elements.refreshButton) {
-      return;
-    }
-    if (currentState.refresh_in_progress) {
-      return;
-    }
-    elements.refreshButton.disabled = true;
-    elements.refreshButton.textContent = "Refreshing...";
-    try {
-      const response = await fetch("/api/refresh", { method: "POST" });
-      if (!response.ok) {
-        throw new Error(`Refresh failed: ${response.status}`);
-      }
-      const payload = await response.json();
-      if (payload.state) {
-        renderState(payload.state);
-        if (payload.state.status === "pending") {
-          setTimeout(() => fetchSnapshot(true), 2000);
+      if (err) {
+        if (window.console && window.console.error) {
+          window.console.error('Snapshot load failed', err);
         }
-      } else {
-        await fetchSnapshot(true);
+        renderMessages(['Snapshot load error: ' + err.message]);
+        return;
       }
-      if (payload.status === "failed") {
-        const messages = buildMessages(currentState);
-        messages.unshift("Manual refresh failed. Check logs for details.");
-        renderMessages(messages);
+      if (data) {
+        globalState = normalizeState(data);
+        renderAll();
+        ensurePolling();
+        if (force && data.status === 'pending') {
+          window.setTimeout(function () {
+            pollSnapshot(true);
+          }, 2000);
+        }
       }
-    } catch (error) {
-      console.error(error);
-      const messages = buildMessages(currentState);
-      messages.unshift(`Manual refresh error: ${error.message}`);
-      renderMessages(messages);
-    } finally {
-      updateRefreshButton();
-    }
-  };
-
-  const schedulePolling = () => {
-    if (pollingTimer) {
-      clearInterval(pollingTimer);
-    }
-    pollingTimer = setInterval(() => {
-      fetchSnapshot(false);
-    }, pollIntervalSeconds * 1000);
-  };
-
-  if (elements.refreshButton) {
-    elements.refreshButton.addEventListener("click", triggerManualRefresh);
+    });
   }
 
-  if (elements.settingsForm) {
-    elements.settingsForm.addEventListener("submit", handleSettingsSubmit);
+  function triggerManualRefresh(event) {
+    if (event && typeof event.preventDefault === 'function') {
+      event.preventDefault();
+    }
+    if (globalState.refresh_in_progress) {
+      return;
+    }
+    globalState.refresh_in_progress = true;
+    updateRefreshButton();
+    request('POST', '/api/refresh', null, function (err, data) {
+      if (err) {
+        renderMessages(['Manual refresh error: ' + err.message]);
+        globalState.refresh_in_progress = false;
+        updateRefreshButton();
+        return;
+      }
+      if (data && data.state) {
+        globalState = normalizeState(data.state);
+      }
+      renderAll();
+      ensurePolling();
+      if (data && data.status === 'pending') {
+        window.setTimeout(function () {
+          pollSnapshot(true);
+        }, 2000);
+      }
+    });
   }
 
-  syncSettingsForm(initialState.settings ?? defaultSettings);
-  renderState(initialState);
-  schedulePolling();
+  function collectSettingsFromForm() {
+    var result = {
+      sources: {},
+      exchanges: {},
+      parser_refresh_seconds: defaultSettings.parser_refresh_seconds,
+      table_refresh_seconds: defaultSettings.table_refresh_seconds
+    };
+    if (!elements.settingsForm) {
+      return result;
+    }
+    var i;
+    var inputs;
+    inputs = elements.settingsForm.querySelectorAll('input[name="sources"]');
+    for (i = 0; i < inputs.length; i += 1) {
+      result.sources[inputs[i].value] = !!inputs[i].checked;
+    }
+    inputs = elements.settingsForm.querySelectorAll('input[name="exchanges"]');
+    for (i = 0; i < inputs.length; i += 1) {
+      result.exchanges[inputs[i].value] = !!inputs[i].checked;
+    }
+    if (elements.parserInput) {
+      var parserValue = parseInt(elements.parserInput.value, 10);
+      if (!isNaN(parserValue)) {
+        result.parser_refresh_seconds = clamp(parserValue, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+      }
+    }
+    if (elements.tableInput) {
+      var tableValue = parseInt(elements.tableInput.value, 10);
+      if (!isNaN(tableValue)) {
+        result.table_refresh_seconds = clamp(tableValue, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+      }
+    }
+    return result;
+  }
 
-  if (!initialState.snapshot) {
-    fetchSnapshot(true);
+  function syncSettingsForm(settings) {
+    if (!elements.settingsForm || !settings) {
+      return;
+    }
+    var sources = settings.sources || {};
+    var exchanges = settings.exchanges || {};
+    var inputs;
+    var i;
+    inputs = elements.settingsForm.querySelectorAll('input[name="sources"]');
+    for (i = 0; i < inputs.length; i += 1) {
+      var name = inputs[i].value;
+      inputs[i].checked = sources.hasOwnProperty(name) ? !!sources[name] : !!defaultSettings.sources[name];
+    }
+    inputs = elements.settingsForm.querySelectorAll('input[name="exchanges"]');
+    for (i = 0; i < inputs.length; i += 1) {
+      var exchange = inputs[i].value;
+      inputs[i].checked = exchanges.hasOwnProperty(exchange) ? !!exchanges[exchange] : !!defaultSettings.exchanges[exchange];
+    }
+    if (elements.parserInput) {
+      elements.parserInput.value = settings.parser_refresh_seconds;
+    }
+    if (elements.tableInput) {
+      elements.tableInput.value = settings.table_refresh_seconds;
+    }
+  }
+
+  function setSettingsStatus(message, tone) {
+    if (!elements.settingsStatus) {
+      return;
+    }
+    var className = 'settings-status';
+    if (tone === 'error') {
+      className += ' settings-status--error';
+    } else if (tone === 'success') {
+      className += ' settings-status--success';
+    } else if (tone === 'info') {
+      className += ' settings-status--info';
+    }
+    elements.settingsStatus.className = className;
+    elements.settingsStatus.textContent = message || '';
+  }
+
+  function handleSettingsSubmit(event) {
+    if (event && typeof event.preventDefault === 'function') {
+      event.preventDefault();
+    }
+    var payload = collectSettingsFromForm();
+    setSettingsStatus('Saving settings…', 'info');
+    request('POST', '/api/settings', payload, function (err, data) {
+      if (err) {
+        setSettingsStatus(err.message, 'error');
+        return;
+      }
+      if (data && data.settings) {
+        globalState.settings = normalizeSettings(data.settings);
+      }
+      if (data && data.state) {
+        globalState = normalizeState(data.state);
+      }
+      syncSettingsForm(globalState.settings);
+      renderAll();
+      ensurePolling();
+      setSettingsStatus('Settings saved', 'success');
+      window.setTimeout(function () {
+        setSettingsStatus('', '');
+      }, 2500);
+    });
+  }
+
+  function appendTelemetry(entry) {
+    if (!globalState.execution) {
+      globalState.execution = clone(defaultExecution);
+    }
+    if (!Array.isArray(globalState.execution.telemetry)) {
+      globalState.execution.telemetry = [];
+    }
+    globalState.execution.telemetry.push(entry);
+    if (globalState.execution.telemetry.length > MAX_TELEMETRY) {
+      globalState.execution.telemetry = globalState.execution.telemetry.slice(-MAX_TELEMETRY);
+    }
+    renderExecutionLog(globalState.execution.telemetry);
+  }
+
+  function connectTelemetry() {
+    if (!window.WebSocket) {
+      return;
+    }
+    if (telemetrySocket && telemetrySocket.readyState !== window.WebSocket.CLOSED && telemetrySocket.readyState !== window.WebSocket.CLOSING) {
+      return;
+    }
+    var protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+    var url = protocol + window.location.host + '/ws/telemetry';
+    try {
+      telemetrySocket = new window.WebSocket(url);
+    } catch (_err) {
+      return;
+    }
+    telemetrySocket.onmessage = function (event) {
+      try {
+        var payload = JSON.parse(event.data);
+        appendTelemetry(payload);
+      } catch (err) {
+        if (window.console && window.console.error) {
+          window.console.error('Telemetry parse failed', err);
+        }
+      }
+    };
+    telemetrySocket.onclose = function () {
+      window.setTimeout(connectTelemetry, 5000);
+    };
+    telemetrySocket.onerror = function () {
+      try {
+        telemetrySocket.close();
+      } catch (_err) {
+      }
+    };
+  }
+
+  function init() {
+    globalState = normalizeState(globalState);
+    syncSettingsForm(globalState.settings);
+    renderAll();
+    ensurePolling();
+
+    if (elements.refreshButton) {
+      elements.refreshButton.addEventListener('click', triggerManualRefresh);
+    }
+    if (elements.settingsForm) {
+      elements.settingsForm.addEventListener('submit', handleSettingsSubmit);
+      elements.settingsForm.addEventListener('change', function () {
+        setSettingsStatus('', '');
+      });
+    }
+
+    connectTelemetry();
+    pollSnapshot(true);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
   }
 })();

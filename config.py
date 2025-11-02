@@ -14,6 +14,9 @@ from typing import Final, List
 # Root directory of the project (useful for resolving relative paths).
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 
+# Persistent state directory (wallets, positions, etc.).
+STATE_DIR: Final[Path] = BASE_DIR / "state"
+
 # Exchanges we currently support across the pipeline.
 SUPPORTED_EXCHANGES: Final[List[str]] = [
     "bybit",
@@ -26,3 +29,6 @@ PARSE_CACHE_TTL_SECONDS: Final[int] = 300
 
 # Base directory for lightweight cache files.
 CACHE_DIR: Final[Path] = BASE_DIR / "data" / "cache"
+
+# Default path for execution-layer runtime configuration.
+EXECUTION_SETTINGS_PATH: Final[Path] = BASE_DIR / "data" / "execution_settings.json"

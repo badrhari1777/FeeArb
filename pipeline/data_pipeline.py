@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Iterable, List, Mapping, Sequence
+
+from typing import TYPE_CHECKING
+
+try:
+    import aiohttp
+except ImportError as exc:  # pragma: no cover - optional dependency
+    aiohttp = None  # type: ignore[assignment]
+    _aiohttp_import_error = exc
+else:
+    _aiohttp_import_error = None
+
+if TYPE_CHECKING:  # pragma: no cover
+    from aiohttp import ClientSession
 
 from config import PARSE_CACHE_TTL_SECONDS, SUPPORTED_EXCHANGES
 from project_settings import DEFAULT_SOURCES
@@ -52,12 +66,16 @@ class DataSnapshot:
 ProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
-def collect_snapshot(
+async def collect_snapshot_async(
     progress_cb: ProgressCallback | None = None,
     *,
     source_settings: Mapping[str, bool] | None = None,
     exchange_settings: Mapping[str, bool] | None = None,
 ) -> DataSnapshot:
+    if aiohttp is None:
+        raise RuntimeError(
+            'aiohttp is required for asynchronous snapshot collection. Install it via "pip install aiohttp".'
+        ) from _aiohttp_import_error
     timestamp = datetime.now(timezone.utc)
 
     def _emit(event: str, payload: dict[str, Any] | None = None) -> None:
@@ -68,95 +86,114 @@ def collect_snapshot(
     sources = _effective_sources(source_settings)
     exchanges = _effective_exchanges(exchange_settings)
 
-    if sources.get('arbitragescanner', True):
-        _emit(
-            'screener:start',
-            {
-                'message': 'Fetching ArbitrageScanner candidates...',
-            },
-        )
-        screener_rows, screener_from_cache = _load_screener_snapshot()
-        _emit(
-            'screener:complete',
-            {
-                'message': f'ArbitrageScanner returned {len(screener_rows)} rows',
-                'count': len(screener_rows),
-                'from_cache': screener_from_cache,
-            },
-        )
-        if not screener_rows:
-            messages.append('ArbitrageScanner returned no candidates.')
-    else:
-        screener_rows = []
-        screener_from_cache = True
-        messages.append('ArbitrageScanner fetch disabled via settings.')
-        _emit(
-            'screener:skipped',
-            {
-                'message': 'ArbitrageScanner polling skipped (disabled in settings).',
-            },
-        )
+    timeout = aiohttp.ClientTimeout(total=30)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "*/*",
+    }
 
-    if sources.get('coinglass', True):
-        _emit(
-            'coinglass:start',
-            {
-                'message': 'Fetching Coinglass arbitrage table...',
-            },
-        )
-        coinglass_rows, coinglass_from_cache = _load_coinglass_snapshot()
-        _emit(
-            'coinglass:complete',
-            {
-                'message': f'Coinglass returned {len(coinglass_rows)} rows',
-                'count': len(coinglass_rows),
-                'from_cache': coinglass_from_cache,
-            },
-        )
-        if not coinglass_rows:
-            messages.append('Coinglass returned no rows.')
-    else:
-        coinglass_rows = []
-        coinglass_from_cache = True
-        messages.append('Coinglass fetch disabled via settings.')
-        _emit(
-            'coinglass:skipped',
-            {
-                'message': 'Coinglass polling skipped (disabled in settings).',
-            },
-        )
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        if sources.get("arbitragescanner", True):
+            _emit(
+                "screener:start",
+                {
+                    "message": "Fetching ArbitrageScanner candidates...",
+                },
+            )
+            (
+                screener_rows,
+                screener_from_cache,
+                screener_warning,
+            ) = await _load_screener_snapshot_async(session)
+            _emit(
+                "screener:complete",
+                {
+                    "message": f"ArbitrageScanner returned {len(screener_rows)} rows",
+                    "count": len(screener_rows),
+                    "from_cache": screener_from_cache,
+                },
+            )
+            if screener_warning:
+                messages.append(screener_warning)
+        else:
+            screener_rows = []
+            screener_from_cache = True
+            messages.append("ArbitrageScanner fetch disabled via settings.")
+            _emit(
+                "screener:skipped",
+                {
+                    "message": "ArbitrageScanner polling skipped (disabled in settings).",
+                },
+            )
+
+        if sources.get("coinglass", True):
+            _emit(
+                "coinglass:start",
+                {
+                    "message": "Fetching Coinglass arbitrage table...",
+                },
+            )
+            (
+                coinglass_rows,
+                coinglass_from_cache,
+                coinglass_warning,
+            ) = await _load_coinglass_snapshot_async(session)
+            _emit(
+                "coinglass:complete",
+                {
+                    "message": f"Coinglass returned {len(coinglass_rows)} rows",
+                    "count": len(coinglass_rows),
+                    "from_cache": coinglass_from_cache,
+                },
+            )
+            if coinglass_warning:
+                messages.append(coinglass_warning)
+        else:
+            coinglass_rows = []
+            coinglass_from_cache = True
+            messages.append("Coinglass fetch disabled via settings.")
+            _emit(
+                "coinglass:skipped",
+                {
+                    "message": "Coinglass polling skipped (disabled in settings).",
+                },
+            )
 
     universe = _build_symbol_universe(screener_rows, coinglass_rows)
     _emit(
-        'universe:ready',
+        "universe:ready",
         {
-            'message': f'Symbol universe built with {len(universe)} items',
-            'count': len(universe),
+            "message": f"Symbol universe built with {len(universe)} items",
+            "count": len(universe),
         },
     )
     if not universe:
-        messages.append('Symbol universe is empty. Enable at least one data source.')
+        messages.append("Symbol universe is empty. Enable at least one data source.")
 
-    symbols = [entry['symbol'] for entry in universe]
+    symbols = [entry["symbol"] for entry in universe]
 
     adapters = _active_adapters(exchanges)
     if adapters and symbols:
         _emit(
-            'exchanges:start',
+            "exchanges:start",
             {
-                'message': f'Fetching exchange snapshots for {len(symbols)} symbols...',
-                'symbol_count': len(symbols),
-                'exchange_count': len(adapters),
+                "message": f"Fetching exchange snapshots for {len(symbols)} symbols...",
+                "symbol_count": len(symbols),
+                "exchange_count": len(adapters),
             },
         )
-        opportunities, raw_payloads, exchange_status = compute_opportunities(
-            symbols, adapters, progress_cb=progress_cb
+        opportunities, raw_payloads, exchange_status = await asyncio.to_thread(
+            compute_opportunities,
+            symbols,
+            adapters,
+            0.0,
+            progress_cb,
         )
         _emit(
-            'opportunities:complete',
+            "opportunities:complete",
             {
-                'message': f'Computed {len(opportunities)} funding opportunities',
-                'count': len(opportunities),
+                "message": f"Computed {len(opportunities)} funding opportunities",
+                "count": len(opportunities),
             },
         )
     else:
@@ -164,37 +201,37 @@ def collect_snapshot(
         raw_payloads = {}
         exchange_status = []
         if not adapters:
-            messages.append('Exchange polling skipped - all exchanges disabled.')
+            messages.append("Exchange polling skipped - all exchanges disabled.")
             _emit(
-                'exchanges:skipped',
+                "exchanges:skipped",
                 {
-                    'message': 'Exchange polling skipped (no exchanges enabled).',
+                    "message": "Exchange polling skipped (no exchanges enabled).",
                 },
             )
         if not symbols:
             _emit(
-                'opportunities:skipped',
+                "opportunities:skipped",
                 {
-                    'message': 'Opportunity scan skipped (no symbols available).',
+                    "message": "Opportunity scan skipped (no symbols available).",
                 },
             )
 
     failed_exchanges = [
-        entry['exchange']
+        entry["exchange"]
         for entry in exchange_status
-        if entry.get('status') != 'ok'
+        if entry.get("status") != "ok"
     ]
     if failed_exchanges:
         messages.append(
-            'Missing data from exchanges: ' + ', '.join(sorted(failed_exchanges))
+            "Missing data from exchanges: " + ", ".join(sorted(failed_exchanges))
         )
 
     _emit(
-        'snapshot:ready',
+        "snapshot:ready",
         {
-            'message': 'Snapshot assembled successfully',
-            'opportunity_count': len(opportunities),
-            'failed_exchanges': failed_exchanges,
+            "message": "Snapshot assembled successfully",
+            "opportunity_count": len(opportunities),
+            "failed_exchanges": failed_exchanges,
         },
     )
 
@@ -210,6 +247,132 @@ def collect_snapshot(
         coinglass_from_cache=coinglass_from_cache,
         messages=messages,
     )
+
+
+def collect_snapshot(
+    progress_cb: ProgressCallback | None = None,
+    *,
+    source_settings: Mapping[str, bool] | None = None,
+    exchange_settings: Mapping[str, bool] | None = None,
+) -> DataSnapshot:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(
+            collect_snapshot_async(
+                progress_cb,
+                source_settings=source_settings,
+                exchange_settings=exchange_settings,
+            )
+        )
+    else:
+        if loop.is_running():
+            raise RuntimeError(
+                "collect_snapshot cannot be called from a running event loop; use collect_snapshot_async instead."
+            )
+        return loop.run_until_complete(
+            collect_snapshot_async(
+                progress_cb,
+                source_settings=source_settings,
+                exchange_settings=exchange_settings,
+            )
+        )
+
+
+async def _load_screener_snapshot_async(
+    session: "ClientSession",
+) -> tuple[list[dict], bool, str | None]:
+    cached = load_cache("screener_latest.json", PARSE_CACHE_TTL_SECONDS)
+    if cached:
+        logger.info("Using cached ArbitrageScanner data")
+        rows = _normalize_screener_rows(cached.get("data", []))
+        return rows, True, None
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json",
+        "Referer": "https://screener.arbitragescanner.io/",
+    }
+
+    try:
+        async with session.get(arbitragescanner.URL, headers=headers) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("ArbitrageScanner fetch failed: %s", exc)
+        return [], False, "ArbitrageScanner returned no candidates."
+
+    rows = _normalize_screener_rows(
+        arbitragescanner.build_top(data, exclude=("binance",), limit=20)
+    )
+    save_cache(
+        "screener_latest.json",
+        {"data": rows, "fetched_at": datetime.now(timezone.utc).isoformat()},
+    )
+    logger.info("ArbitrageScanner returned %s candidates", len(rows))
+    return rows, False, None
+
+
+async def _load_coinglass_snapshot_async(
+    session: "ClientSession",
+) -> tuple[list[coinglass.CoinglassRow], bool, str | None]:
+    cached = load_cache("coinglass_latest.json", PARSE_CACHE_TTL_SECONDS)
+    if cached:
+        logger.info("Using cached Coinglass data")
+        try:
+            rows = [_coinglass_row_from_cache(item) for item in cached["data"]]
+            return rows, True, None
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Cached Coinglass payload invalid, refetching: %s", exc)
+
+    def _fetch_rows_wrapper() -> list[coinglass.CoinglassRow]:
+        try:
+            return coinglass.fetch_rows(limit=20)
+        except AttributeError:
+            # Older parser versions exposed `fetch` instead of `fetch_rows`
+            fetch = getattr(coinglass, "fetch", None)
+            if callable(fetch):
+                return fetch(limit=20)  # type: ignore[call-arg]
+            raise
+
+    try:
+        rows = await asyncio.to_thread(_fetch_rows_wrapper)
+    except RuntimeError as exc:
+        logger.warning("Coinglass parsing skipped: %s", exc)
+        return [], False, str(exc)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Coinglass fetch failed: %s", exc)
+        return [], False, "Coinglass request failed."
+
+    if not rows:
+        return [], False, "Coinglass returned no rows."
+
+    save_cache(
+        "coinglass_latest.json",
+        {
+            "data": [row.to_dict() for row in rows],
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    logger.info("Coinglass returned %s candidates", len(rows))
+    return rows, False, None
+
+
+def _parse_coinglass_html(html: str, *, limit: int) -> list[coinglass.CoinglassRow]:
+    if getattr(coinglass, "BeautifulSoup", None) is None:
+        raise RuntimeError(
+            'BeautifulSoup (beautifulsoup4) is required for Coinglass parsing. Install it via "pip install beautifulsoup4".'
+        )
+
+    soup = coinglass.BeautifulSoup(html, "html.parser")  # type: ignore[attr-defined]
+    rows: list[coinglass.CoinglassRow] = []
+    for tr in soup.select("table tbody tr"):
+        entry = coinglass._parse_row(tr)  # type: ignore[attr-defined]
+        if entry:
+            rows.append(entry)
+            if len(rows) >= limit:
+                break
+    return rows
 
 
 def format_screener_table(rows: Sequence[dict]) -> str:
@@ -269,49 +432,6 @@ def _normalize_screener_rows(rows: Iterable[dict]) -> list[dict]:
     return normalized
 
 
-def _load_screener_snapshot() -> tuple[list[dict], bool]:
-    cached = load_cache("screener_latest.json", PARSE_CACHE_TTL_SECONDS)
-    if cached:
-        logger.info("Using cached ArbitrageScanner data")
-        rows = _normalize_screener_rows(cached.get("data", []))
-        return rows, True
-
-    logger.info("Fetching candidates from ArbitrageScanner...")
-    data = arbitragescanner.fetch_json()
-    rows = _normalize_screener_rows(
-        arbitragescanner.build_top(data, exclude=("binance",), limit=20)
-    )
-    save_cache(
-        "screener_latest.json",
-        {"data": rows, "fetched_at": datetime.now(timezone.utc).isoformat()},
-    )
-    logger.info("Screener returned %s candidates", len(rows))
-    return rows, False
-
-
-def _load_coinglass_snapshot() -> tuple[list[coinglass.CoinglassRow], bool]:
-    cached = load_cache("coinglass_latest.json", PARSE_CACHE_TTL_SECONDS)
-    if cached:
-        logger.info("Using cached Coinglass data")
-        try:
-            rows = [_coinglass_row_from_cache(item) for item in cached["data"]]
-            return rows, True
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("Cached Coinglass payload invalid, refetching: %s", exc)
-
-    logger.info("Fetching candidates from Coinglass...")
-    rows = coinglass.fetch_rows(limit=20)
-    save_cache(
-        "coinglass_latest.json",
-        {
-            "data": [row.to_dict() for row in rows],
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-    logger.info("Coinglass returned %s candidates", len(rows))
-    return rows, False
-
-
 def _build_symbol_universe(
     screener_rows: Sequence[dict], coinglass_rows: Sequence[coinglass.CoinglassRow]
 ) -> list[dict[str, object]]:
@@ -360,7 +480,7 @@ def _active_adapters(enabled: Iterable[str] | None = None):
         try:
             adapters.append(get_adapter(canonical))
         except KeyError:
-            logger.warning('No adapter implemented for %s', canonical)
+            logger.warning("No adapter implemented for %s", canonical)
     return adapters
 
 
@@ -424,29 +544,25 @@ def _safe_float(value: object) -> float:
 
 
 def _open_interest_from_cache(item: dict) -> list[str]:
-    if "open_interest" in item and isinstance(item["open_interest"], list):
-        return [str(entry) for entry in item["open_interest"] if entry]
-    entries: list[str] = []
-    if item.get("open_interest_long"):
-        entries.append(str(item["open_interest_long"]))
-    if item.get("open_interest_short"):
-        entries.append(str(item["open_interest_short"]))
+    entries = []
+    if "open_interest_long" in item:
+        entries.append(str(item.get("open_interest_long") or ""))
+    if "open_interest_short" in item:
+        entries.append(str(item.get("open_interest_short") or ""))
     return entries
 
 
 def _trade_links_from_cache(item: dict) -> list[str]:
-    links = item.get("trade_links")
-    if isinstance(links, list):
-        return [str(link) for link in links if link]
-    if isinstance(links, str):
-        return [part for part in links.split(";") if part]
+    raw = item.get("trade_links")
+    if isinstance(raw, str):
+        return [segment for segment in raw.split(";") if segment]
+    if isinstance(raw, list):
+        return [str(entry) for entry in raw]
     return []
-
-
-_GMT_PLUS_3 = timezone(timedelta(hours=3))
 
 
 def _format_time_gmt3(dt: datetime | None) -> str:
     if dt is None:
-        return ""
-    return dt.astimezone(_GMT_PLUS_3).strftime("%Y-%m-%d %H:%M:%S GMT+3")
+        return "-"
+    gmt3 = timezone(timedelta(hours=3))
+    return dt.astimezone(gmt3).strftime("%Y-%m-%d %H:%M:%S GMT+3")

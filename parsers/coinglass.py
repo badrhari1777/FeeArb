@@ -8,8 +8,20 @@ from typing import List, Sequence
 
 os.environ.setdefault("PYPPETEER_NO_SIGNAL_HANDLERS", "1")
 
-from bs4 import BeautifulSoup
-from requests_html import HTMLSession
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except ImportError as exc:  # pragma: no cover - optional dependency
+    BeautifulSoup = None  # type: ignore[assignment]
+    _bs4_import_error = exc
+else:
+    _bs4_import_error = None
+try:
+    from requests_html import HTMLSession
+except ImportError as exc:  # pragma: no cover - optional dependency
+    HTMLSession = None  # type: ignore[assignment]
+    _requests_html_error = exc
+else:
+    _requests_html_error = None
 
 try:
     from pyppeteer import launcher as _pyppeteer_launcher
@@ -135,6 +147,17 @@ class CoinglassRow:
 
 def fetch_rows(limit: int = 20) -> List[CoinglassRow]:
     """Render the Coinglass arbitrage table and parse the first `limit` rows."""
+
+    if BeautifulSoup is None:
+        raise RuntimeError(
+            "BeautifulSoup (beautifulsoup4) is required for Coinglass parsing. "
+            "Install it via `pip install beautifulsoup4`."
+        ) from _bs4_import_error
+    if HTMLSession is None:
+        raise RuntimeError(
+            "requests-html is required for Coinglass parsing. "
+            "Install it via `pip install requests-html`."
+        ) from _requests_html_error
 
     session = HTMLSession()
     response = session.get(COINGLASS_URL, headers=DEFAULT_HEADERS)
