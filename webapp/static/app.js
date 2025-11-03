@@ -15,6 +15,7 @@
     sources: { arbitragescanner: true, coinglass: true },
     exchanges: { bybit: true, mexc: true },
     parser_refresh_seconds: 300,
+    exchange_refresh_seconds: 60,
     table_refresh_seconds: 300
   };
 
@@ -29,6 +30,7 @@
     status: 'idle',
     refresh_interval: defaultSettings.table_refresh_seconds,
     parser_refresh_interval: defaultSettings.parser_refresh_seconds,
+    exchange_refresh_interval: defaultSettings.exchange_refresh_seconds,
     last_error: null,
     last_updated: null,
     snapshot: null,
@@ -63,6 +65,7 @@
     messagesList: document.getElementById('messages-list'),
     settingsForm: document.getElementById('settings-form'),
     parserInput: document.getElementById('parser-interval'),
+    exchangeInput: document.getElementById('exchange-interval'),
     tableInput: document.getElementById('table-interval'),
     settingsStatus: document.getElementById('settings-status'),
     settingsSubmit: document.getElementById('settings-submit'),
@@ -132,6 +135,10 @@
       if (!isNaN(parsed)) {
         normalized.parser_refresh_seconds = clamp(parsed, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
       }
+      parsed = parseInt(settings.exchange_refresh_seconds, 10);
+      if (!isNaN(parsed)) {
+        normalized.exchange_refresh_seconds = clamp(parsed, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+      }
       parsed = parseInt(settings.table_refresh_seconds, 10);
       if (!isNaN(parsed)) {
         normalized.table_refresh_seconds = clamp(parsed, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
@@ -176,6 +183,9 @@
       }
       if (typeof source.parser_refresh_interval === 'number') {
         state.parser_refresh_interval = source.parser_refresh_interval;
+      }
+      if (typeof source.exchange_refresh_interval === 'number') {
+        state.exchange_refresh_interval = source.exchange_refresh_interval;
       }
       state.last_error = source.last_error || null;
       state.last_updated = source.last_updated || null;
@@ -651,7 +661,8 @@
     }
     var tableSeconds = getRefreshInterval(state);
     var parserSeconds = getParserInterval(state);
-    elements.hint.textContent = 'UI refresh: ' + tableSeconds + ' s | Parser: ' + parserSeconds + ' s';
+    var exchangeSeconds = getExchangeInterval(state);
+    elements.hint.textContent = 'UI refresh: ' + tableSeconds + ' s | Parser: ' + parserSeconds + ' s | Exchange poll: ' + exchangeSeconds + ' s';
   }
 
   function renderAll() {
@@ -684,6 +695,17 @@
     }
     if (typeof state.parser_refresh_interval === 'number') {
       interval = state.parser_refresh_interval;
+    }
+    return clamp(interval, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+  }
+
+  function getExchangeInterval(state) {
+    var interval = defaultState.exchange_refresh_interval;
+    if (state.settings && typeof state.settings.exchange_refresh_seconds === 'number') {
+      interval = state.settings.exchange_refresh_seconds;
+    }
+    if (typeof state.exchange_refresh_interval === 'number') {
+      interval = state.exchange_refresh_interval;
     }
     return clamp(interval, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
   }
@@ -806,6 +828,7 @@
       sources: {},
       exchanges: {},
       parser_refresh_seconds: defaultSettings.parser_refresh_seconds,
+      exchange_refresh_seconds: defaultSettings.exchange_refresh_seconds,
       table_refresh_seconds: defaultSettings.table_refresh_seconds
     };
     if (!elements.settingsForm) {
@@ -825,6 +848,12 @@
       var parserValue = parseInt(elements.parserInput.value, 10);
       if (!isNaN(parserValue)) {
         result.parser_refresh_seconds = clamp(parserValue, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+      }
+    }
+    if (elements.exchangeInput) {
+      var exchangeValue = parseInt(elements.exchangeInput.value, 10);
+      if (!isNaN(exchangeValue)) {
+        result.exchange_refresh_seconds = clamp(exchangeValue, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
       }
     }
     if (elements.tableInput) {
@@ -856,6 +885,9 @@
     }
     if (elements.parserInput) {
       elements.parserInput.value = settings.parser_refresh_seconds;
+    }
+    if (elements.exchangeInput) {
+      elements.exchangeInput.value = settings.exchange_refresh_seconds;
     }
     if (elements.tableInput) {
       elements.tableInput.value = settings.table_refresh_seconds;

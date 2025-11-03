@@ -34,20 +34,24 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class DataSnapshot:
+class SourceSnapshot:
     generated_at: datetime
     screener_rows: List[dict]
     coinglass_rows: List[coinglass.CoinglassRow]
     universe: List[dict[str, object]]
-    opportunities: List[FundingOpportunity]
-    raw_payloads: dict[str, list[dict]]
     screener_from_cache: bool = False
     coinglass_from_cache: bool = False
-    exchange_status: List[dict[str, object]] = field(default_factory=list)
     messages: List[str] = field(default_factory=list)
 
+
+@dataclass
+class DataSnapshot(SourceSnapshot):
+    opportunities: List[FundingOpportunity] = field(default_factory=list)
+    raw_payloads: dict[str, list[dict]] = field(default_factory=dict)
+    exchange_status: List[dict[str, object]] = field(default_factory=list)
+
     def as_dict(self) -> dict[str, object]:
-        return {
+        base = {
             "generated_at": self.generated_at.isoformat(),
             "screener_rows": self.screener_rows,
             "coinglass_rows": [row.to_dict() for row in self.coinglass_rows],
@@ -61,17 +65,17 @@ class DataSnapshot:
             "coinglass_from_cache": self.coinglass_from_cache,
             "exchange_status": self.exchange_status,
         }
+        return base
 
 
 ProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
-async def collect_snapshot_async(
+async def collect_sources_async(
     progress_cb: ProgressCallback | None = None,
     *,
     source_settings: Mapping[str, bool] | None = None,
-    exchange_settings: Mapping[str, bool] | None = None,
-) -> DataSnapshot:
+) -> SourceSnapshot:
     if aiohttp is None:
         raise RuntimeError(
             'aiohttp is required for asynchronous snapshot collection. Install it via "pip install aiohttp".'
@@ -84,7 +88,6 @@ async def collect_snapshot_async(
 
     messages: list[str] = []
     sources = _effective_sources(source_settings)
-    exchanges = _effective_exchanges(exchange_settings)
 
     timeout = aiohttp.ClientTimeout(total=30)
     headers = {
@@ -170,9 +173,32 @@ async def collect_snapshot_async(
     if not universe:
         messages.append("Symbol universe is empty. Enable at least one data source.")
 
-    symbols = [entry["symbol"] for entry in universe]
+    return SourceSnapshot(
+        generated_at=timestamp,
+        screener_rows=screener_rows,
+        coinglass_rows=coinglass_rows,
+        universe=universe,
+        screener_from_cache=screener_from_cache,
+        coinglass_from_cache=coinglass_from_cache,
+        messages=messages,
+    )
 
+
+async def build_snapshot_from_sources(
+    sources: SourceSnapshot,
+    progress_cb: ProgressCallback | None = None,
+    *,
+    exchange_settings: Mapping[str, bool] | None = None,
+) -> DataSnapshot:
+    def _emit(event: str, payload: dict[str, Any] | None = None) -> None:
+        if progress_cb:
+            progress_cb(event, payload or {})
+
+    messages = list(sources.messages)
+    exchanges = _effective_exchanges(exchange_settings)
     adapters = _active_adapters(exchanges)
+    symbols = [entry["symbol"] for entry in sources.universe]
+
     if adapters and symbols:
         _emit(
             "exchanges:start",
@@ -235,16 +261,33 @@ async def collect_snapshot_async(
     )
 
     return DataSnapshot(
-        generated_at=timestamp,
-        screener_rows=screener_rows,
-        coinglass_rows=coinglass_rows,
-        universe=universe,
+        generated_at=sources.generated_at,
+        screener_rows=sources.screener_rows,
+        coinglass_rows=sources.coinglass_rows,
+        universe=sources.universe,
         opportunities=opportunities,
         raw_payloads=raw_payloads,
         exchange_status=exchange_status,
-        screener_from_cache=screener_from_cache,
-        coinglass_from_cache=coinglass_from_cache,
+        screener_from_cache=sources.screener_from_cache,
+        coinglass_from_cache=sources.coinglass_from_cache,
         messages=messages,
+    )
+
+
+async def collect_snapshot_async(
+    progress_cb: ProgressCallback | None = None,
+    *,
+    source_settings: Mapping[str, bool] | None = None,
+    exchange_settings: Mapping[str, bool] | None = None,
+) -> DataSnapshot:
+    sources = await collect_sources_async(
+        progress_cb,
+        source_settings=source_settings,
+    )
+    return await build_snapshot_from_sources(
+        sources,
+        progress_cb,
+        exchange_settings=exchange_settings,
     )
 
 

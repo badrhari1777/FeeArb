@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
+import os
+import time
+from pathlib import Path
 from typing import Iterable, List
 from urllib.request import Request, urlopen
 
@@ -15,6 +20,32 @@ from .base import ExchangeAdapter
 
 
 logger = logging.getLogger(__name__)
+_ENV_BOOTSTRAPPED = False
+
+
+def _ensure_env_loaded() -> None:
+    global _ENV_BOOTSTRAPPED  # pylint: disable=global-statement
+    if _ENV_BOOTSTRAPPED:
+        return
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        _ENV_BOOTSTRAPPED = True
+        return
+    try:
+        with env_path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key or key.startswith("#"):
+                    continue
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+    except OSError:
+        logger.debug("Unable to read .env file for MEXC credentials")
+    _ENV_BOOTSTRAPPED = True
 
 
 class MexcAdapter(ExchangeAdapter):
@@ -24,6 +55,29 @@ class MexcAdapter(ExchangeAdapter):
     ticker_url = "https://contract.mexc.com/api/v1/contract/ticker"
     funding_url_tpl = "https://contract.mexc.com/api/v1/contract/funding_rate/{symbol}"
     ws_url = "wss://contract.mexc.com/ws"
+    _login_timeout_seconds = 5.0
+
+    def __init__(self, api_key: str | None = None, api_secret: str | None = None) -> None:
+        _ensure_env_loaded()
+        self.api_key = api_key or os.getenv("MEXC_API_KEY") or ""
+        self.api_secret = api_secret or os.getenv("MEXC_API_SECRET") or ""
+        self._last_login_success: bool | None = None
+        self._ws_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Origin": "https://contract.mexc.com",
+        }
+
+    @property
+    def has_api_credentials(self) -> bool:
+        return bool(self.api_key and self.api_secret)
+
+    @property
+    def last_login_success(self) -> bool | None:
+        return self._last_login_success
 
     def map_symbol(self, symbol: str) -> str | None:
         symbol = symbol.upper().strip()
@@ -97,7 +151,11 @@ class MexcAdapter(ExchangeAdapter):
                 ping_interval=20,
                 ping_timeout=20,
                 max_size=1_000_000,
+                extra_headers=self._ws_headers,
             ) as ws:
+                auth_ok = await self._authenticate_ws(ws)
+                if not auth_ok and self.has_api_credentials:
+                    logger.warning("MEXC websocket authentication failed; continuing with public channels")
                 # Subscribe to ticker and funding channels for each symbol.
                 for idx, symbol in enumerate(list(pending), start=1):
                     await ws.send(
@@ -146,10 +204,11 @@ class MexcAdapter(ExchangeAdapter):
             funding_data.clear()
 
         for canonical, exchange_symbol in targets.items():
-            ticker = ticker_data.get(exchange_symbol, {})
+            ticker = ticker_data.get(exchange_symbol)
             funding = funding_data.get(exchange_symbol, {})
             if not ticker:
                 logger.debug("MEXC websocket missing ticker for %s", exchange_symbol)
+                continue
             snapshots.append(
                 self._snapshot_from_payload(
                     canonical,
@@ -163,6 +222,65 @@ class MexcAdapter(ExchangeAdapter):
             logger.debug("MEXC websocket falling back to REST for %s symbols", len(targets))
             return await self._fetch_via_rest_async(symbols)
         return snapshots
+
+    async def test_private_connection(self) -> bool:
+        """Perform a standalone websocket authentication probe."""
+        if not self.has_api_credentials:
+            raise RuntimeError("MEXC_API_KEY and MEXC_API_SECRET are required for authentication test")
+        async with websockets.connect(
+            self.ws_url,
+            ping_interval=20,
+            ping_timeout=20,
+            max_size=1_000_000,
+            extra_headers=self._ws_headers,
+        ) as ws:
+            return await self._authenticate_ws(ws)
+
+    async def _authenticate_ws(self, ws) -> bool:
+        """Authenticate against the private websocket if credentials are available."""
+        if not self.has_api_credentials:
+            self._last_login_success = None
+            return True
+
+        req_time = int(time.time() * 1000)
+        payload = f"apiKey={self.api_key}&reqTime={req_time}"
+        signature = hmac.new(self.api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        login_message = {
+            "method": "login",
+            "params": {
+                "apiKey": self.api_key,
+                "reqTime": req_time,
+                "sign": signature,
+            },
+        }
+
+        await ws.send(json.dumps(login_message))
+        try:
+            response_text = await asyncio.wait_for(ws.recv(), timeout=self._login_timeout_seconds)
+        except asyncio.TimeoutError:
+            logger.warning("MEXC websocket login timed out after %.1fs", self._login_timeout_seconds)
+            self._last_login_success = False
+            return False
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("MEXC websocket login failed: %r", exc)
+            self._last_login_success = False
+            return False
+
+        try:
+            data = json.loads(response_text)
+        except json.JSONDecodeError:
+            logger.warning("MEXC websocket login returned invalid JSON")
+            self._last_login_success = False
+            return False
+
+        success = _is_login_success(data)
+        if success:
+            logger.debug("MEXC websocket login acknowledged")
+        else:
+            logger.warning("MEXC websocket login rejected: %s", data)
+        self._last_login_success = success
+        return success
 
     async def _fetch_via_rest_async(self, symbols: Iterable[str]) -> List[MarketSnapshot]:
         mapped = {sym.upper(): self.map_symbol(sym) for sym in symbols}
@@ -256,6 +374,27 @@ def _get_json(url: str) -> dict:
     req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
     with urlopen(req, timeout=15) as resp:  # nosec - public API call
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _is_login_success(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if data.get("code") == 0:
+        return True
+    msg = str(data.get("msg") or "").lower()
+    if msg in {"success", "suc"}:
+        return True
+    if data.get("success") is True or data.get("result") is True:
+        return True
+    channel = data.get("channel") or data.get("method")
+    if isinstance(channel, str) and channel.lower() in {"rs.login", "login"}:
+        payload = data.get("data")
+        if isinstance(payload, dict):
+            if payload.get("isSuccess") is True or payload.get("success") is True:
+                return True
+        if data.get("code") == 0:
+            return True
+    return False
 
 
 def _get_funding(exchange_symbol: str) -> dict:

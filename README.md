@@ -74,8 +74,9 @@ cp .env.example .env  # customise if private endpoints/keys needed later
 ## Configuration
 `data/settings.json` is created on first run. Toggle sources/exchanges or adjust refresh timers via the dashboard's **Configuration** panel or by editing the file manually.
 
-- `parser_refresh_seconds`: backend orchestration loop interval (snapshot + orchestrator).
-- `table_refresh_seconds`: client polling cadence (still used for REST refreshes).
+- `parser_refresh_seconds`: cadence for external scrapers (ArbitrageScanner, Coinglass, symbol universe).
+- `exchange_refresh_seconds`: frequency of exchange adapter polling (reuses the latest scraper data).
+- `table_refresh_seconds`: client polling cadence (used by the web UI to fetch snapshots).
 - At least one source and exchange must remain enabled.
 
 Execution settings live in `data/execution_settings.json` (auto-generated). They hold wallet balances, allocation brackets, risk thresholds, telemetry paths, etc. You can edit them before launching for different paper balances or allocation heuristics.

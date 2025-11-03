@@ -13,6 +13,7 @@ import websockets
 from orchestrator.models import MarketSnapshot
 
 from .base import ExchangeAdapter
+from utils.missing_symbols import is_recently_missing, record_missing
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,9 @@ class BybitAdapter(ExchangeAdapter):
             if not exchange_symbol:
                 logger.debug("Bybit: symbol %s is not supported", canonical)
                 continue
+            if is_recently_missing(self.name, exchange_symbol):
+                logger.debug("Bybit: skipping %s (recently missing)", exchange_symbol)
+                continue
 
             category = "linear" if exchange_symbol.endswith("USDT") else "inverse"
             params = urlencode({"category": category, "symbol": exchange_symbol})
@@ -65,11 +69,15 @@ class BybitAdapter(ExchangeAdapter):
                     data.get("retMsg"),
                     exchange_symbol,
                 )
+                msg = (data.get("retMsg") or "").lower()
+                if data.get("retCode") == 10001 or "symbol invalid" in msg:
+                    record_missing(self.name, exchange_symbol)
                 continue
 
             items = data.get("result", {}).get("list") or []
             if not items:
                 logger.info("Bybit: empty list for %s", exchange_symbol)
+                record_missing(self.name, exchange_symbol)
                 continue
 
             item = items[0]
@@ -79,11 +87,22 @@ class BybitAdapter(ExchangeAdapter):
 
     async def fetch_market_snapshots_async(self, symbols: Iterable[str]) -> List[MarketSnapshot]:
         normalized = {sym.upper(): self.map_symbol(sym) for sym in symbols}
-        targets = {canon: exch for canon, exch in normalized.items() if exch}
+        targets = {
+            canon: exch
+            for canon, exch in normalized.items()
+            if exch and not is_recently_missing(self.name, exch)
+        }
         if not targets:
             return []
 
-        args = [f"tickers.{symbol}" for symbol in targets.values()]
+        subscription_args = [
+            {
+                "channel": "tickers",
+                "instId": symbol,
+                "instType": "linear" if symbol.endswith("USDT") else "inverse",
+            }
+            for symbol in targets.values()
+        ]
         pending = {symbol: canonical for canonical, symbol in targets.items()}
         snapshots: list[MarketSnapshot] = []
         deadline = asyncio.get_event_loop().time() + 5.0
@@ -95,7 +114,13 @@ class BybitAdapter(ExchangeAdapter):
                 ping_timeout=20,
                 max_size=1_000_000,
             ) as ws:
-                await ws.send(json.dumps({"op": "subscribe", "args": args}))
+                if subscription_args:
+                    for idx in range(0, len(subscription_args), 10):
+                        batch = subscription_args[idx : idx + 10]
+                        await ws.send(json.dumps({"op": "subscribe", "args": batch}))
+                legacy_args = [f"tickers.{symbol}" for symbol in pending]
+                if legacy_args:
+                    await ws.send(json.dumps({"op": "subscribe", "args": legacy_args}))
 
                 while pending and asyncio.get_event_loop().time() < deadline:
                     timeout = max(0.1, deadline - asyncio.get_event_loop().time())
@@ -105,22 +130,44 @@ class BybitAdapter(ExchangeAdapter):
                         break
                     data = json.loads(message)
 
-                    topic = data.get("topic")
-                    if not topic or not topic.startswith("tickers."):
+                    if data.get("op") == "subscribe":
                         continue
 
+                    topic = data.get("topic") or data.get("channel")
                     payload = data.get("data")
-                    if isinstance(payload, list):
-                        payload = payload[0] if payload else None
-                    if not isinstance(payload, dict):
+                    entries: list[dict] = []
+
+                    if isinstance(payload, dict):
+                        if "tickers" in payload and isinstance(payload["tickers"], list):
+                            entries = [item for item in payload["tickers"] if isinstance(item, dict)]
+                        else:
+                            entries = [payload]
+                    elif isinstance(payload, list):
+                        entries = [item for item in payload if isinstance(item, dict)]
+
+                    if not entries and isinstance(data.get("result"), dict):
+                        result = data["result"]
+                        if isinstance(result.get("list"), list):
+                            entries = [item for item in result["list"] if isinstance(item, dict)]
+
+                    if not entries and isinstance(data.get("tickers"), list):
+                        entries = [item for item in data["tickers"] if isinstance(item, dict)]
+
+                    if not entries:
                         continue
 
-                    symbol_code = topic.split(".", 1)[1]
-                    canonical = pending.pop(symbol_code, None)
-                    if not canonical:
-                        continue
-
-                    snapshots.append(self._snapshot_from_ticker(canonical, symbol_code, payload))
+                    for entry in entries:
+                        symbol_code = entry.get("symbol") or entry.get("instId")
+                        if not symbol_code and isinstance(topic, str) and "." in topic:
+                            symbol_code = topic.split(".", 1)[1]
+                        if not symbol_code:
+                            continue
+                        canonical = pending.pop(symbol_code, None)
+                        if not canonical:
+                            continue
+                        snapshots.append(self._snapshot_from_ticker(canonical, symbol_code, entry))
+                        if not pending:
+                            break
 
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("Bybit websocket fetch failed: %r", exc)

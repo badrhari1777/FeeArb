@@ -58,6 +58,7 @@ class AppSettings:
         default_factory=lambda: dict(DEFAULT_EXCHANGES)
     )
     parser_refresh_seconds: int = 300
+    exchange_refresh_seconds: int = 60
     table_refresh_seconds: int = 300
 
     def with_updates(self, payload: Mapping[str, object]) -> "AppSettings":
@@ -78,9 +79,15 @@ class AppSettings:
         else:
             updated.exchanges = _normalise_bool_map(
                 _default_exchanges(), self.exchanges, allow_new_keys=True
-            )
+        )
         updated.parser_refresh_seconds = int(
             payload.get("parser_refresh_seconds", self.parser_refresh_seconds)
+        )
+        updated.exchange_refresh_seconds = int(
+            payload.get(
+                "exchange_refresh_seconds",
+                self.exchange_refresh_seconds,
+            )
         )
         updated.table_refresh_seconds = int(
             payload.get("table_refresh_seconds", self.table_refresh_seconds)
@@ -104,6 +111,7 @@ class AppSettings:
         if (
             self.parser_refresh_seconds < MIN_REFRESH_SECONDS
             or self.table_refresh_seconds < MIN_REFRESH_SECONDS
+            or self.exchange_refresh_seconds < MIN_REFRESH_SECONDS
         ):
             raise ValueError(
                 f"Refresh intervals must be >= {MIN_REFRESH_SECONDS} seconds."
@@ -111,6 +119,7 @@ class AppSettings:
         if (
             self.parser_refresh_seconds > MAX_REFRESH_SECONDS
             or self.table_refresh_seconds > MAX_REFRESH_SECONDS
+            or self.exchange_refresh_seconds > MAX_REFRESH_SECONDS
         ):
             raise ValueError(
                 f"Refresh intervals must be <= {MAX_REFRESH_SECONDS} seconds."
@@ -121,6 +130,7 @@ class AppSettings:
             "sources": dict(self.sources),
             "exchanges": dict(self.exchanges),
             "parser_refresh_seconds": self.parser_refresh_seconds,
+            "exchange_refresh_seconds": self.exchange_refresh_seconds,
             "table_refresh_seconds": self.table_refresh_seconds,
         }
 
@@ -188,9 +198,10 @@ class SettingsManager:
     def enabled_exchanges(self) -> Dict[str, bool]:
         return dict(self._settings.exchanges)
 
-    def refresh_intervals(self) -> tuple[int, int]:
+    def refresh_intervals(self) -> tuple[int, int, int]:
         return (
             self._settings.parser_refresh_seconds,
             self._settings.table_refresh_seconds,
+            self._settings.exchange_refresh_seconds,
         )
 

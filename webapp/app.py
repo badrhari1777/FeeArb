@@ -29,6 +29,7 @@ class SettingsPayload(BaseModel):
     sources: Dict[str, bool]
     exchanges: Dict[str, bool]
     parser_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
+    exchange_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
     table_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
 
 

@@ -5,7 +5,12 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional
 
-from pipeline import DataSnapshot, collect_snapshot_async
+from pipeline import (
+    DataSnapshot,
+    SourceSnapshot,
+    build_snapshot_from_sources,
+    collect_sources_async,
+)
 from project_settings import SettingsManager
 from execution import (
     ExecutionSettingsManager,
@@ -16,6 +21,7 @@ from execution import (
 from execution.allocator import Allocator
 from execution.lifecycle import LifecycleController
 from execution.settings import ExecutionSettings
+from utils import purge_expired
 from .realtime import ConnectionManager
 
 RefreshResult = Literal["completed", "in_progress", "failed"]
@@ -27,13 +33,16 @@ class DataService:
     def __init__(self, settings_manager: SettingsManager | None = None) -> None:
         self._settings_manager = settings_manager or SettingsManager()
         self._parser_interval = self._settings_manager.current.parser_refresh_seconds
+        self._exchange_interval = self._settings_manager.current.exchange_refresh_seconds
         self._snapshot: Optional[DataSnapshot] = None
+        self._cached_sources: Optional[SourceSnapshot] = None
         self._lock = asyncio.Lock()
         self._task: Optional[asyncio.Task] = None
         self._bootstrap_task: Optional[asyncio.Task] = None
         self._status: str = "idle"
         self._last_error: Optional[str] = None
         self._last_refreshed: Optional[datetime] = None
+        self._last_source_refresh: Optional[datetime] = None
         self._in_progress: bool = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._events: List[dict[str, Any]] = []
@@ -52,9 +61,11 @@ class DataService:
 
     async def startup(self) -> None:
         self._loop = asyncio.get_running_loop()
+        purge_expired()
         async with self._lock:
             self._status = "pending"
             self._parser_interval = self._settings_manager.current.parser_refresh_seconds
+            self._exchange_interval = self._settings_manager.current.exchange_refresh_seconds
         if self._task is None:
             await self._restart_scheduler()
         if self._bootstrap_task is None or self._bootstrap_task.done():
@@ -84,9 +95,11 @@ class DataService:
     async def _scheduler(self) -> None:
         try:
             while True:
-                interval = max(self._parser_interval, 1)
+                interval = max(self._exchange_interval, 1)
                 await asyncio.sleep(interval)
-                result = await self.refresh_snapshot()
+                result = await self.refresh_snapshot(
+                    force_sources=self._sources_due(),
+                )
                 if result == "failed":
                     logger.warning(
                         "Scheduled snapshot refresh failed; will retry after interval."
@@ -106,7 +119,13 @@ class DataService:
             self._task = None
         self._task = asyncio.create_task(self._scheduler())
 
-    async def refresh_snapshot(self) -> RefreshResult:
+    def _sources_due(self) -> bool:
+        if self._cached_sources is None or self._last_source_refresh is None:
+            return True
+        age = datetime.now(timezone.utc) - self._last_source_refresh
+        return age.total_seconds() >= max(self._parser_interval, 1)
+
+    async def refresh_snapshot(self, *, force_sources: bool = True) -> RefreshResult:
         async with self._lock:
             if self._in_progress:
                 return "in_progress"
@@ -126,10 +145,52 @@ class DataService:
         current_settings = self._settings_manager.current
         source_flags = dict(current_settings.sources)
         exchange_flags = dict(current_settings.exchanges)
+        sources: Optional[SourceSnapshot] = self._cached_sources
+
+        need_sources = (
+            force_sources
+            or sources is None
+            or self._sources_due()
+        )
+        if need_sources:
+            try:
+                sources = await collect_sources_async(
+                    progress_cb,
+                    source_settings=source_flags,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("Source refresh raised an error")
+                self._record_event(
+                    "sources:failed",
+                    {"message": "Source refresh failed", "error": str(exc)},
+                )
+                if self._cached_sources is None:
+                    outcome = "failed"
+                    self._record_event(
+                        "refresh:failed",
+                        {
+                            "message": "Snapshot refresh failed (no cached sources)",
+                            "error": str(exc),
+                        },
+                    )
+                    async with self._lock:
+                        self._last_error = str(exc)
+                        self._status = "error"
+                        self._in_progress = False
+                    return outcome
+                sources = self._cached_sources
+                # attach warning for downstream reporting
+                warning_message = "Source refresh failed; using cached data."
+                if warning_message not in sources.messages:
+                    sources.messages.append(warning_message)
+            else:
+                self._cached_sources = sources
+                self._last_source_refresh = sources.generated_at
+
         try:
-            snapshot = await collect_snapshot_async(
-                progress_cb,
-                source_settings=source_flags,
+            snapshot = await build_snapshot_from_sources(
+                sources,
+                progress_cb=progress_cb,
                 exchange_settings=exchange_flags,
             )
         except Exception as exc:  # pylint: disable=broad-except
@@ -156,6 +217,7 @@ class DataService:
                 self._last_error = None
                 self._last_refreshed = datetime.now(timezone.utc)
                 self._parser_interval = current_settings.parser_refresh_seconds
+                self._exchange_interval = current_settings.exchange_refresh_seconds
                 self._exchange_status = {
                     entry.get("exchange", f"exchange-{idx}"): entry
                     for idx, entry in enumerate(snapshot.exchange_status)
@@ -168,7 +230,9 @@ class DataService:
 
     async def on_settings_updated(self) -> None:
         async with self._lock:
-            self._parser_interval = self._settings_manager.current.parser_refresh_seconds
+            current = self._settings_manager.current
+            self._parser_interval = current.parser_refresh_seconds
+            self._exchange_interval = current.exchange_refresh_seconds
         await self._restart_scheduler()
 
     def latest_snapshot(self) -> Optional[DataSnapshot]:
@@ -191,10 +255,14 @@ class DataService:
         table_interval = int(
             settings_payload.get("table_refresh_seconds", parser_interval)
         )
+        exchange_interval = int(
+            settings_payload.get("exchange_refresh_seconds", self._exchange_interval)
+        )
         return {
             "status": status,
             "refresh_interval": table_interval,
             "parser_refresh_interval": parser_interval,
+            "exchange_refresh_interval": exchange_interval,
             "last_error": self._last_error,
             "last_updated": (
                 self._last_refreshed.isoformat() if self._last_refreshed else None

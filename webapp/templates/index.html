@@ -15,8 +15,9 @@
   {% set status = state.get('status', 'idle') %}
   {% set status_class = status|lower|replace(' ', '-') %}
   {% set settings = state.get('settings', {}) %}
-  {% set refresh_interval = settings.get('table_refresh_seconds', state.get('refresh_interval', 300)) %}
-  {% set parser_interval = settings.get('parser_refresh_seconds', refresh_interval) %}
+{% set refresh_interval = settings.get('table_refresh_seconds', state.get('refresh_interval', 300)) %}
+{% set parser_interval = settings.get('parser_refresh_seconds', state.get('parser_refresh_interval', refresh_interval)) %}
+{% set exchange_interval = settings.get('exchange_refresh_seconds', state.get('exchange_refresh_interval', parser_interval)) %}
   {% set exchange_status_rows = state.get('exchange_status', []) %}
   {% set events = state.get('events', []) %}
   {% set last_event = events[-1] if events %}
@@ -102,7 +103,7 @@
         </div>
       </dl>
       <button id="refresh-button" class="button" type="button">Manual refresh</button>
-      <p class="hint">UI refresh: {{ refresh_interval }} s | Parser: {{ parser_interval }} s</p>
+      <p class="hint">UI refresh: {{ refresh_interval }} s | Parser: {{ parser_interval }} s | Exchange poll: {{ exchange_interval }} s</p>
     </div>
   </header>
 
@@ -136,6 +137,10 @@
           <label>
             Parser refresh (seconds)
             <input type="number" id="parser-interval" min="30" max="86400" step="1" value="{{ parser_interval }}" />
+          </label>
+          <label>
+            Exchange poll (seconds)
+            <input type="number" id="exchange-interval" min="30" max="86400" step="1" value="{{ exchange_interval }}" />
           </label>
           <label>
             UI refresh (seconds)
