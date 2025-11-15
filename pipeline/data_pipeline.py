@@ -22,7 +22,7 @@ if TYPE_CHECKING:  # pragma: no cover
 from config import PARSE_CACHE_TTL_SECONDS, SUPPORTED_EXCHANGES
 from project_settings import DEFAULT_SOURCES
 from exchanges import get_adapter, normalize_exchange_name
-from orchestrator.models import FundingOpportunity
+from orchestrator.models import FundingOpportunity, MarketSnapshot
 from orchestrator.opportunities import (
     compute_opportunities,
     format_opportunity_table,
@@ -49,6 +49,7 @@ class DataSnapshot(SourceSnapshot):
     opportunities: List[FundingOpportunity] = field(default_factory=list)
     raw_payloads: dict[str, list[dict]] = field(default_factory=dict)
     exchange_status: List[dict[str, object]] = field(default_factory=list)
+    market_snapshots: dict[str, dict[str, MarketSnapshot]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         base = {
@@ -64,6 +65,10 @@ class DataSnapshot(SourceSnapshot):
             "screener_from_cache": self.screener_from_cache,
             "coinglass_from_cache": self.coinglass_from_cache,
             "exchange_status": self.exchange_status,
+            "market_snapshots": {
+                exchange: [snapshot.to_dict() for snapshot in snapshots.values()]
+                for exchange, snapshots in self.market_snapshots.items()
+            },
         }
         return base
 
@@ -208,7 +213,12 @@ async def build_snapshot_from_sources(
                 "exchange_count": len(adapters),
             },
         )
-        opportunities, raw_payloads, exchange_status = await compute_opportunities(
+        (
+            opportunities,
+            raw_payloads,
+            exchange_status,
+            snapshot_map,
+        ) = await compute_opportunities(
             symbols,
             adapters,
             0.0,
@@ -225,6 +235,7 @@ async def build_snapshot_from_sources(
         opportunities = []
         raw_payloads = {}
         exchange_status = []
+        snapshot_map = {}
         if not adapters:
             messages.append("Exchange polling skipped - all exchanges disabled.")
             _emit(
@@ -268,6 +279,7 @@ async def build_snapshot_from_sources(
         opportunities=opportunities,
         raw_payloads=raw_payloads,
         exchange_status=exchange_status,
+        market_snapshots=snapshot_map,
         screener_from_cache=sources.screener_from_cache,
         coinglass_from_cache=sources.coinglass_from_cache,
         messages=messages,

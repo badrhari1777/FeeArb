@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from typing import Dict
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -12,9 +11,10 @@ from pydantic import BaseModel, Field
 from project_settings import MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS, SettingsManager
 
 from .services import DataService
-from .realtime import ConnectionManager
 
 BASE_DIR = Path(__file__).resolve().parent
+
+STATIC_VERSION = "v2025-11-15-01"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -22,8 +22,6 @@ templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 settings_manager = SettingsManager()
 service = DataService(settings_manager=settings_manager)
-realtime_manager = ConnectionManager()
-service.attach_realtime(realtime_manager)
 
 class SettingsPayload(BaseModel):
     sources: Dict[str, bool]
@@ -31,6 +29,7 @@ class SettingsPayload(BaseModel):
     parser_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
     exchange_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
     table_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
+    account_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
 
 
 @app.on_event("startup")
@@ -49,6 +48,7 @@ async def index(request: Request) -> HTMLResponse:
         {
             "request": request,
             "state": state,
+            "static_version": STATIC_VERSION,
         },
     )
 
@@ -58,7 +58,7 @@ async def snapshot_api() -> JSONResponse:
 
 @app.post("/api/refresh")
 async def refresh_snapshot() -> JSONResponse:
-    result = await service.refresh_snapshot()
+    result = await service.refresh_snapshot(force_accounts=True)
     return JSONResponse({"status": result, "state": service.state_payload()})
 
 @app.get("/api/settings")
@@ -78,17 +78,3 @@ async def update_settings(payload: SettingsPayload) -> JSONResponse:
             "state": service.state_payload(),
         }
     )
-
-
-@app.websocket("/ws/telemetry")
-async def telemetry_ws(websocket: WebSocket) -> None:
-    await realtime_manager.connect(websocket)
-    try:
-        for entry in service.telemetry_backlog():
-            await websocket.send_json(entry)
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        await realtime_manager.disconnect(websocket)
-    except Exception:
-        await realtime_manager.disconnect(websocket)

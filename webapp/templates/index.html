@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <title>Funding Arbitrage Monitor</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}?v={{ static_version }}" />
   {% set raw_snapshot = state.get('snapshot') %}
   {% set snapshot = raw_snapshot or {} %}
   {% set has_snapshot = raw_snapshot is not none %}
@@ -18,13 +18,19 @@
 {% set refresh_interval = settings.get('table_refresh_seconds', state.get('refresh_interval', 300)) %}
 {% set parser_interval = settings.get('parser_refresh_seconds', state.get('parser_refresh_interval', refresh_interval)) %}
 {% set exchange_interval = settings.get('exchange_refresh_seconds', state.get('exchange_refresh_interval', parser_interval)) %}
+{% set account_interval = settings.get('account_refresh_seconds', state.get('account_refresh_interval', 3600)) %}
   {% set exchange_status_rows = state.get('exchange_status', []) %}
   {% set events = state.get('events', []) %}
   {% set last_event = events[-1] if events %}
+  {% set accounts = state.get('accounts', {}) %}
+  {% set account_status_rows = accounts.get('status', []) %}
+  {% set account_balance_rows = accounts.get('balances', []) %}
+  {% set symbol_position_rows = accounts.get('positions_by_symbol', []) %}
+  {% set account_last_checked = accounts.get('last_updated') %}
   <script>
     window.__INITIAL_STATE__ = {{ state | tojson | safe }};
   </script>
-  <script defer src="{{ url_for('static', path='/app.js') }}"></script>
+  <script defer src="{{ url_for('static', path='/app.js') }}?v={{ static_version }}"></script>
 </head>
 <body class="page">
   <header class="masthead">
@@ -103,7 +109,7 @@
         </div>
       </dl>
       <button id="refresh-button" class="button" type="button">Manual refresh</button>
-      <p class="hint">UI refresh: {{ refresh_interval }} s | Parser: {{ parser_interval }} s | Exchange poll: {{ exchange_interval }} s</p>
+      <p class="hint">UI refresh: {{ refresh_interval }} s | Parser: {{ parser_interval }} s | Exchange poll: {{ exchange_interval }} s | Account refresh: {{ account_interval }} s</p>
     </div>
   </header>
 
@@ -145,6 +151,10 @@
           <label>
             UI refresh (seconds)
             <input type="number" id="table-interval" min="30" max="86400" step="1" value="{{ refresh_interval }}" />
+          </label>
+          <label>
+            Account refresh (seconds)
+            <input type="number" id="account-interval" min="30" max="86400" step="1" value="{{ account_interval }}" />
           </label>
         </div>
         <p class="settings-note muted">Keep at least one source and one exchange enabled.</p>
@@ -351,19 +361,105 @@
       {% endif %}
     </section>
 
-    <section class="panel" id="execution-balances">
-      <h2>Exchange Balances</h2>
+    <section class="panel" id="account-status-panel">
+      <h2>Exchange API Status</h2>
+      <p class="muted">Last check: <span id="account-last-updated">{{ account_last_checked or "-" }}</span></p>
       <table class="data-table">
         <thead>
           <tr>
             <th>Exchange</th>
-            <th>Total (USDT)</th>
-            <th>Available</th>
-            <th>Reserved</th>
-            <th>In Positions</th>
+            <th>Status</th>
+            <th>Message</th>
+            <th>Checked</th>
           </tr>
         </thead>
-        <tbody id="wallet-table-body"></tbody>
+        <tbody id="account-status-body">
+          {% for row in account_status_rows %}
+            <tr>
+              <td>{{ row.exchange }}</td>
+              <td>{{ row.status }}</td>
+              <td>{{ row.message or row.error or "-" }}</td>
+              <td>{{ row.checked_at or "-" }}</td>
+            </tr>
+          {% endfor %}
+          {% if account_status_rows | length == 0 %}
+            <tr><td colspan="4" class="muted">No credential checks have been run yet.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="perp-balances">
+      <h2>Perpetual Account Balances</h2>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Exchange</th>
+            <th>Asset</th>
+            <th>Total</th>
+            <th>Available</th>
+            <th>In Use</th>
+            <th>Unrealized PnL</th>
+            <th>Margin Ratio</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody id="account-balance-body">
+          {% for row in account_balance_rows %}
+            <tr>
+              <td>{{ row.exchange }}</td>
+              <td>{{ row.asset }}</td>
+              <td>{{ row.total if row.total is not none else "-" }}</td>
+              <td>{{ row.available if row.available is not none else "-" }}</td>
+              <td>{{ row.used if row.used is not none else "-" }}</td>
+              <td>{{ row.unrealized_pnl if row.unrealized_pnl is not none else "-" }}</td>
+              <td>{{ row.margin_ratio if row.margin_ratio is not none else "-" }}</td>
+              <td>{{ row.timestamp or "-" }}</td>
+            </tr>
+          {% endfor %}
+          {% if account_balance_rows | length == 0 %}
+            <tr><td colspan="8" class="muted">Balances will appear after the first refresh.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="symbol-positions-panel">
+      <h2>Symbol Positions</h2>
+      <table class="data-table data-table--wide">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Net Contracts</th>
+            <th>Net Notional</th>
+            <th>Leg Details</th>
+          </tr>
+        </thead>
+        <tbody id="symbol-positions-body">
+          {% for row in symbol_position_rows %}
+            <tr>
+              <td>{{ row.symbol }}</td>
+              <td>{{ row.net_contracts }}</td>
+              <td>{{ row.net_notional }}</td>
+              <td>
+                <ul class="event-log">
+                  {% for leg in row.legs %}
+                    <li class="event-log__item">
+                      <span class="event-log__message">
+                        <strong>{{ leg.exchange }}</strong> · {{ leg.side or "-" }} · {{ leg.contracts or "-" }} contracts /
+                        {{ leg.notional or "-" }} USDT · entry {{ leg.entry_price or "-" }} · mark {{ leg.mark_price or leg.snapshot_mark or "-" }} ·
+                        PnL {{ leg.unrealized_pnl or "-" }} · funding {{ leg.funding_rate or "-" }}
+                      </span>
+                    </li>
+                  {% endfor %}
+                </ul>
+              </td>
+            </tr>
+          {% endfor %}
+          {% if symbol_position_rows | length == 0 %}
+            <tr><td colspan="4" class="muted">No live positions detected.</td></tr>
+          {% endif %}
+        </tbody>
       </table>
     </section>
 

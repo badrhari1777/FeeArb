@@ -118,7 +118,12 @@ async def compute_opportunities(
     adapters: Sequence[ExchangeAdapter],
     min_spread: float = 0.0,
     progress_cb: ProgressCallback | None = None,
-) -> tuple[List[FundingOpportunity], dict[str, list[dict]], List[dict[str, Any]]]:
+) -> tuple[
+    List[FundingOpportunity],
+    dict[str, list[dict]],
+    List[dict[str, Any]],
+    dict[str, dict[str, MarketSnapshot]],
+]:
     snapshots_by_exchange, raw_payloads, status_entries = await gather_snapshots(
         adapters, symbols, progress_cb=progress_cb
     )
@@ -187,7 +192,7 @@ async def compute_opportunities(
         )
 
     opportunities.sort(key=lambda item: item.spread, reverse=True)
-    return opportunities, raw_payloads, status_entries
+    return opportunities, raw_payloads, status_entries, snapshots_by_exchange
 
 
 def format_opportunity_table(rows: Sequence[FundingOpportunity]) -> str:

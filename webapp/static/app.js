@@ -16,7 +16,8 @@
     exchanges: { bybit: true, mexc: true },
     parser_refresh_seconds: 300,
     exchange_refresh_seconds: 60,
-    table_refresh_seconds: 300
+    table_refresh_seconds: 300,
+    account_refresh_seconds: 120
   };
 
   var defaultExecution = {
@@ -26,11 +27,20 @@
     telemetry: []
   };
 
+  var defaultAccounts = {
+    balances: [],
+    status: [],
+    positions: [],
+    positions_by_symbol: [],
+    last_updated: null
+  };
+
   var defaultState = {
     status: 'idle',
     refresh_interval: defaultSettings.table_refresh_seconds,
     parser_refresh_interval: defaultSettings.parser_refresh_seconds,
     exchange_refresh_interval: defaultSettings.exchange_refresh_seconds,
+    account_refresh_interval: defaultSettings.account_refresh_seconds,
     last_error: null,
     last_updated: null,
     snapshot: null,
@@ -38,14 +48,14 @@
     events: [],
     exchange_status: [],
     settings: clone(defaultSettings),
-    execution: clone(defaultExecution)
+    execution: clone(defaultExecution),
+    accounts: clone(defaultAccounts)
   };
 
   var globalState = normalizeState(window.__INITIAL_STATE__);
   var pollingTimer = null;
   var currentPollInterval = 0;
   var pollingInFlight = false;
-  var telemetrySocket = null;
 
   var elements = {
     generatedAt: document.getElementById('generated-at'),
@@ -67,6 +77,7 @@
     parserInput: document.getElementById('parser-interval'),
     exchangeInput: document.getElementById('exchange-interval'),
     tableInput: document.getElementById('table-interval'),
+    accountInput: document.getElementById('account-interval'),
     settingsStatus: document.getElementById('settings-status'),
     settingsSubmit: document.getElementById('settings-submit'),
     refreshButton: document.getElementById('refresh-button'),
@@ -78,7 +89,11 @@
     walletTable: document.getElementById('wallet-table-body'),
     reservationTable: document.getElementById('reservation-table-body'),
     positionTable: document.getElementById('positions-table-body'),
-    executionLog: document.getElementById('execution-activity')
+    executionLog: document.getElementById('execution-activity'),
+    accountLastUpdated: document.getElementById('account-last-updated'),
+    accountStatusTable: document.getElementById('account-status-body'),
+    accountBalanceTable: document.getElementById('account-balance-body'),
+    symbolPositionsTable: document.getElementById('symbol-positions-body')
   };
 
   function clone(value) {
@@ -143,6 +158,10 @@
       if (!isNaN(parsed)) {
         normalized.table_refresh_seconds = clamp(parsed, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
       }
+      parsed = parseInt(settings.account_refresh_seconds, 10);
+      if (!isNaN(parsed)) {
+        normalized.account_refresh_seconds = clamp(parsed, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+      }
     }
     return normalized;
   }
@@ -172,6 +191,33 @@
     return normalized;
   }
 
+  function normalizeAccounts(accounts) {
+    var normalized = clone(defaultAccounts) || {
+      balances: [],
+      status: [],
+      positions: [],
+      positions_by_symbol: [],
+      last_updated: null
+    };
+    if (!accounts || typeof accounts !== 'object') {
+      return normalized;
+    }
+    if (Array.isArray(accounts.balances)) {
+      normalized.balances = clone(accounts.balances) || [];
+    }
+    if (Array.isArray(accounts.status)) {
+      normalized.status = clone(accounts.status) || [];
+    }
+    if (Array.isArray(accounts.positions)) {
+      normalized.positions = clone(accounts.positions) || [];
+    }
+    if (Array.isArray(accounts.positions_by_symbol)) {
+      normalized.positions_by_symbol = clone(accounts.positions_by_symbol) || [];
+    }
+    normalized.last_updated = accounts.last_updated || null;
+    return normalized;
+  }
+
   function normalizeState(source) {
     var state = clone(defaultState) || defaultState;
     if (source && typeof source === 'object') {
@@ -187,6 +233,9 @@
       if (typeof source.exchange_refresh_interval === 'number') {
         state.exchange_refresh_interval = source.exchange_refresh_interval;
       }
+      if (typeof source.account_refresh_interval === 'number') {
+        state.account_refresh_interval = source.account_refresh_interval;
+      }
       state.last_error = source.last_error || null;
       state.last_updated = source.last_updated || null;
       state.refresh_in_progress = !!source.refresh_in_progress;
@@ -200,6 +249,7 @@
     }
     state.settings = normalizeSettings(source ? source.settings : null);
     state.execution = normalizeExecution(source ? source.execution : null);
+    state.accounts = normalizeAccounts(source ? source.accounts : null);
     return state;
   }
 
@@ -612,6 +662,114 @@
     renderExecutionLog(data.telemetry || []);
   }
 
+  function renderAccountStatus(entries) {
+    if (!elements.accountStatusTable) {
+      return;
+    }
+    var rows = entries || [];
+    var html = '';
+    var i;
+    for (i = 0; i < rows.length; i += 1) {
+      var row = rows[i] || {};
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.exchange || '-') + '</td>' +
+        '<td>' + escapeHtml(row.status || '-') + '</td>' +
+        '<td>' + escapeHtml(row.message || row.error || '-') + '</td>' +
+        '<td>' + escapeHtml(formatDate(row.checked_at)) + '</td>' +
+      '</tr>';
+    }
+    if (!html) {
+      html = '<tr><td colspan="4" class="muted">No credential checks yet.</td></tr>';
+    }
+    elements.accountStatusTable.innerHTML = html;
+  }
+
+  function renderAccountBalances(entries) {
+    if (!elements.accountBalanceTable) {
+      return;
+    }
+    var rows = entries || [];
+    var html = '';
+    var i;
+    for (i = 0; i < rows.length; i += 1) {
+      var row = rows[i] || {};
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.exchange || '-') + '</td>' +
+        '<td>' + escapeHtml(row.asset || '-') + '</td>' +
+        '<td>' + formatNumber(row.total, 2) + '</td>' +
+        '<td>' + formatNumber(row.available, 2) + '</td>' +
+        '<td>' + formatNumber(row.used, 2) + '</td>' +
+        '<td>' + formatNumber(row.unrealized_pnl, 2) + '</td>' +
+        '<td>' + formatNumber(row.margin_ratio, 4) + '</td>' +
+        '<td>' + escapeHtml(formatDate(row.timestamp)) + '</td>' +
+      '</tr>';
+    }
+    if (!html) {
+      html = '<tr><td colspan="8" class="muted">Balances will appear after the first refresh.</td></tr>';
+    }
+    elements.accountBalanceTable.innerHTML = html;
+  }
+
+  function formatLegRow(leg) {
+    if (!leg) {
+      return '-';
+    }
+    var funding = leg.funding_rate !== undefined && leg.funding_rate !== null
+      ? formatPercent(leg.funding_rate, 4)
+      : '-';
+    var mark = typeof leg.mark_price === 'number' ? formatNumber(leg.mark_price, 4)
+      : (typeof leg.snapshot_mark === 'number' ? formatNumber(leg.snapshot_mark, 4) : '-');
+    return (leg.exchange || '-') + ' · ' +
+      (leg.side || '-') + ' · ' +
+      formatNumber(leg.contracts, 4) + ' ctr · ' +
+      formatNumber(leg.notional, 2) + ' USDT · entry ' +
+      formatNumber(leg.entry_price, 4) + ' · mark ' + mark +
+      ' · PnL ' + formatNumber(leg.unrealized_pnl, 4) +
+      ' · funding ' + funding;
+  }
+
+  function renderSymbolPositions(groups) {
+    if (!elements.symbolPositionsTable) {
+      return;
+    }
+    var rows = groups || [];
+    var html = '';
+    var i;
+    for (i = 0; i < rows.length; i += 1) {
+      var row = rows[i] || {};
+      var legHtml = '<ul class="event-log">';
+      var legs = Array.isArray(row.legs) ? row.legs : [];
+      var j;
+      for (j = 0; j < legs.length; j += 1) {
+        legHtml += '<li class="event-log__item"><span class="event-log__message">' + escapeHtml(formatLegRow(legs[j])) + '</span></li>';
+      }
+      if (!legs.length) {
+        legHtml += '<li class="event-log__item"><span class="event-log__message muted">No legs</span></li>';
+      }
+      legHtml += '</ul>';
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.symbol || '-') + '</td>' +
+        '<td>' + formatNumber(row.net_contracts, 4) + '</td>' +
+        '<td>' + formatNumber(row.net_notional, 2) + '</td>' +
+        '<td>' + legHtml + '</td>' +
+      '</tr>';
+    }
+    if (!html) {
+      html = '<tr><td colspan="4" class="muted">No live positions.</td></tr>';
+    }
+    elements.symbolPositionsTable.innerHTML = html;
+  }
+
+  function renderAccounts(accounts) {
+    var data = accounts || defaultAccounts;
+    renderAccountStatus(data.status || []);
+    renderAccountBalances(data.balances || []);
+    renderSymbolPositions(data.positions_by_symbol || []);
+    if (elements.accountLastUpdated) {
+      elements.accountLastUpdated.textContent = data.last_updated ? formatDate(data.last_updated) : '-';
+    }
+  }
+
   function toggleEmptyState(show) {
     if (elements.emptyState) {
       elements.emptyState.style.display = show ? '' : 'none';
@@ -662,7 +820,8 @@
     var tableSeconds = getRefreshInterval(state);
     var parserSeconds = getParserInterval(state);
     var exchangeSeconds = getExchangeInterval(state);
-    elements.hint.textContent = 'UI refresh: ' + tableSeconds + ' s | Parser: ' + parserSeconds + ' s | Exchange poll: ' + exchangeSeconds + ' s';
+    var accountSeconds = getAccountInterval(state);
+    elements.hint.textContent = 'UI refresh: ' + tableSeconds + ' s | Parser: ' + parserSeconds + ' s | Exchange poll: ' + exchangeSeconds + ' s | Account refresh: ' + accountSeconds + ' s';
   }
 
   function renderAll() {
@@ -671,6 +830,7 @@
     renderSnapshotData(globalState.snapshot);
     renderEvents(globalState.events || []);
     renderExecution(globalState.execution);
+    renderAccounts(globalState.accounts);
     renderMessages(collectMessages(globalState));
     toggleEmptyState(!globalState.snapshot);
     updateHint(globalState);
@@ -706,6 +866,17 @@
     }
     if (typeof state.exchange_refresh_interval === 'number') {
       interval = state.exchange_refresh_interval;
+    }
+    return clamp(interval, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+  }
+
+  function getAccountInterval(state) {
+    var interval = defaultState.account_refresh_interval;
+    if (state.settings && typeof state.settings.account_refresh_seconds === 'number') {
+      interval = state.settings.account_refresh_seconds;
+    }
+    if (typeof state.account_refresh_interval === 'number') {
+      interval = state.account_refresh_interval;
     }
     return clamp(interval, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
   }
@@ -829,7 +1000,8 @@
       exchanges: {},
       parser_refresh_seconds: defaultSettings.parser_refresh_seconds,
       exchange_refresh_seconds: defaultSettings.exchange_refresh_seconds,
-      table_refresh_seconds: defaultSettings.table_refresh_seconds
+      table_refresh_seconds: defaultSettings.table_refresh_seconds,
+      account_refresh_seconds: defaultSettings.account_refresh_seconds
     };
     if (!elements.settingsForm) {
       return result;
@@ -862,6 +1034,12 @@
         result.table_refresh_seconds = clamp(tableValue, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
       }
     }
+    if (elements.accountInput) {
+      var accountValue = parseInt(elements.accountInput.value, 10);
+      if (!isNaN(accountValue)) {
+        result.account_refresh_seconds = clamp(accountValue, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+      }
+    }
     return result;
   }
 
@@ -891,6 +1069,9 @@
     }
     if (elements.tableInput) {
       elements.tableInput.value = settings.table_refresh_seconds;
+    }
+    if (elements.accountInput) {
+      elements.accountInput.value = settings.account_refresh_seconds;
     }
   }
 
@@ -937,55 +1118,6 @@
     });
   }
 
-  function appendTelemetry(entry) {
-    if (!globalState.execution) {
-      globalState.execution = clone(defaultExecution);
-    }
-    if (!Array.isArray(globalState.execution.telemetry)) {
-      globalState.execution.telemetry = [];
-    }
-    globalState.execution.telemetry.push(entry);
-    if (globalState.execution.telemetry.length > MAX_TELEMETRY) {
-      globalState.execution.telemetry = globalState.execution.telemetry.slice(-MAX_TELEMETRY);
-    }
-    renderExecutionLog(globalState.execution.telemetry);
-  }
-
-  function connectTelemetry() {
-    if (!window.WebSocket) {
-      return;
-    }
-    if (telemetrySocket && telemetrySocket.readyState !== window.WebSocket.CLOSED && telemetrySocket.readyState !== window.WebSocket.CLOSING) {
-      return;
-    }
-    var protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-    var url = protocol + window.location.host + '/ws/telemetry';
-    try {
-      telemetrySocket = new window.WebSocket(url);
-    } catch (_err) {
-      return;
-    }
-    telemetrySocket.onmessage = function (event) {
-      try {
-        var payload = JSON.parse(event.data);
-        appendTelemetry(payload);
-      } catch (err) {
-        if (window.console && window.console.error) {
-          window.console.error('Telemetry parse failed', err);
-        }
-      }
-    };
-    telemetrySocket.onclose = function () {
-      window.setTimeout(connectTelemetry, 5000);
-    };
-    telemetrySocket.onerror = function () {
-      try {
-        telemetrySocket.close();
-      } catch (_err) {
-      }
-    };
-  }
-
   function init() {
     globalState = normalizeState(globalState);
     syncSettingsForm(globalState.settings);
@@ -1002,7 +1134,6 @@
       });
     }
 
-    connectTelemetry();
     pollSnapshot(true);
   }
 

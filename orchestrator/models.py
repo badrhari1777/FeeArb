@@ -22,6 +22,21 @@ class MarketSnapshot:
     ask_size: float | None = None
     funding_interval_hours: float | None = None
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exchange": self.exchange,
+            "symbol": self.symbol,
+            "exchange_symbol": self.exchange_symbol,
+            "funding_rate": self.funding_rate,
+            "next_funding_time": self.next_funding_time.isoformat() if self.next_funding_time else None,
+            "mark_price": self.mark_price,
+            "bid": self.bid,
+            "ask": self.ask,
+            "bid_size": self.bid_size,
+            "ask_size": self.ask_size,
+            "funding_interval_hours": self.funding_interval_hours,
+        }
+
 
 @dataclass(slots=True)
 class ValidationResult:

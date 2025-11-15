@@ -11,6 +11,7 @@ from pipeline import (
     build_snapshot_from_sources,
     collect_sources_async,
 )
+from orchestrator.models import MarketSnapshot
 from project_settings import SettingsManager
 from execution import (
     ExecutionSettingsManager,
@@ -21,8 +22,8 @@ from execution import (
 from execution.allocator import Allocator
 from execution.lifecycle import LifecycleController
 from execution.settings import ExecutionSettings
+from execution.accounts import AccountMonitor, normalize_symbol
 from utils import purge_expired
-from .realtime import ConnectionManager
 
 RefreshResult = Literal["completed", "in_progress", "failed"]
 
@@ -34,6 +35,7 @@ class DataService:
         self._settings_manager = settings_manager or SettingsManager()
         self._parser_interval = self._settings_manager.current.parser_refresh_seconds
         self._exchange_interval = self._settings_manager.current.exchange_refresh_seconds
+        self._account_interval = self._settings_manager.current.account_refresh_seconds
         self._snapshot: Optional[DataSnapshot] = None
         self._cached_sources: Optional[SourceSnapshot] = None
         self._lock = asyncio.Lock()
@@ -55,8 +57,8 @@ class DataService:
         self._lifecycle = LifecycleController(self._execution_settings, self._positions, self._allocator)
         self._telemetry = TelemetryClient(self._execution_settings)
         self._telemetry_events: List[dict[str, Any]] = []
-        self._realtime: ConnectionManager | None = None
         self._telemetry.register_listener(self._handle_telemetry_event)
+        self._accounts = AccountMonitor(refresh_interval=self._account_interval)
 
 
     async def startup(self) -> None:
@@ -66,6 +68,10 @@ class DataService:
             self._status = "pending"
             self._parser_interval = self._settings_manager.current.parser_refresh_seconds
             self._exchange_interval = self._settings_manager.current.exchange_refresh_seconds
+            self._account_interval = self._settings_manager.current.account_refresh_seconds
+        await self._accounts.start()
+        # Do an immediate balance/positions pull before other work.
+        await self._accounts.refresh_now(force_env=True)
         if self._task is None:
             await self._restart_scheduler()
         if self._bootstrap_task is None or self._bootstrap_task.done():
@@ -88,9 +94,7 @@ class DataService:
                 pass
             self._bootstrap_task = None
         await self._telemetry.stop()
-
-    def attach_realtime(self, manager: ConnectionManager) -> None:
-        self._realtime = manager
+        await self._accounts.stop()
 
     async def _scheduler(self) -> None:
         try:
@@ -99,6 +103,7 @@ class DataService:
                 await asyncio.sleep(interval)
                 result = await self.refresh_snapshot(
                     force_sources=self._sources_due(),
+                    force_accounts=False,
                 )
                 if result == "failed":
                     logger.warning(
@@ -125,7 +130,7 @@ class DataService:
         age = datetime.now(timezone.utc) - self._last_source_refresh
         return age.total_seconds() >= max(self._parser_interval, 1)
 
-    async def refresh_snapshot(self, *, force_sources: bool = True) -> RefreshResult:
+    async def refresh_snapshot(self, *, force_sources: bool = True, force_accounts: bool = False) -> RefreshResult:
         async with self._lock:
             if self._in_progress:
                 return "in_progress"
@@ -226,6 +231,12 @@ class DataService:
             async with self._lock:
                 self._in_progress = False
 
+        if force_accounts:
+            try:
+                await self._accounts.refresh_now(force_env=True)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Account refresh failed: %s", exc)
+
         return outcome
 
     async def on_settings_updated(self) -> None:
@@ -233,7 +244,11 @@ class DataService:
             current = self._settings_manager.current
             self._parser_interval = current.parser_refresh_seconds
             self._exchange_interval = current.exchange_refresh_seconds
+            self._account_interval = current.account_refresh_seconds
         await self._restart_scheduler()
+        self._accounts.update_interval(self._account_interval)
+        # Kick an async refresh so UI sees new cadence sooner.
+        asyncio.create_task(self._accounts.refresh_now(force_env=True))
 
     def latest_snapshot(self) -> Optional[DataSnapshot]:
         return self._snapshot
@@ -258,11 +273,15 @@ class DataService:
         exchange_interval = int(
             settings_payload.get("exchange_refresh_seconds", self._exchange_interval)
         )
+        account_interval = int(
+            settings_payload.get("account_refresh_seconds", self._account_interval)
+        )
         return {
             "status": status,
             "refresh_interval": table_interval,
             "parser_refresh_interval": parser_interval,
             "exchange_refresh_interval": exchange_interval,
+            "account_refresh_interval": account_interval,
             "last_error": self._last_error,
             "last_updated": (
                 self._last_refreshed.isoformat() if self._last_refreshed else None
@@ -273,6 +292,7 @@ class DataService:
             "exchange_status": list(self._exchange_status.values()),
             "settings": settings_payload,
             "execution": self._execution_state(),
+            "accounts": self._account_state(),
         }
 
     def telemetry_backlog(self, limit: int = 50) -> List[dict[str, Any]]:
@@ -316,6 +336,96 @@ class DataService:
             ],
             "telemetry": list(self._telemetry_events),
         }
+
+    def _account_state(self) -> dict[str, object]:
+        payload = self._accounts.snapshot()
+        positions = payload.get("positions") or []
+        payload["positions_by_symbol"] = self._positions_by_symbol(positions)
+        return payload
+
+    def _positions_by_symbol(self, positions: List[dict[str, Any]]) -> List[dict[str, Any]]:
+        if not positions:
+            return []
+        market_lookup = self._market_snapshot_lookup()
+        grouped: dict[str, dict[str, Any]] = {}
+        for entry in positions:
+            symbol_norm = entry.get("symbol_normalized") or normalize_symbol(entry.get("symbol"))
+            if not symbol_norm:
+                continue
+            container = grouped.setdefault(
+                symbol_norm,
+                {"symbol": symbol_norm, "net_contracts": 0.0, "net_notional": 0.0, "legs": []},
+            )
+            side = (entry.get("side") or "").lower()
+            contracts = float(entry.get("contracts") or 0.0)
+            if side == "short":
+                signed_contracts = -contracts
+            else:
+                signed_contracts = contracts
+            container["net_contracts"] += signed_contracts
+            notional = float(entry.get("notional") or 0.0)
+            container["net_notional"] += notional if signed_contracts >= 0 else -notional
+            key = (str(entry.get("exchange")).lower(), symbol_norm)
+            snapshot = market_lookup.get(key)
+            container["legs"].append(
+                {
+                    "exchange": entry.get("exchange"),
+                    "side": side or None,
+                    "contracts": contracts or None,
+                    "notional": notional if notional else None,
+                    "entry_price": entry.get("entry_price"),
+                    "mark_price": entry.get("mark_price"),
+                    "unrealized_pnl": entry.get("unrealized_pnl"),
+                    "leverage": entry.get("leverage"),
+                    "liquidation_price": entry.get("liquidation_price"),
+                    "timestamp": entry.get("timestamp"),
+                    "funding_rate": snapshot.funding_rate if snapshot else None,
+                    "next_funding": (
+                        snapshot.next_funding_time.isoformat()
+                        if snapshot and snapshot.next_funding_time
+                        else None
+                    ),
+                    "snapshot_mark": snapshot.mark_price if snapshot else None,
+                }
+            )
+        for value in grouped.values():
+            value["legs"].sort(key=lambda leg: (leg.get("side") or "", leg.get("exchange") or ""))
+        return sorted(grouped.values(), key=lambda item: item["symbol"])
+
+    def _market_snapshot_lookup(self) -> dict[tuple[str, str], MarketSnapshot]:
+        if not self._snapshot or not self._snapshot.market_snapshots:
+            return {}
+        lookup: dict[tuple[str, str], MarketSnapshot] = {}
+        for exchange, mapping in self._snapshot.market_snapshots.items():
+            for snapshot in mapping.values():
+                if isinstance(snapshot, MarketSnapshot):
+                    key = (exchange.lower(), normalize_symbol(snapshot.symbol))
+                    lookup[key] = snapshot
+                elif isinstance(snapshot, dict):
+                    symbol = snapshot.get("symbol")
+                    funding = snapshot.get("funding_rate")
+                    next_funding = snapshot.get("next_funding_time")
+                    mark_price = snapshot.get("mark_price")
+                    key = (exchange.lower(), normalize_symbol(symbol))
+                    lookup[key] = MarketSnapshot(
+                        exchange=exchange,
+                        symbol=symbol or "",
+                        exchange_symbol=snapshot.get("exchange_symbol") or "",
+                        funding_rate=funding,
+                        next_funding_time=(
+                            datetime.fromisoformat(next_funding)
+                            if isinstance(next_funding, str)
+                            else None
+                        ),
+                        mark_price=mark_price,
+                        bid=snapshot.get("bid"),
+                        ask=snapshot.get("ask"),
+                        raw={},
+                        bid_size=snapshot.get("bid_size"),
+                        ask_size=snapshot.get("ask_size"),
+                        funding_interval_hours=snapshot.get("funding_interval_hours"),
+                    )
+        return lookup
 
 
     def _make_progress_callback(
@@ -370,8 +480,6 @@ class DataService:
         self._telemetry_events.append(entry)
         if len(self._telemetry_events) > 200:
             self._telemetry_events = self._telemetry_events[-200:]
-        if self._realtime is not None:
-            await self._realtime.broadcast(entry)
 
 
 def _fmt_ts(ts: float | None) -> str | None:

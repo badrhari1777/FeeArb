@@ -60,6 +60,7 @@ class AppSettings:
     parser_refresh_seconds: int = 300
     exchange_refresh_seconds: int = 60
     table_refresh_seconds: int = 300
+    account_refresh_seconds: int = 120
 
     def with_updates(self, payload: Mapping[str, object]) -> "AppSettings":
         """Return a new settings instance with the provided updates applied."""
@@ -92,6 +93,9 @@ class AppSettings:
         updated.table_refresh_seconds = int(
             payload.get("table_refresh_seconds", self.table_refresh_seconds)
         )
+        updated.account_refresh_seconds = int(
+            payload.get("account_refresh_seconds", self.account_refresh_seconds)
+        )
         return updated.normalised()
 
     def normalised(self) -> "AppSettings":
@@ -112,6 +116,7 @@ class AppSettings:
             self.parser_refresh_seconds < MIN_REFRESH_SECONDS
             or self.table_refresh_seconds < MIN_REFRESH_SECONDS
             or self.exchange_refresh_seconds < MIN_REFRESH_SECONDS
+            or self.account_refresh_seconds < MIN_REFRESH_SECONDS
         ):
             raise ValueError(
                 f"Refresh intervals must be >= {MIN_REFRESH_SECONDS} seconds."
@@ -120,6 +125,7 @@ class AppSettings:
             self.parser_refresh_seconds > MAX_REFRESH_SECONDS
             or self.table_refresh_seconds > MAX_REFRESH_SECONDS
             or self.exchange_refresh_seconds > MAX_REFRESH_SECONDS
+            or self.account_refresh_seconds > MAX_REFRESH_SECONDS
         ):
             raise ValueError(
                 f"Refresh intervals must be <= {MAX_REFRESH_SECONDS} seconds."
@@ -132,6 +138,7 @@ class AppSettings:
             "parser_refresh_seconds": self.parser_refresh_seconds,
             "exchange_refresh_seconds": self.exchange_refresh_seconds,
             "table_refresh_seconds": self.table_refresh_seconds,
+            "account_refresh_seconds": self.account_refresh_seconds,
         }
 
     @classmethod
