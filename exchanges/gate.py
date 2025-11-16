@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 from orchestrator.models import MarketSnapshot
 
 from .base import ExchangeAdapter
+from utils.cache_db import SymbolMeta, get_or_fetch_symbol_meta, get_or_fetch_funding_history
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 class GateAdapter(ExchangeAdapter):
     name = "gate"
     base_url = "https://api.gateio.ws/api/v4"
+    _META_TTL_SECONDS = 86_400  # 24h
 
     def map_symbol(self, symbol: str) -> str | None:
         symbol = symbol.upper().strip()
@@ -48,6 +50,7 @@ class GateAdapter(ExchangeAdapter):
             ticker_item = ticker_payload[0]
 
             contract_payload = _get_json(contract_url)
+            self._cache_symbol_meta(contract, contract_payload)
 
             snapshots.append(
                 MarketSnapshot(
@@ -67,6 +70,67 @@ class GateAdapter(ExchangeAdapter):
             )
 
         return snapshots
+
+    def _cache_symbol_meta(self, contract: str, payload: dict | None) -> None:
+        def _fetch() -> SymbolMeta | None:
+            if not isinstance(payload, dict):
+                return None
+            return SymbolMeta(
+                exchange=self.name,
+                symbol=contract,
+                contract_size=_to_float(payload.get("quanto_multiplier")),
+                price_step=_to_float(payload.get("order_price_round")),
+                qty_step=_to_float(payload.get("order_size_min")),
+                min_qty=_to_float(payload.get("order_size_min")),
+                max_qty=_to_float(payload.get("order_size_max")),
+                min_notional=_to_float(payload.get("order_price_deviate")),
+                max_leverage=_to_float(payload.get("leverage_max")),
+                tick_size=_to_float(payload.get("order_price_round")),
+            )
+
+        get_or_fetch_symbol_meta(
+            self.name,
+            contract,
+            _fetch,
+            max_age_seconds=self._META_TTL_SECONDS,
+        )
+
+    def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
+        """Return cached funding history (expected 8h interval) with 1h refresh."""
+        contract = self.map_symbol(symbol) or symbol
+
+        def _fetch() -> list[dict]:
+            url = (
+                f"{self.base_url}/futures/usdt/funding_rate?"
+                + urlencode({"contract": contract, "limit": limit})
+            )
+            try:
+                payload = _get_json(url)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Gate funding history fetch failed for %s: %s", contract, exc)
+                return []
+            if not isinstance(payload, list):
+                return []
+            out: list[dict] = []
+            for item in payload:
+                ts = _to_float(item.get("t"))
+                out.append(
+                    {
+                        "ts_ms": int(ts * 1000) if ts else 0,
+                        "rate": _to_float(item.get("r")),
+                        "interval_hours": 8.0,
+                        "mark_price": _to_float(item.get("p")),
+                    }
+                )
+            return out
+
+        return get_or_fetch_funding_history(
+            self.name,
+            contract,
+            _fetch,
+            max_age_seconds=3600,
+            limit=limit,
+        )
 
 
 def _get_json(url: str) -> dict | list:

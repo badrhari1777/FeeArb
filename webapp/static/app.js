@@ -88,7 +88,6 @@
     eventEmpty: document.getElementById('event-empty'),
     walletTable: document.getElementById('wallet-table-body'),
     reservationTable: document.getElementById('reservation-table-body'),
-    positionTable: document.getElementById('positions-table-body'),
     executionLog: document.getElementById('execution-activity'),
     accountLastUpdated: document.getElementById('account-last-updated'),
     accountStatusTable: document.getElementById('account-status-body'),
@@ -606,29 +605,6 @@
     elements.reservationTable.innerHTML = html;
   }
 
-  function renderPositions(positions) {
-    if (!elements.positionTable) {
-      return;
-    }
-    var html = '';
-    var i;
-    for (i = 0; i < positions.length; i += 1) {
-      var row = positions[i] || {};
-      html += '<tr>' +
-        '<td>' + escapeHtml(row.symbol) + '</td>' +
-        '<td>' + escapeHtml(row.strategy || '-') + '</td>' +
-        '<td>' + escapeHtml(row.status || '-') + '</td>' +
-        '<td>' + formatNumber(row.notional, 2) + '</td>' +
-        '<td>' + formatDate(row.hedged_at) + '</td>' +
-        '<td>' + escapeHtml(row.position_id || '-') + '</td>' +
-      '</tr>';
-    }
-    if (!html) {
-      html = '<tr><td colspan="6" class="muted">No open positions.</td></tr>';
-    }
-    elements.positionTable.innerHTML = html;
-  }
-
   function renderExecutionLog(entries) {
     if (!elements.executionLog) {
       return;
@@ -658,7 +634,6 @@
     var data = execution || defaultExecution;
     renderWallets(data.wallets || []);
     renderReservations(data.reservations || []);
-    renderPositions(data.positions || []);
     renderExecutionLog(data.telemetry || []);
   }
 
@@ -710,54 +685,91 @@
     elements.accountBalanceTable.innerHTML = html;
   }
 
-  function formatLegRow(leg) {
-    if (!leg) {
+  function formatNextFunding(ts) {
+    if (!ts) {
       return '-';
     }
-    var funding = leg.funding_rate !== undefined && leg.funding_rate !== null
-      ? formatPercent(leg.funding_rate, 4)
-      : '-';
-    var mark = typeof leg.mark_price === 'number' ? formatNumber(leg.mark_price, 4)
-      : (typeof leg.snapshot_mark === 'number' ? formatNumber(leg.snapshot_mark, 4) : '-');
-    return (leg.exchange || '-') + ' · ' +
-      (leg.side || '-') + ' · ' +
-      formatNumber(leg.contracts, 4) + ' ctr · ' +
-      formatNumber(leg.notional, 2) + ' USDT · entry ' +
-      formatNumber(leg.entry_price, 4) + ' · mark ' + mark +
-      ' · PnL ' + formatNumber(leg.unrealized_pnl, 4) +
-      ' · funding ' + funding;
+    var dt = new Date(ts);
+    if (isNaN(dt.getTime())) {
+      return '-';
+    }
+    var diffMs = dt.getTime() - Date.now();
+    if (diffMs <= 0) {
+      return 'due';
+    }
+    var minutes = Math.floor(diffMs / 60000);
+    var hours = Math.floor(minutes / 60);
+    var remMinutes = minutes % 60;
+    return hours + 'h ' + remMinutes + 'm';
   }
 
-  function renderSymbolPositions(groups) {
+  function renderSymbolPositions(rows) {
     if (!elements.symbolPositionsTable) {
       return;
     }
-    var rows = groups || [];
+    rows = rows || [];
     var html = '';
     var i;
+    var lastSymbol = null;
     for (i = 0; i < rows.length; i += 1) {
       var row = rows[i] || {};
-      var legHtml = '<ul class="event-log">';
-      var legs = Array.isArray(row.legs) ? row.legs : [];
-      var j;
-      for (j = 0; j < legs.length; j += 1) {
-        legHtml += '<li class="event-log__item"><span class="event-log__message">' + escapeHtml(formatLegRow(legs[j])) + '</span></li>';
-      }
-      if (!legs.length) {
-        legHtml += '<li class="event-log__item"><span class="event-log__message muted">No legs</span></li>';
-      }
-      legHtml += '</ul>';
-      html += '<tr>' +
-        '<td>' + escapeHtml(row.symbol || '-') + '</td>' +
-        '<td>' + formatNumber(row.net_contracts, 4) + '</td>' +
-        '<td>' + formatNumber(row.net_notional, 2) + '</td>' +
-        '<td>' + legHtml + '</td>' +
+      var isSummary = row.type === 'summary';
+      var showSymbol = row.symbol !== lastSymbol || isSummary;
+      var entryText = isSummary
+        ? (row.entry_price !== null && row.entry_price !== undefined ? formatNumber(row.entry_price, 2) + '%' : '-')
+        : formatNumber(row.entry_price, 4);
+      var markText = isSummary
+        ? (row.mark_price !== null && row.mark_price !== undefined ? formatNumber(row.mark_price, 2) + '%' : '-')
+        : formatNumber(row.mark_price, 4);
+      var fundingText = row.funding_rate !== null && row.funding_rate !== undefined
+        ? formatPercent(row.funding_rate, 4)
+        : '-';
+      var classes = isSummary ? 'summary-row' : '';
+      var symbolAttr = row.symbol ? ' data-symbol="' + escapeHtml(row.symbol) + '"' : '';
+      html += '<tr class="' + classes + '"'+ symbolAttr + '>' +
+        '<td>' + (showSymbol ? escapeHtml(row.symbol || '-') : '-') + '</td>' +
+        '<td>' + escapeHtml(isSummary ? (row.exchange || 'TOTAL') : (row.exchange || '-')) + '</td>' +
+        '<td>' + formatNumber(row.quantity, 4) + '</td>' +
+        '<td>' + formatNumber(row.amount, 2) + '</td>' +
+        '<td>' + entryText + '</td>' +
+        '<td>' + markText + '</td>' +
+        '<td>' + formatNumber(row.unrealized_pnl, 2) + '</td>' +
+        '<td>' + fundingText + '</td>' +
+        '<td>' + escapeHtml(formatNextFunding(row.next_funding)) + '</td>' +
       '</tr>';
+      lastSymbol = row.symbol;
     }
     if (!html) {
-      html = '<tr><td colspan="4" class="muted">No live positions.</td></tr>';
+      html = '<tr><td colspan="9" class="muted">No live positions.</td></tr>';
     }
     elements.symbolPositionsTable.innerHTML = html;
+    attachSymbolHover(elements.symbolPositionsTable);
+  }
+
+  function attachSymbolHover(tbody) {
+    if (!tbody) {
+      return;
+    }
+    var rows = tbody.querySelectorAll('tr');
+    function clear() {
+      rows.forEach(function (r) { r.classList.remove('pos-hover'); });
+    }
+    tbody.onmouseover = function (evt) {
+      var tr = evt.target.closest('tr');
+      if (!tr || !tr.dataset || !tr.dataset.symbol) {
+        return;
+      }
+      clear();
+      var sym = tr.dataset.symbol;
+      rows.forEach(function (r) {
+        if (r.dataset && r.dataset.symbol === sym) {
+          r.classList.add('pos-hover');
+        }
+      });
+    };
+    tbody.onmouseout = function () {
+      clear();
+    };
   }
 
   function renderAccounts(accounts) {

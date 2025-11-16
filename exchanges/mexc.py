@@ -17,6 +17,11 @@ import websockets
 from orchestrator.models import MarketSnapshot
 
 from .base import ExchangeAdapter
+from utils.cache_db import (
+    SymbolMeta,
+    get_or_fetch_symbol_meta,
+    get_or_fetch_funding_history,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -49,13 +54,15 @@ def _ensure_env_loaded() -> None:
 
 
 class MexcAdapter(ExchangeAdapter):
-    """Public websocket + REST adapter for the MEXC futures API."""
+    """REST adapter for the MEXC futures API."""
 
     name = "mexc"
     ticker_url = "https://contract.mexc.com/api/v1/contract/ticker"
     funding_url_tpl = "https://contract.mexc.com/api/v1/contract/funding_rate/{symbol}"
     ws_url = "wss://contract.mexc.com/ws"
+    detail_url = "https://contract.mexc.com/api/v1/contract/detail"
     _login_timeout_seconds = 5.0
+    _META_TTL_SECONDS = 86_400  # 24h
 
     def __init__(self, api_key: str | None = None, api_secret: str | None = None) -> None:
         _ensure_env_loaded()
@@ -134,94 +141,8 @@ class MexcAdapter(ExchangeAdapter):
         return snapshots
 
     async def fetch_market_snapshots_async(self, symbols: Iterable[str]) -> List[MarketSnapshot]:
-        mapped = {sym.upper(): self.map_symbol(sym) for sym in symbols}
-        targets = {canon: exch for canon, exch in mapped.items() if exch}
-        if not targets:
-            return []
-
-        pending = set(targets.values())
-        ticker_data: dict[str, dict] = {}
-        funding_data: dict[str, dict] = {}
-        deadline = asyncio.get_event_loop().time() + 8.0
-
-        snapshots: list[MarketSnapshot] = []
-        try:
-            async with websockets.connect(
-                self.ws_url,
-                ping_interval=20,
-                ping_timeout=20,
-                max_size=1_000_000,
-                extra_headers=self._ws_headers,
-            ) as ws:
-                auth_ok = await self._authenticate_ws(ws)
-                if not auth_ok and self.has_api_credentials:
-                    logger.warning("MEXC websocket authentication failed; continuing with public channels")
-                # Subscribe to ticker and funding channels for each symbol.
-                for idx, symbol in enumerate(list(pending), start=1):
-                    await ws.send(
-                        json.dumps({"method": "sub.ticker", "params": [symbol], "id": idx})
-                    )
-                    await ws.send(
-                        json.dumps({"method": "sub.fundingRate", "params": [symbol], "id": idx + 10_000})
-                    )
-
-                while pending and asyncio.get_event_loop().time() < deadline:
-                    timeout = max(0.2, deadline - asyncio.get_event_loop().time())
-                    try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                    except asyncio.TimeoutError:
-                        break
-
-                    data = json.loads(message)
-                    method = data.get("method")
-                    params = data.get("params") or []
-                    if not method or not isinstance(params, list) or not params:
-                        continue
-
-                    payload = params[0] if isinstance(params[0], dict) else None
-                    if not isinstance(payload, dict):
-                        continue
-
-                    symbol = payload.get("symbol")
-                    if not symbol:
-                        continue
-
-                    if method == "push.ticker":
-                        ticker_data[symbol] = payload
-                    elif method == "push.fundingRate":
-                        funding_data[symbol] = payload
-
-                    if (
-                        symbol in pending
-                        and symbol in ticker_data
-                        and symbol in funding_data
-                    ):
-                        pending.remove(symbol)
-
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("MEXC websocket fetch failed: %r", exc)
-            ticker_data.clear()
-            funding_data.clear()
-
-        for canonical, exchange_symbol in targets.items():
-            ticker = ticker_data.get(exchange_symbol)
-            funding = funding_data.get(exchange_symbol, {})
-            if not ticker:
-                logger.debug("MEXC websocket missing ticker for %s", exchange_symbol)
-                continue
-            snapshots.append(
-                self._snapshot_from_payload(
-                    canonical,
-                    exchange_symbol,
-                    ticker=ticker,
-                    funding=funding,
-                )
-            )
-
-        if not snapshots or all(s.mark_price is None for s in snapshots):
-            logger.debug("MEXC websocket falling back to REST for %s symbols", len(targets))
-            return await self._fetch_via_rest_async(symbols)
-        return snapshots
+        # Use REST-only path to avoid websocket dependencies/timeouts.
+        return await self._fetch_via_rest_async(symbols)
 
     async def test_private_connection(self) -> bool:
         """Perform a standalone websocket authentication probe."""
@@ -303,6 +224,7 @@ class MexcAdapter(ExchangeAdapter):
                 for item in ticker_payload.get("data", [])
                 if isinstance(item, dict)
             }
+            detail_map = await self._fetch_detail_map(session)
 
             async def _fetch_funding(symbol: str) -> dict:
                 url = self.funding_url_tpl.format(symbol=symbol)
@@ -335,6 +257,7 @@ class MexcAdapter(ExchangeAdapter):
         for canonical, exchange_symbol in targets.items():
             ticker = ticker_map.get(exchange_symbol, {})
             funding = funding_map.get(exchange_symbol, {})
+            self._cache_symbol_meta(exchange_symbol, detail_map.get(exchange_symbol))
             snapshots.append(
                 self._snapshot_from_payload(
                     canonical,
@@ -344,6 +267,74 @@ class MexcAdapter(ExchangeAdapter):
                 )
             )
         return snapshots
+
+    async def _fetch_detail_map(self, session: aiohttp.ClientSession) -> dict:
+        try:
+            async with session.get(self.detail_url) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("MEXC contract detail fetch failed: %r", exc)
+            return {}
+        data = payload.get("data") or []
+        return {item.get("symbol"): item for item in data if isinstance(item, dict)}
+
+    def _cache_symbol_meta(self, exchange_symbol: str, detail: dict | None) -> None:
+        def _fetch() -> SymbolMeta | None:
+            if not isinstance(detail, dict):
+                return None
+            return SymbolMeta(
+                exchange=self.name,
+                symbol=exchange_symbol,
+                contract_size=_to_float(detail.get("contractSize")),
+                price_step=_to_float(detail.get("priceScale")),
+                qty_step=_to_float(detail.get("volScale")),
+                min_qty=_to_float(detail.get("minVol")),
+                max_qty=_to_float(detail.get("maxVol")),
+                min_notional=_to_float(detail.get("minValue")),
+                max_leverage=_to_float(detail.get("maxLever")),
+                tick_size=_to_float(detail.get("priceScale")),
+            )
+
+        get_or_fetch_symbol_meta(
+            self.name,
+            exchange_symbol,
+            _fetch,
+            max_age_seconds=self._META_TTL_SECONDS,
+        )
+
+    def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
+        """Return cached funding history with 1h refresh (best-effort)."""
+        exch_symbol = self.map_symbol(symbol) or symbol
+
+        def _fetch() -> list[dict]:
+            url = f"https://contract.mexc.com/api/v1/contract/funding_rate/history/" + exch_symbol
+            try:
+                payload = _get_json(url)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("MEXC funding history fetch failed for %s: %s", exch_symbol, exc)
+                return []
+            data = payload.get("data") or []
+            out: list[dict] = []
+            for item in data[:limit]:
+                ts = _to_float(item.get("timestamp") or item.get("time"))
+                out.append(
+                    {
+                        "ts_ms": int(ts * 1000) if ts and ts < 10_000_000_000 else int(ts or 0),
+                        "rate": _to_float(item.get("fundingRate") or item.get("fundingRate")),
+                        "interval_hours": _to_float(item.get("collectCycle")) or 8.0,
+                        "mark_price": _to_float(item.get("fairPrice")),
+                    }
+                )
+            return out
+
+        return get_or_fetch_funding_history(
+            self.name,
+            exch_symbol,
+            _fetch,
+            max_age_seconds=3600,
+            limit=limit,
+        )
 
     def _snapshot_from_payload(
         self,

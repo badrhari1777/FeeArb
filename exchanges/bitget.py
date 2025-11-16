@@ -10,6 +10,11 @@ from urllib.request import Request, urlopen
 from orchestrator.models import MarketSnapshot
 
 from .base import ExchangeAdapter
+from utils.cache_db import (
+    SymbolMeta,
+    get_or_fetch_symbol_meta,
+    get_or_fetch_funding_history,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +22,7 @@ logger = logging.getLogger(__name__)
 class BitgetAdapter(ExchangeAdapter):
     name = "bitget"
     base_url = "https://api.bitget.com"
+    _META_TTL_SECONDS = 86_400  # 24h
 
     def map_symbol(self, symbol: str) -> str | None:
         symbol = symbol.upper().strip()
@@ -66,6 +72,7 @@ class BitgetAdapter(ExchangeAdapter):
                 raise
             funding_item = funding_payload.get("data") or {}
 
+            self._cache_symbol_meta(contract)
             snapshots.append(
                 MarketSnapshot(
                     exchange=self.name,
@@ -82,6 +89,77 @@ class BitgetAdapter(ExchangeAdapter):
             )
 
         return snapshots
+
+    def _cache_symbol_meta(self, contract: str) -> None:
+        def _fetch() -> SymbolMeta | None:
+            try:
+                payload = _get_json(
+                    f"{self.base_url}/api/mix/v1/market/contracts?"
+                    + urlencode({"productType": "umcbl"})
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Bitget: market meta fetch failed: %s", exc)
+                return None
+            items = payload.get("data") or []
+            info = next((item for item in items if item.get("symbol") == contract), None)
+            if not info:
+                return None
+            return SymbolMeta(
+                exchange=self.name,
+                symbol=contract,
+                contract_size=_to_float(info.get("size")),
+                price_step=_to_float(info.get("priceScale")),
+                qty_step=_to_float(info.get("volumePlace")) or _to_float(info.get("sizePlace")),
+                min_qty=_to_float(info.get("minTradeNum")),
+                max_qty=_to_float(info.get("maxTradeNum")),
+                min_notional=None,
+                max_leverage=_to_float(info.get("maxLeverage")),
+                tick_size=_to_float(info.get("priceScale")),
+            )
+
+        get_or_fetch_symbol_meta(
+            self.name,
+            contract,
+            _fetch,
+            max_age_seconds=self._META_TTL_SECONDS,
+        )
+
+    def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
+        """Return cached funding history with 1h refresh."""
+        contract = self.map_symbol(symbol) or symbol
+
+        def _fetch() -> list[dict]:
+            url = f"{self.base_url}/api/mix/v1/market/history-fundRate?" + urlencode(
+                {"symbol": contract, "pageSize": limit}
+            )
+            try:
+                payload = _get_json(url)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Bitget funding history fetch failed for %s: %s", contract, exc)
+                return []
+            if payload.get("code") != "00000":
+                return []
+            items = payload.get("data") or []
+            out: list[dict] = []
+            for item in items:
+                ts = _to_float(item.get("timePoint"))
+                out.append(
+                    {
+                        "ts_ms": int(ts) if ts else 0,
+                        "rate": _to_float(item.get("fundRate")),
+                        "interval_hours": 8.0,
+                        "mark_price": None,
+                    }
+                )
+            return out
+
+        return get_or_fetch_funding_history(
+            self.name,
+            contract,
+            _fetch,
+            max_age_seconds=3600,
+            limit=limit,
+        )
 
 
 def _get_json(url: str) -> dict:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -8,23 +7,24 @@ from typing import Iterable, List
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-import websockets
-
 from orchestrator.models import MarketSnapshot
 
 from .base import ExchangeAdapter
 from utils.missing_symbols import is_recently_missing, record_missing
+from utils.cache_db import SymbolMeta, get_or_fetch_symbol_meta, get_or_fetch_funding_history
+from utils.cache_db import SymbolMeta, get_or_fetch_symbol_meta
 
 
 logger = logging.getLogger(__name__)
 
 
 class BybitAdapter(ExchangeAdapter):
-    """Public websocket + REST adapter for Bybit funding and mark price data."""
+    """REST adapter for Bybit funding and mark price data."""
 
     name = "bybit"
     base_url = "https://api.bybit.com"
     ws_url_linear = "wss://stream.bybit.com/v5/public/linear"
+    _META_TTL_SECONDS = 86_400  # 24h
 
     def map_symbol(self, symbol: str) -> str | None:
         symbol = symbol.upper().strip()
@@ -81,112 +81,14 @@ class BybitAdapter(ExchangeAdapter):
                 continue
 
             item = items[0]
+            self._cache_symbol_meta(exchange_symbol, category)
             snapshots.append(self._snapshot_from_ticker(canonical, exchange_symbol, item))
 
         return snapshots
 
     async def fetch_market_snapshots_async(self, symbols: Iterable[str]) -> List[MarketSnapshot]:
-        normalized = {sym.upper(): self.map_symbol(sym) for sym in symbols}
-        targets = {
-            canon: exch
-            for canon, exch in normalized.items()
-            if exch and not is_recently_missing(self.name, exch)
-        }
-        if not targets:
-            return []
-
-        subscription_args = [
-            {
-                "channel": "tickers",
-                "instId": symbol,
-                "instType": "linear" if symbol.endswith("USDT") else "inverse",
-            }
-            for symbol in targets.values()
-        ]
-        pending = {symbol: canonical for canonical, symbol in targets.items()}
-        snapshots: list[MarketSnapshot] = []
-        deadline = asyncio.get_event_loop().time() + 5.0
-
-        try:
-            async with websockets.connect(
-                self.ws_url_linear,
-                ping_interval=20,
-                ping_timeout=20,
-                max_size=1_000_000,
-            ) as ws:
-                if subscription_args:
-                    for idx in range(0, len(subscription_args), 10):
-                        batch = subscription_args[idx : idx + 10]
-                        await ws.send(json.dumps({"op": "subscribe", "args": batch}))
-                legacy_args = [f"tickers.{symbol}" for symbol in pending]
-                if legacy_args:
-                    await ws.send(json.dumps({"op": "subscribe", "args": legacy_args}))
-
-                while pending and asyncio.get_event_loop().time() < deadline:
-                    timeout = max(0.1, deadline - asyncio.get_event_loop().time())
-                    try:
-                        message = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                    except asyncio.TimeoutError:
-                        break
-                    data = json.loads(message)
-
-                    if data.get("op") == "subscribe":
-                        continue
-
-                    topic = data.get("topic") or data.get("channel")
-                    payload = data.get("data")
-                    entries: list[dict] = []
-
-                    if isinstance(payload, dict):
-                        if "tickers" in payload and isinstance(payload["tickers"], list):
-                            entries = [item for item in payload["tickers"] if isinstance(item, dict)]
-                        else:
-                            entries = [payload]
-                    elif isinstance(payload, list):
-                        entries = [item for item in payload if isinstance(item, dict)]
-
-                    if not entries and isinstance(data.get("result"), dict):
-                        result = data["result"]
-                        if isinstance(result.get("list"), list):
-                            entries = [item for item in result["list"] if isinstance(item, dict)]
-
-                    if not entries and isinstance(data.get("tickers"), list):
-                        entries = [item for item in data["tickers"] if isinstance(item, dict)]
-
-                    if not entries:
-                        continue
-
-                    for entry in entries:
-                        symbol_code = entry.get("symbol") or entry.get("instId")
-                        if not symbol_code and isinstance(topic, str) and "." in topic:
-                            symbol_code = topic.split(".", 1)[1]
-                        if not symbol_code:
-                            continue
-                        canonical = pending.pop(symbol_code, None)
-                        if not canonical:
-                            continue
-                        snapshots.append(self._snapshot_from_ticker(canonical, symbol_code, entry))
-                        if not pending:
-                            break
-
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("Bybit websocket fetch failed: %r", exc)
-
-        if pending:
-            missing_canonicals = [
-                canonical
-                for canonical, symbol in targets.items()
-                if symbol in pending
-            ]
-            if missing_canonicals:
-                logger.debug(
-                    "Bybit websocket missing %s symbols; falling back to REST",
-                    ", ".join(missing_canonicals),
-                )
-                rest_snapshots = await super().fetch_market_snapshots_async(missing_canonicals)
-                snapshots.extend(rest_snapshots)
-
-        return snapshots
+        # Use REST-only path to avoid websocket dependencies/timeouts.
+        return await super().fetch_market_snapshots_async(symbols)
 
     @staticmethod
     def _snapshot_from_ticker(
@@ -208,6 +110,86 @@ class BybitAdapter(ExchangeAdapter):
             bid_size=_to_float(item.get("bid1Size")),
             ask_size=_to_float(item.get("ask1Size")),
             raw=item,
+        )
+
+    def _cache_symbol_meta(self, exchange_symbol: str, category: str) -> None:
+        def _fetch() -> SymbolMeta | None:
+            params = urlencode({"category": category, "symbol": exchange_symbol})
+            url = f"{self.base_url}/v5/market/instruments-info?{params}"
+            try:
+                payload = _get_json(url)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Bybit meta fetch failed for %s: %s", exchange_symbol, exc)
+                return None
+            if payload.get("retCode") != 0:
+                return None
+            items = payload.get("result", {}).get("list") or []
+            if not items:
+                return None
+            info = items[0]
+            price_filter = info.get("priceFilter") or {}
+            lot_filter = info.get("lotSizeFilter") or {}
+            leverage_filter = info.get("leverageFilter") or {}
+            return SymbolMeta(
+                exchange=self.name,
+                symbol=exchange_symbol,
+                contract_size=_to_float(info.get("contractSize")),
+                price_step=_to_float(price_filter.get("tickSize")),
+                qty_step=_to_float(lot_filter.get("qtyStep")),
+                min_qty=_to_float(lot_filter.get("minOrderQty")),
+                max_qty=_to_float(lot_filter.get("maxOrderQty")),
+                min_notional=_to_float(lot_filter.get("minOrderValue")),
+                max_leverage=_to_float(leverage_filter.get("maxLeverage")),
+                tick_size=_to_float(price_filter.get("tickSize")),
+            )
+
+        get_or_fetch_symbol_meta(
+            self.name,
+            exchange_symbol,
+            _fetch,
+            max_age_seconds=self._META_TTL_SECONDS,
+        )
+
+    def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
+        """Return cached funding history (8h interval) with 1h refresh TTL."""
+        exchange_symbol = self.map_symbol(symbol) or symbol
+
+        def _fetch() -> list[dict]:
+            params = urlencode(
+                {
+                    "category": "linear",
+                    "symbol": exchange_symbol,
+                    "limit": limit,
+                }
+            )
+            url = f"{self.base_url}/v5/market/funding/history?{params}"
+            try:
+                payload = _get_json(url)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Bybit funding history fetch failed for %s: %s", exchange_symbol, exc)
+                return []
+            if payload.get("retCode") != 0:
+                return []
+            items = payload.get("result", {}).get("list") or []
+            out: list[dict] = []
+            for item in items:
+                ts = _to_float(item.get("fundingRateTimestamp"))
+                out.append(
+                    {
+                        "ts_ms": int(ts) if ts is not None else 0,
+                        "rate": _to_float(item.get("fundingRate")),
+                        "interval_hours": 8.0,
+                        "mark_price": _to_float(item.get("markPrice")),
+                    }
+                )
+            return out
+
+        return get_or_fetch_funding_history(
+            self.name,
+            exchange_symbol,
+            _fetch,
+            max_age_seconds=3600,
+            limit=limit,
         )
 
 

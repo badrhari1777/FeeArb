@@ -121,9 +121,15 @@ EXCHANGE_SPECS: Tuple[ExchangeSpec, ...] = (
         key_var="MEXC_API_KEY",
         secret_var="MEXC_API_SECRET",
         settle_currency="USDT",
-        options={"defaultType": "swap"},
-        balance_params={"type": "swap"},
-        position_params={"type": "swap"},
+        options={
+            "defaultType": "swap",
+            # Protect against minor clock drift; MEXC requires reqTime within recvWindow.
+            "recvWindow": 60_000,
+            "adjustForTimeDifference": True,
+            "useServerTime": True,
+        },
+        balance_params={"type": "swap", "recvWindow": 60_000},
+        position_params={"type": "swap", "recvWindow": 60_000},
     ),
 )
 
@@ -177,6 +183,12 @@ class ExchangeGateway:
             config["password"] = self.password
         try:
             client = exchange_cls(config)
+            if self.slug == "mexc":
+                # Align timestamps with server to avoid recvWindow errors.
+                try:
+                    client.load_time_difference()
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.debug("MEXC time sync failed; continuing without adjustment: %s", exc)
         except Exception as exc:  # pylint: disable=broad-except
             self._unavailable_reason = str(exc)
             logger.warning("%s: failed to instantiate ccxt client: %s", self.slug, exc)
@@ -230,6 +242,8 @@ class ExchangeGateway:
             raise RuntimeError(self._unavailable_reason or "exchange client unavailable")
         params = dict(self.spec.balance_params)
         balance = self.client.fetch_balance(params=params)
+        if self.slug == "gate":
+            self._patch_gate_balance(balance)
         asset = self.spec.settle_currency.upper()
         asset_row = balance.get(asset) or balance.get(asset.lower()) or {}
         totals = balance.get("total") or {}
@@ -265,16 +279,19 @@ class ExchangeGateway:
         for payload in positions or []:
             contracts = _safe_float(
                 payload.get("contracts")
-                or payload.get("contractSize")
                 or payload.get("positionAmt")
                 or payload.get("size")
+                or payload.get("amount")
             )
-            if not contracts:
+            # Some venues (e.g., Gate) return contractSize even when size=0; ignore those ghosts.
+            if not contracts or abs(contracts) < 1e-8:
                 continue
             symbol = payload.get("symbol") or payload.get("id")
             normalized = normalize_symbol(symbol)
             side = (payload.get("side") or "").lower()
             notional = _safe_float(payload.get("notional"))
+            contract_size = _safe_float(payload.get("contractSize"), default=1.0)
+            coin_qty = contracts * (contract_size or 1.0)
             if notional is None and payload.get("entryPrice") and contracts:
                 notional = contracts * _safe_float(payload.get("entryPrice"), default=0.0)
             result.append(
@@ -283,6 +300,8 @@ class ExchangeGateway:
                     "symbol": symbol,
                     "symbol_normalized": normalized,
                     "contracts": contracts,
+                    "contract_size": contract_size,
+                    "coin_qty": coin_qty,
                     "notional": notional,
                     "side": side or None,
                     "entry_price": _safe_float(payload.get("entryPrice")),
@@ -296,6 +315,30 @@ class ExchangeGateway:
                 }
             )
         return result
+
+    def _patch_gate_balance(self, balance: dict[str, Any]) -> None:
+        """Gate.io futures returns a near-zero total; rebuild from raw fields."""
+        info_list = balance.get("info")
+        if not isinstance(info_list, list) or not info_list:
+            return
+        entry = info_list[0]
+        try:
+            available = float(entry.get("available", 0))  # free funds
+            cross_initial = float(entry.get("cross_initial_margin", 0)) or float(
+                entry.get("position_initial_margin", 0)
+            )
+            cross_order = float(entry.get("cross_order_margin", 0))
+        except (TypeError, ValueError):
+            return
+        total = available + cross_initial + cross_order
+        used = cross_initial + cross_order
+        asset = self.spec.settle_currency.upper()
+        patched = {"free": available, "used": used, "total": total}
+        # Overwrite normalized slots
+        balance[asset] = patched
+        balance.setdefault("free", {})[asset] = available
+        balance.setdefault("used", {})[asset] = used
+        balance.setdefault("total", {})[asset] = total
 
 
 class AccountMonitor:

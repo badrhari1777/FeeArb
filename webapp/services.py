@@ -24,6 +24,8 @@ from execution.lifecycle import LifecycleController
 from execution.settings import ExecutionSettings
 from execution.accounts import AccountMonitor, normalize_symbol
 from utils import purge_expired
+from utils.cache_db import get_or_fetch_funding_history
+from exchanges import get_adapter, normalize_exchange_name
 
 RefreshResult = Literal["completed", "in_progress", "failed"]
 
@@ -352,45 +354,193 @@ class DataService:
             symbol_norm = entry.get("symbol_normalized") or normalize_symbol(entry.get("symbol"))
             if not symbol_norm:
                 continue
-            container = grouped.setdefault(
-                symbol_norm,
-                {"symbol": symbol_norm, "net_contracts": 0.0, "net_notional": 0.0, "legs": []},
-            )
+            container = grouped.setdefault(symbol_norm, {"symbol": symbol_norm, "legs": []})
             side = (entry.get("side") or "").lower()
             contracts = float(entry.get("contracts") or 0.0)
-            if side == "short":
-                signed_contracts = -contracts
-            else:
-                signed_contracts = contracts
-            container["net_contracts"] += signed_contracts
+            contract_size = float(entry.get("contract_size") or 1.0)
+            coin_qty = float(entry.get("coin_qty") or contracts * contract_size)
+            funding_rate = None
+            next_funding_iso = None
+            signed_coin = -coin_qty if side == "short" else coin_qty
             notional = float(entry.get("notional") or 0.0)
-            container["net_notional"] += notional if signed_contracts >= 0 else -notional
             key = (str(entry.get("exchange")).lower(), symbol_norm)
             snapshot = market_lookup.get(key)
+            if snapshot:
+                funding_rate = snapshot.funding_rate
+                next_funding_iso = (
+                    snapshot.next_funding_time.isoformat()
+                    if snapshot.next_funding_time
+                    else None
+                )
+            if funding_rate is None or next_funding_iso is None:
+                cached_rate, cached_next = self._funding_from_cache(
+                    entry.get("exchange"),
+                    entry.get("symbol"),
+                    symbol_norm,
+                )
+                if funding_rate is None:
+                    funding_rate = cached_rate
+                if next_funding_iso is None:
+                    next_funding_iso = cached_next
             container["legs"].append(
                 {
                     "exchange": entry.get("exchange"),
                     "side": side or None,
-                    "contracts": contracts or None,
-                    "notional": notional if notional else None,
+                    "quantity": signed_coin,
+                    "amount": abs(notional) if notional else None,
                     "entry_price": entry.get("entry_price"),
                     "mark_price": entry.get("mark_price"),
                     "unrealized_pnl": entry.get("unrealized_pnl"),
-                    "leverage": entry.get("leverage"),
-                    "liquidation_price": entry.get("liquidation_price"),
-                    "timestamp": entry.get("timestamp"),
-                    "funding_rate": snapshot.funding_rate if snapshot else None,
-                    "next_funding": (
-                        snapshot.next_funding_time.isoformat()
-                        if snapshot and snapshot.next_funding_time
-                        else None
-                    ),
-                    "snapshot_mark": snapshot.mark_price if snapshot else None,
+                    "funding_rate": funding_rate,
+                    "next_funding": next_funding_iso,
                 }
             )
-        for value in grouped.values():
-            value["legs"].sort(key=lambda leg: (leg.get("side") or "", leg.get("exchange") or ""))
-        return sorted(grouped.values(), key=lambda item: item["symbol"])
+
+        rows: list[dict[str, Any]] = []
+        for symbol, data in sorted(grouped.items(), key=lambda item: item[0]):
+            legs = sorted(data["legs"], key=lambda leg: (leg.get("exchange") or ""))
+            rows.extend(
+                [
+                    {
+                        "type": "leg",
+                        "symbol": symbol,
+                        **leg,
+                    }
+                    for leg in legs
+                ]
+            )
+            summary = self._summarize_symbol(symbol, legs)
+            if summary:
+                rows.append(summary)
+        return rows
+
+    def _funding_from_cache(
+        self,
+        exchange: str | None,
+        position_symbol: str | None,
+        normalized_symbol: str,
+    ) -> tuple[float | None, str | None]:
+        if not exchange:
+            return None, None
+        try:
+            adapter = get_adapter(normalize_exchange_name(exchange))
+        except KeyError:
+            return None, None
+
+        exchange_symbol = None
+        candidates = [
+            position_symbol or "",
+            normalized_symbol,
+        ]
+        for cand in candidates:
+            mapped = None
+            try:
+                mapped = adapter.map_symbol(str(cand))
+            except Exception:  # pylint: disable=broad-except
+                mapped = None
+            if mapped:
+                exchange_symbol = mapped
+                break
+        if not exchange_symbol:
+            exchange_symbol = position_symbol or normalized_symbol
+
+        def _fetch() -> list[dict]:
+            if hasattr(adapter, "funding_history"):
+                try:
+                    return adapter.funding_history(exchange_symbol, limit=50)  # type: ignore[attr-defined]
+                except Exception:  # pylint: disable=broad-except
+                    return []
+            return []
+
+        history = get_or_fetch_funding_history(
+            normalize_exchange_name(exchange),
+            exchange_symbol,
+            _fetch,
+            # Always fetch fresh rate alongside positions/balances; cache mainly used for next funding fallback.
+            max_age_seconds=0,
+            limit=5,
+        )
+        if not history:
+            return None, None
+        latest = history[0]
+        rate = latest.get("rate")
+        ts_ms = latest.get("ts_ms")
+        interval_hours = latest.get("interval_hours") or 8.0
+        next_funding_iso = None
+        if ts_ms:
+            try:
+                ts_ms = int(ts_ms)
+                next_ms = ts_ms + int(interval_hours * 3600 * 1000)
+                next_funding_iso = datetime.fromtimestamp(next_ms / 1000, tz=timezone.utc).isoformat()
+            except Exception:  # pylint: disable=broad-except
+                next_funding_iso = None
+        return rate, next_funding_iso
+
+    def _summarize_symbol(self, symbol: str, legs: List[dict[str, Any]]) -> dict[str, Any] | None:
+        if not legs:
+            return None
+        long_legs = [leg for leg in legs if (leg.get("side") or "").lower() == "long"]
+        short_legs = [leg for leg in legs if (leg.get("side") or "").lower() == "short"]
+
+        def _weighted_avg(items: List[dict[str, Any]], key: str, weight_key: str = "amount") -> float | None:
+            total_w = 0.0
+            total_v = 0.0
+            for item in items:
+                val = item.get(key)
+                weight = item.get(weight_key) or 0.0
+                if val is None:
+                    continue
+                total_w += weight
+                total_v += float(val) * float(weight)
+            if total_w <= 0:
+                return None
+            return total_v / total_w
+
+        long_entry = _weighted_avg(long_legs, "entry_price")
+        short_entry = _weighted_avg(short_legs, "entry_price")
+        long_mark = _weighted_avg(long_legs, "mark_price")
+        short_mark = _weighted_avg(short_legs, "mark_price")
+        long_funding = _weighted_avg(long_legs, "funding_rate", weight_key="quantity")
+        short_funding = _weighted_avg(short_legs, "funding_rate", weight_key="quantity")
+
+        def _spread_pct(a: float | None, b: float | None) -> float | None:
+            if a is None or b is None or b == 0:
+                return None
+            return (a - b) / b * 100.0
+
+        entry_spread = _spread_pct(long_entry, short_entry)
+        mark_spread = _spread_pct(long_mark, short_mark)
+        funding_spread = None
+        if long_funding is not None and short_funding is not None:
+            funding_spread = short_funding - long_funding
+
+        net_quantity = sum(leg.get("quantity") or 0.0 for leg in legs)
+        pnl_total = sum(leg.get("unrealized_pnl") or 0.0 for leg in legs)
+
+        soonest_next = None
+        for leg in legs:
+            ts = leg.get("next_funding")
+            if not ts:
+                continue
+            try:
+                candidate = datetime.fromisoformat(ts)
+            except Exception:  # pylint: disable=broad-except
+                continue
+            if soonest_next is None or candidate < soonest_next:
+                soonest_next = candidate
+
+        return {
+            "type": "summary",
+            "symbol": symbol,
+            "exchange": "TOTAL",
+            "quantity": net_quantity,
+            "amount": None,
+            "entry_price": entry_spread,
+            "mark_price": mark_spread,
+            "unrealized_pnl": pnl_total,
+            "funding_rate": funding_spread,
+            "next_funding": soonest_next.isoformat() if soonest_next else None,
+        }
 
     def _market_snapshot_lookup(self) -> dict[tuple[str, str], MarketSnapshot]:
         if not self._snapshot or not self._snapshot.market_snapshots:

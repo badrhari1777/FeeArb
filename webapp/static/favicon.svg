@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="btc" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f9a531"/>
+      <stop offset="100%" stop-color="#f7931a"/>
+    </linearGradient>
+    <linearGradient id="usdt" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#28c29c"/>
+      <stop offset="100%" stop-color="#1c8c6e"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0d0f14"/>
+  <circle cx="24" cy="32" r="18" fill="url(#btc)" />
+  <circle cx="40" cy="28" r="18" fill="url(#usdt)" opacity="0.92" />
+  <text x="24" y="36" text-anchor="middle" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="16" font-weight="700" fill="#0d0f14">₿</text>
+  <text x="40" y="32" text-anchor="middle" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="14" font-weight="700" fill="#0d0f14">USDT</text>
+</svg>

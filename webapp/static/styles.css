@@ -369,3 +369,17 @@ a {
 .settings-status--info {
   color: #30456b;
 }
+
+.summary-row {
+  font-weight: 700;
+  background: rgba(0, 128, 255, 0.06);
+}
+
+.pos-hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.pos-hover.summary-row {
+  background: rgba(0, 128, 255, 0.12);
+}
+

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from pathlib import Path
 from typing import Dict
 
@@ -7,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from project_settings import MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS, SettingsManager
 
@@ -22,6 +25,7 @@ templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 settings_manager = SettingsManager()
 service = DataService(settings_manager=settings_manager)
+logger = logging.getLogger(__name__)
 
 class SettingsPayload(BaseModel):
     sources: Dict[str, bool]
@@ -34,11 +38,23 @@ class SettingsPayload(BaseModel):
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    await service.startup()
+    # Kick off background startup so FastAPI can serve immediately.
+    async def _run_startup() -> None:
+        try:
+            await service.startup()
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Data service startup failed")
+
+    asyncio.create_task(_run_startup())
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
     await service.shutdown()
+
+
+@app.get("/favicon.ico")
+async def favicon() -> FileResponse:
+    return FileResponse(BASE_DIR / "static" / "favicon.svg", media_type="image/svg+xml")
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:

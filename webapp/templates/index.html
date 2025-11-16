@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <title>Funding Arbitrage Monitor</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', path='/favicon.svg') }}?v={{ static_version }}">
   <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}?v={{ static_version }}" />
   {% set raw_snapshot = state.get('snapshot') %}
   {% set snapshot = raw_snapshot or {} %}
@@ -430,34 +431,32 @@
         <thead>
           <tr>
             <th>Symbol</th>
-            <th>Net Contracts</th>
-            <th>Net Notional</th>
-            <th>Leg Details</th>
+            <th>Exchange</th>
+            <th>Quantity</th>
+            <th>Amount (USDT)</th>
+            <th>Entry</th>
+            <th>Mark</th>
+            <th>PnL</th>
+            <th>Funding</th>
+            <th>Next Funding</th>
           </tr>
         </thead>
-        <tbody id="symbol-positions-body">
+                <tbody id="symbol-positions-body">
           {% for row in symbol_position_rows %}
-            <tr>
+            <tr class="{{ 'summary-row' if row.type == 'summary' else '' }}">
               <td>{{ row.symbol }}</td>
-              <td>{{ row.net_contracts }}</td>
-              <td>{{ row.net_notional }}</td>
-              <td>
-                <ul class="event-log">
-                  {% for leg in row.legs %}
-                    <li class="event-log__item">
-                      <span class="event-log__message">
-                        <strong>{{ leg.exchange }}</strong> · {{ leg.side or "-" }} · {{ leg.contracts or "-" }} contracts /
-                        {{ leg.notional or "-" }} USDT · entry {{ leg.entry_price or "-" }} · mark {{ leg.mark_price or leg.snapshot_mark or "-" }} ·
-                        PnL {{ leg.unrealized_pnl or "-" }} · funding {{ leg.funding_rate or "-" }}
-                      </span>
-                    </li>
-                  {% endfor %}
-                </ul>
-              </td>
+              <td>{{ row.exchange or "-" }}</td>
+              <td>{{ row.quantity }}</td>
+              <td>{{ row.amount or "-" }}</td>
+              <td>{{ row.entry_price or "-" }}</td>
+              <td>{{ row.mark_price or "-" }}</td>
+              <td>{{ row.unrealized_pnl or "-" }}</td>
+              <td>{{ row.funding_rate or "-" }}</td>
+              <td>{{ row.next_funding or "-" }}</td>
             </tr>
           {% endfor %}
           {% if symbol_position_rows | length == 0 %}
-            <tr><td colspan="4" class="muted">No live positions detected.</td></tr>
+            <tr><td colspan="9" class="muted">No live positions detected.</td></tr>
           {% endif %}
         </tbody>
       </table>
@@ -479,23 +478,6 @@
       </table>
     </section>
 
-    <section class="panel" id="execution-positions">
-      <h2>Open Positions</h2>
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Strategy</th>
-            <th>Status</th>
-            <th>Notional</th>
-            <th>Hedged At</th>
-            <th>Position</th>
-          </tr>
-        </thead>
-        <tbody id="positions-table-body"></tbody>
-      </table>
-    </section>
-
     <section class="panel" id="execution-activity-panel">
       <h2>Execution Activity</h2>
       <ul class="event-log" id="execution-activity"></ul>
@@ -503,3 +485,5 @@
   </main>
 </body>
 </html>
+
+
