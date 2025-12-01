@@ -5,7 +5,9 @@ from typing import Iterable
 from urllib.request import Request, urlopen
 
 
-URL = "https://screener.arbitragescanner.io/api/funding-table?fid=arbitragescanner"
+URL_PRIMARY = "https://screener.arbitragescanner.io/api/funding-table?fid=arbitragescanner"
+URL_FALLBACK = "https://arbitragescanner.io/ru/funding-rates"
+URL = URL_PRIMARY
 QUOTE_SUFFIXES = ("USDT",)
 
 
@@ -19,21 +21,28 @@ def normalize_symbol(value: object) -> str:
     return symbol
 
 
-def fetch_json(url: str = URL, timeout: int = 20) -> list[dict]:
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/json",
-            "Referer": "https://screener.arbitragescanner.io/",
-        },
-    )
-    with urlopen(req, timeout=timeout) as resp:  # nosec - trusted public API
-        raw = resp.read()
-    data = json.loads(raw.decode("utf-8"))
-    if not isinstance(data, list):
-        raise ValueError("Expected top-level list in ArbitrageScanner response")
-    return data
+def fetch_json(timeout: int = 20) -> list[dict]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json",
+        "Referer": "https://screener.arbitragescanner.io/",
+    }
+    last_exc = None
+    for url in (URL_PRIMARY, URL_FALLBACK):
+        try:
+            req = Request(url, headers=headers)
+            with urlopen(req, timeout=timeout) as resp:  # nosec - trusted public API
+                raw = resp.read()
+                data = json.loads(raw.decode("utf-8"))
+                if not isinstance(data, list):
+                    raise ValueError("Expected top-level list in ArbitrageScanner response")
+                return data
+        except Exception as exc:  # pylint: disable=broad-except
+            last_exc = exc
+            continue
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("ArbitrageScanner fetch failed")
 
 
 def build_top(

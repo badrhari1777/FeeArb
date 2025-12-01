@@ -9,6 +9,8 @@ from typing import Callable, Iterable, List, Optional, Sequence
 
 from config import BASE_DIR
 
+# Re-export helpers grouped at bottom.
+
 
 DB_PATH = Path(BASE_DIR) / "state" / "cache.db"
 
@@ -66,6 +68,13 @@ def ensure_schema() -> None:
                 mark_price REAL,
                 fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (exchange, symbol, ts_ms)
+            );
+
+            CREATE TABLE IF NOT EXISTS source_cache (
+                source TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (source)
             );
             """
         )
@@ -357,3 +366,17 @@ def get_or_fetch_risk_limits(
         }
         for tier, max_notional, max_leverage, maintenance_margin_rate, initial_margin_rate, ts in rows
     ]
+
+
+__all__ = [
+    "SymbolMeta",
+    "ensure_schema",
+    "upsert_symbol_meta",
+    "get_symbol_meta",
+    "get_or_fetch_symbol_meta",
+    "upsert_risk_limits",
+    "get_or_fetch_risk_limits",
+    "insert_funding_history",
+    "get_funding_history",
+    "get_or_fetch_funding_history",
+]

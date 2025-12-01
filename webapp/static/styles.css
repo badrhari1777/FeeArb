@@ -370,11 +370,6 @@ a {
   color: #30456b;
 }
 
-.summary-row {
-  font-weight: 700;
-  background: rgba(0, 128, 255, 0.06);
-}
-
 .pos-hover {
   background: rgba(255, 255, 255, 0.06);
 }
@@ -383,3 +378,26 @@ a {
   background: rgba(0, 128, 255, 0.12);
 }
 
+.summary-row {
+  font-weight: 700;
+}
+
+.tone-pos.summary-row {
+  background: rgba(46, 204, 113, 0.55) !important;
+}
+
+.tone-neg.summary-row {
+  background: rgba(231, 76, 60, 0.55) !important;
+}
+
+.tone-mixed.summary-row {
+  background: rgba(241, 196, 15, 0.5) !important;
+}
+
+.value-pos {
+  color: #6dd99a;
+}
+
+.value-neg {
+  color: #ff6b6b;
+}

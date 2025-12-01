@@ -28,9 +28,12 @@ from orchestrator.opportunities import (
     format_opportunity_table,
 )
 from parsers import arbitragescanner, coinglass
+from pipeline.source_cache import fetch_with_cache_async
+from utils.sources import get_cached_source, upsert_cached_source
 from utils import load_cache, save_cache
 
 logger = logging.getLogger(__name__)
+FRESH_CACHE_SECONDS = 600  # 10 minutes
 
 
 @dataclass
@@ -102,17 +105,36 @@ async def collect_sources_async(
 
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         if sources.get("arbitragescanner", True):
-            _emit(
-                "screener:start",
-                {
-                    "message": "Fetching ArbitrageScanner candidates...",
-                },
-            )
-            (
-                screener_rows,
-                screener_from_cache,
-                screener_warning,
-            ) = await _load_screener_snapshot_async(session)
+            # If cache is fresh (<10m), skip live fetch.
+            cached = load_cache("screener_latest.json", FRESH_CACHE_SECONDS)
+            screener_rows = []
+            screener_from_cache = False
+            screener_warning = None
+            if cached:
+                screener_rows = _normalize_screener_rows(cached.get("data", []))
+                screener_from_cache = True
+                screener_warning = "ArbitrageScanner cache <10m; live fetch skipped."
+            else:
+                _emit(
+                    "screener:start",
+                    {
+                        "message": "Fetching ArbitrageScanner candidates...",
+                    },
+                )
+                try:
+                    (
+                        screener_rows,
+                        screener_from_cache,
+                        screener_warning,
+                    ) = await _load_screener_snapshot_async(session)
+                    upsert_cached_source("arbitragescanner", {"rows": screener_rows})
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning("ArbitrageScanner fetch failed: %s", exc)
+                    cached = get_cached_source("arbitragescanner")
+                    if cached and isinstance(cached, dict):
+                        screener_rows = cached.get("rows", []) or []
+                        screener_from_cache = True
+                        screener_warning = "ArbitrageScanner offline; using cached candidates."
             _emit(
                 "screener:complete",
                 {
@@ -125,8 +147,8 @@ async def collect_sources_async(
                 messages.append(screener_warning)
         else:
             screener_rows = []
-            screener_from_cache = True
-            messages.append("ArbitrageScanner fetch disabled via settings.")
+            screener_from_cache = False
+            messages.append("ArbitrageScanner disabled via settings; cache not used.")
             _emit(
                 "screener:skipped",
                 {
@@ -135,17 +157,44 @@ async def collect_sources_async(
             )
 
         if sources.get("coinglass", True):
-            _emit(
-                "coinglass:start",
-                {
-                    "message": "Fetching Coinglass arbitrage table...",
-                },
-            )
-            (
-                coinglass_rows,
-                coinglass_from_cache,
-                coinglass_warning,
-            ) = await _load_coinglass_snapshot_async(session)
+            cached = load_cache("coinglass_latest.json", FRESH_CACHE_SECONDS)
+            coinglass_rows = []
+            coinglass_from_cache = False
+            coinglass_warning = None
+            if cached:
+                try:
+                    coinglass_rows = [_coinglass_row_from_cache(item) for item in cached["data"]]
+                    coinglass_from_cache = True
+                    coinglass_warning = "Coinglass cache <10m; live fetch skipped."
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning("Cached Coinglass payload invalid: %s", exc)
+            if not coinglass_rows:
+                _emit(
+                    "coinglass:start",
+                    {
+                        "message": "Fetching Coinglass arbitrage table...",
+                    },
+                )
+                try:
+                    (
+                        coinglass_rows,
+                        coinglass_from_cache,
+                        coinglass_warning,
+                    ) = await _load_coinglass_snapshot_async(session)
+                    upsert_cached_source("coinglass", {"rows": [row.to_dict() for row in coinglass_rows]})
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning("Coinglass fetch failed: %s", exc)
+                    cached = get_cached_source("coinglass")
+                    if cached and isinstance(cached, dict):
+                        raw_rows = cached.get("rows", []) or []
+                        coinglass_rows = []
+                        for item in raw_rows:
+                            try:
+                                coinglass_rows.append(coinglass.CoinglassRow.from_dict(item))
+                            except Exception:  # pylint: disable=broad-except
+                                continue
+                        coinglass_from_cache = True
+                        coinglass_warning = "Coinglass offline; using cached table."
             _emit(
                 "coinglass:complete",
                 {
@@ -158,8 +207,8 @@ async def collect_sources_async(
                 messages.append(coinglass_warning)
         else:
             coinglass_rows = []
-            coinglass_from_cache = True
-            messages.append("Coinglass fetch disabled via settings.")
+            coinglass_from_cache = False
+            messages.append("Coinglass disabled via settings; cache not used.")
             _emit(
                 "coinglass:skipped",
                 {
@@ -336,12 +385,6 @@ def collect_snapshot(
 async def _load_screener_snapshot_async(
     session: "ClientSession",
 ) -> tuple[list[dict], bool, str | None]:
-    cached = load_cache("screener_latest.json", PARSE_CACHE_TTL_SECONDS)
-    if cached:
-        logger.info("Using cached ArbitrageScanner data")
-        rows = _normalize_screener_rows(cached.get("data", []))
-        return rows, True, None
-
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json",
@@ -354,6 +397,11 @@ async def _load_screener_snapshot_async(
             data = await resp.json()
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("ArbitrageScanner fetch failed: %s", exc)
+        # Fallback to cached snapshot if it is reasonably fresh.
+        cached = load_cache("screener_latest.json", PARSE_CACHE_TTL_SECONDS)
+        if cached:
+            rows = _normalize_screener_rows(cached.get("data", []))
+            return rows, True, "ArbitrageScanner offline; using cached candidates."
         return [], False, "ArbitrageScanner returned no candidates."
 
     rows = _normalize_screener_rows(
@@ -370,15 +418,6 @@ async def _load_screener_snapshot_async(
 async def _load_coinglass_snapshot_async(
     session: "ClientSession",
 ) -> tuple[list[coinglass.CoinglassRow], bool, str | None]:
-    cached = load_cache("coinglass_latest.json", PARSE_CACHE_TTL_SECONDS)
-    if cached:
-        logger.info("Using cached Coinglass data")
-        try:
-            rows = [_coinglass_row_from_cache(item) for item in cached["data"]]
-            return rows, True, None
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("Cached Coinglass payload invalid, refetching: %s", exc)
-
     def _fetch_rows_wrapper() -> list[coinglass.CoinglassRow]:
         try:
             return coinglass.fetch_rows(limit=20)
@@ -396,6 +435,13 @@ async def _load_coinglass_snapshot_async(
         return [], False, str(exc)
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning("Coinglass fetch failed: %s", exc)
+        cached = load_cache("coinglass_latest.json", PARSE_CACHE_TTL_SECONDS)
+        if cached:
+            try:
+                rows = [_coinglass_row_from_cache(item) for item in cached["data"]]
+                return rows, True, "Coinglass request failed; using cached table."
+            except Exception as err:  # pylint: disable=broad-except
+                logger.warning("Cached Coinglass payload invalid: %s", err)
         return [], False, "Coinglass request failed."
 
     if not rows:

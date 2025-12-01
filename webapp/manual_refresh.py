@@ -16,12 +16,17 @@ import logging
 
 from pipeline import collect_snapshot
 from utils import setup_logging
+from project_settings import SettingsManager
 
 
 def main() -> None:
     setup_logging()
+    settings = SettingsManager().current
     logging.info("Collecting snapshot...")
-    snapshot = collect_snapshot()
+    snapshot = collect_snapshot(
+        source_settings=settings.sources,
+        exchange_settings=settings.exchanges,
+    )
     logging.info(
         "Snapshot prepared at %s with %d opportunities.",
         snapshot.generated_at.isoformat(),

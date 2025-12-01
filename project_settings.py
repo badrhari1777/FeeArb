@@ -57,10 +57,22 @@ class AppSettings:
     exchanges: Dict[str, bool] = field(
         default_factory=lambda: dict(DEFAULT_EXCHANGES)
     )
-    parser_refresh_seconds: int = 300
-    exchange_refresh_seconds: int = 60
-    table_refresh_seconds: int = 300
-    account_refresh_seconds: int = 120
+    parser_refresh_seconds: int = 600  # 10 minutes
+    exchange_refresh_seconds: int = 300  # Funding Opportunities refresh (5 minutes)
+    table_refresh_seconds: int = 60  # Page refresh
+    account_refresh_seconds: int = 90  # Account/positions refresh (1.5 minutes)
+    summary_refresh_seconds: int = 1800  # Balance digest (30 minutes)
+    protective: Dict[str, object] = field(
+        default_factory=lambda: {
+            "auto_protect_enabled": True,
+            "auto_take_enabled": True,
+            "anti_orphan_enabled": False,
+            "stop_gap_from_liq_pct": 0.07,
+            "stop_requote_threshold_pct": 0.005,
+            "fallback_liq_factor_long": 0.33,
+            "fallback_liq_factor_short": 1.66,
+        }
+    )
 
     def with_updates(self, payload: Mapping[str, object]) -> "AppSettings":
         """Return a new settings instance with the provided updates applied."""
@@ -96,6 +108,10 @@ class AppSettings:
         updated.account_refresh_seconds = int(
             payload.get("account_refresh_seconds", self.account_refresh_seconds)
         )
+        updated.summary_refresh_seconds = int(
+            payload.get("summary_refresh_seconds", self.summary_refresh_seconds)
+        )
+        updated.protective = dict(payload.get("protective", self.protective))
         return updated.normalised()
 
     def normalised(self) -> "AppSettings":
@@ -104,6 +120,19 @@ class AppSettings:
         self.exchanges = _normalise_bool_map(
             _default_exchanges(), self.exchanges
         )
+        defaults = {
+            "auto_protect_enabled": True,
+            "auto_take_enabled": True,
+            "anti_orphan_enabled": False,
+            "stop_gap_from_liq_pct": 0.07,
+            "stop_requote_threshold_pct": 0.005,
+            "fallback_liq_factor_long": 0.33,
+            "fallback_liq_factor_short": 1.66,
+        }
+        merged = dict(defaults)
+        if isinstance(self.protective, dict):
+            merged.update(self.protective)
+        self.protective = merged
         return self
 
     def validate(self) -> None:
@@ -117,6 +146,7 @@ class AppSettings:
             or self.table_refresh_seconds < MIN_REFRESH_SECONDS
             or self.exchange_refresh_seconds < MIN_REFRESH_SECONDS
             or self.account_refresh_seconds < MIN_REFRESH_SECONDS
+            or self.summary_refresh_seconds < MIN_REFRESH_SECONDS
         ):
             raise ValueError(
                 f"Refresh intervals must be >= {MIN_REFRESH_SECONDS} seconds."
@@ -126,10 +156,19 @@ class AppSettings:
             or self.table_refresh_seconds > MAX_REFRESH_SECONDS
             or self.exchange_refresh_seconds > MAX_REFRESH_SECONDS
             or self.account_refresh_seconds > MAX_REFRESH_SECONDS
+            or self.summary_refresh_seconds > MAX_REFRESH_SECONDS
         ):
             raise ValueError(
                 f"Refresh intervals must be <= {MAX_REFRESH_SECONDS} seconds."
             )
+        try:
+            protective = self.protective or {}
+            if protective.get("stop_gap_from_liq_pct", 0.07) < 0:
+                raise ValueError("stop_gap_from_liq_pct must be >= 0.")
+            if protective.get("stop_requote_threshold_pct", 0.005) < 0:
+                raise ValueError("stop_requote_threshold_pct must be >= 0.")
+        except Exception as exc:
+            raise ValueError(f"Invalid protective settings: {exc}") from exc
 
     def to_dict(self) -> Dict[str, object]:
         return {
@@ -139,6 +178,8 @@ class AppSettings:
             "exchange_refresh_seconds": self.exchange_refresh_seconds,
             "table_refresh_seconds": self.table_refresh_seconds,
             "account_refresh_seconds": self.account_refresh_seconds,
+            "summary_refresh_seconds": self.summary_refresh_seconds,
+            "protective": dict(self.protective),
         }
 
     @classmethod

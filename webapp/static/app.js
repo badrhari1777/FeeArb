@@ -17,7 +17,11 @@
     parser_refresh_seconds: 300,
     exchange_refresh_seconds: 60,
     table_refresh_seconds: 300,
-    account_refresh_seconds: 120
+    account_refresh_seconds: 90,
+    stop_gap_from_liq_pct: 0.07,
+    stop_requote_threshold_pct: 0.005,
+    fallback_liq_factor_long: 0.33,
+    fallback_liq_factor_short: 1.66
   };
 
   var defaultExecution = {
@@ -78,6 +82,13 @@
     exchangeInput: document.getElementById('exchange-interval'),
     tableInput: document.getElementById('table-interval'),
     accountInput: document.getElementById('account-interval'),
+    protectAuto: document.getElementById('protect-auto'),
+    takeAuto: document.getElementById('take-auto'),
+    antiOrphan: document.getElementById('anti-orphan'),
+    stopGapInput: document.getElementById('stop-gap'),
+    requoteInput: document.getElementById('stop-requote'),
+    fallbackLongInput: document.getElementById('fallback-long'),
+    fallbackShortInput: document.getElementById('fallback-short'),
     settingsStatus: document.getElementById('settings-status'),
     settingsSubmit: document.getElementById('settings-submit'),
     refreshButton: document.getElementById('refresh-button'),
@@ -668,19 +679,23 @@
     var i;
     for (i = 0; i < rows.length; i += 1) {
       var row = rows[i] || {};
+      var marginRatioText = typeof row.margin_ratio === 'number' ? formatNumber(row.margin_ratio, 4) : '-';
+      var equityText = typeof row.equity === 'number' ? formatNumber(row.equity, 2) : '-';
+      var bufferText = typeof row.buffer_pct === 'number' ? formatNumber(row.buffer_pct, 2) + '%' : '-';
       html += '<tr>' +
         '<td>' + escapeHtml(row.exchange || '-') + '</td>' +
         '<td>' + escapeHtml(row.asset || '-') + '</td>' +
         '<td>' + formatNumber(row.total, 2) + '</td>' +
         '<td>' + formatNumber(row.available, 2) + '</td>' +
         '<td>' + formatNumber(row.used, 2) + '</td>' +
-        '<td>' + formatNumber(row.unrealized_pnl, 2) + '</td>' +
-        '<td>' + formatNumber(row.margin_ratio, 4) + '</td>' +
+        '<td>' + marginRatioText + '</td>' +
+        '<td>' + equityText + '</td>' +
+        '<td>' + bufferText + '</td>' +
         '<td>' + escapeHtml(formatDate(row.timestamp)) + '</td>' +
       '</tr>';
     }
     if (!html) {
-      html = '<tr><td colspan="8" class="muted">Balances will appear after the first refresh.</td></tr>';
+      html = '<tr><td colspan="9" class="muted">Balances will appear after the first refresh.</td></tr>';
     }
     elements.accountBalanceTable.innerHTML = html;
   }
@@ -711,6 +726,32 @@
     var html = '';
     var i;
     var lastSymbol = null;
+
+    function toneClass(row) {
+      var pnlVal = parseFloat(row.unrealized_pnl);
+      var expVal = parseFloat(row.expected_funding);
+      var pnlSign = isFinite(pnlVal) && Math.abs(pnlVal) > 1e-9 ? (pnlVal > 0 ? 1 : -1) : 0;
+      var expSign = isFinite(expVal) && Math.abs(expVal) > 1e-9 ? (expVal > 0 ? 1 : -1) : 0;
+      if (pnlSign === 1 && expSign === 1) {
+        return 'tone-pos';
+      }
+      if (pnlSign === -1 && expSign === -1) {
+        return 'tone-neg';
+      }
+      return 'tone-mixed';
+    }
+
+    function valueClass(value) {
+      var numeric = parseFloat(value);
+      if (isFinite(numeric) && numeric > 0) {
+        return 'value-pos';
+      }
+      if (isFinite(numeric) && numeric < 0) {
+        return 'value-neg';
+      }
+      return '';
+    }
+
     for (i = 0; i < rows.length; i += 1) {
       var row = rows[i] || {};
       var isSummary = row.type === 'summary';
@@ -724,23 +765,49 @@
       var fundingText = row.funding_rate !== null && row.funding_rate !== undefined
         ? formatPercent(row.funding_rate, 4)
         : '-';
-      var classes = isSummary ? 'summary-row' : '';
+      var marginUsedText = isSummary ? '-' : formatNumber(row.margin_used, 2);
+      var liqPriceText = isSummary ? '-' : formatNumber(row.liquidation_price, 4);
+      var liqDistText = row.dist_to_liq_pct !== null && row.dist_to_liq_pct !== undefined
+        ? formatNumber(row.dist_to_liq_pct, 3) + '%'
+        : '-';
+      var leverageText = isSummary ? '-' : formatNumber(row.leverage, 2);
+      var expectedFundingText = row.expected_funding !== null && row.expected_funding !== undefined
+        ? formatNumber(row.expected_funding, 6)
+        : '-';
+      var stopPriceText = row.stop_price !== null && row.stop_price !== undefined
+        ? formatNumber(row.stop_price, 6)
+        : '-';
+      var takePriceText = row.take_price !== null && row.take_price !== undefined
+        ? formatNumber(row.take_price, 6)
+        : '-';
+      var nextFundingText = row.next_funding_eta || formatNextFunding(row.next_funding);
+      var summaryTone = isSummary ? toneClass(row) : '';
+      var classes = isSummary ? ('summary-row ' + summaryTone) : '';
       var symbolAttr = row.symbol ? ' data-symbol="' + escapeHtml(row.symbol) + '"' : '';
+      var pnlClass = valueClass(row.unrealized_pnl);
+      var expClass = valueClass(row.expected_funding);
       html += '<tr class="' + classes + '"'+ symbolAttr + '>' +
         '<td>' + (showSymbol ? escapeHtml(row.symbol || '-') : '-') + '</td>' +
         '<td>' + escapeHtml(isSummary ? (row.exchange || 'TOTAL') : (row.exchange || '-')) + '</td>' +
         '<td>' + formatNumber(row.quantity, 4) + '</td>' +
         '<td>' + formatNumber(row.amount, 2) + '</td>' +
+        '<td>' + marginUsedText + '</td>' +
         '<td>' + entryText + '</td>' +
         '<td>' + markText + '</td>' +
-        '<td>' + formatNumber(row.unrealized_pnl, 2) + '</td>' +
+        '<td class="' + pnlClass + '">' + formatNumber(row.unrealized_pnl, 4) + '</td>' +
+        '<td>' + liqPriceText + '</td>' +
+        '<td>' + liqDistText + '</td>' +
+        '<td>' + leverageText + '</td>' +
         '<td>' + fundingText + '</td>' +
-        '<td>' + escapeHtml(formatNextFunding(row.next_funding)) + '</td>' +
+        '<td class="' + expClass + '">' + expectedFundingText + '</td>' +
+        '<td>' + stopPriceText + '</td>' +
+        '<td>' + takePriceText + '</td>' +
+        '<td>' + escapeHtml(nextFundingText) + '</td>' +
       '</tr>';
       lastSymbol = row.symbol;
     }
     if (!html) {
-      html = '<tr><td colspan="9" class="muted">No live positions.</td></tr>';
+      html = '<tr><td colspan="16" class="muted">No live positions.</td></tr>';
     }
     elements.symbolPositionsTable.innerHTML = html;
     attachSymbolHover(elements.symbolPositionsTable);
@@ -1013,7 +1080,8 @@
       parser_refresh_seconds: defaultSettings.parser_refresh_seconds,
       exchange_refresh_seconds: defaultSettings.exchange_refresh_seconds,
       table_refresh_seconds: defaultSettings.table_refresh_seconds,
-      account_refresh_seconds: defaultSettings.account_refresh_seconds
+      account_refresh_seconds: defaultSettings.account_refresh_seconds,
+      protective: {}
     };
     if (!elements.settingsForm) {
       return result;
@@ -1052,6 +1120,15 @@
         result.account_refresh_seconds = clamp(accountValue, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
       }
     }
+    result.protective = {
+      auto_protect_enabled: elements.protectAuto ? !!elements.protectAuto.checked : true,
+      auto_take_enabled: elements.takeAuto ? !!elements.takeAuto.checked : true,
+      anti_orphan_enabled: elements.antiOrphan ? !!elements.antiOrphan.checked : false,
+      stop_gap_from_liq_pct: elements.stopGapInput ? parseFloat(elements.stopGapInput.value) || defaultSettings.stop_gap_from_liq_pct || 0.07 : 0.07,
+      stop_requote_threshold_pct: elements.requoteInput ? parseFloat(elements.requoteInput.value) || 0.005 : 0.005,
+      fallback_liq_factor_long: elements.fallbackLongInput ? parseFloat(elements.fallbackLongInput.value) || 0.33 : 0.33,
+      fallback_liq_factor_short: elements.fallbackShortInput ? parseFloat(elements.fallbackShortInput.value) || 1.66 : 1.66
+    };
     return result;
   }
 
@@ -1084,6 +1161,28 @@
     }
     if (elements.accountInput) {
       elements.accountInput.value = settings.account_refresh_seconds;
+    }
+    var protective = settings.protective || {};
+    if (elements.protectAuto) {
+      elements.protectAuto.checked = protective.hasOwnProperty('auto_protect_enabled') ? !!protective.auto_protect_enabled : true;
+    }
+    if (elements.takeAuto) {
+      elements.takeAuto.checked = protective.hasOwnProperty('auto_take_enabled') ? !!protective.auto_take_enabled : true;
+    }
+    if (elements.antiOrphan) {
+      elements.antiOrphan.checked = protective.hasOwnProperty('anti_orphan_enabled') ? !!protective.anti_orphan_enabled : false;
+    }
+    if (elements.stopGapInput) {
+      elements.stopGapInput.value = protective.stop_gap_from_liq_pct !== undefined ? protective.stop_gap_from_liq_pct : 0.07;
+    }
+    if (elements.requoteInput) {
+      elements.requoteInput.value = protective.stop_requote_threshold_pct !== undefined ? protective.stop_requote_threshold_pct : 0.005;
+    }
+    if (elements.fallbackLongInput) {
+      elements.fallbackLongInput.value = protective.fallback_liq_factor_long !== undefined ? protective.fallback_liq_factor_long : 0.33;
+    }
+    if (elements.fallbackShortInput) {
+      elements.fallbackShortInput.value = protective.fallback_liq_factor_short !== undefined ? protective.fallback_liq_factor_short : 1.66;
     }
   }
 

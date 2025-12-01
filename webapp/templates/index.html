@@ -19,7 +19,7 @@
 {% set refresh_interval = settings.get('table_refresh_seconds', state.get('refresh_interval', 300)) %}
 {% set parser_interval = settings.get('parser_refresh_seconds', state.get('parser_refresh_interval', refresh_interval)) %}
 {% set exchange_interval = settings.get('exchange_refresh_seconds', state.get('exchange_refresh_interval', parser_interval)) %}
-{% set account_interval = settings.get('account_refresh_seconds', state.get('account_refresh_interval', 3600)) %}
+{% set account_interval = settings.get('account_refresh_seconds', state.get('account_refresh_interval', 90)) %}
   {% set exchange_status_rows = state.get('exchange_status', []) %}
   {% set events = state.get('events', []) %}
   {% set last_event = events[-1] if events %}
@@ -159,6 +159,39 @@
           </label>
         </div>
         <p class="settings-note muted">Keep at least one source and one exchange enabled.</p>
+        <fieldset class="settings-fieldset">
+          <legend>Protective orders</legend>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="protect-auto" {% if settings.get('protective', {}).get('auto_protect_enabled', True) %}checked{% endif %} />
+            Auto-place protective stops
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="take-auto" {% if settings.get('protective', {}).get('auto_take_enabled', True) %}checked{% endif %} />
+            Auto-place protective takes
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="anti-orphan" {% if settings.get('protective', {}).get('anti_orphan_enabled', False) %}checked{% endif %} />
+            Close paired leg on protective execution (anti-orphan)
+          </label>
+          <div class="settings-intervals">
+            <label>
+              Stop gap from liq (decimal)
+              <input type="number" id="stop-gap" step="0.001" min="0" value="{{ settings.get('protective', {}).get('stop_gap_from_liq_pct', 0.07) }}" />
+            </label>
+            <label>
+              Requote threshold (decimal)
+              <input type="number" id="stop-requote" step="0.001" min="0" value="{{ settings.get('protective', {}).get('stop_requote_threshold_pct', 0.005) }}" />
+            </label>
+            <label>
+              Fallback liq (long, multiplier)
+              <input type="number" id="fallback-long" step="0.01" min="0" value="{{ settings.get('protective', {}).get('fallback_liq_factor_long', 0.33) }}" />
+            </label>
+            <label>
+              Fallback liq (short, multiplier)
+              <input type="number" id="fallback-short" step="0.01" min="0" value="{{ settings.get('protective', {}).get('fallback_liq_factor_short', 1.66) }}" />
+            </label>
+          </div>
+        </fieldset>
         <div class="settings-actions">
           <button type="submit" class="button" id="settings-submit">Save settings</button>
           <span class="settings-status" id="settings-status" aria-live="polite"></span>
@@ -400,26 +433,46 @@
             <th>Total</th>
             <th>Available</th>
             <th>In Use</th>
-            <th>Unrealized PnL</th>
             <th>Margin Ratio</th>
+            <th>Equity</th>
+            <th>Buffer %</th>
             <th>Updated</th>
           </tr>
         </thead>
         <tbody id="account-balance-body">
           {% for row in account_balance_rows %}
             <tr>
-              <td>{{ row.exchange }}</td>
-              <td>{{ row.asset }}</td>
-              <td>{{ row.total if row.total is not none else "-" }}</td>
-              <td>{{ row.available if row.available is not none else "-" }}</td>
-              <td>{{ row.used if row.used is not none else "-" }}</td>
-              <td>{{ row.unrealized_pnl if row.unrealized_pnl is not none else "-" }}</td>
-              <td>{{ row.margin_ratio if row.margin_ratio is not none else "-" }}</td>
-              <td>{{ row.timestamp or "-" }}</td>
+                <td>{{ row.exchange }}</td>
+                <td>{{ row.asset }}</td>
+                <td>{{ row.total if row.total is not none else "-" }}</td>
+                <td>{{ row.available if row.available is not none else "-" }}</td>
+                <td>{{ row.used if row.used is not none else "-" }}</td>
+                <td>
+                {% if row.margin_ratio is number %}
+                  {{ row.margin_ratio | round(4) }}
+                {% else %}
+                  -
+                {% endif %}
+                </td>
+                <td>
+                {% if row.equity is number %}
+                  {{ row.equity | round(4) }}
+                {% else %}
+                  -
+                {% endif %}
+                </td>
+                <td>
+                {% if row.buffer_pct is number %}
+                  {{ row.buffer_pct | round(2) }}%
+                {% else %}
+                  -
+                {% endif %}
+                </td>
+                <td>{{ row.timestamp or "-" }}</td>
             </tr>
           {% endfor %}
           {% if account_balance_rows | length == 0 %}
-            <tr><td colspan="8" class="muted">Balances will appear after the first refresh.</td></tr>
+            <tr><td colspan="9" class="muted">Balances will appear after the first refresh.</td></tr>
           {% endif %}
         </tbody>
       </table>
@@ -434,29 +487,130 @@
             <th>Exchange</th>
             <th>Quantity</th>
             <th>Amount (USDT)</th>
+            <th>Margin Used</th>
             <th>Entry</th>
             <th>Mark</th>
             <th>PnL</th>
+            <th>Liq Price</th>
+            <th>Liq Dist %</th>
+            <th>Lev.</th>
             <th>Funding</th>
+            <th>Exp. Funding</th>
+            <th>Stop Price</th>
+            <th>Take Price</th>
             <th>Next Funding</th>
           </tr>
         </thead>
                 <tbody id="symbol-positions-body">
           {% for row in symbol_position_rows %}
-            <tr class="{{ 'summary-row' if row.type == 'summary' else '' }}">
+            {% set tone = '' %}
+            {% if row.type == 'summary' %}
+              {% set pnl = row.unrealized_pnl %}
+              {% set exp = row.expected_funding %}
+              {% set pnl_sign = 1 if pnl is number and pnl > 0 else (-1 if pnl is number and pnl < 0 else 0) %}
+              {% set exp_sign = 1 if exp is number and exp > 0 else (-1 if exp is number and exp < 0 else 0) %}
+              {% if pnl_sign == 1 and exp_sign == 1 %}
+                {% set tone = 'tone-pos' %}
+              {% elif pnl_sign == -1 and exp_sign == -1 %}
+                {% set tone = 'tone-neg' %}
+              {% else %}
+                {% set tone = 'tone-mixed' %}
+              {% endif %}
+            {% endif %}
+            <tr class="{{ ('summary-row ' + tone) if row.type == 'summary' else '' }}" data-symbol="{{ row.symbol or '' }}">
               <td>{{ row.symbol }}</td>
               <td>{{ row.exchange or "-" }}</td>
               <td>{{ row.quantity }}</td>
               <td>{{ row.amount or "-" }}</td>
+              <td>{{ row.margin_used if row.margin_used is not none else "-" }}</td>
               <td>{{ row.entry_price or "-" }}</td>
               <td>{{ row.mark_price or "-" }}</td>
               <td>{{ row.unrealized_pnl or "-" }}</td>
-              <td>{{ row.funding_rate or "-" }}</td>
-              <td>{{ row.next_funding or "-" }}</td>
+              <td>{{ row.liquidation_price if row.liquidation_price is not none else "-" }}</td>
+              <td>
+                {% if row.dist_to_liq_pct is defined and row.dist_to_liq_pct is not none %}
+                  {{ row.dist_to_liq_pct | round(3) }}%
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>{{ row.leverage if row.leverage is not none else "-" }}</td>
+              <td>
+                {% if row.funding_rate is not none %}
+                  {{ ((row.funding_rate or 0) * 100) | round(4) }}%
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>
+                {% if row.expected_funding is defined and row.expected_funding is not none %}
+                  {{ row.expected_funding | round(6) }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>
+                {% if row.stop_price is defined and row.stop_price is not none %}
+                  {{ row.stop_price | round(6) }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>
+                {% if row.take_price is defined and row.take_price is not none %}
+                  {{ row.take_price | round(6) }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>{{ row.next_funding_eta or row.next_funding or "-" }}</td>
             </tr>
           {% endfor %}
           {% if symbol_position_rows | length == 0 %}
-            <tr><td colspan="9" class="muted">No live positions detected.</td></tr>
+            <tr><td colspan="16" class="muted">No live positions detected.</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="reduction-candidates">
+      <h2>Risk Reduction Candidates</h2>
+      <table class="data-table data-table--wide">
+        <thead>
+          <tr>
+            <th>Exchange</th>
+            <th>Symbol</th>
+            <th>Side</th>
+            <th>Qty</th>
+            <th>Suggested Close</th>
+            <th>Paired Exchange</th>
+            <th>Funding&nbsp;%</th>
+            <th>Margin Ratio</th>
+            <th>Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in accounts.get('reduction_candidates', []) %}
+            <tr>
+              <td>{{ row.exchange }}</td>
+              <td>{{ row.symbol }}</td>
+              <td>{{ row.side }}</td>
+              <td>{{ row.quantity }}</td>
+              <td>{{ row.close_quantity }}</td>
+              <td>{{ row.paired_exchange }}</td>
+              <td>
+                {% if row.funding_rate is not none %}
+                  {{ (row.funding_rate * 100) | round(4) }}
+                {% else %}
+                  -
+                {% endif %}
+              </td>
+              <td>{{ row.margin_ratio if row.margin_ratio is not none else "-" }}</td>
+              <td>{{ row.reason }}</td>
+            </tr>
+          {% endfor %}
+          {% if accounts.get('reduction_candidates', []) | length == 0 %}
+            <tr><td colspan="9" class="muted">No candidates detected based on margin thresholds.</td></tr>
           {% endif %}
         </tbody>
       </table>

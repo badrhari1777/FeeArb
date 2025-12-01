@@ -17,7 +17,7 @@ from .services import DataService
 
 BASE_DIR = Path(__file__).resolve().parent
 
-STATIC_VERSION = "v2025-11-15-01"
+STATIC_VERSION = "v2025-12-01-19"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
