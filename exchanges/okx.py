@@ -101,7 +101,7 @@ class OKXAdapter(ExchangeAdapter):
         )
 
     def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
-        """Return cached funding history with 1h refresh."""
+        """Return cached funding history with ~2m refresh."""
         inst_id = self.map_symbol(symbol) or symbol
 
         def _fetch() -> list[dict]:
@@ -133,7 +133,7 @@ class OKXAdapter(ExchangeAdapter):
             self.name,
             inst_id,
             _fetch,
-            max_age_seconds=3600,
+            max_age_seconds=120,
             limit=limit,
         )
 

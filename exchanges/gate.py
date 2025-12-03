@@ -96,7 +96,7 @@ class GateAdapter(ExchangeAdapter):
         )
 
     def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
-        """Return cached funding history (expected 8h interval) with 1h refresh."""
+        """Return cached funding history (expected 8h interval) with ~2m refresh."""
         contract = self.map_symbol(symbol) or symbol
 
         def _fetch() -> list[dict]:
@@ -128,7 +128,7 @@ class GateAdapter(ExchangeAdapter):
             self.name,
             contract,
             _fetch,
-            max_age_seconds=3600,
+            max_age_seconds=120,
             limit=limit,
         )
 

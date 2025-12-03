@@ -151,7 +151,7 @@ class BybitAdapter(ExchangeAdapter):
         )
 
     def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
-        """Return cached funding history (8h interval) with 1h refresh TTL."""
+        """Return cached funding history (8h interval) with ~2m refresh TTL."""
         exchange_symbol = self.map_symbol(symbol) or symbol
 
         def _fetch() -> list[dict]:
@@ -188,7 +188,7 @@ class BybitAdapter(ExchangeAdapter):
             self.name,
             exchange_symbol,
             _fetch,
-            max_age_seconds=3600,
+            max_age_seconds=120,
             limit=limit,
         )
 

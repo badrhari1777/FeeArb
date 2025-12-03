@@ -304,7 +304,7 @@ class MexcAdapter(ExchangeAdapter):
         )
 
     def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
-        """Return cached funding history with 1h refresh (best-effort)."""
+        """Return cached funding history with ~2m refresh (best-effort)."""
         exch_symbol = self.map_symbol(symbol) or symbol
 
         def _fetch() -> list[dict]:
@@ -332,7 +332,7 @@ class MexcAdapter(ExchangeAdapter):
             self.name,
             exch_symbol,
             _fetch,
-            max_age_seconds=3600,
+            max_age_seconds=120,
             limit=limit,
         )
 

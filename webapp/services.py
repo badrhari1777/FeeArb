@@ -25,6 +25,7 @@ from execution.lifecycle import LifecycleController
 from execution.settings import ExecutionSettings
 from execution.accounts import AccountMonitor, normalize_symbol
 from risk.config import default_risk_config, RiskConfig
+from risk.stop_manager import ProtectiveOrderManager
 from utils import purge_expired
 from utils.cache_db import get_or_fetch_funding_history
 from exchanges import get_adapter, normalize_exchange_name
@@ -32,6 +33,14 @@ from exchanges import get_adapter, normalize_exchange_name
 RefreshResult = Literal["completed", "in_progress", "failed"]
 
 logger = logging.getLogger(__name__)
+funding_logger = logging.getLogger("funding")
+if not funding_logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    handler.setFormatter(formatter)
+    funding_logger.addHandler(handler)
+funding_logger.setLevel(logging.INFO)
+funding_logger.propagate = False
 
 
 def _dedupe_settle(symbol: str | None) -> str:
@@ -90,35 +99,15 @@ class DataService:
             summary_interval=self._summary_interval,
         )
         self._risk_config: RiskConfig = self._risk_config_from_settings()
+        self._protective_manager = ProtectiveOrderManager(self._risk_config)
         self._last_protective: dict[tuple[str, str, str], dict[str, float | None]] = {}
+        self._protective_interval = getattr(self._risk_config, "position_check_interval_sec", 180)
+        self._protective_task: Optional[asyncio.Task] = None
 
     def _extend_universe_with_positions(self, sources: SourceSnapshot) -> SourceSnapshot:
         """Include symbols from live positions so market snapshots stay fresh for the UI."""
-        try:
-            positions = self._accounts.snapshot().get("positions") or []
-        except Exception:  # pylint: disable=broad-except
-            positions = []
-        existing = {str(item.get("symbol") or "").upper() for item in sources.universe}
-        extras: list[dict[str, str]] = []
-        for pos in positions:
-            symbol_raw = pos.get("symbol_normalized") or pos.get("symbol")
-            symbol_norm = _dedupe_settle(normalize_symbol(symbol_raw))
-            if not symbol_norm or symbol_norm.upper() in existing:
-                continue
-            existing.add(symbol_norm.upper())
-            extras.append({"symbol": symbol_norm, "sources": "positions"})
-        if not extras:
-            return sources
-        # Make a shallow copy to avoid mutating cached snapshots across runs.
-        return SourceSnapshot(
-            generated_at=sources.generated_at,
-            screener_rows=list(sources.screener_rows),
-            coinglass_rows=list(sources.coinglass_rows),
-            universe=list(sources.universe) + extras,
-            screener_from_cache=sources.screener_from_cache,
-            coinglass_from_cache=sources.coinglass_from_cache,
-            messages=list(sources.messages),
-        )
+        # Keep “universe” strictly for opportunity discovery; positions are handled separately.
+        return sources
 
 
     async def startup(self) -> None:
@@ -132,10 +121,13 @@ class DataService:
         await self._accounts.start()
         # Do an immediate balance/positions pull before other work.
         await self._accounts.refresh_now(force_env=True)
+        await self._maybe_sync_protective_orders()
         if self._task is None:
             await self._restart_scheduler()
         if self._bootstrap_task is None or self._bootstrap_task.done():
             self._bootstrap_task = asyncio.create_task(self.refresh_markets())
+        if self._protective_task is None:
+            self._protective_task = asyncio.create_task(self._protective_scheduler())
         await self._telemetry.start()
 
     async def shutdown(self) -> None:
@@ -153,6 +145,13 @@ class DataService:
             except asyncio.CancelledError:
                 pass
             self._bootstrap_task = None
+        if self._protective_task:
+            self._protective_task.cancel()
+            try:
+                await self._protective_task
+            except asyncio.CancelledError:
+                pass
+            self._protective_task = None
         await self._telemetry.stop()
         await self._accounts.stop()
 
@@ -182,6 +181,28 @@ class DataService:
                 pass
             self._task = None
         self._task = asyncio.create_task(self._scheduler())
+
+    async def _protective_scheduler(self) -> None:
+        """Independent loop for balance/position driven protective upkeep."""
+        try:
+            while True:
+                interval = max(30, int(self._protective_interval or self._account_interval))
+                await asyncio.sleep(interval)
+                await self._maybe_sync_protective_orders()
+        except asyncio.CancelledError:
+            raise
+
+    async def _restart_protective_scheduler(self) -> None:
+        if self._loop is None or self._loop.is_closed():
+            return
+        if self._protective_task:
+            self._protective_task.cancel()
+            try:
+                await self._protective_task
+            except asyncio.CancelledError:
+                pass
+            self._protective_task = None
+        self._protective_task = asyncio.create_task(self._protective_scheduler())
 
     def _sources_due(self) -> bool:
         if self._cached_sources is None or self._last_source_refresh is None:
@@ -301,7 +322,10 @@ class DataService:
             self._account_interval = current.account_refresh_seconds
             self._summary_interval = current.summary_refresh_seconds
             self._risk_config = self._risk_config_from_settings()
+            self._protective_manager.update_config(self._risk_config)
+            self._protective_interval = getattr(self._risk_config, "position_check_interval_sec", self._protective_interval)
         await self._restart_scheduler()
+        await self._restart_protective_scheduler()
         self._accounts.update_interval(self._account_interval)
         self._accounts.update_summary_interval(self._summary_interval)
         # Kick an async refresh so UI sees new cadence sooner.
@@ -486,7 +510,12 @@ class DataService:
         positions = payload.get("positions") or []
         balances = self._sanitize_balances(payload.get("balances") or [])
         payload["balances"] = balances
-        positions_by_symbol, grouped = self._positions_by_symbol(positions, return_grouped=True)
+        market_lookup = self._market_snapshot_lookup()
+        positions_by_symbol, grouped = self._positions_by_symbol(
+            positions,
+            return_grouped=True,
+            market_lookup=market_lookup,
+        )
         payload["positions_by_symbol"] = positions_by_symbol
         payload["reduction_candidates"] = self._reduction_candidates(grouped, balances)
         return payload
@@ -509,11 +538,14 @@ class DataService:
         return cleaned
 
     def _positions_by_symbol(
-        self, positions: List[dict[str, Any]], return_grouped: bool = False
+        self,
+        positions: List[dict[str, Any]],
+        return_grouped: bool = False,
+        market_lookup: Optional[dict[tuple[str, str], MarketSnapshot]] = None,
     ) -> tuple[List[dict[str, Any]], dict[str, list[dict[str, Any]]]] | List[dict[str, Any]]:
         if not positions:
             return ([], {}) if return_grouped else []
-        market_lookup = self._market_snapshot_lookup()
+        market_lookup = market_lookup or {}
         grouped: dict[str, dict[str, Any]] = {}
         for entry in positions:
             symbol_norm = _dedupe_settle(
@@ -552,19 +584,18 @@ class DataService:
                 )
                 if mark_price is None and snapshot.mark_price is not None:
                     mark_price = snapshot.mark_price
-            if funding_rate is None or next_funding_iso is None:
-                cached_rate, cached_next, cached_mark = self._funding_from_cache(
-                    entry.get("exchange"),
-                    entry.get("symbol"),
-                    symbol_norm,
-                    entry.get("exchange_symbol"),
-                )
-                if funding_rate is None:
-                    funding_rate = cached_rate
-                if next_funding_iso is None:
-                    next_funding_iso = cached_next
-                if mark_price is None:
-                    mark_price = cached_mark
+            live_rate, live_next, live_mark = self._funding_live(
+                entry.get("exchange"),
+                entry.get("symbol"),
+                symbol_norm,
+                entry.get("exchange_symbol"),
+            )
+            if live_rate is not None:
+                funding_rate = live_rate
+            if live_next is not None:
+                next_funding_iso = live_next
+            if live_mark is not None:
+                mark_price = live_mark
             if (
                 unrealized is None
                 and entry_price is not None
@@ -714,7 +745,7 @@ class DataService:
             return rows, grouped_simple
         return rows
 
-    def _funding_from_cache(
+    def _funding_live(
         self,
         exchange: str | None,
         position_symbol: str | None,
@@ -722,10 +753,16 @@ class DataService:
         raw_exchange_symbol: str | None = None,
     ) -> tuple[float | None, str | None, float | None]:
         if not exchange:
+            funding_logger.warning("funding failed exchange=? symbol=%s reason=no_exchange", normalized_symbol)
             return None, None, None
         try:
             adapter = get_adapter(normalize_exchange_name(exchange))
         except KeyError:
+            funding_logger.warning(
+                "funding failed exchange=%s symbol=%s reason=adapter_missing",
+                exchange,
+                normalized_symbol,
+            )
             return None, None, None
         exchange_symbol = None
 
@@ -762,10 +799,39 @@ class DataService:
 
         key = (normalize_exchange_name(exchange), exchange_symbol or canonical_symbol)
         now_ts = datetime.now(tz=timezone.utc).timestamp()
-        cached_local = self._funding_cache.get(key)
-        local_ttl = 120.0  # 2 minutes to keep funding/mark fresher alongside position polls
-        if cached_local and (now_ts - cached_local[3]) <= local_ttl:
-            return cached_local[0], cached_local[1], cached_local[2]
+
+        logger.info(
+            "funding fetch start exchange=%s key=%s canonical=%s candidates=%s",
+            exchange,
+            key,
+            canonical_symbol,
+            candidates,
+        )
+
+        # Try live snapshot first for freshest funding; fallback to cached history (<=2m), then ccxt.
+        try:
+            snapshots = adapter.fetch_market_snapshots([canonical_symbol])
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("Market snapshot fetch failed for %s %s: %s", exchange, canonical_symbol, exc)
+            snapshots = []
+
+        if snapshots:
+            snap = snapshots[0]
+            rate = getattr(snap, "funding_rate", None)
+            next_time = getattr(snap, "next_funding_time", None)
+            next_funding_iso = next_time.isoformat() if next_time else None
+            mark_val = getattr(snap, "mark_price", None)
+            if rate is not None or next_funding_iso is not None or mark_val is not None:
+                funding_logger.info(
+                    "funding ok source=snapshot exchange=%s symbol=%s rate=%s next=%s mark=%s",
+                    exchange,
+                    canonical_symbol,
+                    rate,
+                    next_funding_iso,
+                    mark_val,
+                )
+                self._funding_cache[key] = (rate, next_funding_iso, mark_val, now_ts)
+                return rate, next_funding_iso, mark_val
 
         def _fetch() -> list[dict]:
             if hasattr(adapter, "funding_history"):
@@ -780,8 +846,7 @@ class DataService:
             normalize_exchange_name(exchange),
             exchange_symbol,
             _fetch,
-            # Use cache unless stale; separate local cache prevents hammering on every UI poll.
-            max_age_seconds=900,
+            max_age_seconds=120,
             limit=5,
         )
         if history:
@@ -802,22 +867,78 @@ class DataService:
                     except Exception:  # pylint: disable=broad-except
                         next_funding_iso = None
                 self._funding_cache[key] = (rate, next_funding_iso, mark_val, now_ts)
+                funding_logger.info(
+                    "funding ok source=history exchange=%s symbol=%s rate=%s next=%s mark=%s",
+                    exchange,
+                    exchange_symbol,
+                    rate,
+                    next_funding_iso,
+                    mark_val,
+                )
                 return rate, next_funding_iso, mark_val
+        else:
+            logger.debug("Funding history empty for %s %s", exchange, exchange_symbol)
 
-        # Fallback: try a fresh market snapshot to extract funding fields.
-        try:
-            snapshots = adapter.fetch_market_snapshots([canonical_symbol])
-        except Exception:  # pylint: disable=broad-except
-            snapshots = []
-        if snapshots:
-            snap = snapshots[0]
-            rate = getattr(snap, "funding_rate", None)
-            next_time = getattr(snap, "next_funding_time", None)
-            next_funding_iso = next_time.isoformat() if next_time else None
-            mark_val = getattr(snap, "mark_price", None)
-            self._funding_cache[key] = (rate, next_funding_iso, mark_val, now_ts)
-            return rate, next_funding_iso, mark_val
+        # Additional fallback for Bitget: use ccxt funding rate directly if history/snapshot failed.
+        if normalize_exchange_name(exchange) == "bitget":
+            try:
+                import ccxt  # type: ignore
 
+                client = ccxt.bitget({"options": {"defaultType": "swap"}})
+                mapped = adapter.map_symbol(canonical_symbol) or canonical_symbol
+                # Load markets to get consistent ids for exotic symbols.
+                try:
+                    client.load_markets()
+                except Exception:  # pylint: disable=broad-except
+                    pass
+                # ccxt expects pair format SYMBOL/USDT:USDT; fall back to mapped contract and raw market ids.
+                try_symbols = [
+                    f"{canonical_symbol}/USDT:USDT",
+                    mapped,
+                    f"{canonical_symbol}USDT_UMCBL",
+                    f"{canonical_symbol}USD_DMCBL",
+                ]
+                funding = None
+                last_exc: Exception | None = None
+                for cand in try_symbols:
+                    if not cand:
+                        continue
+                    try:
+                        funding = client.fetch_funding_rate(cand)
+                        break
+                    except Exception as exc:  # pylint: disable=broad-except
+                        last_exc = exc
+                        continue
+                if funding:
+                    rate = _safe_float(funding.get("fundingRate"))
+                    next_ts = funding.get("fundingTimestamp")
+                    next_iso = None
+                    try:
+                        if next_ts:
+                            next_iso = datetime.fromtimestamp(float(next_ts) / 1000, tz=timezone.utc).isoformat()
+                    except Exception:  # pylint: disable=broad-except
+                        next_iso = None
+                    mark_val = _safe_float(
+                        funding.get("markPrice")
+                        or funding.get("indexPrice")
+                        or funding.get("mark")
+                    )
+                    funding_logger.info(
+                        "funding ok source=ccxt exchange=%s symbol=%s rate=%s next=%s mark=%s",
+                        exchange,
+                        canonical_symbol,
+                        rate,
+                        next_iso,
+                        mark_val,
+                    )
+                    self._funding_cache[key] = (rate, next_iso, mark_val, now_ts)
+                    return rate, next_iso, mark_val
+                if last_exc:
+                    logger.debug("Bitget ccxt fallback attempts failed for %s: %s", canonical_symbol, last_exc)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Bitget ccxt fallback failed for %s: %s", canonical_symbol, exc)
+
+        funding_logger.warning("funding failed exchange=%s symbol=%s reason=unavailable", exchange, canonical_symbol)
         return None, None, None
 
     def _summarize_symbol(self, symbol: str, legs: List[dict[str, Any]]) -> dict[str, Any] | None:
@@ -854,8 +975,8 @@ class DataService:
                 return None
             return (a - b) / b * 100.0
 
-        entry_spread = _spread_pct(long_entry, short_entry)
-        mark_spread = _spread_pct(long_mark, short_mark)
+        entry_diff_pct = _spread_pct(long_entry, short_entry)
+        mark_diff_pct = _spread_pct(long_mark, short_mark)
         funding_spread = None
         if long_funding is not None and short_funding is not None:
             funding_spread = short_funding - long_funding
@@ -888,12 +1009,16 @@ class DataService:
             "exchange": "TOTAL",
             "quantity": net_quantity,
             "amount": None,
-            "entry_price": entry_spread,
-            "mark_price": mark_spread,
+            "entry_price": entry_diff_pct,
+            "mark_price": mark_diff_pct,
             "unrealized_pnl": pnl_total,
             "funding_rate": funding_spread,
             "expected_funding": expected_total,
             "next_funding": soonest_next.isoformat() if soonest_next else None,
+            "long_entry_avg": long_entry,
+            "short_entry_avg": short_entry,
+            "long_mark_avg": long_mark,
+            "short_mark_avg": short_mark,
         }
 
     def _market_snapshot_lookup(self) -> dict[tuple[str, str], MarketSnapshot]:
@@ -1052,6 +1177,65 @@ class DataService:
         except Exception:
             pass
         return cfg
+
+    async def _maybe_sync_protective_orders(self) -> None:
+        """Best-effort protective order sync if enabled in settings."""
+        settings = self._settings_manager.current
+        protective = getattr(settings, "protective", {}) or {}
+        auto_protect = bool(protective.get("auto_protect_enabled", True))
+        auto_take = bool(protective.get("auto_take_enabled", True))
+        if not auto_protect and not auto_take:
+            return
+        snapshot = self._accounts.snapshot()
+        positions = snapshot.get("positions") or []
+        anti_orphan = bool(protective.get("anti_orphan_enabled", False))
+        try:
+            actions = await self._protective_manager.sync_protective_orders(
+                positions,
+                anti_orphan_enabled=anti_orphan,
+            )
+            if actions:
+                summary = {
+                    "message": "Protective orders synced",
+                    "count": len(actions),
+                    "updated": sum(1 for a in actions if a.get("status") == "updated"),
+                    "unchanged": sum(1 for a in actions if a.get("status") == "unchanged"),
+                    "timeout": sum(1 for a in actions if a.get("status") == "timeout"),
+                    "error": sum(1 for a in actions if a.get("status") == "error"),
+                }
+                # Build a human-readable per-symbol summary.
+                per_symbol: dict[str, list[str]] = {}
+                for action in actions:
+                    sym = str(action.get("symbol") or "").upper()
+                    exch = str(action.get("exchange") or "")
+                    status = action.get("status")
+                    stop_val = action.get("target_stop")
+                    take_val = action.get("target_take")
+                    reason = action.get("reason") or action.get("error")
+                    parts = [f"{exch}: {status}"]
+                    if stop_val is not None:
+                        parts.append(f"sl={stop_val}")
+                    if take_val is not None:
+                        parts.append(f"tp={take_val}")
+                    if reason:
+                        parts.append(f"reason={reason}")
+                    per_symbol.setdefault(sym, []).append(", ".join(parts))
+                summary["details"] = {k: v for k, v in per_symbol.items()}
+                self._record_event("protective:sync", summary)
+                # Emit compact overall status instead of per-leg spam.
+                failures = [a for a in actions if a.get("status") not in ("updated", "unchanged")]
+                if failures:
+                    logger.warning(
+                        "protective sync issues: %s",
+                        "; ".join(
+                            f"{f.get('exchange')} {f.get('symbol')} status={f.get('status')} err={f.get('error') or f.get('reason')}"
+                            for f in failures
+                        ),
+                    )
+                else:
+                    logger.info("protective sync ok: all stops/takes placed")
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Protective sync failed: %s", exc)
 
     async def refresh_snapshot(self, *, force_accounts: bool = False) -> RefreshResult:
         """Compatibility wrapper used by the HTTP API."""

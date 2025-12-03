@@ -204,9 +204,14 @@ def insert_funding_history(
     with _connect() as conn:
         conn.executemany(
             """
-            INSERT OR IGNORE INTO funding_history
+            INSERT INTO funding_history
             (exchange, symbol, ts_ms, rate, interval_hours, mark_price, fetched_at)
             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(exchange, symbol, ts_ms) DO UPDATE SET
+                rate=COALESCE(excluded.rate, funding_history.rate),
+                interval_hours=COALESCE(excluded.interval_hours, funding_history.interval_hours),
+                mark_price=COALESCE(excluded.mark_price, funding_history.mark_price),
+                fetched_at=CURRENT_TIMESTAMP
             """,
             rows,
         )
@@ -274,7 +279,7 @@ def get_or_fetch_funding_history(
     symbol: str,
     fetch_fn: Callable[[], Sequence[dict]],
     *,
-    max_age_seconds: int = 3600,
+    max_age_seconds: int = 120,
     since_ms: Optional[int] = None,
     limit: int = 500,
 ) -> List[dict]:

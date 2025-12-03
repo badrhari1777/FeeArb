@@ -130,6 +130,7 @@ EXCHANGE_SPECS: Tuple[ExchangeSpec, ...] = (
             "recvWindow": 60_000,
             "adjustForTimeDifference": True,
             "useServerTime": True,
+            "timeout": 20_000,  # ms
         },
         balance_params={"type": "swap", "recvWindow": 60_000},
         position_params={"type": "swap", "recvWindow": 60_000},
@@ -303,6 +304,15 @@ class ExchangeGateway:
                 self._cycles_open = 0
         else:
             self._cycles_open += 1
+
+    def map_symbol(self, symbol: str) -> str:
+        """Map canonical symbol to exchange-specific if supported by ccxt."""
+        if self.client and hasattr(self.client, "market_id"):  # type: ignore[truthy-bool]
+            try:
+                return self.client.market_id(symbol)  # type: ignore[union-attr]
+            except Exception:
+                return symbol
+        return symbol
 
     async def fetch_balance(self) -> dict[str, Any]:
         if not self.client:
@@ -598,7 +608,7 @@ class AccountMonitor:
             force_env=force_env
         )
         await self._maybe_send_alerts(balances)
-        await self._maybe_send_summary(balances, refreshed)
+        await self._maybe_send_summary(balances, positions, refreshed)
         async with self._lock:
             self._balances = balances
             self._positions = positions
@@ -683,16 +693,27 @@ class AccountMonitor:
                 )
         return balances, positions, status_entries, refreshed
 
-    async def _maybe_send_summary(self, balances: list[dict[str, Any]], refreshed_at: str | None) -> None:
+    async def _maybe_send_summary(
+        self,
+        balances: list[dict[str, Any]],
+        positions: list[dict[str, Any]],
+        refreshed_at: str | None,
+    ) -> None:
         """Send a periodic balance digest via Telegram."""
         now = time.time()
         if now < self._next_summary_at:
             return
-        text = self._build_balance_summary(balances, refreshed_at)
+        warnings = await self._mexc_stop_warnings(positions)
+        text = self._build_balance_summary(balances, refreshed_at, warnings)
         if await self._send_telegram_text(text):
             self._next_summary_at = now + self._summary_interval
 
-    def _build_balance_summary(self, balances: list[dict[str, Any]], refreshed_at: str | None) -> str:
+    def _build_balance_summary(
+        self,
+        balances: list[dict[str, Any]],
+        refreshed_at: str | None,
+        warnings: list[str] | None = None,
+    ) -> str:
         tz = timezone(timedelta(hours=3))
         timestamp = "unknown"
         time_only = "unknown"
@@ -727,7 +748,73 @@ class AccountMonitor:
 
         if missing:
             lines.append("Missing data: " + ", ".join(missing))
+        for idx, warning in enumerate(warnings or []):
+            prefix = "Warnings:" if idx == 0 else " -"
+            lines.append(f"{prefix} {warning}")
         return "\n".join(lines)
+
+    async def _mexc_stop_warnings(self, positions: list[dict[str, Any]]) -> list[str]:
+        """Check MEXC legs for protective stops and emit warnings for balance digest."""
+        mexc_positions = [p for p in positions if str(p.get("exchange") or "").lower() == "mexc"]
+        if not mexc_positions:
+            return []
+        gateway = self._gateways.get("mexc")
+        if gateway is None:
+            return ["WARNING mexc: шлюз недоступен, стопы не проверены"]
+        try:
+            await gateway.refresh_credentials_async()
+            await gateway.ensure_client()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("mexc stop check init failed: %s", exc)
+            return ["WARNING mexc: не удалось подготовить клиент для проверки стопов"]
+        if not gateway.client:
+            return ["WARNING mexc: нет клиента, стопы не проверены"]
+
+        warnings: list[str] = []
+        cache: dict[str, dict[str, Any]] = {}
+        for pos in mexc_positions:
+            symbol = str(pos.get("symbol") or pos.get("symbol_normalized") or "")
+            if not symbol:
+                continue
+            existing = cache.get(symbol)
+            if existing is None:
+                try:
+                    existing = await self._fetch_existing_orders(gateway, symbol)
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.debug("mexc stop fetch failed for %s: %s", symbol, exc)
+                    existing = {"order_ids": [], "error": str(exc)}
+                cache[symbol] = existing
+            stop_val = _safe_float(existing.get("stop"))
+            if stop_val is None or stop_val <= 0:
+                warnings.append(f"WARNING mexc {normalize_symbol(symbol)}: стоп не найден")
+        return warnings
+
+    async def _fetch_existing_orders(self, gateway: ExchangeGateway, symbol: str) -> dict[str, Any]:
+        orders: list[dict[str, Any]] = []
+        mapped_symbol = gateway.map_symbol(symbol)
+        try:
+            orders = await gateway.client.fetch_open_orders(mapped_symbol)  # type: ignore[union-attr]
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("open orders fetch failed for %s %s: %s", gateway.slug, symbol, exc)
+            return {"order_ids": [], "error": str(exc)}
+        stop = None
+        take = None
+        order_ids: list[str] = []
+        for order in orders or []:
+            oid = str(order.get("id") or "")
+            if oid:
+                order_ids.append(oid)
+            info = order.get("info") or {}
+            stop_px = _safe_float(info.get("stopLossPrice") or order.get("stopPrice") or info.get("triggerPrice"))
+            take_px = _safe_float(info.get("takeProfitPrice"))
+            reduce_flag = info.get("reduceOnly") or info.get("reduce_only") or order.get("reduceOnly")
+            if reduce_flag is False:
+                continue
+            if stop_px:
+                stop = stop_px
+            if take_px:
+                take = take_px
+        return {"stop": stop, "take": take, "order_ids": order_ids}
 
     async def _maybe_send_alerts(self, balances: list[dict[str, Any]]) -> None:
         """Evaluate balances and send Telegram alert on high-risk accounts."""
