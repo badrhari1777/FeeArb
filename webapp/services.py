@@ -3,7 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+import json
+import time
 from typing import Any, Callable, Dict, List, Literal, Optional
+from urllib.error import URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from pipeline import (
     DataSnapshot,
@@ -13,6 +18,7 @@ from pipeline import (
 )
 from orchestrator.models import MarketSnapshot
 from project_settings import SettingsManager
+from execution.manual import ManualTradeManager
 from execution import (
     ExecutionSettingsManager,
     WalletService,
@@ -29,6 +35,7 @@ from risk.stop_manager import ProtectiveOrderManager
 from utils import purge_expired
 from utils.cache_db import get_or_fetch_funding_history
 from exchanges import get_adapter, normalize_exchange_name
+from uuid import uuid4
 
 RefreshResult = Literal["completed", "in_progress", "failed"]
 
@@ -62,6 +69,184 @@ def _strip_settle(symbol: str) -> str:
         if upper.endswith(suffix):
             return upper[: -len(suffix)]
     return upper
+
+
+def _ccxt_perp_symbol(symbol: str) -> str:
+    """Best-effort CCXT perp notation (e.g. BTCUSDT -> BTC/USDT:USDT)."""
+    normalized = normalize_symbol(symbol)
+    for suffix in ("USDT", "USDC", "USD"):
+        if normalized.endswith(suffix):
+            base = normalized[: -len(suffix)]
+            return f"{base}/{suffix}:{suffix}"
+    return f"{normalized}/USDT:USDT"
+
+
+def _fetch_json(url: str) -> dict:
+    """Tiny helper around urlopen with a browser UA."""
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(req, timeout=15) as resp:
+        return json.load(resp)
+
+
+def _fetch_bybit_candles(symbol: str, limit: int) -> list[dict[str, Any]]:
+    params = urlencode({"category": "linear", "symbol": symbol, "interval": "1", "limit": limit})
+    url = f"https://api.bybit.com/v5/market/kline?{params}"
+    data = _fetch_json(url)
+    series = data.get("result", {}).get("list") or []
+    candles: list[dict[str, Any]] = []
+    for item in series:
+        if not isinstance(item, (list, tuple)) or len(item) < 6:
+            continue
+        try:
+            candles.append(
+                {
+                    "ts_ms": int(item[0]),
+                    "open": _safe_float(item[1]),
+                    "high": _safe_float(item[2]),
+                    "low": _safe_float(item[3]),
+                    "close": _safe_float(item[4]),
+                    "volume": _safe_float(item[5]),
+                }
+            )
+        except Exception:
+            continue
+    return candles
+
+
+def _fetch_mexc_candles(symbol: str, limit: int) -> list[dict[str, Any]]:
+    params = urlencode({"interval": "Min1", "limit": limit})
+    url = f"https://contract.mexc.com/api/v1/contract/kline/{symbol}?{params}"
+    data = _fetch_json(url)
+    series = data.get("data") or []
+    candles: list[dict[str, Any]] = []
+    for item in series:
+        if not isinstance(item, (list, tuple)) or len(item) < 6:
+            continue
+        try:
+            ts_ms = int(item[0]) if item[0] else None
+            candles.append(
+                {
+                    "ts_ms": ts_ms,
+                    "open": _safe_float(item[1]),
+                    "high": _safe_float(item[2]),
+                    "low": _safe_float(item[3]),
+                    "close": _safe_float(item[4]),
+                    "volume": _safe_float(item[5]),
+                }
+            )
+        except Exception:
+            continue
+    return candles
+
+
+def _ccxt_client(exchange: str):
+    """Return a ccxt client configured for perpetual swaps."""
+    try:
+        import ccxt  # type: ignore
+    except Exception as exc:  # pylint: disable=broad-except
+        raise RuntimeError("ccxt not available") from exc
+
+    name = normalize_exchange_name(exchange)
+    opts = {"options": {"defaultType": "swap"}}
+    if name == "kucoin":
+        return ccxt.kucoinfutures(opts)
+    if name == "bybit":
+        return ccxt.bybit(opts)
+    if name == "mexc":
+        return ccxt.mexc(opts)
+    if name == "bitget":
+        return ccxt.bitget(opts)
+    if name == "okx":
+        return ccxt.okx(opts)
+    if name == "gate":
+        return ccxt.gate(opts)
+    if name == "bingx":
+        return ccxt.bingx(opts)
+    if name == "htx":
+        return ccxt.huobi(opts)
+    return None
+
+
+def _fetch_candles_ccxt(exchange: str, canonical_symbol: str, limit: int) -> list[dict[str, Any]]:
+    client = _ccxt_client(exchange)
+    if client is None:
+        return []
+    try:
+        client.load_markets()
+    except Exception:  # pylint: disable=broad-except
+        # load_markets is optional; continue best-effort.
+        pass
+
+    def _translate(symbol: str) -> str:
+        # ccxt prefers slash notation. Try a few variants.
+        perp = _ccxt_perp_symbol(symbol)
+        base = _strip_settle(symbol)
+        return perp if perp in getattr(client, "symbols", []) else perp
+
+    candidates = [
+        _translate(canonical_symbol),
+        canonical_symbol,
+    ]
+    # Some exchanges expect dash separators (e.g. OKX uses BTC-USDT-SWAP as id but ccxt symbol is BTC/USDT:USDT).
+    for symbol in getattr(client, "symbols", []) or []:
+        upper = str(symbol).upper()
+        if _strip_settle(canonical_symbol) in upper and ":USD" in upper:
+            candidates.append(symbol)
+    seen: set[str] = set()
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            ohlcv = client.fetch_ohlcv(cand, timeframe="1m", limit=limit)
+        except Exception:  # pylint: disable=broad-except
+            continue
+        candles: list[dict[str, Any]] = []
+        for row in ohlcv or []:
+            if not isinstance(row, (list, tuple)) or len(row) < 6:
+                continue
+            candles.append(
+                {
+                    "ts_ms": int(row[0]),
+                    "open": _safe_float(row[1]),
+                    "high": _safe_float(row[2]),
+                    "low": _safe_float(row[3]),
+                    "close": _safe_float(row[4]),
+                    "volume": _safe_float(row[5]),
+                }
+            )
+        if candles:
+            return candles
+    return []
+
+
+def _load_funding_history_cached(
+    exchange: str,
+    exchange_symbol: str,
+    canonical_symbol: str,
+    limit: int,
+    adapter: Any,
+) -> list[dict]:
+    """Fetch funding history with caching, falling back to adapter hook."""
+
+    def _fetch() -> list[dict]:
+        if hasattr(adapter, "funding_history"):
+            try:
+                return adapter.funding_history(canonical_symbol, limit=max(limit * 2, limit))
+            except Exception:  # pylint: disable=broad-except
+                return []
+        return []
+
+    try:
+        return get_or_fetch_funding_history(
+            normalize_exchange_name(exchange),
+            exchange_symbol,
+            _fetch,
+            max_age_seconds=300,
+            limit=limit,
+        )
+    except Exception:  # pylint: disable=broad-except
+        return []
 
 
 class DataService:
@@ -103,6 +288,13 @@ class DataService:
         self._last_protective: dict[tuple[str, str, str], dict[str, float | None]] = {}
         self._protective_interval = getattr(self._risk_config, "position_check_interval_sec", 180)
         self._protective_task: Optional[asyncio.Task] = None
+        self._manual = ManualTradeManager()
+        self._manual_runs: Dict[str, dict[str, Any]] = {}
+        self._manual_run_ttl = 3600
+        self._mexc_alert_cooldown = 600  # seconds
+        self._last_mexc_alert: dict[tuple[str, str], float] = {}
+        self._send_missing_stop_alerts = True
+        self._apply_alert_settings()
 
     def _extend_universe_with_positions(self, sources: SourceSnapshot) -> SourceSnapshot:
         """Include symbols from live positions so market snapshots stay fresh for the UI."""
@@ -324,12 +516,110 @@ class DataService:
             self._risk_config = self._risk_config_from_settings()
             self._protective_manager.update_config(self._risk_config)
             self._protective_interval = getattr(self._risk_config, "position_check_interval_sec", self._protective_interval)
+            self._apply_alert_settings()
         await self._restart_scheduler()
         await self._restart_protective_scheduler()
         self._accounts.update_interval(self._account_interval)
         self._accounts.update_summary_interval(self._summary_interval)
         # Kick an async refresh so UI sees new cadence sooner.
         asyncio.create_task(self._accounts.refresh_now(force_env=True))
+
+    async def manual_enter(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("dry_run") or not payload.get("async_run"):
+            return await self._manual.enter(payload)
+        return await self._start_manual_run("enter", payload, None)
+
+    async def manual_exit(self, payload: dict[str, Any]) -> dict[str, Any]:
+        positions = self._accounts.snapshot().get("positions") or []
+        if payload.get("dry_run") or not payload.get("async_run"):
+            return await self._manual.exit(payload, positions)
+        return await self._start_manual_run("exit", payload, positions)
+
+    async def manual_roll(self, payload: dict[str, Any]) -> dict[str, Any]:
+        positions = self._accounts.snapshot().get("positions") or []
+        if payload.get("dry_run") or not payload.get("async_run"):
+            return await self._manual.roll(payload, positions)
+        return await self._start_manual_run("roll", payload, positions)
+
+    async def manual_analyze(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self._manual.analyze(payload)
+
+    async def manual_exec_status(self, exec_id: str) -> dict[str, Any]:
+        self._prune_manual_runs()
+        run = self._manual_runs.get(exec_id)
+        if not run:
+            return {"error": "execution_not_found"}
+        return {
+            "execution_id": exec_id,
+            "status": run.get("status"),
+            "created_at": run.get("created_at"),
+            "updated_at": run.get("updated_at"),
+            "logs": list(run.get("logs") or []),
+            "result": run.get("result"),
+            "error": run.get("error"),
+        }
+
+    async def _start_manual_run(
+        self,
+        action: str,
+        payload: dict[str, Any],
+        positions: Optional[list[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        self._prune_manual_runs()
+        exec_id = uuid4().hex[:12]
+        now = datetime.now(timezone.utc).isoformat()
+        run: dict[str, Any] = {
+            "execution_id": exec_id,
+            "action": action,
+            "status": "running",
+            "created_at": now,
+            "updated_at": now,
+            "created_at_ts": time.time(),
+            "logs": [],
+            "result": None,
+            "error": None,
+        }
+        self._manual_runs[exec_id] = run
+
+        def _log_cb(entry: dict[str, Any]) -> None:
+            logs = run["logs"]
+            logs.append(entry)
+            if len(logs) > 200:
+                del logs[:-200]
+            run["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        async def _runner() -> None:
+            try:
+                if action == "enter":
+                    result = await self._manual.enter(payload, log_cb=_log_cb)
+                elif action == "exit":
+                    result = await self._manual.exit(payload, positions or [], log_cb=_log_cb)
+                elif action == "roll":
+                    result = await self._manual.roll(payload, positions or [], log_cb=_log_cb)
+                else:
+                    result = {"errors": [f"unsupported manual action {action}"]}
+                run["result"] = result
+                if result.get("errors"):
+                    run["status"] = "completed_with_errors"
+                else:
+                    run["status"] = "completed"
+            except Exception as exc:  # pylint: disable=broad-except
+                run["status"] = "failed"
+                run["error"] = str(exc)
+            run["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        asyncio.create_task(_runner())
+        return {"execution_id": exec_id, "status": "running"}
+
+    def _prune_manual_runs(self) -> None:
+        now = time.time()
+        expired = [
+            key
+            for key, run in self._manual_runs.items()
+            if (now - float(run.get("created_at_ts") or 0)) > self._manual_run_ttl
+        ]
+        for key in expired:
+            self._manual_runs.pop(key, None)
 
     def latest_snapshot(self) -> Optional[DataSnapshot]:
         return self._snapshot
@@ -671,63 +961,67 @@ class DataService:
         for symbol, data in sorted(grouped.items(), key=lambda item: item[0]):
             legs = sorted(data["legs"], key=lambda leg: (leg.get("exchange") or ""))
             grouped_simple[symbol] = legs
-            # Derive mirrored take/stop with spread consideration for two-legged pairs.
-            if len(legs) == 2:
-                long_leg = next((l for l in legs if l.get("side") == "long"), None)
-                short_leg = next((l for l in legs if l.get("side") == "short"), None)
-                if long_leg and short_leg:
-                    long_stop = self._target_stop_price(
-                        "long",
-                        long_leg.get("liquidation_price"),
-                        mark_price=_safe_float(long_leg.get("mark_price")),
-                        entry_price=_safe_float(long_leg.get("entry_price")),
+            # Derive mirrored take/stop with spread consideration for hedged pairs (any count >=2).
+            longs = [l for l in legs if l.get("side") == "long"]
+            shorts = [l for l in legs if l.get("side") == "short"]
+            if longs and shorts:
+                primary_long = longs[0]
+                primary_short = shorts[0]
+                long_stop = self._target_stop_price(
+                    "long",
+                    primary_long.get("liquidation_price"),
+                    mark_price=_safe_float(primary_long.get("mark_price")),
+                    entry_price=_safe_float(primary_long.get("entry_price")),
+                )
+                short_stop = self._target_stop_price(
+                    "short",
+                    primary_short.get("liquidation_price"),
+                    mark_price=_safe_float(primary_short.get("mark_price")),
+                    entry_price=_safe_float(primary_short.get("entry_price")),
+                )
+                # Spread-aware mirror: convert stop across exchanges via mark ratio.
+                lm = _safe_float(primary_long.get("mark_price") or primary_long.get("entry_price"))
+                sm = _safe_float(primary_short.get("mark_price") or primary_short.get("entry_price"))
+                long_to_short_ratio = (sm / lm) if lm and sm else 1.0
+                short_to_long_ratio = (lm / sm) if lm and sm else 1.0
+                threshold = getattr(self._risk_config, "stop_requote_threshold_pct", 0.005)
+
+                def _should_update(prev: float | None, new: float | None) -> tuple[bool, float | None]:
+                    if new is None:
+                        return False, prev
+                    if prev is None or prev <= 0:
+                        return True, new
+                    try:
+                        delta = abs(new - prev) / prev
+                    except Exception:
+                        delta = 1.0
+                    if delta >= threshold:
+                        return True, new
+                    return False, prev
+
+                def _apply_targets(leg: dict[str, Any], stop_target: float | None, take_target: float | None) -> None:
+                    key = (
+                        str(leg.get("exchange") or ""),
+                        str(leg.get("symbol") or ""),
+                        str(leg.get("side") or ""),
                     )
-                    short_stop = self._target_stop_price(
-                        "short",
-                        short_leg.get("liquidation_price"),
-                        mark_price=_safe_float(short_leg.get("mark_price")),
-                        entry_price=_safe_float(short_leg.get("entry_price")),
-                    )
-                    # Spread-aware mirror: convert stop across exchanges via mark ratio.
-                    lm = _safe_float(long_leg.get("mark_price"))
-                    sm = _safe_float(short_leg.get("mark_price"))
-                    long_to_short_ratio = (sm / lm) if lm and sm else 1.0
-                    short_to_long_ratio = (lm / sm) if lm and sm else 1.0
-                    long_take = short_stop * short_to_long_ratio if short_stop is not None else None
-                    short_take = long_stop * long_to_short_ratio if long_stop is not None else None
-                    # Apply throttling: only update if change > threshold_pct.
-                    threshold = getattr(self._risk_config, "stop_requote_threshold_pct", 0.005)
-                    for leg, stop_target, take_target in (
-                        (long_leg, long_stop, long_take),
-                        (short_leg, short_stop, short_take),
-                    ):
-                        key = (
-                            str(leg.get("exchange") or ""),
-                            str(leg.get("symbol") or ""),
-                            str(leg.get("side") or ""),
-                        )
-                        last = self._last_protective.get(key, {})
-                        def _should_update(prev: float | None, new: float | None) -> tuple[bool, float | None]:
-                            if new is None:
-                                return False, prev
-                            if prev is None or prev <= 0:
-                                return True, new
-                            try:
-                                delta = abs(new - prev) / prev
-                            except Exception:
-                                delta = 1.0
-                            if delta >= threshold:
-                                return True, new
-                            return False, prev
-                        update_stop, stop_val = _should_update(last.get("stop"), stop_target)
-                        update_take, take_val = _should_update(last.get("take"), take_target)
-                        if update_stop or update_take:
-                            self._last_protective[key] = {
-                                "stop": stop_val,
-                                "take": take_val,
-                            }
-                        leg["stop_price"] = stop_val
-                        leg["take_price"] = take_val
+                    last = self._last_protective.get(key, {})
+                    update_stop, stop_val = _should_update(last.get("stop"), stop_target)
+                    update_take, take_val = _should_update(last.get("take"), take_target)
+                    if update_stop or update_take:
+                        self._last_protective[key] = {
+                            "stop": stop_val,
+                            "take": take_val,
+                        }
+                    leg["stop_price"] = stop_val
+                    leg["take_price"] = take_val
+
+                for leg in longs:
+                    take_target = short_stop * short_to_long_ratio if short_stop is not None else None
+                    _apply_targets(leg, leg.get("stop_price"), take_target)
+                for leg in shorts:
+                    take_target = long_stop * long_to_short_ratio if long_stop is not None else None
+                    _apply_targets(leg, leg.get("stop_price"), take_target)
             rows.extend(
                 [
                     {
@@ -1174,9 +1468,35 @@ class DataService:
                 protective.get("panic_close_batch_size", cfg.panic_close_batch_size)
             )
             cfg.telegram_alert_chat_id = str(protective.get("telegram_alert_chat_id", cfg.telegram_alert_chat_id))
+            cfg.send_missing_stop_alerts = bool(
+                protective.get("send_missing_stop_alerts", cfg.send_missing_stop_alerts)
+            )
         except Exception:
             pass
         return cfg
+
+    def _apply_alert_settings(self) -> None:
+        protective = getattr(self._settings_manager.current, "protective", {}) or {}
+        send_margin = bool(protective.get("send_margin_alerts", True))
+        warning_buffer = _safe_float(protective.get("warning_buffer_pct"))
+        panic_buffer = _safe_float(protective.get("panic_buffer_pct"))
+        min_free_abs = _safe_float(protective.get("min_free_balance_abs"))
+        if warning_buffer is None:
+            warning_buffer = self._risk_config.warning_buffer_pct
+        if panic_buffer is None:
+            panic_buffer = self._risk_config.panic_buffer_pct
+        if min_free_abs is None:
+            min_free_abs = self._risk_config.min_free_balance_abs
+        self._accounts.update_alert_settings(
+            send_margin_alerts=send_margin,
+            send_missing_stop_alerts=bool(protective.get("send_missing_stop_alerts", True)),
+            warning_buffer_pct=warning_buffer,
+            panic_buffer_pct=panic_buffer,
+            min_free_balance_abs=min_free_abs,
+        )
+        self._send_missing_stop_alerts = bool(
+            protective.get("send_missing_stop_alerts", self._send_missing_stop_alerts)
+        )
 
     async def _maybe_sync_protective_orders(self) -> None:
         """Best-effort protective order sync if enabled in settings."""
@@ -1195,6 +1515,8 @@ class DataService:
                 anti_orphan_enabled=anti_orphan,
             )
             if actions:
+                if self._send_missing_stop_alerts:
+                    await self._handle_mexc_protective_alerts(actions)
                 summary = {
                     "message": "Protective orders synced",
                     "count": len(actions),
@@ -1223,7 +1545,8 @@ class DataService:
                 summary["details"] = {k: v for k, v in per_symbol.items()}
                 self._record_event("protective:sync", summary)
                 # Emit compact overall status instead of per-leg spam.
-                failures = [a for a in actions if a.get("status") not in ("updated", "unchanged")]
+                ok_states = {"updated", "unchanged", "blocked_ok"}
+                failures = [a for a in actions if a.get("status") not in ok_states]
                 if failures:
                     logger.warning(
                         "protective sync issues: %s",
@@ -1237,12 +1560,197 @@ class DataService:
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("Protective sync failed: %s", exc)
 
+    async def analyze_symbol(
+        self,
+        symbol: str,
+        *,
+        window_minutes: int = 720,
+        funding_points: int = 24,
+    ) -> dict[str, Any]:
+        """Collect per-symbol analytics on demand without touching the global snapshot."""
+        canonical = normalize_symbol(symbol)
+        if not canonical:
+            raise ValueError("Symbol must be provided for analysis.")
+
+        window = max(30, min(int(window_minutes), 4320))  # clamp to 3 days of 1m bars.
+        funding_limit = max(6, int(funding_points))
+
+        exchange_flags = getattr(self._settings_manager.current, "analysis_exchanges", None) or {}
+        enabled_exchanges = [
+            normalize_exchange_name(name)
+            for name, enabled in exchange_flags.items()
+            if enabled
+        ]
+
+        tasks = [
+            self._analyze_symbol_on_exchange(ex, canonical, window, funding_limit)
+            for ex in enabled_exchanges
+        ]
+        results = await asyncio.gather(*tasks)
+
+        return {
+            "symbol": canonical,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "window_minutes": window,
+            "funding_points": funding_limit,
+            "exchanges": [item for item in results if item],
+        }
+
+    async def _analyze_symbol_on_exchange(
+        self,
+        exchange: str,
+        canonical_symbol: str,
+        window_minutes: int,
+        funding_points: int,
+    ) -> dict[str, Any] | None:
+        result: dict[str, Any] = {
+            "exchange": exchange,
+            "symbol": canonical_symbol,
+        }
+        try:
+            adapter = get_adapter(exchange)
+        except KeyError:
+            result["status"] = "error"
+            result["error"] = f"Adapter for {exchange} not registered."
+            return result
+
+        try:
+            exchange_symbol = adapter.map_symbol(canonical_symbol)
+        except Exception:  # pylint: disable=broad-except
+            exchange_symbol = None
+
+        if not exchange_symbol:
+            result["status"] = "unsupported"
+            result["error"] = "Symbol not supported on this exchange."
+            return result
+
+        result["exchange_symbol"] = exchange_symbol
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        # Latest snapshot (bid/ask/mark/funding).
+        try:
+            snapshots = await adapter.fetch_market_snapshots_async([canonical_symbol])
+            if snapshots:
+                snap = snapshots[0]
+                snapshot_dict = snap.to_dict()
+                bid = snapshot_dict.get("bid")
+                ask = snapshot_dict.get("ask")
+                if bid is not None and ask is not None:
+                    snapshot_dict["spread"] = (ask or 0.0) - (bid or 0.0)
+                    snapshot_dict["mid"] = (ask + bid) / 2 if bid is not None else None
+                result["snapshot"] = snapshot_dict
+        except Exception as exc:  # pylint: disable=broad-except
+            errors.append(f"snapshot:{exc}")
+
+        # Funding history (last N points).
+        funding_history = await asyncio.to_thread(
+            _load_funding_history_cached,
+            exchange,
+            exchange_symbol,
+            canonical_symbol,
+            funding_points,
+            adapter,
+        )
+        if funding_history:
+            funding_history = sorted(
+                funding_history,
+                key=lambda item: item.get("ts_ms") or item.get("timestamp") or 0,
+                reverse=True,
+            )
+            funding_history = funding_history[:funding_points]
+        result["funding_history"] = funding_history
+
+        # Recent 1m candles for spread/time-sync analysis.
+        try:
+            candles = await asyncio.to_thread(
+                self._fetch_candles_for_exchange,
+                exchange,
+                exchange_symbol,
+                canonical_symbol,
+                window_minutes,
+            )
+            if candles:
+                result["candles_1m"] = candles
+            else:
+                warnings.append("candles_unavailable")
+        except Exception as exc:  # pylint: disable=broad-except
+            errors.append(f"candles:{exc}")
+
+        status = "ok"
+        if errors and warnings:
+            status = "partial"
+        elif errors:
+            status = "error"
+        elif warnings:
+            status = "partial"
+        result["status"] = status
+        if errors:
+            result["errors"] = errors
+        if warnings:
+            result["warnings"] = warnings
+        return result
+
+    def _fetch_candles_for_exchange(
+        self,
+        exchange: str,
+        exchange_symbol: str,
+        canonical_symbol: str,
+        window_minutes: int,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(window_minutes, 4320))
+        name = normalize_exchange_name(exchange)
+        try:
+            if name == "bybit":
+                return _fetch_bybit_candles(exchange_symbol, limit)
+            if name == "mexc":
+                return _fetch_mexc_candles(exchange_symbol, limit)
+        except URLError as exc:
+            logger.debug("Candle fetch network error for %s %s: %s", exchange, exchange_symbol, exc)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("Candle fetch failed for %s %s: %s", exchange, exchange_symbol, exc)
+        try:
+            return _fetch_candles_ccxt(name, canonical_symbol, limit)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("CCXT candle fallback failed for %s %s: %s", exchange, canonical_symbol, exc)
+            return []
+
     async def refresh_snapshot(self, *, force_accounts: bool = False) -> RefreshResult:
         """Compatibility wrapper used by the HTTP API."""
         if force_accounts:
             await self._accounts.refresh_now(force_env=True)
         return await self.refresh_markets(force_sources=True)
 
+    async def _handle_mexc_protective_alerts(self, actions: list[dict[str, Any]]) -> None:
+        """Send reminder alerts for MEXC legs where stops cannot be auto-placed."""
+        now = time.time()
+        for action in actions or []:
+            if str(action.get("exchange") or "").lower() != "mexc":
+                continue
+            status = str(action.get("status") or "")
+            if status not in ("blocked_missing_stop", "blocked_bad_stop"):
+                continue
+            target_stop = action.get("target_stop")
+            if target_stop is None:
+                continue
+            symbol = str(action.get("symbol") or "").upper()
+            qty = action.get("quantity") or 0.0
+            existing = action.get("existing") or {}
+            key = ("mexc", symbol)
+            last = self._last_mexc_alert.get(key, 0.0)
+            if (now - last) < self._mexc_alert_cooldown:
+                continue
+            if status == "blocked_missing_stop":
+                text = f"Позиция {symbol} {qty:g} монет стоп не стоит! поставьте стоп {target_stop}"
+            else:
+                text = (
+                    f"Позиция {symbol} {qty:g} монет неправильный стоп {existing.get('stop')}, "
+                    f"нужно поставить {target_stop}"
+                )
+            text = f"MEXC: {text}"
+            sent = await self._accounts.send_telegram_message(text)
+            if sent:
+                self._last_mexc_alert[key] = now
 
 def _fmt_ts(ts: float | None) -> str | None:
     if ts is None:

@@ -21,6 +21,7 @@ STATE_DIR: Final[Path] = BASE_DIR / "state"
 SUPPORTED_EXCHANGES: Final[List[str]] = [
     "bybit",
     "mexc",
+    "kucoin",
     # Remaining adapters stay registered but are inactive by default.
 ]
 
@@ -32,6 +33,7 @@ EXCHANGE_COMMISSIONS: Final[Dict[str, Dict[str, float]]] = {
     "bitget": {"maker": 0.00036, "taker": 0.001},
     "gate": {"maker": 0.0002, "taker": 0.0005},
     "mexc": {"maker": 0.00008, "taker": 0.00032},
+    "kucoin": {"maker": 0.0002, "taker": 0.0006},
 }
 
 # Cached scraper payloads remain valid for this many seconds.

@@ -146,6 +146,44 @@ a {
   font-size: 1.25rem;
 }
 
+.panel-muted {
+  margin-top: 12px;
+}
+
+.code-block {
+  background: #0d1522;
+  border: 1px solid #1f2a38;
+  border-radius: 8px;
+  color: #cbd5e1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 0;
+  min-height: 80px;
+  padding: 12px;
+  white-space: pre-wrap;
+}
+
+.live-metrics {
+  display: inline-block;
+  margin-bottom: 8px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(49, 67, 94, 0.4);
+  color: #d7e3f7;
+  font-size: 0.85rem;
+}
+
+.live-metrics--ok {
+  background: rgba(34, 197, 94, 0.18);
+  color: #bbf7d0;
+}
+
+.live-metrics--bad {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fecaca;
+}
+
 .panel--alert {
   border-color: #f59e0b;
   background: rgba(245, 158, 11, 0.08);
@@ -400,4 +438,94 @@ a {
 
 .value-neg {
   color: #ff6b6b;
+}
+
+.back-link {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.9rem;
+}
+
+.analysis-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.analysis-form label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.9rem;
+  color: #9aa5b1;
+}
+
+.analysis-form input {
+  margin-top: 0.35rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid #1f2a38;
+  background: #0f1824;
+  color: #e6edf3;
+}
+
+.table-wrapper {
+  overflow-x: auto;
+}
+
+.grid-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.grid-card {
+  padding: 0.75rem;
+  border: 1px solid #1f2a38;
+  border-radius: 8px;
+  background: #0f1624;
+}
+
+.grid-card h3 {
+  margin: 0 0 0.5rem 0;
+}
+
+.history-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.history-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.history-time {
+  color: #9aa5b1;
+  font-size: 0.85rem;
+}
+
+.history-rate {
+  font-weight: 600;
+}
+
+.history-mark {
+  color: #9aa5b1;
+  font-size: 0.85rem;
+}
+
+.slot-col {
+  text-align: center;
+  width: 56px;
+}
+
+.time-col {
+  white-space: nowrap;
+}
+
+.row-now {
+  background: rgba(46, 204, 113, 0.08);
 }

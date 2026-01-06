@@ -110,11 +110,32 @@
         </div>
       </dl>
       <button id="refresh-button" class="button" type="button">Manual refresh</button>
+      <a class="button" href="/manual">Manual trading</a>
       <p class="hint">UI refresh: {{ refresh_interval }} s | Parser: {{ parser_interval }} s | Exchange poll: {{ exchange_interval }} s | Account refresh: {{ account_interval }} s</p>
     </div>
   </header>
 
   <main class="content">
+    <section class="panel">
+      <h2>Coin analysis</h2>
+      <form id="quick-analyze-form" class="analysis-form">
+        <label>
+          Symbol
+          <input type="text" id="quick-analyze-input" placeholder="e.g. BTCUSDT" autocomplete="off" />
+        </label>
+        <label>
+          1m window (minutes)
+          <input type="number" id="quick-window-input" min="30" max="4320" step="30" value="720" />
+        </label>
+        <label>
+          Funding points
+          <input type="number" id="quick-funding-input" min="6" max="120" step="2" value="24" />
+        </label>
+        <button type="submit" class="button" id="quick-analyze-button">Анализировать</button>
+        <span class="settings-status" id="quick-analyze-status" aria-live="polite"></span>
+      </form>
+      <p class="muted">Или нажмите на символ в таблице возможностей, чтобы открыть детальный вид.</p>
+    </section>
     <section class="panel" id="settings-panel">
       <h2>Configuration</h2>
       <form id="settings-form">
@@ -130,15 +151,24 @@
           </label>
         </fieldset>
         <fieldset class="settings-fieldset">
-          <legend>Exchanges</legend>
+          <legend>Exchanges (opportunities)</legend>
+          {% set exchanges_settings = settings.get('exchanges', {}) %}
+          {% for name, enabled in exchanges_settings.items() %}
           <label class="settings-checkbox">
-            <input type="checkbox" name="exchanges" value="bybit"{% if settings.get('exchanges', {}).get('bybit', True) %} checked{% endif %} />
-            Bybit
+            <input type="checkbox" name="exchanges" value="{{ name }}"{% if enabled %} checked{% endif %} />
+            {{ name|upper }}
           </label>
+          {% endfor %}
+        </fieldset>
+        <fieldset class="settings-fieldset">
+          <legend>Exchanges (analysis)</legend>
+          {% set analysis_exchanges = settings.get('analysis_exchanges', exchanges_settings) %}
+          {% for name, enabled in analysis_exchanges.items() %}
           <label class="settings-checkbox">
-            <input type="checkbox" name="exchanges" value="mexc"{% if settings.get('exchanges', {}).get('mexc', True) %} checked{% endif %} />
-            MEXC
+            <input type="checkbox" name="analysis_exchanges" value="{{ name }}"{% if enabled %} checked{% endif %} />
+            {{ name|upper }}
           </label>
+          {% endfor %}
         </fieldset>
         <div class="settings-intervals">
           <label>
@@ -172,6 +202,14 @@
           <label class="settings-checkbox">
             <input type="checkbox" id="anti-orphan" {% if settings.get('protective', {}).get('anti_orphan_enabled', False) %}checked{% endif %} />
             Close paired leg on protective execution (anti-orphan)
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="alert-margin" {% if settings.get('protective', {}).get('send_margin_alerts', True) %}checked{% endif %} />
+            Telegram alerts: low margin
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="alert-missing-stops" {% if settings.get('protective', {}).get('send_missing_stop_alerts', True) %}checked{% endif %} />
+            Telegram alerts: missing stop/take
           </label>
           <div class="settings-intervals">
             <label>
@@ -573,6 +611,26 @@
       </table>
     </section>
 
+    <section class="panel" id="candidate-testing-panel">
+      <h2>Candidate Testing</h2>
+      <table class="data-table data-table--wide">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Exchange</th>
+            <th>Edge</th>
+            <th>Funding %</th>
+            <th>Spread %</th>
+            <th>Liquidity</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody id="candidate-testing-body">
+          <tr><td colspan="7" class="muted">No candidates yet (testing table placeholder).</td></tr>
+        </tbody>
+      </table>
+    </section>
+
     <section class="panel" id="reduction-candidates">
       <h2>Risk Reduction Candidates</h2>
       <table class="data-table data-table--wide">
@@ -639,5 +697,3 @@
   </main>
 </body>
 </html>
-
-

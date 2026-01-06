@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Manual Arbitrage</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', path='/favicon.svg') }}?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}?v={{ static_version }}" />
+  {% set settings = settings or {} %}
+  {% set analysis_exchanges = settings.get('analysis_exchanges', {}) %}
+  {% set manual_settings = settings.get('manual', {}) %}
+  <script defer src="{{ url_for('static', path='/manual.js') }}?v={{ static_version }}"></script>
+</head>
+<body class="page">
+  <header class="masthead">
+    <div>
+      <h1>Manual Arbitrage</h1>
+      <p class="subtitle">Dry-run or execute manual entries, exits, and rolls.</p>
+    </div>
+    <div class="status-block">
+      <dl>
+        <div>
+          <dt>Mode</dt>
+          <dd>Manual control</dd>
+        </div>
+        <div>
+          <dt>Hint</dt>
+          <dd>Start with a dry-run to review spreads and liquidity.</dd>
+        </div>
+      </dl>
+      <a class="button" href="/">Back to dashboard</a>
+    </div>
+  </header>
+
+  <main class="content">
+    <section class="panel">
+      <h2>Manual enter</h2>
+      <form id="manual-enter-form" class="analysis-form">
+        <label>
+          Symbol
+          <input type="text" id="enter-symbol" placeholder="BTC or BTCUSDT" autocomplete="off" />
+        </label>
+        <label>
+          Quantity (base)
+          <input type="number" id="enter-qty" step="0.0001" min="0" />
+        </label>
+        <label>
+          Long exchange
+          <select id="enter-long-exchange">
+            {% for name, enabled in analysis_exchanges.items() %}
+              {% if enabled %}<option value="{{ name }}">{{ name|upper }}</option>{% endif %}
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Short exchange
+          <select id="enter-short-exchange">
+            {% for name, enabled in analysis_exchanges.items() %}
+              {% if enabled %}<option value="{{ name }}">{{ name|upper }}</option>{% endif %}
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Mode
+          <select id="enter-mode">
+            <option value="smart-enter">Smart enter (chunked limit + hedge)</option>
+            <option value="fast-enter">Fast enter (market chunks)</option>
+            <option value="limit-first-expensive">Limit first (expensive leg)</option>
+            <option value="dual-limit">Dual limit</option>
+            <option value="dual-market">Dual market</option>
+            <option value="limit-then-market-fallback">Limit then market fallback</option>
+          </select>
+        </label>
+        <label>
+          Expensive leg (manual)
+          <select id="enter-expensive-leg">
+            <option value="">Auto hint</option>
+            <option value="long">Long leg</option>
+            <option value="short">Short leg</option>
+          </select>
+        </label>
+        <label>
+          Spread min (%)
+          <input type="number" id="enter-spread-min" step="0.01" />
+        </label>
+        <label>
+          Spread max (%)
+          <input type="number" id="enter-spread-max" step="0.01" />
+        </label>
+        <label>
+          Limit price (long)
+          <input type="number" id="enter-limit-long" step="0.0001" min="0" />
+        </label>
+        <label>
+          Limit price (short)
+          <input type="number" id="enter-limit-short" step="0.0001" min="0" />
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="enter-auto-limit" checked />
+          Auto limit price
+        </label>
+        <label>
+          Min level notional (USDT)
+          <input type="number" id="enter-min-level-notional" min="0" step="0.01" />
+        </label>
+        <label>
+          Min level qty (base)
+          <input type="number" id="enter-min-level-qty" min="0" step="0.0001" />
+        </label>
+        <label>
+          Max limit deviation (bps)
+          <input type="number" id="enter-max-limit-dev" min="0" step="0.1" value="30" />
+        </label>
+        <label>
+          Max slippage (bps)
+          <input type="number" id="enter-slippage" min="0" step="0.1" value="8" />
+        </label>
+        <label>
+          Timeout (sec)
+          <input type="number" id="enter-timeout" min="1" step="1" value="15" />
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="enter-orderbook-check" checked />
+          Use orderbook checks
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="enter-fallback" />
+          Fallback to market on timeout
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="enter-live-orderbook" {% if manual_settings.get('enter_live_orderbook') %}checked{% endif %} />
+          Show live orderbook
+        </label>
+        <label>
+          Live depth
+          <input type="number" id="enter-live-depth" min="1" max="20" step="1" value="{{ manual_settings.get('enter_live_depth', 5) }}" />
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="enter-dry-run">Dry-run</button>
+          <button type="button" class="button" id="enter-analyze">Analyze</button>
+          <button type="button" class="button" id="enter-execute">Execute now</button>
+          <span class="settings-status" id="enter-status" aria-live="polite"></span>
+        </div>
+      </form>
+      <div class="panel-muted">
+        <div class="live-metrics" id="enter-live">Live spread: -</div>
+        <p class="muted">Suggested expensive leg and liquidity metrics appear after dry-run.</p>
+        <pre id="enter-live-book" class="code-block"></pre>
+        <pre id="enter-plan" class="code-block"></pre>
+        <pre id="enter-exec-log" class="code-block"></pre>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Manual exit</h2>
+      <form id="manual-exit-form" class="analysis-form">
+        <label>
+          Symbol
+          <input type="text" id="exit-symbol" placeholder="BTC or BTCUSDT" autocomplete="off" />
+        </label>
+        <label>
+          Quantity (base)
+          <input type="number" id="exit-qty" step="0.0001" min="0" />
+        </label>
+        <label>
+          Long exchange
+          <select id="exit-long-exchange">
+            {% for name, enabled in analysis_exchanges.items() %}
+              {% if enabled %}<option value="{{ name }}">{{ name|upper }}</option>{% endif %}
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Short exchange
+          <select id="exit-short-exchange">
+            {% for name, enabled in analysis_exchanges.items() %}
+              {% if enabled %}<option value="{{ name }}">{{ name|upper }}</option>{% endif %}
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Mode
+          <select id="exit-mode">
+            <option value="smart-exit">Smart exit (chunked limit + hedge)</option>
+            <option value="fast-exit">Fast exit (market chunks)</option>
+          </select>
+        </label>
+        <label>
+          Expensive leg (manual)
+          <select id="exit-expensive-leg">
+            <option value="">Auto hint</option>
+            <option value="long">Long leg</option>
+            <option value="short">Short leg</option>
+          </select>
+        </label>
+        <label>
+          Spread min (%)
+          <input type="number" id="exit-spread-min" step="0.01" />
+        </label>
+        <label>
+          Spread max (%)
+          <input type="number" id="exit-spread-max" step="0.01" />
+        </label>
+        <label>
+          Limit price (long)
+          <input type="number" id="exit-limit-long" step="0.0001" min="0" />
+        </label>
+        <label>
+          Limit price (short)
+          <input type="number" id="exit-limit-short" step="0.0001" min="0" />
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="exit-auto-limit" checked />
+          Auto limit price
+        </label>
+        <label>
+          Min level notional (USDT)
+          <input type="number" id="exit-min-level-notional" min="0" step="0.01" />
+        </label>
+        <label>
+          Min level qty (base)
+          <input type="number" id="exit-min-level-qty" min="0" step="0.0001" />
+        </label>
+        <label>
+          Max limit deviation (bps)
+          <input type="number" id="exit-max-limit-dev" min="0" step="0.1" value="30" />
+        </label>
+        <label>
+          Chunk qty (base)
+          <input type="number" id="exit-chunk-qty" step="0.0001" min="0" />
+        </label>
+        <label>
+          Chunk notional (USDT)
+          <input type="number" id="exit-chunk-notional" step="0.01" min="0" />
+        </label>
+        <label>
+          Reprice interval (sec)
+          <input type="number" id="exit-reprice" min="0" step="0.1" value="2" />
+        </label>
+        <label>
+          Max runtime (sec)
+          <input type="number" id="exit-runtime" min="1" step="1" value="60" />
+        </label>
+        <label>
+          Max unhedged time (sec)
+          <input type="number" id="exit-unhedged-sec" min="0" step="0.5" value="8" />
+        </label>
+        <label>
+          Max unhedged (%)
+          <input type="number" id="exit-unhedged-pct" min="0" step="1" value="15" />
+        </label>
+        <label>
+          Hedge order type
+          <select id="exit-hedge-type">
+            <option value="market">Market</option>
+            <option value="limit">Aggressive limit</option>
+          </select>
+        </label>
+        <label>
+          Hedge offset (bps)
+          <input type="number" id="exit-hedge-bps" min="0" step="0.1" value="2" />
+        </label>
+        <label>
+          Hedge offset (ticks)
+          <input type="number" id="exit-hedge-ticks" min="0" step="1" value="1" />
+        </label>
+        <label>
+          Limit offset (bps)
+          <input type="number" id="exit-limit-bps" min="0" step="0.1" value="0" />
+        </label>
+        <label>
+          Limit offset (ticks)
+          <input type="number" id="exit-limit-ticks" min="0" step="1" value="0" />
+        </label>
+        <label>
+          Max slippage (bps)
+          <input type="number" id="exit-slippage" min="0" step="0.1" value="8" />
+        </label>
+        <label>
+          Timeout (sec)
+          <input type="number" id="exit-timeout" min="1" step="1" value="15" />
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="exit-orderbook-check" checked />
+          Use orderbook checks
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="exit-fallback" />
+          Fallback to market on timeout
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="exit-live-orderbook" {% if manual_settings.get('exit_live_orderbook') %}checked{% endif %} />
+          Show live orderbook
+        </label>
+        <label>
+          Live depth
+          <input type="number" id="exit-live-depth" min="1" max="20" step="1" value="{{ manual_settings.get('exit_live_depth', 5) }}" />
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="exit-dry-run">Dry-run</button>
+          <button type="button" class="button" id="exit-analyze">Analyze</button>
+          <button type="button" class="button" id="exit-execute">Execute now</button>
+          <span class="settings-status" id="exit-status" aria-live="polite"></span>
+        </div>
+      </form>
+      <div class="panel-muted">
+        <div class="live-metrics" id="exit-live">Live spread: -</div>
+        <pre id="exit-live-book" class="code-block"></pre>
+        <pre id="exit-plan" class="code-block"></pre>
+        <pre id="exit-exec-log" class="code-block"></pre>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Manual roll</h2>
+      <form id="manual-roll-form" class="analysis-form">
+        <label>
+          Symbol
+          <input type="text" id="roll-symbol" placeholder="BTC or BTCUSDT" autocomplete="off" />
+        </label>
+        <label>
+          Quantity (base)
+          <input type="number" id="roll-qty" step="0.0001" min="0" />
+        </label>
+        <label>
+          Side
+          <select id="roll-side">
+            <option value="long">Long</option>
+            <option value="short">Short</option>
+          </select>
+        </label>
+        <label>
+          From exchange
+          <select id="roll-from-exchange">
+            {% for name, enabled in analysis_exchanges.items() %}
+              {% if enabled %}<option value="{{ name }}">{{ name|upper }}</option>{% endif %}
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          To exchange
+          <select id="roll-to-exchange">
+            {% for name, enabled in analysis_exchanges.items() %}
+              {% if enabled %}<option value="{{ name }}">{{ name|upper }}</option>{% endif %}
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Mode
+          <select id="roll-mode">
+            <option value="limit-first-expensive">Limit first (expensive leg)</option>
+            <option value="dual-limit">Dual limit</option>
+            <option value="dual-market">Dual market</option>
+            <option value="limit-then-market-fallback">Limit then market fallback</option>
+          </select>
+        </label>
+        <label>
+          Expensive leg (manual)
+          <select id="roll-expensive-leg">
+            <option value="">Auto hint</option>
+            <option value="to">To leg</option>
+            <option value="from">From leg</option>
+          </select>
+        </label>
+        <label>
+          Spread min (%)
+          <input type="number" id="roll-spread-min" step="0.01" />
+        </label>
+        <label>
+          Spread max (%)
+          <input type="number" id="roll-spread-max" step="0.01" />
+        </label>
+        <label>
+          Limit price (to)
+          <input type="number" id="roll-limit-to" step="0.0001" min="0" />
+        </label>
+        <label>
+          Limit price (from)
+          <input type="number" id="roll-limit-from" step="0.0001" min="0" />
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="roll-auto-limit" checked />
+          Auto limit price
+        </label>
+        <label>
+          Min level notional (USDT)
+          <input type="number" id="roll-min-level-notional" min="0" step="0.01" />
+        </label>
+        <label>
+          Min level qty (base)
+          <input type="number" id="roll-min-level-qty" min="0" step="0.0001" />
+        </label>
+        <label>
+          Max limit deviation (bps)
+          <input type="number" id="roll-max-limit-dev" min="0" step="0.1" value="30" />
+        </label>
+        <label>
+          Max slippage (bps)
+          <input type="number" id="roll-slippage" min="0" step="0.1" value="8" />
+        </label>
+        <label>
+          Timeout (sec)
+          <input type="number" id="roll-timeout" min="1" step="1" value="15" />
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="roll-orderbook-check" checked />
+          Use orderbook checks
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="roll-fallback" />
+          Fallback to market on timeout
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="roll-dry-run">Dry-run</button>
+          <button type="button" class="button" id="roll-execute">Execute now</button>
+          <span class="settings-status" id="roll-status" aria-live="polite"></span>
+        </div>
+      </form>
+      <div class="panel-muted">
+        <pre id="roll-plan" class="code-block"></pre>
+        <pre id="roll-exec-log" class="code-block"></pre>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

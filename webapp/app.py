@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -14,10 +14,11 @@ from pydantic import BaseModel, Field
 from project_settings import MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS, SettingsManager
 
 from .services import DataService
+from .manual_stream import ManualSpreadStream
 
 BASE_DIR = Path(__file__).resolve().parent
 
-STATIC_VERSION = "v2025-12-01-19"
+STATIC_VERSION = "v2026-01-06-07"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -30,10 +31,72 @@ logger = logging.getLogger(__name__)
 class SettingsPayload(BaseModel):
     sources: Dict[str, bool]
     exchanges: Dict[str, bool]
+    analysis_exchanges: Dict[str, bool]
     parser_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
     exchange_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
     table_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
     account_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
+    summary_refresh_seconds: Optional[int] = Field(
+        default=None, ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS
+    )
+    protective: Optional[Dict[str, object]] = None
+    manual: Optional[Dict[str, object]] = None
+
+
+class ManualBasePayload(BaseModel):
+    symbol: str
+    qty: Optional[float] = Field(default=None, gt=0)
+    notional: Optional[float] = Field(default=None, gt=0)
+    mode: str = "limit-first-expensive"
+    max_slippage_bps: Optional[float] = Field(default=8.0, ge=0)
+    spread_min_pct: Optional[float] = None
+    spread_max_pct: Optional[float] = None
+    timeout_sec: Optional[int] = Field(default=15, ge=1)
+    max_runtime_sec: Optional[int] = Field(default=None, ge=1)
+    reprice_sec: Optional[float] = Field(default=None, ge=0)
+    chunk_qty: Optional[float] = Field(default=None, gt=0)
+    chunk_notional: Optional[float] = Field(default=None, gt=0)
+    max_unhedged_sec: Optional[float] = Field(default=None, ge=0)
+    max_unhedged_pct: Optional[float] = Field(default=None, ge=0)
+    hedge_order_type: Optional[str] = None
+    hedge_offset_bps: Optional[float] = Field(default=None, ge=0)
+    hedge_offset_ticks: Optional[int] = Field(default=None, ge=0)
+    limit_offset_bps: Optional[float] = Field(default=None, ge=0)
+    limit_offset_ticks: Optional[int] = Field(default=None, ge=0)
+    auto_limit_price: bool = True
+    min_level_notional: Optional[float] = Field(default=None, ge=0)
+    min_level_qty: Optional[float] = Field(default=None, ge=0)
+    max_limit_deviation_bps: Optional[float] = Field(default=None, ge=0)
+    use_orderbook_check: bool = True
+    fallback_to_market: bool = False
+    async_run: bool = False
+    dry_run: bool = False
+    limit_price_long: Optional[float] = None
+    limit_price_short: Optional[float] = None
+    expensive_leg: Optional[str] = None
+
+
+class ManualEnterPayload(ManualBasePayload):
+    long_exchange: str
+    short_exchange: str
+
+
+class ManualExitPayload(ManualBasePayload):
+    long_exchange: str
+    short_exchange: str
+    position_id: Optional[str] = None
+
+
+class ManualRollPayload(ManualBasePayload):
+    from_exchange: str
+    to_exchange: str
+    side: str
+
+
+class ManualAnalyzePayload(ManualBasePayload):
+    long_exchange: str
+    short_exchange: str
+    action: str = "enter"
 
 
 @app.on_event("startup")
@@ -68,9 +131,59 @@ async def index(request: Request) -> HTMLResponse:
         },
     )
 
+@app.get("/coin/{symbol}", response_class=HTMLResponse)
+async def coin_analysis_page(
+    request: Request,
+    symbol: str,
+    window_minutes: int = 720,
+    funding_points: int = 24,
+) -> HTMLResponse:
+    settings = settings_manager.as_dict()
+    return templates.TemplateResponse(
+        "coin.html",
+        {
+            "request": request,
+            "symbol": symbol,
+            "window_minutes": window_minutes,
+            "funding_points": funding_points,
+            "static_version": STATIC_VERSION,
+            "settings": settings,
+        },
+    )
+
+@app.get("/manual", response_class=HTMLResponse)
+async def manual_page(request: Request) -> HTMLResponse:
+    settings = settings_manager.as_dict()
+    return templates.TemplateResponse(
+        "manual.html",
+        {
+            "request": request,
+            "settings": settings,
+            "static_version": STATIC_VERSION,
+        },
+    )
+
 @app.get("/api/snapshot")
 async def snapshot_api() -> JSONResponse:
     return JSONResponse(service.state_payload())
+
+@app.get("/api/coin/{symbol}")
+async def coin_analysis_api(
+    symbol: str,
+    window_minutes: int = 720,
+    funding_points: int = 24,
+) -> JSONResponse:
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+    try:
+        payload = await service.analyze_symbol(
+            symbol,
+            window_minutes=window_minutes,
+            funding_points=funding_points,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(payload)
 
 @app.post("/api/refresh")
 async def refresh_snapshot() -> JSONResponse:
@@ -80,6 +193,15 @@ async def refresh_snapshot() -> JSONResponse:
 @app.get("/api/settings")
 async def get_settings() -> JSONResponse:
     return JSONResponse({"settings": settings_manager.as_dict()})
+
+@app.websocket("/ws/manual")
+async def manual_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    stream = ManualSpreadStream(websocket)
+    try:
+        await stream.run()
+    except WebSocketDisconnect:
+        pass
 
 @app.post("/api/settings")
 async def update_settings(payload: SettingsPayload) -> JSONResponse:
@@ -94,3 +216,30 @@ async def update_settings(payload: SettingsPayload) -> JSONResponse:
             "state": service.state_payload(),
         }
     )
+
+@app.post("/api/manual/enter")
+async def manual_enter(payload: ManualEnterPayload) -> JSONResponse:
+    result = await service.manual_enter(payload.dict())
+    return JSONResponse(result)
+
+@app.post("/api/manual/exit")
+async def manual_exit(payload: ManualExitPayload) -> JSONResponse:
+    result = await service.manual_exit(payload.dict())
+    return JSONResponse(result)
+
+@app.post("/api/manual/roll")
+async def manual_roll(payload: ManualRollPayload) -> JSONResponse:
+    result = await service.manual_roll(payload.dict())
+    return JSONResponse(result)
+
+@app.post("/api/manual/analyze")
+async def manual_analyze(payload: ManualAnalyzePayload) -> JSONResponse:
+    result = await service.manual_analyze(payload.dict())
+    return JSONResponse(result)
+
+@app.get("/api/manual/exec/{exec_id}")
+async def manual_exec_status(exec_id: str) -> JSONResponse:
+    result = await service.manual_exec_status(exec_id)
+    if result.get("error"):
+        raise HTTPException(status_code=404, detail=result["error"])
+    return JSONResponse(result)

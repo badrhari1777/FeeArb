@@ -148,7 +148,7 @@ async def collect_sources_async(
         else:
             screener_rows = []
             screener_from_cache = False
-            messages.append("ArbitrageScanner disabled via settings; cache not used.")
+            messages.append("ArbitrageScanner fetch disabled via settings.")
             _emit(
                 "screener:skipped",
                 {
@@ -208,7 +208,7 @@ async def collect_sources_async(
         else:
             coinglass_rows = []
             coinglass_from_cache = False
-            messages.append("Coinglass disabled via settings; cache not used.")
+            messages.append("Coinglass fetch disabled via settings.")
             _emit(
                 "coinglass:skipped",
                 {

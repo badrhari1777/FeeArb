@@ -26,6 +26,17 @@ DEFAULT_EXCHANGES: Final[Dict[str, bool]] = {
     name: True for name in SUPPORTED_EXCHANGES
 }
 
+# Broader set for deep-dive analysis (can include venues not in SUPPORTED_EXCHANGES).
+DEFAULT_ANALYSIS_EXCHANGES: Final[Dict[str, bool]] = {
+    "bybit": True,
+    "bingx": True,
+    "bitget": True,
+    "okx": True,
+    "gate": True,
+    "mexc": True,
+    "kucoin": True,
+}
+
 MIN_REFRESH_SECONDS: Final[int] = 30
 MAX_REFRESH_SECONDS: Final[int] = 24 * 60 * 60  # one day
 
@@ -57,6 +68,9 @@ class AppSettings:
     exchanges: Dict[str, bool] = field(
         default_factory=lambda: dict(DEFAULT_EXCHANGES)
     )
+    analysis_exchanges: Dict[str, bool] = field(
+        default_factory=lambda: dict(DEFAULT_ANALYSIS_EXCHANGES)
+    )
     parser_refresh_seconds: int = 600  # 10 minutes
     exchange_refresh_seconds: int = 300  # Funding Opportunities refresh (5 minutes)
     table_refresh_seconds: int = 60  # Page refresh
@@ -67,10 +81,20 @@ class AppSettings:
             "auto_protect_enabled": True,
             "auto_take_enabled": True,
             "anti_orphan_enabled": False,
+            "send_margin_alerts": True,
+            "send_missing_stop_alerts": True,
             "stop_gap_from_liq_pct": 0.07,
             "stop_requote_threshold_pct": 0.005,
             "fallback_liq_factor_long": 0.33,
             "fallback_liq_factor_short": 1.66,
+        }
+    )
+    manual: Dict[str, object] = field(
+        default_factory=lambda: {
+            "enter_live_orderbook": False,
+            "enter_live_depth": 5,
+            "exit_live_orderbook": False,
+            "exit_live_depth": 5,
         }
     )
 
@@ -93,6 +117,14 @@ class AppSettings:
             updated.exchanges = _normalise_bool_map(
                 _default_exchanges(), self.exchanges, allow_new_keys=True
         )
+        if "analysis_exchanges" in payload:
+            updated.analysis_exchanges = _normalise_bool_map(
+                DEFAULT_ANALYSIS_EXCHANGES, payload["analysis_exchanges"]
+            )
+        else:
+            updated.analysis_exchanges = _normalise_bool_map(
+                DEFAULT_ANALYSIS_EXCHANGES, self.analysis_exchanges, allow_new_keys=True
+            )
         updated.parser_refresh_seconds = int(
             payload.get("parser_refresh_seconds", self.parser_refresh_seconds)
         )
@@ -108,10 +140,13 @@ class AppSettings:
         updated.account_refresh_seconds = int(
             payload.get("account_refresh_seconds", self.account_refresh_seconds)
         )
-        updated.summary_refresh_seconds = int(
-            payload.get("summary_refresh_seconds", self.summary_refresh_seconds)
-        )
+        # Allow optional summary_refresh_seconds; fall back to current value when omitted/None.
+        summary_value = payload.get("summary_refresh_seconds", self.summary_refresh_seconds)
+        if summary_value is None:
+            summary_value = self.summary_refresh_seconds
+        updated.summary_refresh_seconds = int(summary_value)
         updated.protective = dict(payload.get("protective", self.protective))
+        updated.manual = dict(payload.get("manual", self.manual))
         return updated.normalised()
 
     def normalised(self) -> "AppSettings":
@@ -120,10 +155,15 @@ class AppSettings:
         self.exchanges = _normalise_bool_map(
             _default_exchanges(), self.exchanges
         )
+        self.analysis_exchanges = _normalise_bool_map(
+            DEFAULT_ANALYSIS_EXCHANGES, self.analysis_exchanges
+        )
         defaults = {
             "auto_protect_enabled": True,
             "auto_take_enabled": True,
             "anti_orphan_enabled": False,
+            "send_margin_alerts": True,
+            "send_missing_stop_alerts": True,
             "stop_gap_from_liq_pct": 0.07,
             "stop_requote_threshold_pct": 0.005,
             "fallback_liq_factor_long": 0.33,
@@ -133,6 +173,16 @@ class AppSettings:
         if isinstance(self.protective, dict):
             merged.update(self.protective)
         self.protective = merged
+        manual_defaults = {
+            "enter_live_orderbook": False,
+            "enter_live_depth": 5,
+            "exit_live_orderbook": False,
+            "exit_live_depth": 5,
+        }
+        manual = dict(manual_defaults)
+        if isinstance(self.manual, dict):
+            manual.update(self.manual)
+        self.manual = manual
         return self
 
     def validate(self) -> None:
@@ -141,6 +191,8 @@ class AppSettings:
             raise ValueError("At least one data source must remain enabled.")
         if not any(self.exchanges.values()):
             raise ValueError("At least one exchange must remain enabled.")
+        if not any(self.analysis_exchanges.values()):
+            raise ValueError("At least one analysis exchange must remain enabled.")
         if (
             self.parser_refresh_seconds < MIN_REFRESH_SECONDS
             or self.table_refresh_seconds < MIN_REFRESH_SECONDS
@@ -174,12 +226,14 @@ class AppSettings:
         return {
             "sources": dict(self.sources),
             "exchanges": dict(self.exchanges),
+            "analysis_exchanges": dict(self.analysis_exchanges),
             "parser_refresh_seconds": self.parser_refresh_seconds,
             "exchange_refresh_seconds": self.exchange_refresh_seconds,
             "table_refresh_seconds": self.table_refresh_seconds,
             "account_refresh_seconds": self.account_refresh_seconds,
             "summary_refresh_seconds": self.summary_refresh_seconds,
             "protective": dict(self.protective),
+            "manual": dict(self.manual),
         }
 
     @classmethod
@@ -246,10 +300,12 @@ class SettingsManager:
     def enabled_exchanges(self) -> Dict[str, bool]:
         return dict(self._settings.exchanges)
 
+    def enabled_analysis_exchanges(self) -> Dict[str, bool]:
+        return dict(self._settings.analysis_exchanges)
+
     def refresh_intervals(self) -> tuple[int, int, int]:
         return (
             self._settings.parser_refresh_seconds,
             self._settings.table_refresh_seconds,
             self._settings.exchange_refresh_seconds,
         )
-

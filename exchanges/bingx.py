@@ -54,14 +54,18 @@ class BingXAdapter(ExchangeAdapter):
                 logger.debug("BingX: no ticker for %s", exch_symbol)
                 continue
             self._cache_symbol_meta(exch_symbol, ticker_item)
+            mark_price = _to_float(ticker_item.get("lastPrice")) or _to_float(funding_item.get("markPrice"))
+            next_funding = _to_datetime(
+                funding_item.get("nextFundingTime") or funding_item.get("fundingTime")
+            )
             snapshots.append(
                 MarketSnapshot(
                     exchange=self.name,
                     symbol=canonical,
                     exchange_symbol=exch_symbol,
                     funding_rate=_to_float(funding_item.get("fundingRate")),
-                    next_funding_time=_to_datetime(funding_item.get("nextFundingTime")),
-                    mark_price=_to_float(ticker_item.get("lastPrice")),
+                    next_funding_time=next_funding,
+                    mark_price=mark_price,
                     bid=_to_float(ticker_item.get("bestBid")),
                     ask=_to_float(ticker_item.get("bestAsk")),
                     raw={"ticker": ticker_item, "funding": funding_item},

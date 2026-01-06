@@ -11,17 +11,31 @@
   var MAX_RENDERED_EVENTS = 50;
   var MAX_TELEMETRY = 200;
 
-  var defaultSettings = {
-    sources: { arbitragescanner: true, coinglass: true },
-    exchanges: { bybit: true, mexc: true },
-    parser_refresh_seconds: 300,
-    exchange_refresh_seconds: 60,
-    table_refresh_seconds: 300,
-    account_refresh_seconds: 90,
+  var protectiveDefaults = {
+    auto_protect_enabled: true,
+    auto_take_enabled: true,
+    anti_orphan_enabled: false,
+    send_margin_alerts: true,
+    send_missing_stop_alerts: true,
     stop_gap_from_liq_pct: 0.07,
     stop_requote_threshold_pct: 0.005,
     fallback_liq_factor_long: 0.33,
     fallback_liq_factor_short: 1.66
+  };
+
+  var defaultSettings = {
+    sources: { arbitragescanner: true, coinglass: true },
+    exchanges: { bybit: true, mexc: true },
+    analysis_exchanges: { bybit: true, bingx: true, bitget: true, okx: true, gate: true, mexc: true, kucoin: true },
+    parser_refresh_seconds: 300,
+    exchange_refresh_seconds: 60,
+    table_refresh_seconds: 300,
+    account_refresh_seconds: 90,
+    stop_gap_from_liq_pct: protectiveDefaults.stop_gap_from_liq_pct,
+    stop_requote_threshold_pct: protectiveDefaults.stop_requote_threshold_pct,
+    fallback_liq_factor_long: protectiveDefaults.fallback_liq_factor_long,
+    fallback_liq_factor_short: protectiveDefaults.fallback_liq_factor_short,
+    protective: clone(protectiveDefaults)
   };
 
   var defaultExecution = {
@@ -85,6 +99,8 @@
     protectAuto: document.getElementById('protect-auto'),
     takeAuto: document.getElementById('take-auto'),
     antiOrphan: document.getElementById('anti-orphan'),
+    alertMargin: document.getElementById('alert-margin'),
+    alertMissingStops: document.getElementById('alert-missing-stops'),
     stopGapInput: document.getElementById('stop-gap'),
     requoteInput: document.getElementById('stop-requote'),
     fallbackLongInput: document.getElementById('fallback-long'),
@@ -103,7 +119,13 @@
     accountLastUpdated: document.getElementById('account-last-updated'),
     accountStatusTable: document.getElementById('account-status-body'),
     accountBalanceTable: document.getElementById('account-balance-body'),
-    symbolPositionsTable: document.getElementById('symbol-positions-body')
+    symbolPositionsTable: document.getElementById('symbol-positions-body'),
+    quickAnalyzeForm: document.getElementById('quick-analyze-form'),
+    quickAnalyzeInput: document.getElementById('quick-analyze-input'),
+    quickWindowInput: document.getElementById('quick-window-input'),
+    quickFundingInput: document.getElementById('quick-funding-input'),
+    quickAnalyzeStatus: document.getElementById('quick-analyze-status'),
+    quickAnalyzeButton: document.getElementById('quick-analyze-button')
   };
 
   function clone(value) {
@@ -156,6 +178,16 @@
           }
         }
       }
+      if (settings.analysis_exchanges) {
+        normalized.analysis_exchanges = {};
+        for (key in settings.analysis_exchanges) {
+          if (Object.prototype.hasOwnProperty.call(settings.analysis_exchanges, key)) {
+            normalized.analysis_exchanges[key] = !!settings.analysis_exchanges[key];
+          }
+        }
+      } else {
+        normalized.analysis_exchanges = clone(normalized.exchanges);
+      }
       parsed = parseInt(settings.parser_refresh_seconds, 10);
       if (!isNaN(parsed)) {
         normalized.parser_refresh_seconds = clamp(parsed, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
@@ -172,6 +204,17 @@
       if (!isNaN(parsed)) {
         normalized.account_refresh_seconds = clamp(parsed, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
       }
+      // Merge protective toggles/thresholds, preserving falsey values.
+      var incomingProtective = (settings && typeof settings.protective === 'object') ? settings.protective : null;
+      var mergedProtective = clone(protectiveDefaults) || {};
+      if (incomingProtective) {
+        for (key in incomingProtective) {
+          if (Object.prototype.hasOwnProperty.call(incomingProtective, key)) {
+            mergedProtective[key] = incomingProtective[key];
+          }
+        }
+      }
+      normalized.protective = mergedProtective;
     }
     return normalized;
   }
@@ -443,7 +486,7 @@
     for (i = 0; i < (rows && rows.length ? rows.length : 0); i += 1) {
       var row = rows[i] || {};
       html += '<tr>' +
-        '<td>' + escapeHtml(row.symbol) + '</td>' +
+        '<td><a class="symbol-link" href="/coin/' + encodeURIComponent(row.symbol || '') + '">' + escapeHtml(row.symbol) + '</a></td>' +
         '<td>' + escapeHtml(row.sources) + '</td>' +
       '</tr>';
     }
@@ -476,7 +519,7 @@
     for (i = 0; i < dataset.length; i += 1) {
       var row = dataset[i] || {};
       html += '<tr>' +
-        '<td>' + escapeHtml(row.symbol) + '</td>' +
+        '<td><a class="symbol-link" href="/coin/' + encodeURIComponent(row.symbol || '') + '">' + escapeHtml(row.symbol) + '</a></td>' +
         '<td>' + escapeHtml(row.long_exchange) + '</td>' +
         '<td>' + formatPercent(row.long_rate, 3) + '</td>' +
         '<td>' + formatNumber(row.long_ask, 4) + '</td>' +
@@ -1073,6 +1116,53 @@
     });
   }
 
+  function setQuickAnalyzeStatus(message, tone) {
+    if (!elements.quickAnalyzeStatus) {
+      return;
+    }
+    var cls = 'settings-status';
+    if (tone === 'error') {
+      cls += ' settings-status--error';
+    } else if (tone === 'success') {
+      cls += ' settings-status--success';
+    }
+    elements.quickAnalyzeStatus.className = cls;
+    elements.quickAnalyzeStatus.textContent = message || '';
+  }
+
+  function navigateToAnalysis(symbol, windowMinutes, fundingPoints) {
+    var params = [];
+    if (windowMinutes) {
+      params.push('window_minutes=' + encodeURIComponent(windowMinutes));
+    }
+    if (fundingPoints) {
+      params.push('funding_points=' + encodeURIComponent(fundingPoints));
+    }
+    var url = '/coin/' + encodeURIComponent(symbol);
+    if (params.length) {
+      url += '?' + params.join('&');
+    }
+    window.location.href = url;
+  }
+
+  function handleQuickAnalyzeSubmit(event) {
+    if (event && typeof event.preventDefault === 'function') {
+      event.preventDefault();
+    }
+    if (!elements.quickAnalyzeInput) {
+      return;
+    }
+    var symbol = (elements.quickAnalyzeInput.value || '').trim().toUpperCase();
+    var windowMinutes = elements.quickWindowInput ? parseInt(elements.quickWindowInput.value || '720', 10) : 720;
+    var fundingPoints = elements.quickFundingInput ? parseInt(elements.quickFundingInput.value || '24', 10) : 24;
+    if (!symbol) {
+      setQuickAnalyzeStatus('Введите символ.', 'error');
+      return;
+    }
+    setQuickAnalyzeStatus('Открываю анализ...', 'success');
+    navigateToAnalysis(symbol, windowMinutes, fundingPoints);
+  }
+
   function collectSettingsFromForm() {
     var result = {
       sources: {},
@@ -1095,6 +1185,11 @@
     inputs = elements.settingsForm.querySelectorAll('input[name="exchanges"]');
     for (i = 0; i < inputs.length; i += 1) {
       result.exchanges[inputs[i].value] = !!inputs[i].checked;
+    }
+    inputs = elements.settingsForm.querySelectorAll('input[name="analysis_exchanges"]');
+    result.analysis_exchanges = {};
+    for (i = 0; i < inputs.length; i += 1) {
+      result.analysis_exchanges[inputs[i].value] = !!inputs[i].checked;
     }
     if (elements.parserInput) {
       var parserValue = parseInt(elements.parserInput.value, 10);
@@ -1124,6 +1219,8 @@
       auto_protect_enabled: elements.protectAuto ? !!elements.protectAuto.checked : true,
       auto_take_enabled: elements.takeAuto ? !!elements.takeAuto.checked : true,
       anti_orphan_enabled: elements.antiOrphan ? !!elements.antiOrphan.checked : false,
+      send_margin_alerts: elements.alertMargin ? !!elements.alertMargin.checked : true,
+      send_missing_stop_alerts: elements.alertMissingStops ? !!elements.alertMissingStops.checked : true,
       stop_gap_from_liq_pct: elements.stopGapInput ? parseFloat(elements.stopGapInput.value) || defaultSettings.stop_gap_from_liq_pct || 0.07 : 0.07,
       stop_requote_threshold_pct: elements.requoteInput ? parseFloat(elements.requoteInput.value) || 0.005 : 0.005,
       fallback_liq_factor_long: elements.fallbackLongInput ? parseFloat(elements.fallbackLongInput.value) || 0.33 : 0.33,
@@ -1150,6 +1247,12 @@
       var exchange = inputs[i].value;
       inputs[i].checked = exchanges.hasOwnProperty(exchange) ? !!exchanges[exchange] : !!defaultSettings.exchanges[exchange];
     }
+    var analysis = settings.analysis_exchanges || exchanges || {};
+    inputs = elements.settingsForm.querySelectorAll('input[name="analysis_exchanges"]');
+    for (i = 0; i < inputs.length; i += 1) {
+      var name = inputs[i].value;
+      inputs[i].checked = analysis.hasOwnProperty(name) ? !!analysis[name] : !!defaultSettings.analysis_exchanges[name];
+    }
     if (elements.parserInput) {
       elements.parserInput.value = settings.parser_refresh_seconds;
     }
@@ -1171,6 +1274,12 @@
     }
     if (elements.antiOrphan) {
       elements.antiOrphan.checked = protective.hasOwnProperty('anti_orphan_enabled') ? !!protective.anti_orphan_enabled : false;
+    }
+    if (elements.alertMargin) {
+      elements.alertMargin.checked = protective.hasOwnProperty('send_margin_alerts') ? !!protective.send_margin_alerts : true;
+    }
+    if (elements.alertMissingStops) {
+      elements.alertMissingStops.checked = protective.hasOwnProperty('send_missing_stop_alerts') ? !!protective.send_missing_stop_alerts : true;
     }
     if (elements.stopGapInput) {
       elements.stopGapInput.value = protective.stop_gap_from_liq_pct !== undefined ? protective.stop_gap_from_liq_pct : 0.07;
@@ -1237,6 +1346,9 @@
 
     if (elements.refreshButton) {
       elements.refreshButton.addEventListener('click', triggerManualRefresh);
+    }
+    if (elements.quickAnalyzeForm) {
+      elements.quickAnalyzeForm.addEventListener('submit', handleQuickAnalyzeSubmit);
     }
     if (elements.settingsForm) {
       elements.settingsForm.addEventListener('submit', handleSettingsSubmit);

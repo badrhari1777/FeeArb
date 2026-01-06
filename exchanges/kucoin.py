@@ -88,6 +88,45 @@ class KucoinAdapter(ExchangeAdapter):
         self._contracts = {item.get("symbol"): item for item in data if isinstance(item, dict)}
         return self._contracts
 
+    def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
+        """Return recent funding history."""
+        contract = self.map_symbol(symbol) or symbol
+
+        def _fetch() -> list[dict]:
+            params = urlencode({"symbol": contract, "pageSize": limit})
+            url = f"{self.base_url}/api/v1/contract/funding-rates?{params}"
+            try:
+                payload = _get_json(url)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("KuCoin funding history fetch failed for %s: %s", contract, exc)
+                return []
+            out: list[dict] = []
+            if payload.get("code") == "200000":
+                for item in payload.get("data") or []:
+                    ts_ms = _to_float(item.get("timePoint") or item.get("ts")) or 0
+                    out.append(
+                        {
+                            "ts_ms": int(ts_ms),
+                            "rate": _to_float(item.get("fundingRate") or item.get("funding_rate")),
+                            "interval_hours": 8.0,
+                            "mark_price": _to_float(item.get("markPrice")),
+                        }
+                    )
+            return out
+
+        try:
+            from utils.cache_db import get_or_fetch_funding_history
+
+            return get_or_fetch_funding_history(
+                self.name,
+                contract,
+                _fetch,
+                max_age_seconds=300,
+                limit=limit,
+            )
+        except Exception:  # pylint: disable=broad-except
+            return _fetch()
+
 
 def _get_json(url: str) -> dict:
     req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
