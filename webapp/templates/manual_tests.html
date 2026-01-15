@@ -99,6 +99,57 @@
         <pre id="test-result" class="code-block"></pre>
       </div>
     </section>
+
+    <section class="panel">
+      <h2>WebSocket spread test</h2>
+      <form id="ws-test-form" class="analysis-form">
+        <label>
+          Symbol
+          <input type="text" id="ws-symbol" placeholder="BTC or BTCUSDT" autocomplete="off" />
+        </label>
+        <label>
+          Long exchange
+          <select id="ws-long-exchange">
+            {% for name, enabled in analysis_exchanges.items() %}
+              {% if enabled %}<option value="{{ name }}">{{ name|upper }}</option>{% endif %}
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Short exchange
+          <select id="ws-short-exchange">
+            {% for name, enabled in analysis_exchanges.items() %}
+              {% if enabled %}<option value="{{ name }}">{{ name|upper }}</option>{% endif %}
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Spread min (%)
+          <input type="number" id="ws-spread-min" step="0.01" />
+        </label>
+        <label>
+          Spread max (%)
+          <input type="number" id="ws-spread-max" step="0.01" />
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="ws-include-orderbook" checked />
+          Show live orderbook
+        </label>
+        <label>
+          Live depth
+          <input type="number" id="ws-live-depth" min="1" max="20" step="1" value="5" />
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-connect">Connect</button>
+          <button type="button" class="button" id="ws-disconnect">Disconnect</button>
+          <span class="settings-status" id="ws-status" aria-live="polite"></span>
+        </div>
+      </form>
+      <div class="panel-muted">
+        <div class="live-metrics" id="ws-live">Live spread: -</div>
+        <pre id="ws-live-book" class="code-block"></pre>
+      </div>
+    </section>
   </main>
 </body>
 </html>

@@ -66,5 +66,8 @@ def _normalize_gate_symbol(symbol: str) -> str:
 def _normalize_kucoin_symbol(symbol: str) -> str:
     symbol = _normalize_input_symbol(symbol)
     if symbol.endswith("USDT"):
-        return f"{symbol}M"
+        base = symbol[:-4]
+        if base == "BTC":
+            base = "XBT"
+        return f"{base}USDTM"
     return symbol

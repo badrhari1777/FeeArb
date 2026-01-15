@@ -35,6 +35,7 @@ from risk.stop_manager import ProtectiveOrderManager
 from utils import purge_expired
 from utils.cache_db import get_or_fetch_funding_history
 from exchanges import get_adapter, normalize_exchange_name
+from .market_data import MarketDataBus
 from uuid import uuid4
 
 RefreshResult = Literal["completed", "in_progress", "failed"]
@@ -289,7 +290,8 @@ class DataService:
         self._last_protective: dict[tuple[str, str, str], dict[str, float | None]] = {}
         self._protective_interval = getattr(self._risk_config, "position_check_interval_sec", 180)
         self._protective_task: Optional[asyncio.Task] = None
-        self._manual = ManualTradeManager()
+        self._market_data = MarketDataBus()
+        self._manual = ManualTradeManager(orderbook_provider=self._market_data)
         self._manual_runs: Dict[str, dict[str, Any]] = {}
         self._manual_run_ttl = 3600
         self._mexc_alert_cooldown = 600  # seconds
@@ -345,6 +347,7 @@ class DataService:
             except asyncio.CancelledError:
                 pass
             self._protective_task = None
+        await self._market_data.shutdown()
         await self._telemetry.stop()
         await self._accounts.stop()
 

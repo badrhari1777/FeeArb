@@ -72,6 +72,52 @@
     }
   }
 
+  function formatNumber(value, digits) {
+    var number = typeof value === 'number' ? value : parseFloat(value);
+    if (isNaN(number)) {
+      return '-';
+    }
+    var places = typeof digits === 'number' ? digits : 4;
+    return number.toFixed(places);
+  }
+
+  function formatLevels(levels, reverse) {
+    if (!levels || !levels.length) {
+      return ['    -'];
+    }
+    var ordered = levels.slice();
+    if (reverse) {
+      ordered.reverse();
+    }
+    return ordered.map(function (level) {
+      return '    ' + formatNumber(level[0], 4) + ' x ' + formatNumber(level[1], 4);
+    });
+  }
+
+  function formatLiveBooks(longBook, shortBook, longExchange, shortExchange, subscriptions) {
+    var lines = [];
+    lines.push('LONG (' + (longExchange || '-').toUpperCase() + ')');
+    if (subscriptions && subscriptions[longExchange]) {
+      lines.push('  Sub: ' + subscriptions[longExchange]);
+    }
+    lines.push('  Asks (top -> mid):');
+    lines = lines.concat(formatLevels(longBook.asks, true));
+    lines.push('  Mid: ' + formatNumber(longBook.best_bid, 4) + ' / ' + formatNumber(longBook.best_ask, 4));
+    lines.push('  Bids (mid -> down):');
+    lines = lines.concat(formatLevels(longBook.bids, false));
+    lines.push('');
+    lines.push('SHORT (' + (shortExchange || '-').toUpperCase() + ')');
+    if (subscriptions && subscriptions[shortExchange]) {
+      lines.push('  Sub: ' + subscriptions[shortExchange]);
+    }
+    lines.push('  Asks (top -> mid):');
+    lines = lines.concat(formatLevels(shortBook.asks, true));
+    lines.push('  Mid: ' + formatNumber(shortBook.best_bid, 4) + ' / ' + formatNumber(shortBook.best_ask, 4));
+    lines.push('  Bids (mid -> down):');
+    lines = lines.concat(formatLevels(shortBook.bids, false));
+    return lines.join('\n');
+  }
+
   function buildPayload() {
     return {
       exchange: (getValue('test-exchange') || '').trim(),
@@ -130,5 +176,177 @@
     });
   }
 
-  document.addEventListener('DOMContentLoaded', bind);
+  function bindWsTest() {
+    var statusEl = document.getElementById('ws-status');
+    var liveEl = document.getElementById('ws-live');
+    var bookEl = document.getElementById('ws-live-book');
+    var ws = null;
+
+    function wsUrl() {
+      var proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      return proto + window.location.host + '/ws/manual';
+    }
+
+    function setLive(text, tone) {
+      if (!liveEl) {
+        return;
+      }
+      liveEl.textContent = text;
+      liveEl.className = 'live-metrics' + (tone ? (' live-metrics--' + tone) : '');
+    }
+
+    function currentPayload() {
+      var symbol = (getValue('ws-symbol') || '').trim().toUpperCase();
+      var longExchange = (getValue('ws-long-exchange') || '').trim();
+      var shortExchange = (getValue('ws-short-exchange') || '').trim();
+      var includeOrderbook = getChecked('ws-include-orderbook');
+      var depth = parseInt(getValue('ws-live-depth'), 10) || 5;
+      return {
+        action: 'subscribe',
+        symbol: symbol,
+        long_exchange: longExchange,
+        short_exchange: shortExchange,
+        spread_min_pct: parseOptionalNumber(getValue('ws-spread-min')),
+        spread_max_pct: parseOptionalNumber(getValue('ws-spread-max')),
+        include_orderbook: includeOrderbook,
+        orderbook_depth: depth
+      };
+    }
+
+    function subscribe() {
+      if (!ws || ws.readyState !== 1) {
+        return;
+      }
+      var payload = currentPayload();
+      if (!payload.symbol || !payload.long_exchange || !payload.short_exchange) {
+        setLive('Live spread: -', '');
+        if (bookEl) {
+          bookEl.textContent = '';
+        }
+        return;
+      }
+      ws.send(JSON.stringify(payload));
+      setLive('Live spread: connecting...', '');
+    }
+
+    function connect() {
+      if (ws && ws.readyState === 1) {
+        return;
+      }
+      ws = new WebSocket(wsUrl());
+      ws.onopen = function () {
+        setStatus(statusEl, 'Connected', 'success');
+        subscribe();
+      };
+      ws.onmessage = function (evt) {
+        var data = null;
+        try {
+          data = JSON.parse(evt.data);
+        } catch (_err) {
+          return;
+        }
+        if (!data) {
+          return;
+        }
+        if (data.type === 'status') {
+          if (data.status === 'waiting') {
+            var missing = data.missing || [];
+            var label = missing.length ? ('waiting for ' + missing.join(', ')) : 'waiting for data';
+            setLive('Live spread: ' + label, 'info');
+            if (bookEl) {
+              bookEl.textContent = 'Live orderbook: waiting for ' + (missing.length ? missing.join(', ') : 'data');
+            }
+          }
+          return;
+        }
+        if (data.type === 'error') {
+          setLive('Live spread: ' + (data.error || 'error'), 'error');
+          setStatus(statusEl, data.error || 'Error', 'error');
+          return;
+        }
+        if (data.type !== 'spread') {
+          return;
+        }
+        var spread = data.spread_pct;
+        if (spread === null || spread === undefined) {
+          setLive('Live spread: -', '');
+          return;
+        }
+        var range = data.spread_range || {};
+        var within = data.within_range;
+        var text = 'Live spread: ' + formatNumber(spread, 4) + '%';
+        if (range.min !== null && range.min !== undefined || range.max !== null && range.max !== undefined) {
+          text += ' (range ' + (range.min !== null && range.min !== undefined ? range.min : '-') +
+            ' to ' + (range.max !== null && range.max !== undefined ? range.max : '-') + ')';
+        }
+        if (within === true) {
+          setLive(text, 'ok');
+        } else if (within === false) {
+          setLive(text, 'bad');
+        } else {
+          setLive(text, '');
+        }
+        if (bookEl) {
+          var longBook = data.long || {};
+          var shortBook = data.short || {};
+          if (longBook.bids && longBook.asks && shortBook.bids && shortBook.asks) {
+            bookEl.textContent = formatLiveBooks(
+              longBook,
+              shortBook,
+              data.long_exchange,
+              data.short_exchange,
+              data.subscriptions || {}
+            );
+          } else {
+            bookEl.textContent = 'Live orderbook: off';
+          }
+        }
+      };
+      ws.onclose = function () {
+        setStatus(statusEl, 'Disconnected', 'info');
+        setLive('Live spread: -', '');
+      };
+      ws.onerror = function () {
+        setStatus(statusEl, 'WebSocket error', 'error');
+      };
+    }
+
+    function disconnect() {
+      if (!ws) {
+        return;
+      }
+      try {
+        ws.close();
+      } catch (_err) {
+        // ignore close errors
+      }
+      ws = null;
+    }
+
+    var connectBtn = document.getElementById('ws-connect');
+    var disconnectBtn = document.getElementById('ws-disconnect');
+    if (connectBtn) {
+      connectBtn.addEventListener('click', function () {
+        setStatus(statusEl, 'Connecting...', 'info');
+        connect();
+      });
+    }
+    if (disconnectBtn) {
+      disconnectBtn.addEventListener('click', function () {
+        disconnect();
+      });
+    }
+
+    var form = document.getElementById('ws-test-form');
+    if (form) {
+      form.addEventListener('change', function () {
+        subscribe();
+      });
+    }
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    bind();
+    bindWsTest();
+  });
 })();

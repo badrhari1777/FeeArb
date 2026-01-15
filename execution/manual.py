@@ -465,6 +465,7 @@ class ManualTradeManager:
         fee_table: Mapping[str, Mapping[str, float]] | None = None,
         orderbook_depth: int = 20,
         liquidity_top_n: int = 3,
+        orderbook_provider: Any | None = None,
     ) -> None:
         self._fees = fee_table or EXCHANGE_COMMISSIONS
         self._orderbook_depth = max(5, int(orderbook_depth))
@@ -472,6 +473,7 @@ class ManualTradeManager:
         self._gateways = {spec.slug: ExchangeGateway(spec) for spec in EXCHANGE_SPECS}
         self._lock = asyncio.Lock()
         self._position_mode_cache: dict[str, tuple[bool | None, float]] = {}
+        self._orderbook_provider = orderbook_provider
 
     async def enter(
         self,
@@ -698,10 +700,15 @@ class ManualTradeManager:
                 errors.append(f"{exchange}: unable to resolve symbol {symbol}")
                 continue
             ccxt_symbols[exchange] = ccxt_symbol
-            try:
-                orderbook = await client.fetch_order_book(ccxt_symbol, limit=self._orderbook_depth)
-            except Exception as exc:  # pylint: disable=broad-except
-                errors.append(f"{exchange}: orderbook fetch failed: {exc}")
+            orderbook = await self._fetch_orderbook(
+                client=client,
+                exchange=exchange,
+                symbol=symbol,
+                ccxt_symbol=ccxt_symbol,
+                depth=self._orderbook_depth,
+                errors=errors,
+            )
+            if not orderbook:
                 continue
             constraints = self._extract_market_constraints(client, ccxt_symbol)
             override = _safe_float(
@@ -813,6 +820,9 @@ class ManualTradeManager:
                 min_notional_overrides=min_notional_overrides,
                 min_notional_buffer_pct=min_notional_buffer_pct,
             )
+        orderbook_sources = {
+            exch: (orderbooks.get(exch) or {}).get("source") for exch in orderbooks
+        }
         return {
             "dry_run": bool(payload.get("dry_run", False)),
             "action": action,
@@ -822,6 +832,7 @@ class ManualTradeManager:
             "mode": payload.get("mode"),
             "legs": legs,
             "orderbooks": orderbooks if include_orderbooks else {},
+            "orderbook_sources": orderbook_sources,
             "stats": {
                 exch: {
                     "best_bid": stats_by_exchange[exch].best_bid,
@@ -915,14 +926,18 @@ class ManualTradeManager:
                 except Exception:  # pylint: disable=broad-except
                     price_hint = None
                 if price_hint is None:
-                    try:
-                        orderbook = await client.fetch_order_book(ccxt_symbol, limit=1)
+                    orderbook = await self._fetch_orderbook(
+                        client=client,
+                        exchange=exchange,
+                        symbol=symbol,
+                        ccxt_symbol=ccxt_symbol,
+                        depth=1,
+                    )
+                    if orderbook:
                         contract_size = constraints.get("contract_size")
                         scaled_orderbook = _scale_orderbook(orderbook, contract_size)
                         stats = orderbook_stats(scaled_orderbook, top_n=1)
                         price_hint = stats.mid
-                    except Exception:  # pylint: disable=broad-except
-                        price_hint = None
                 if price_hint:
                     price_for_min = price_hint * (1.0 + buffer_pct / 100.0)
                     constraints["min_qty_required"] = _min_qty_required(
@@ -1309,6 +1324,7 @@ class ManualTradeManager:
                     "mid_price": snapshot.get("mid_price"),
                     "primary": _stats_payload(snapshot.get("stats", {}).get(primary_leg["exchange"])),
                     "hedge": _stats_payload(snapshot.get("stats", {}).get(hedge_leg["exchange"])),
+                    "sources": snapshot.get("orderbook_sources"),
                 },
             )
             spread_val = snapshot.get("spread_pct")
@@ -2151,6 +2167,7 @@ class ManualTradeManager:
                     "mid_price": snapshot.get("mid_price"),
                     "primary": _stats_payload(snapshot.get("stats", {}).get(primary_leg["exchange"])),
                     "hedge": _stats_payload(snapshot.get("stats", {}).get(hedge_leg["exchange"])),
+                    "sources": snapshot.get("orderbook_sources"),
                 },
             )
             spread_val = snapshot.get("spread_pct")
@@ -3635,6 +3652,39 @@ class ManualTradeManager:
             return None
         return gateway.client
 
+    async def _fetch_orderbook(
+        self,
+        *,
+        client: Any,
+        exchange: str,
+        symbol: str,
+        ccxt_symbol: str,
+        depth: int,
+        errors: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        if self._orderbook_provider:
+            try:
+                orderbook = await self._orderbook_provider.get_orderbook(exchange, symbol, depth=depth)
+            except Exception as exc:  # pylint: disable=broad-except
+                if errors is not None:
+                    errors.append(f"{exchange}: orderbook stream failed: {exc}")
+            else:
+                if orderbook:
+                    result = dict(orderbook)
+                    result["source"] = "ws"
+                    return result
+        try:
+            orderbook = await client.fetch_order_book(ccxt_symbol, limit=depth)
+        except Exception as exc:  # pylint: disable=broad-except
+            if errors is not None:
+                errors.append(f"{exchange}: orderbook fetch failed: {exc}")
+            return None
+        if not orderbook:
+            return None
+        result = dict(orderbook)
+        result["source"] = "rest"
+        return result
+
     async def _snapshot_legs(
         self,
         symbol: str,
@@ -3657,10 +3707,15 @@ class ManualTradeManager:
             if not ccxt_symbol:
                 errors.append(f"{exchange}: unable to resolve symbol {symbol}")
                 continue
-            try:
-                orderbook = await client.fetch_order_book(ccxt_symbol, limit=self._orderbook_depth)
-            except Exception as exc:  # pylint: disable=broad-except
-                errors.append(f"{exchange}: orderbook fetch failed: {exc}")
+            orderbook = await self._fetch_orderbook(
+                client=client,
+                exchange=exchange,
+                symbol=symbol,
+                ccxt_symbol=ccxt_symbol,
+                depth=self._orderbook_depth,
+                errors=errors,
+            )
+            if not orderbook:
                 continue
             constraints[exchange] = self._extract_market_constraints(client, ccxt_symbol)
             contract_size = (constraints.get(exchange) or {}).get("contract_size")
@@ -3691,6 +3746,9 @@ class ManualTradeManager:
             primary_stats = stats_by_exchange.get(primary_leg["exchange"])
             if primary_stats:
                 primary_best = primary_stats.best_ask if primary_leg["side"] == "buy" else primary_stats.best_bid
+        orderbook_sources = {
+            exch: (orderbooks.get(exch) or {}).get("source") for exch in orderbooks
+        }
         return {
             "errors": [],
             "orderbooks": orderbooks,
@@ -3700,6 +3758,7 @@ class ManualTradeManager:
             "primary_best": primary_best,
             "max_qty_by_exchange": max_qty_by_exchange,
             "constraints": constraints,
+            "orderbook_sources": orderbook_sources,
         }
 
     def _within_spread(
@@ -3720,11 +3779,13 @@ class ManualTradeManager:
 
     async def _resolve_market_symbol(self, client: Any, symbol: str) -> str | None:
         ccxt_symbol = _to_ccxt_symbol(symbol)
-        try:
-            await client.load_markets()
-        except Exception:  # pylint: disable=broad-except
-            return None
-        markets = getattr(client, "markets", None) or {}
+        markets = getattr(client, "markets", None)
+        if not markets:
+            try:
+                await client.load_markets()
+            except Exception:  # pylint: disable=broad-except
+                return None
+            markets = getattr(client, "markets", None) or {}
         exact_market = markets.get(ccxt_symbol) if isinstance(markets, dict) else None
         if isinstance(exact_market, dict):
             market_type = str(exact_market.get("type") or "").lower()
@@ -3941,9 +4002,14 @@ class ManualTradeManager:
         ccxt_symbol = await self._resolve_market_symbol(client, symbol)
         if not ccxt_symbol:
             return None
-        try:
-            orderbook = await client.fetch_order_book(ccxt_symbol, limit=self._orderbook_depth)
-        except Exception:  # pylint: disable=broad-except
+        orderbook = await self._fetch_orderbook(
+            client=client,
+            exchange=exchange,
+            symbol=symbol,
+            ccxt_symbol=ccxt_symbol,
+            depth=self._orderbook_depth,
+        )
+        if not orderbook:
             return None
         constraints = self._extract_market_constraints(client, ccxt_symbol)
         contract_size = constraints.get("contract_size") if constraints else None
