@@ -31,6 +31,7 @@
     exchange_refresh_seconds: 60,
     table_refresh_seconds: 300,
     account_refresh_seconds: 90,
+    positions_market_refresh_seconds: 30,
     stop_gap_from_liq_pct: protectiveDefaults.stop_gap_from_liq_pct,
     stop_requote_threshold_pct: protectiveDefaults.stop_requote_threshold_pct,
     fallback_liq_factor_long: protectiveDefaults.fallback_liq_factor_long,
@@ -50,7 +51,8 @@
     status: [],
     positions: [],
     positions_by_symbol: [],
-    last_updated: null
+    last_updated: null,
+    positions_market: null
   };
 
   var defaultState = {
@@ -59,6 +61,7 @@
     parser_refresh_interval: defaultSettings.parser_refresh_seconds,
     exchange_refresh_interval: defaultSettings.exchange_refresh_seconds,
     account_refresh_interval: defaultSettings.account_refresh_seconds,
+    positions_market_refresh_interval: defaultSettings.positions_market_refresh_seconds,
     last_error: null,
     last_updated: null,
     snapshot: null,
@@ -96,6 +99,7 @@
     exchangeInput: document.getElementById('exchange-interval'),
     tableInput: document.getElementById('table-interval'),
     accountInput: document.getElementById('account-interval'),
+    positionsMarketInput: document.getElementById('positions-market-interval'),
     protectAuto: document.getElementById('protect-auto'),
     takeAuto: document.getElementById('take-auto'),
     antiOrphan: document.getElementById('anti-orphan'),
@@ -120,6 +124,8 @@
     accountStatusTable: document.getElementById('account-status-body'),
     accountBalanceTable: document.getElementById('account-balance-body'),
     symbolPositionsTable: document.getElementById('symbol-positions-body'),
+    symbolPositionsMeta: document.getElementById('symbol-positions-meta'),
+    symbolPositionsDiffs: document.getElementById('symbol-positions-diffs'),
     quickAnalyzeForm: document.getElementById('quick-analyze-form'),
     quickAnalyzeInput: document.getElementById('quick-analyze-input'),
     quickWindowInput: document.getElementById('quick-window-input'),
@@ -204,6 +210,10 @@
       if (!isNaN(parsed)) {
         normalized.account_refresh_seconds = clamp(parsed, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
       }
+      parsed = parseInt(settings.positions_market_refresh_seconds, 10);
+      if (!isNaN(parsed)) {
+        normalized.positions_market_refresh_seconds = clamp(parsed, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+      }
       // Merge protective toggles/thresholds, preserving falsey values.
       var incomingProtective = (settings && typeof settings.protective === 'object') ? settings.protective : null;
       var mergedProtective = clone(protectiveDefaults) || {};
@@ -250,7 +260,8 @@
       status: [],
       positions: [],
       positions_by_symbol: [],
-      last_updated: null
+      last_updated: null,
+      positions_market: null
     };
     if (!accounts || typeof accounts !== 'object') {
       return normalized;
@@ -268,6 +279,7 @@
       normalized.positions_by_symbol = clone(accounts.positions_by_symbol) || [];
     }
     normalized.last_updated = accounts.last_updated || null;
+    normalized.positions_market = accounts.positions_market || null;
     return normalized;
   }
 
@@ -288,6 +300,9 @@
       }
       if (typeof source.account_refresh_interval === 'number') {
         state.account_refresh_interval = source.account_refresh_interval;
+      }
+      if (typeof source.positions_market_refresh_interval === 'number') {
+        state.positions_market_refresh_interval = source.positions_market_refresh_interval;
       }
       state.last_error = source.last_error || null;
       state.last_updated = source.last_updated || null;
@@ -801,10 +816,10 @@
       var showSymbol = row.symbol !== lastSymbol || isSummary;
       var entryText = isSummary
         ? (row.entry_price !== null && row.entry_price !== undefined ? formatNumber(row.entry_price, 2) + '%' : '-')
-        : formatNumber(row.entry_price, 4);
+        : formatNumber(row.entry_price, 6);
       var markText = isSummary
         ? (row.mark_price !== null && row.mark_price !== undefined ? formatNumber(row.mark_price, 2) + '%' : '-')
-        : formatNumber(row.mark_price, 4);
+        : formatNumber(row.mark_price, 6);
       var fundingText = row.funding_rate !== null && row.funding_rate !== undefined
         ? formatPercent(row.funding_rate, 4)
         : '-';
@@ -856,6 +871,85 @@
     attachSymbolHover(elements.symbolPositionsTable);
   }
 
+  function renderSymbolPositionsDiagnostics(meta) {
+    if (!elements.symbolPositionsMeta || !elements.symbolPositionsDiffs) {
+      return;
+    }
+    if (!meta || typeof meta !== 'object') {
+      elements.symbolPositionsMeta.textContent = 'Positions market diagnostics unavailable.';
+      elements.symbolPositionsDiffs.textContent = '';
+      return;
+    }
+    var lastUpdated = meta.last_updated ? formatDate(meta.last_updated) : '-';
+    var symbolCount = typeof meta.symbols === 'number' ? meta.symbols : 0;
+    var exchangeCount = typeof meta.exchanges === 'number' ? meta.exchanges : 0;
+      var metaLine = 'Positions market: last=' + lastUpdated + ' | symbols=' + symbolCount + ' | exchanges=' + exchangeCount;
+      if (meta.last_error) {
+        metaLine += ' | last_error=' + meta.last_error;
+      }
+    if (Array.isArray(meta.status) && meta.status.length) {
+      var parts = [];
+      var i;
+      for (i = 0; i < meta.status.length; i += 1) {
+        var row = meta.status[i] || {};
+        if (!row.exchange) {
+          continue;
+        }
+        var line = row.exchange + ':' + (row.status || 'unknown');
+        if (typeof row.count === 'number' && typeof row.symbols === 'number') {
+          line += ' (' + row.count + '/' + row.symbols + ')';
+        } else if (typeof row.symbols === 'number') {
+          line += ' (' + row.symbols + ')';
+        }
+        parts.push(line);
+      }
+      if (parts.length) {
+        metaLine += ' | per-exchange: ' + parts.join(', ');
+      }
+    }
+    elements.symbolPositionsMeta.textContent = metaLine;
+
+      var diffs = Array.isArray(meta.diffs) ? meta.diffs : [];
+      var marginIssues = Array.isArray(meta.margin_issues) ? meta.margin_issues : [];
+      if (marginIssues.length) {
+        metaLine += ' | margin_issues=' + marginIssues.length;
+      }
+      var lines = [];
+      if (diffs.length) {
+        lines.push('Diffs (position vs market snapshot):');
+        var j;
+        for (j = 0; j < diffs.length; j += 1) {
+          var diff = diffs[j] || {};
+          var label = (diff.exchange || '-') + ' ' + (diff.symbol || '-');
+          var field = diff.field || 'value';
+          var posVal = diff.position !== undefined ? diff.position : '-';
+          var snapVal = diff.snapshot !== undefined ? diff.snapshot : '-';
+          var delta = diff.delta_pct !== undefined ? (formatNumber(diff.delta_pct, 3) + '%') : (diff.delta !== undefined ? formatNumber(diff.delta, 6) : '-');
+          lines.push('  ' + label + ' ' + field + ': pos=' + posVal + ' snap=' + snapVal + ' delta=' + delta);
+        }
+      } else {
+        lines.push('No mark/funding diffs above threshold.');
+      }
+      if (marginIssues.length) {
+        lines.push('Margin mode/leverage issues:');
+        var k;
+        for (k = 0; k < marginIssues.length; k += 1) {
+          var issue = marginIssues[k] || {};
+          var issueLabel = (issue.exchange || '-') + ' ' + (issue.symbol || '-');
+          var sideText = issue.side ? (' ' + issue.side) : '';
+          var modeText = issue.margin_mode !== undefined && issue.margin_mode !== null ? issue.margin_mode : '-';
+          var levText = issue.leverage !== undefined && issue.leverage !== null ? formatNumber(issue.leverage, 2) : '-';
+          var modeSrc = issue.margin_mode_source || '-';
+          var levSrc = issue.leverage_source || '-';
+          var issueBits = Array.isArray(issue.issues) ? issue.issues.join(',') : '-';
+          lines.push('  ' + issueLabel + sideText + ' mode=' + modeText + ' (' + modeSrc + ') lev=' + levText + ' (' + levSrc + ') [' + issueBits + ']');
+        }
+      } else {
+        lines.push('No margin mode/leverage issues detected.');
+      }
+      elements.symbolPositionsDiffs.innerHTML = lines.map(escapeHtml).join('<br>');
+  }
+
   function attachSymbolHover(tbody) {
     if (!tbody) {
       return;
@@ -887,6 +981,7 @@
     renderAccountStatus(data.status || []);
     renderAccountBalances(data.balances || []);
     renderSymbolPositions(data.positions_by_symbol || []);
+    renderSymbolPositionsDiagnostics(data.positions_market || null);
     if (elements.accountLastUpdated) {
       elements.accountLastUpdated.textContent = data.last_updated ? formatDate(data.last_updated) : '-';
     }
@@ -943,7 +1038,8 @@
     var parserSeconds = getParserInterval(state);
     var exchangeSeconds = getExchangeInterval(state);
     var accountSeconds = getAccountInterval(state);
-    elements.hint.textContent = 'UI refresh: ' + tableSeconds + ' s | Parser: ' + parserSeconds + ' s | Exchange poll: ' + exchangeSeconds + ' s | Account refresh: ' + accountSeconds + ' s';
+    var positionsSeconds = getPositionsMarketInterval(state);
+    elements.hint.textContent = 'UI refresh: ' + tableSeconds + ' s | Parser: ' + parserSeconds + ' s | Exchange poll: ' + exchangeSeconds + ' s | Account refresh: ' + accountSeconds + ' s | Positions market: ' + positionsSeconds + ' s';
   }
 
   function renderAll() {
@@ -999,6 +1095,17 @@
     }
     if (typeof state.account_refresh_interval === 'number') {
       interval = state.account_refresh_interval;
+    }
+    return clamp(interval, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+  }
+
+  function getPositionsMarketInterval(state) {
+    var interval = defaultState.positions_market_refresh_interval;
+    if (state.settings && typeof state.settings.positions_market_refresh_seconds === 'number') {
+      interval = state.settings.positions_market_refresh_seconds;
+    }
+    if (typeof state.positions_market_refresh_interval === 'number') {
+      interval = state.positions_market_refresh_interval;
     }
     return clamp(interval, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
   }
@@ -1171,6 +1278,7 @@
       exchange_refresh_seconds: defaultSettings.exchange_refresh_seconds,
       table_refresh_seconds: defaultSettings.table_refresh_seconds,
       account_refresh_seconds: defaultSettings.account_refresh_seconds,
+      positions_market_refresh_seconds: defaultSettings.positions_market_refresh_seconds,
       protective: {}
     };
     if (!elements.settingsForm) {
@@ -1213,6 +1321,12 @@
       var accountValue = parseInt(elements.accountInput.value, 10);
       if (!isNaN(accountValue)) {
         result.account_refresh_seconds = clamp(accountValue, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
+      }
+    }
+    if (elements.positionsMarketInput) {
+      var positionsValue = parseInt(elements.positionsMarketInput.value, 10);
+      if (!isNaN(positionsValue)) {
+        result.positions_market_refresh_seconds = clamp(positionsValue, MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS);
       }
     }
     result.protective = {
@@ -1264,6 +1378,9 @@
     }
     if (elements.accountInput) {
       elements.accountInput.value = settings.account_refresh_seconds;
+    }
+    if (elements.positionsMarketInput) {
+      elements.positionsMarketInput.value = settings.positions_market_refresh_seconds;
     }
     var protective = settings.protective || {};
     if (elements.protectAuto) {

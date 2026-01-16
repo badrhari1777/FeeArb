@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<!-- saved from url=(0123)https://bingx-api.github.io/docs-v3/#/en/Swap/Websocket%20Account%20Data/Account%20balance%20and%20position%20update%20push -->
+<html><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="https://bingx.com/favicon.ico"><title>BingX API Docs</title><style>/*! normalize.css v8.0.1 | MIT License | github.com/necolas/normalize.css */
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        line-height: 1.15; /* 1 */
+        -webkit-text-size-adjust: 100%; /* 2 */
+        height: 100vh;
+      }
+      body {
+        margin: 0;
+        height: 100%;
+        font-family: 'HarmonyOS Sans SC';
+        font-style: normal;
+        font-weight: 400;
+        font-size: 14px;
+        line-height: 22px;
+        color: #1A1A1A;
+        background-color: #ffffff;
+        overflow-x: hidden;
+      }
+      main {
+        display: block;
+      }
+
+      h1 {
+        font-size: 2em;
+        /* margin: 0.67em 0; */
+        margin: 0;
+      }
+      hr {
+        box-sizing: content-box; /* 1 */
+        height: 0; /* 1 */
+        overflow: visible; /* 2 */
+      }
+      pre {
+        font-family: monospace, monospace; /* 1 */
+        font-size: 1em; /* 2 */
+      }
+      a {
+        background-color: transparent;
+        color: #3eaf7c;
+        text-decoration: none;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+      abbr[title] {
+        border-bottom: none; /* 1 */
+        text-decoration: underline; /* 2 */
+        text-decoration: underline dotted; /* 2 */
+      }     b,
+      strong {
+        font-weight: bolder;
+      }
+      code,
+      kbd,
+      samp {
+        font-family: monospace, monospace; /* 1 */
+        font-size: 1em; /* 2 */
+      }
+
+      small {
+        font-size: 80%;
+      }
+      sub,
+      sup {
+        font-size: 75%;
+        line-height: 0;
+        position: relative;
+        vertical-align: baseline;
+      }
+
+      sub {
+        bottom: -0.25em;
+      }
+
+      sup {
+        top: -0.5em;
+      }
+      img {
+        border-style: none;
+      }
+      button,
+      input,
+      optgroup,
+      select,
+      textarea {
+        font-family: inherit; /* 1 */
+        font-size: 100%; /* 1 */
+        line-height: 1.15; /* 1 */
+        margin: 0; /* 2 */
+      }
+      button,
+      input { /* 1 */
+        overflow: visible;
+      }
+      button,
+      select { /* 1 */
+        text-transform: none;
+      }
+      button,
+      [type="button"],
+      [type="reset"],
+      [type="submit"] {
+        -webkit-appearance: button;
+      }
+      button::-moz-focus-inner,
+      [type="button"]::-moz-focus-inner,
+      [type="reset"]::-moz-focus-inner,
+      [type="submit"]::-moz-focus-inner {
+        border-style: none;
+        padding: 0;
+      }
+      button:-moz-focusring,
+      [type="button"]:-moz-focusring,
+      [type="reset"]:-moz-focusring,
+      [type="submit"]:-moz-focusring {
+        outline: 1px dotted ButtonText;
+      }
+      fieldset {
+        padding: 0.35em 0.75em 0.625em;
+      }
+      legend {
+        box-sizing: border-box; /* 1 */
+        color: inherit; /* 2 */
+        display: table; /* 1 */
+        max-width: 100%; /* 1 */
+        padding: 0; /* 3 */
+        white-space: normal; /* 1 */
+      }
+      progress {
+        vertical-align: baseline;
+      }
+      textarea {
+        overflow: auto;
+      }
+      [type="checkbox"],
+      [type="radio"] {
+        box-sizing: border-box; /* 1 */
+        padding: 0; /* 2 */
+      }
+      [type="number"]::-webkit-inner-spin-button,
+      [type="number"]::-webkit-outer-spin-button {
+        height: auto;
+      }
+      [type="search"] {
+        -webkit-appearance: textfield; /* 1 */
+        outline-offset: -2px; /* 2 */
+      }
+
+      [type="search"]::-webkit-search-decoration {
+        -webkit-appearance: none;
+      }
+      ::-webkit-file-upload-button {
+        -webkit-appearance: button; /* 1 */
+        font: inherit; /* 2 */
+      }
+      details {
+        display: block;
+      }
+      summary {
+        display: list-item;
+      }
+      template {
+        display: none;
+      }
+
+      [hidden] {
+        display: none;
+      }
+      .search-results {
+        right: 10px;
+        max-width: 600px;
+      }</style><link href="./Account balance and position update push_files/app.15d808027c4f9c408c0b77336f77e79a.css" rel="stylesheet"></head><body style=""><div style="height: 100%;"><section class="el-container is-vertical"><header class="el-header" width="100%" style="height: 64px;"><div class="header-row el-row" style="margin-left: -5px; margin-right: -5px;"><div class="el-col el-col-24 el-col-xs-4 el-col-sm-4 el-col-md-4 el-col-lg-3 el-col-xl-2" style="padding-left: 5px; padding-right: 5px;"><div><div style="height: 64px; width: 100%; display: flex; align-items: center; padding-left: 10%;"><svg width="76" height="24" viewBox="0 0 76 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M55.9707 5.28027V17.0781C55.9707 19.2285 54.8671 23.9998 48.0898 24C44.6915 24 41.8882 22.5981 40.6113 20.6494L43.4912 18.7197C44.0672 19.5069 45.5843 20.6396 47.8115 20.6396C51.3248 20.6394 52.1309 18.2205 52.1309 17.0781C51.0749 17.8268 49.5968 18.2402 47.6963 18.2402C44.0195 18.2402 40.6211 15.2345 40.6211 11.3945C40.6214 7.55495 44.0478 5.28044 47.7051 5.28027C49.9226 5.28027 51.5838 5.99973 52.1406 6.26855V5.28027H55.9707ZM11.1396 3.36914C13.5202 3.36938 15.5459 5.21277 15.6611 7.57422C15.6995 8.77411 15.2764 9.86864 14.5469 10.6846V10.6943C15.142 11.0975 16.6209 12.201 16.6211 14.3223C16.6211 16.751 14.6337 18.7294 12.1953 18.7295H0.300781V3.36914H11.1396ZM22.3906 18.7197H18.5508V5.28027H22.3906V18.7197ZM28.6211 6.24023C30.0802 5.51068 31.5487 5.28028 32.7871 5.28027C33.1806 5.28027 33.5549 5.31823 33.9004 5.36621C36.7804 5.83661 39.1806 8.07335 39.1807 11.5869V18.7197H35.3408V11.9805C35.3408 9.58054 33.9004 8.31348 31.9805 8.31348C30.195 8.31358 28.6211 9.2831 28.6211 11.9805V18.7197H24.7812V5.28027H28.6211V6.24023ZM75.6992 8.30371C74.2016 8.30371 71.5996 8.68741 69.2764 11.5098C71.5996 14.3322 74.192 14.7168 75.6992 14.7168V18.7002C73.4912 18.7002 69.9582 18.0858 66.8574 14.793C63.8622 18.0666 60.0414 18.7002 57.9102 18.7002V14.7168C59.4846 14.7168 62.326 14.2266 64.4092 11.5098C62.326 8.79339 59.4845 8.30371 57.9102 8.30371V4.32031C60.0413 4.32031 63.8623 4.95325 66.8574 8.22656C69.9582 4.9339 73.4913 4.32031 75.6992 4.32031V8.30371ZM4.14062 15.7725V15.7627H10.8604C11.8492 15.7627 12.762 15.1193 12.7812 14.0537C12.7811 12.9787 11.8779 12.3447 10.8604 12.3447H4.12109L4.14062 15.7725ZM48.3008 8.31348C46.1792 8.31348 44.4609 9.78228 44.4609 11.5967C44.461 13.411 46.1792 14.8799 48.3008 14.8799C50.4223 14.8798 52.1406 13.411 52.1406 11.5967C52.1406 9.78231 50.4223 8.31352 48.3008 8.31348ZM4.14062 9.38867H9.90039C10.8988 9.38867 11.8019 8.94646 11.8115 7.88086C11.8114 6.80585 10.9179 6.32617 9.90039 6.32617H4.14062V9.38867ZM20.4707 0C21.6609 0.000217486 22.6299 0.96989 22.6299 2.16016C22.6298 3.35035 21.6609 4.3201 20.4707 4.32031C19.2804 4.32031 18.3106 3.35048 18.3105 2.16016C18.3105 0.969756 19.2803 0 20.4707 0Z" fill="black"></path></svg> <svg width="2" height="38" viewBox="0 0 2 18" fill="none" xmlns="http://www.w3.org/2000/svg" style="margin-left: 20%;"><path d="M1 0V18" stroke="black" stroke-opacity="0.08"></path></svg></div></div></div> <div class="el-col el-col-24 el-col-xs-4 el-col-sm-9 el-col-md-13 el-col-lg-14 el-col-xl-14" style="padding-left: 5px; padding-right: 5px;"><div><div style="height: 64px; width: 100%; display: flex;"><ul role="menubar" class="el-menu-demo el-menu--horizontal el-menu" style="margin-top: 2px;"><li role="menuitem" tabindex="0" class="el-menu-item is-active"><a href="https://bingx-api.github.io/docs-v3/" target="_self" style="text-decoration: none; color: inherit;">API DOCUMENT</a></li> <li role="menuitem" tabindex="0" class="el-menu-item" style="color: black; border-bottom-color: transparent;"><a href="https://bingx.com/zh-tc/act/template/5302?randomId=1871286856" target="_blank" style="text-decoration: none; color: inherit;">BROKER</a></li> <li role="menuitem" tabindex="0" class="el-menu-item" style="color: black; border-bottom-color: transparent;"><a href="https://bingx-api.github.io/docs/#/zh-tw/swapV2/changelog" target="_blank" style="text-decoration: none; color: inherit;">API DOCUMENT(OLD)</a></li></ul></div></div></div> <div class="el-col el-col-24 el-col-xs-16 el-col-sm-11 el-col-md-7 el-col-lg-7 el-col-xl-8" style="padding-left: 5px; padding-right: 5px;"><div class="header-right"><div class="search-wrapper"><div aria-haspopup="listbox" role="combobox" aria-owns="el-autocomplete-6525" class="el-autocomplete header-search"><div class="el-input el-input--small el-input--prefix"><!----><input type="text" autocomplete="off" valuekey="value" popperclass="search-autocomplete-popper" placeholder="Enter API path or title" fetchsuggestions="function () { [native code] }" triggeronfocus="true" debounce="300" placement="bottom-start" popperappendtobody="true" class="el-input__inner" role="textbox" aria-autocomplete="list" aria-controls="id" aria-activedescendant="el-autocomplete-6525-item--1"><span class="el-input__prefix"><i class="el-input__icon el-icon-search"></i></span><!----><!----><!----></div><div role="region" class="el-autocomplete-suggestion el-popper search-autocomplete-popper" style="display: none;"><div class="el-scrollbar"><div class="el-autocomplete-suggestion__wrap el-scrollbar__wrap" style="margin-bottom: -15px; margin-right: -15px;"><ul class="el-scrollbar__view el-autocomplete-suggestion__list" role="listbox" id="el-autocomplete-6525"></ul></div><div class="el-scrollbar__bar is-horizontal"><div class="el-scrollbar__thumb" style="transform: translateX(0%);"></div></div><div class="el-scrollbar__bar is-vertical"><div class="el-scrollbar__thumb" style="transform: translateY(0%);"></div></div></div></div></div> <!----></div> <div class="lang-pill"><svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" class="lang-pill__icon"><path d="M10 1.75C14.5563 1.75 18.25 5.44365 18.25 10C18.25 14.5563 14.5563 18.25 10 18.25C5.44365 18.25 1.75 14.5563 1.75 10C1.75 5.44365 5.44365 1.75 10 1.75ZM7.43457 10.75C7.5124 12.4332 7.84795 13.9164 8.3291 14.999C8.60514 15.62 8.91419 16.0764 9.21973 16.3672C9.52129 16.6541 9.78391 16.7499 10 16.75C10.2161 16.7499 10.4796 16.6542 10.7812 16.3672C11.0867 16.0763 11.3959 15.6198 11.6719 14.999C12.153 13.9164 12.4886 12.4331 12.5664 10.75H7.43457ZM3.29297 10.75C3.55981 13.1633 5.0979 15.1916 7.22363 16.1523C7.1294 15.9779 7.04157 15.7954 6.95801 15.6074C6.38002 14.3068 6.01121 12.6093 5.93262 10.75H3.29297ZM14.0674 10.75C13.9888 12.6092 13.6209 14.3068 13.043 15.6074C12.9593 15.7956 12.8698 15.9777 12.7754 16.1523C14.9015 15.1917 16.4402 13.1636 16.707 10.75H14.0674ZM12.7754 3.84668C12.87 4.02156 12.9592 4.2041 13.043 4.39258C13.6209 5.69318 13.9888 7.39081 14.0674 9.25H16.707C16.4401 6.83629 14.9017 4.80725 12.7754 3.84668ZM10 3.25C9.78392 3.2501 9.52128 3.34591 9.21973 3.63281C8.9142 3.92362 8.60514 4.38006 8.3291 5.00098C7.84795 6.08356 7.5124 7.5668 7.43457 9.25H12.5664C12.4886 7.56685 12.153 6.08355 11.6719 5.00098C11.3959 4.38016 11.0867 3.92369 10.7812 3.63281C10.4796 3.34578 10.2161 3.25013 10 3.25ZM7.22363 3.84668C5.09772 4.8074 3.55983 6.83659 3.29297 9.25H5.93262C6.01121 7.39071 6.38002 5.69322 6.95801 4.39258C7.04169 4.20431 7.12925 4.02138 7.22363 3.84668Z" fill="black"></path></svg> <div class="el-select lang-pill__select"><!----><div class="el-input el-input--suffix"><!----><input type="text" readonly="readonly" autocomplete="off" placeholder="English" class="el-input__inner"><!----><span class="el-input__suffix"><span class="el-input__suffix-inner"><i class="el-select__caret el-input__icon el-icon-arrow-up"></i><!----><!----><!----><!----><!----></span><!----></span><!----><!----></div><div class="el-select-dropdown el-popper lang-pill__popper" style="display: none; min-width: 120px;"><div class="el-scrollbar" style=""><div class="el-select-dropdown__wrap el-scrollbar__wrap" style="margin-bottom: -15px; margin-right: -15px;"><ul class="el-scrollbar__view el-select-dropdown__list"><!----><li class="el-select-dropdown__item selected"><span>English</span></li> <li class="el-select-dropdown__item"><span>繁体中文</span></li></ul></div><div class="el-scrollbar__bar is-horizontal"><div class="el-scrollbar__thumb" style="transform: translateX(0%);"></div></div><div class="el-scrollbar__bar is-vertical"><div class="el-scrollbar__thumb" style="transform: translateY(0%);"></div></div></div><!----></div></div></div></div></div></div></header> <section class="el-container" style="min-height: 900px;"><aside class="el-aside" height="936px" style="width: 17%; text-align: left;"><div class="tac el-row" style="width: 100%;"><div class="el-col el-col-24"><ul role="menubar" class="el-menu-vertical-demo el-menu"><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 20px;"><span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 11L12 4l8 7"></path>
+          <path d="M6 10v10h12V10"></path>
+          <path d="M10 20v-6h4v6"></path>
+          </svg></span> <span>Introduce</span></li> <!----><li role="menuitem" aria-haspopup="true" class="el-submenu is-opened" aria-expanded="true"><div class="el-submenu__title" style="padding-left: 20px;"><span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"></path>
+            </svg></span> <span>Quick Start</span><i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="" data-old-padding-top="" data-old-padding-bottom="" data-old-overflow=""> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 40px;">
+                  Signature Authentication
+                </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 40px;">
+                  Basic Information
+                </li><!----><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 40px;">
+                  FAQ
+                </li> <!----><!----><li role="menuitem" aria-haspopup="true" class="el-submenu is-opened" aria-expanded="true"><div class="el-submenu__title" style="padding-left: 40px;">WebSocket Rules<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" data-old-padding-top="" data-old-padding-bottom="" data-old-overflow="" style=""> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    WebSocket Rules
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Generate Listen Key
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Extend Listen Key Validity
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Close Listen Key
+                  </li></ul></li><!----></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu is-active is-opened" aria-expanded="true"><div class="el-submenu__title" style="padding-left: 20px;"><span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M7 7h11"></path>
+                <path d="M15 4l3 3-3 3"></path>
+                <path d="M17 17H6"></path>
+                <path d="M9 14l-3 3 3 3"></path>
+              </svg></span> <span>Swap</span><i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="" data-old-padding-top="" data-old-padding-bottom="" data-old-overflow=""> <!----><!----><!----><!----><!----> <li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Market Data<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    USDT-M Perp Futures symbols
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Order Book
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Recent Trades List
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Mark Price and Funding Rate
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Get Funding Rate History
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Kline/Candlestick Data
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Open Interest Statistics
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    24hr Ticker Price Change Statistics
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query historical transaction orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Symbol Order Book Ticker
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Mark Price Kline/Candlestick Data
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Symbol Price Ticker
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Trading Rules
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Trades Endpoints<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Test Order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Place order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Modify Order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Place multiple orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Close All Positions
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel Order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel multiple orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel All Open Orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Current All Open Orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query pending order status
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Order details
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Margin Type
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Change Margin Type
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Leverage and Available Positions
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Set Leverage
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    User's Force Orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Order history
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Modify Isolated Position Margin
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query historical transaction orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Set Position Mode
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query position mode
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel an Existing Order and Send a New Orde
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel orders in batches and place orders in batches
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel All After
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Close position by position ID
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    All Orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Position and Maintenance Margin Ratio
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query historical transaction details
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Position History
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Isolated Margin Change History
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Apply VST
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Place TWAP Order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query TWAP Entrusted Order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query TWAP Historical Orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    TWAP Order Details
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel TWAP Order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Switch Multi-Assets Mode
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Multi-Assets Mode
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Multi-Assets Rules
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Multi-Assets Margin
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    One-Click Reverse Position
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Hedge mode Position - Automatic Margin Addition
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Account Endpoints<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query account data
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query position data
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Get Account Profit and Loss Fund Flow
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Export fund flow
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Trading Commission Rate
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Websocket Market Data<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe to Tick-by-Tick Trades
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Partial Order Book Depth
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe K-Line Data
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe to 24-hour price changes
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe to latest price changes
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe to latest mark price changes
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe to the Book Ticker Streams
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Incremental Depth Information
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu is-active is-opened" aria-expanded="true"><div class="el-submenu__title" style="padding-left: 40px;">Websocket Account Data<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" data-old-padding-top="" data-old-padding-bottom="" data-old-overflow="" style=""> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Order update push
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item is-active" style="padding-left: 60px;">
+                    Account balance and position update push
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Configuration updates such as leverage and margin mode
+                  </li></ul></li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 20px;"><span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="7"></circle>
+          <path d="M9 13l2-2 2 2 2-3"></path>
+        </svg></span> <span>Spot</span><i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <!----><!----><!----><!----><!----><!----> <li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Market Data<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Spot trading symbols
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Recent Trades List
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Order Book
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Kline/Candlestick Data
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    24hr Ticker Price Change Statistics
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Order Book aggregation
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Symbol Price Ticker
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Symbol Order Book Ticker
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Historical K-line
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Old Trade Lookup
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Account Endpoints<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Assets
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Asset transfer records
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Main Accoun internal transfer
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Asset Transfer New
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query transferable currency
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Asset transfer records new
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Fund Account Assets
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Main account internal transfer records
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Asset overview
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Wallet deposits and withdrawals<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Deposit records
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Withdraw records
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query currency deposit and withdrawal data
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Withdraw
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Main Account Deposit Address
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Deposit risk control records
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Trades Endpoints<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Place order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Place multiple orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel Order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel multiple orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel all Open Orders on a Symbol
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel an Existing Order and Send a New Order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Order details
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Current Open Orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Order history
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query transaction details
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Trading Commission Rate
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel All After
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Create an OCO Order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel an OCO Order List
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query an OCO Order List
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query All Open OCO Orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query OCO Historical Order List
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Websocket Market Data<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscription transaction by transaction
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    K-line Streamst
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe Market Depth Data
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe to 24-hour Price Change
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Spot Latest Trade Price
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Spot Best Order Book
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Incremental and Full Depth Information
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Websocket Account Data<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    order update event
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscription account balance push
+                  </li></ul></li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 20px;"><span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M8 3h8l3 3v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"></path>
+                  <path d="M16 3v4h4"></path>
+                  <path d="M10 12h4"></path>
+                  <path d="M10 15l-2 2 2 2"></path>
+                  <path d="M14 19l2-2-2-2"></path>
+                </svg></span> <span>Coin-M Futures</span><i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;" data-old-padding-top="" data-old-padding-bottom="" data-old-overflow=""> <!----><!----><!----><!----> <li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Market Data<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Contract Information
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Price &amp; Current Funding Rate
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Get Swap Open Positions
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Get K-line Data
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Depth Data
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query 24-Hour Price Change
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Trades Endpoints<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Trade order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Trade Commission Rate
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Leverage
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Modify Leverage
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel all orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Close all positions in bulk
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query warehouse
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Account Assets
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query force orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Order Trade Detail
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Cancel an Order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query all current pending orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    User's History Orders
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Margin Type
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Set Margin Type
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Adjust Isolated Margin
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Websocket Market Data<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" data-old-padding-top="" data-old-padding-bottom="" data-old-overflow="" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscription transaction by transaction
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe to the Latest Transaction Price
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe to Mark Price
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe to Limited Depth
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe to Best Bid and Ask
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe to Latest Trading Pair K-Line
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Subscribe to 24-Hour Price Change
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu is-opened" aria-expanded="true"><div class="el-submenu__title" style="padding-left: 40px;">Websocket Account Data<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" data-old-padding-top="" data-old-padding-bottom="" data-old-overflow="" style=""> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Account balance and position update push
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Order update push
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Configuration updates such as leverage and margin mode
+                  </li></ul></li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu is-opened" aria-expanded="true"><div class="el-submenu__title" style="padding-left: 20px;"><span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M4 8h16a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2z"></path>
+                  <path d="M16 12h6"></path>
+                </svg></span> <span>Account and Wallet</span><i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="" data-old-padding-top="" data-old-padding-bottom="" data-old-overflow=""> <!----><!----><!----> <li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Fund Account<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Assets
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Asset transfer records
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Main Accoun internal transfer
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Asset Transfer New
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query transferable currency
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Asset transfer records new
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Fund Account Assets
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Main account internal transfer records
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Asset overview
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Wallet Deposits and Withdrawals<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Deposit records
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Withdraw records
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query currency deposit and withdrawal data
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Withdraw
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Main Account Deposit Address
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Deposit risk control records
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Sub-account Management<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                     Create Sub-account
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                     Query API KEY Permissions
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                     Query Account UID
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                     Query Sub-account List
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                     Query Sub-account Asset Account
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                     Create Sub-account API Key
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                     Query API Key Information
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                     Edit Sub-Account API Key
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                     Delete Sub-Account API Key
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                     Freeze/Unfreeze Sub-Account
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                     Authorize Sub-Account Internal Transfer
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                     Sub-account Internal Transfer
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    User Internal Transfer
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Sub-account Deposit Address
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Sub-account Deposit Address
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Get Sub-account Deposit Records
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Sub-account Internal Transfer Records
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Sub-Mother Account Transfer History (Only for Parent Account Operations)
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Sub-Mother Account Transferable Amount (Only for Parent Account Operations)
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Sub-Mother Account Asset Transfer Interface (Only for Parent Account Operations)
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Batch Query Sub-Account Asset Overview
+                  </li></ul></li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 20px;"><span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M12 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"></path>
+                  <path d="M5 20a7 7 0 0 1 14 0"></path>
+                </svg></span> <span>Agent</span><i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 40px;">
+                  Query Invited Users
+                </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 40px;">
+                  Daily Commission Query（invitation relationship）
+                </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 40px;">
+                  Query agent user information
+                </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 40px;">
+                  Query the deposit details of invited users
+                </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 40px;">
+                  Query API transaction commission （non-invitation relationship）
+                </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 40px;">
+                  Query partner information
+                </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 40px;">
+                  Invitation code data
+                </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 40px;">
+                  Superior verification
+                </li> <!----><!----><!----><!----><!----><!----><!----><!----></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 20px;"><span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                <rect x="9" y="7" width="11" height="13" rx="2"></rect>
+                <rect x="4" y="4" width="11" height="13" rx="2"></rect>
+              </svg></span> <span>Copy Trade</span><i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <!----><!----> <li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">USDT-M Perpetual Contracts<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Trader’s current order
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Traders close positions according to the order number
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Traders set take profit and stop loss based on order numbers
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Personal Trading Overview
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Profit Overview
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Profit Details
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Set Commission Rate
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Trader Gets Copy Trading Pairs
+                  </li></ul></li><li role="menuitem" aria-haspopup="true" class="el-submenu"><div class="el-submenu__title" style="padding-left: 40px;">Spot Trading<i class="el-submenu__icon-arrow el-icon-arrow-down"></i></div><ul role="menu" class="el-menu el-menu--inline" style="display: none;"> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Trader sells spot assets based on buy order number
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Personal Trading Overview
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Profit Summary
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Profit Details
+                  </li><li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 60px;">
+                    Query Historical Orders
+                  </li></ul></li></ul></li><!----> <li role="menuitem" tabindex="-1" class="el-menu-item" style="padding-left: 20px;"><span class="menu-icon"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M20 12a8 8 0 1 1-2.3-5.7"></path>
+                    <path d="M20 4v6h-6"></path>
+                  </svg></span> <span>CHANGE LOGS</span></li></ul></div></div></aside> <main class="el-main" style="text-align: left;"><div><div><!----> <!----> <!----> <div><div content="[object Object]"><div class="el-row" style="margin-left: -5px; margin-right: -5px;"><div class="el-col el-col-24 el-col-xs-24 el-col-sm-20 el-col-md-18 el-col-lg-22 el-col-xl-20" style="padding-left: 5px; padding-right: 5px;"><div><div class="el-col el-col-24 el-col-xs-24 el-col-sm-24 el-col-md-24 el-col-lg-24 el-col-xl-24" style="padding-left: 5px; padding-right: 5px; margin-top: 5px;"><div style="display: block;"><div class="api-path-copy"><span class="api-method">WSS</span> <span class="api-path"></span> <span class="api-title">Account balance and position update push</span></div> <!----> <!----> <div>
+              This type of event will be pushed when a new order is created, an order has a new deal, or a new status change. The event type is unified as ORDER_TRADE_UPDATE.
+            </div><div>
+              Order direction
+            </div><div>
+              BUY buy
+            </div><div>
+              SELL sell
+            </div><div>
+              Order Type
+            </div><div>
+              MARKET market order
+            </div><div>
+              TAKE_PROFIT_MARKET take profit market order
+            </div><div>
+              STOP_MARKET stop market order
+            </div><div>
+              LIMIT limit order
+            </div><div>
+              TAKE_PROFIT take profit limit order
+            </div><div>
+              STOP stop limit order
+            </div><div>
+              TRIGGER_MARKET stop market order with trigger
+            </div><div>
+              TRIGGER_LIMIT stop limit order with trigger
+            </div><div>
+              TRAILING_STOP_MARKET trailing stop market order
+            </div><div>
+              TRAILING_TP_SL trailing take profit or stop loss
+            </div><div>
+              LIQUIDATION strong liquidation order
+            </div><div>
+              The specific execution type of this event
+            </div><div>
+              NEW
+            </div><div>
+              CANCELED removed
+            </div><div>
+              CALCULATED order ADL or liquidation
+            </div><div>
+              EXPIRED order lapsed
+            </div><div>
+              TRADE transaction
+            </div><div>
+              Order Status
+            </div><div>
+              NEW
+            </div><div>
+              PARTIALLY_FILLED
+            </div><div>
+              FILLED
+            </div><div>
+              CANCELED
+            </div><div>
+              EXPIRED
+            </div><div>
+              Account data no longer need to subscribe to channel type, after connect wss://open-api-swap.bingx.com/swap-market?listenKey=a8ea75681542e66f1a50a1616dd06ed77dab61baa0c296bca03a9b13ee5f2dd7 , All event types will be pushed.
+            </div><div>
+              The effective time of the listen key is 1 hour. In order to ensure that your subscription is not interrupted, please update the listen key regularly.
+            </div></div></div> <div class="el-col el-col-24 el-col-xs-24 el-col-sm-24 el-col-md-24 el-col-lg-24 el-col-xl-24" style="padding-left: 5px; padding-right: 5px; margin-top: 5px;"><div><a class="el-link el-link--default is-underline" style="margin: 15px 0px; color: black;"><!----><span class="el-link--inner">subscription address</span><!----></a> <div class="el-table el-table--fit el-table--border el-table--enable-row-hover el-table--enable-row-transition" header-height="30px"><div class="hidden-columns"><div></div> <div></div></div><div class="el-table__header-wrapper"><table cellspacing="0" cellpadding="0" border="0" class="el-table__header" style="width: 1272px;"><colgroup><col name="el-table_57_column_155" width="180"><col name="el-table_57_column_156" width="1092"><col name="gutter" width="0"></colgroup><thead class="has-gutter"><tr class=""><th colspan="1" rowspan="1" class="el-table_57_column_155     is-leaf el-table__cell"><div class="cell">ENV</div></th><th colspan="1" rowspan="1" class="el-table_57_column_156     is-leaf el-table__cell"><div class="cell">HOST</div></th><th class="el-table__cell gutter" style="width: 0px; display: none;"></th></tr></thead></table></div><div class="el-table__body-wrapper is-scrolling-none"><table cellspacing="0" cellpadding="0" border="0" class="el-table__body" style="width: 1272px;"><colgroup><col name="el-table_57_column_155" width="180"><col name="el-table_57_column_156" width="1092"></colgroup><tbody><tr class="el-table__row"><td rowspan="1" colspan="1" class="el-table_57_column_155   el-table__cell"><div class="cell">PROD</div></td><td rowspan="1" colspan="1" class="el-table_57_column_156   el-table__cell"><div class="cell">wss://open-api-swap.bingx.com/swap-market</div></td></tr><tr class="el-table__row"><td rowspan="1" colspan="1" class="el-table_57_column_155   el-table__cell"><div class="cell">VST</div></td><td rowspan="1" colspan="1" class="el-table_57_column_156   el-table__cell"><div class="cell">wss://vst-open-api-ws.bingx.com/swap-market</div></td></tr><!----></tbody></table><!----><!----></div><!----><!----><!----><!----><div class="el-table__column-resize-proxy" style="display: none;"></div></div></div></div> <div class="el-col el-col-24 el-col-xs-24 el-col-sm-24 el-col-md-24 el-col-lg-24 el-col-xl-24" style="padding-left: 5px; padding-right: 5px; margin-top: 5px;"><div style="padding-bottom: 20px;"><a class="el-link el-link--default is-underline" style="margin: 15px 0px; color: black;"><!----><span class="el-link--inner">subscription parameters</span><!----></a> <div class="el-table el-table--fit el-table--border el-table--enable-row-hover" header-height="30px"><div class="hidden-columns"><div></div> <div></div> <div></div> <div></div></div><div class="el-table__header-wrapper"><table cellspacing="0" cellpadding="0" border="0" class="el-table__header" style="width: 1272px;"><colgroup><col name="el-table_58_column_157" width="220"><col name="el-table_58_column_158" width="120"><col name="el-table_58_column_159" width="380"><col name="el-table_58_column_160" width="552"><col name="gutter" width="0"></colgroup><thead class="has-gutter"><tr class=""><th colspan="1" rowspan="1" class="el-table_58_column_157     is-leaf el-table__cell"><div class="cell">subscription parameter</div></th><th colspan="1" rowspan="1" class="el-table_58_column_158     is-leaf el-table__cell"><div class="cell">data type</div></th><th colspan="1" rowspan="1" class="el-table_58_column_159     is-leaf el-table__cell"><div class="cell">description</div></th><th colspan="1" rowspan="1" class="el-table_58_column_160     is-leaf el-table__cell"><div class="cell">values</div></th><th class="el-table__cell gutter" style="width: 0px; display: none;"></th></tr></thead></table></div><div class="el-table__body-wrapper is-scrolling-none"><table cellspacing="0" cellpadding="0" border="0" class="el-table__body" style="width: 1272px;"><colgroup><col name="el-table_58_column_157" width="220"><col name="el-table_58_column_158" width="120"><col name="el-table_58_column_159" width="380"><col name="el-table_58_column_160" width="552"></colgroup><tbody><!----></tbody></table><div class="el-table__empty-block" style="height: 100%; width: 1272px;"><span class="el-table__empty-text">No Data</span></div><!----></div><!----><!----><!----><!----><div class="el-table__column-resize-proxy" style="display: none;"></div></div> <!----></div></div> <div class="el-col el-col-24 el-col-xs-24 el-col-sm-24 el-col-md-24 el-col-lg-24 el-col-xl-24" style="padding-left: 5px; padding-right: 5px; margin-top: 5px;"><div style="padding-bottom: 20px;"><a class="el-link el-link--default is-underline" style="margin: 15px 0px; color: black;"><!----><span class="el-link--inner">data update</span><!----></a> <div class="el-table el-table--fit el-table--border el-table--enable-row-hover" header-height="30px"><div class="hidden-columns"><div></div> <div></div> <div></div></div><div class="el-table__header-wrapper"><table cellspacing="0" cellpadding="0" border="0" class="el-table__header" style="width: 1220px;"><colgroup><col name="el-table_59_column_161" width="120"><col name="el-table_59_column_162" width="120"><col name="el-table_59_column_163" width="980"><col name="gutter" width="0"></colgroup><thead class="has-gutter"><tr class=""><th colspan="1" rowspan="1" class="el-table_59_column_161     is-leaf el-table__cell"><div class="cell">parameter</div></th><th colspan="1" rowspan="1" class="el-table_59_column_162     is-leaf el-table__cell"><div class="cell">data type</div></th><th colspan="1" rowspan="1" class="el-table_59_column_163     is-leaf el-table__cell"><div class="cell">description</div></th><th class="el-table__cell gutter" style="width: 0px; display: none;"></th></tr></thead></table></div><div class="el-table__body-wrapper is-scrolling-none"><table cellspacing="0" cellpadding="0" border="0" class="el-table__body" style="width: 1220px;"><colgroup><col name="el-table_59_column_161" width="120"><col name="el-table_59_column_162" width="120"><col name="el-table_59_column_163" width="980"></colgroup><tbody><!----></tbody></table><div class="el-table__empty-block" style="height: 100%; width: 1220px;"><span class="el-table__empty-text">No Data</span></div><!----></div><!----><!----><!----><!----><div class="el-table__column-resize-proxy" style="display: none;"></div></div> <!----></div></div> <div class="el-col el-col-24 el-col-xs-24 el-col-sm-24 el-col-md-24 el-col-lg-24 el-col-xl-24" style="padding-left: 5px; padding-right: 5px; margin-top: 5px;"><div><a class="el-link el-link--default is-underline" style="margin: 15px 0px; color: black;"><!----><span class="el-link--inner">subscribe sample</span><!----></a> <div class="code-html demo-code" style="height: 44px;"><button type="button" class="code-copy-btn"><i class="el-icon-document-copy"></i>
+                Copy Code
+              </button> <pre class="language-json" tabindex="0"><code class="language-json"><span class="token punctuation">{</span><span class="token punctuation">}</span></code></pre></div></div></div> <div class="el-col el-col-24 el-col-xs-24 el-col-sm-24 el-col-md-24 el-col-lg-24 el-col-xl-24" style="padding-left: 5px; padding-right: 5px; margin-top: 5px;"><div><a class="el-link el-link--default is-underline" style="margin: 15px 0px; color: black;"><!----><span class="el-link--inner">subscribe success sample</span><!----></a> <div class="code-html demo-code" style="height: 163px;"><button type="button" class="code-copy-btn"><i class="el-icon-document-copy"></i>
+                Copy Code
+              </button> <pre class="language-json" tabindex="0"><code class="language-json"><span class="token punctuation">{</span>
+  <span class="token property">"id"</span><span class="token operator">:</span> <span class="token string">"e745cd6d-d0f6-4a70-8d5a-043e4c741b40"</span><span class="token punctuation">,</span>
+  <span class="token property">"code"</span><span class="token operator">:</span> <span class="token number">0</span><span class="token punctuation">,</span>
+  <span class="token property">"msg"</span><span class="token operator">:</span> <span class="token string">""</span><span class="token punctuation">,</span>
+  <span class="token property">"dataType"</span><span class="token operator">:</span> <span class="token string">""</span><span class="token punctuation">,</span>
+  <span class="token property">"data"</span><span class="token operator">:</span> <span class="token null keyword">null</span>
+<span class="token punctuation">}</span></code></pre></div></div></div> <div class="el-col el-col-24 el-col-xs-24 el-col-sm-24 el-col-md-24 el-col-lg-24 el-col-xl-24" style="padding-left: 5px; padding-right: 5px; margin-top: 5px;"><div><a class="el-link el-link--default is-underline" style="margin: 15px 0px; color: black;"><!----><span class="el-link--inner">data update sample</span><!----></a> <div class="code-html demo-code" style="height: 560px;"><button type="button" class="code-copy-btn"><i class="el-icon-document-copy"></i>
+                Copy Code
+              </button> <pre class="language-json" tabindex="0"><code class="language-json"><span class="token punctuation">{</span>
+  <span class="token property">"e"</span><span class="token operator">:</span> <span class="token string">"ACCOUNT_UPDATE"</span><span class="token punctuation">,</span>
+  <span class="token property">"E"</span><span class="token operator">:</span> <span class="token number">1758608899352</span><span class="token punctuation">,</span>
+  <span class="token property">"a"</span><span class="token operator">:</span> <span class="token punctuation">{</span>
+    <span class="token property">"m"</span><span class="token operator">:</span> <span class="token string">"ORDER"</span><span class="token punctuation">,</span>
+    <span class="token property">"B"</span><span class="token operator">:</span> <span class="token punctuation">[</span>
+      <span class="token punctuation">{</span>
+        <span class="token property">"a"</span><span class="token operator">:</span> <span class="token string">"USDT"</span><span class="token punctuation">,</span>
+        <span class="token property">"wb"</span><span class="token operator">:</span> <span class="token string">"117.80007595"</span><span class="token punctuation">,</span>
+        <span class="token property">"cw"</span><span class="token operator">:</span> <span class="token string">"95.23045595"</span><span class="token punctuation">,</span>
+        <span class="token property">"bc"</span><span class="token operator">:</span> <span class="token string">"0"</span>
+      <span class="token punctuation">}</span>
+    <span class="token punctuation">]</span><span class="token punctuation">,</span>
+    <span class="token property">"P"</span><span class="token operator">:</span> <span class="token punctuation">[</span>
+      <span class="token punctuation">{</span>
+        <span class="token property">"s"</span><span class="token operator">:</span> <span class="token string">"BTC-USDT"</span><span class="token punctuation">,</span>
+        <span class="token property">"pa"</span><span class="token operator">:</span> <span class="token string">"0.00100000"</span><span class="token punctuation">,</span>
+        <span class="token property">"ep"</span><span class="token operator">:</span> <span class="token string">"112848.10000000"</span><span class="token punctuation">,</span>
+        <span class="token property">"up"</span><span class="token operator">:</span> <span class="token string">"-0.00004435"</span><span class="token punctuation">,</span>
+        <span class="token property">"mt"</span><span class="token operator">:</span> <span class="token string">"cross"</span><span class="token punctuation">,</span>
+        <span class="token property">"iw"</span><span class="token operator">:</span> <span class="token string">"22.56957565"</span><span class="token punctuation">,</span>
+        <span class="token property">"ps"</span><span class="token operator">:</span> <span class="token string">"SHORT"</span><span class="token punctuation">,</span>
+        <span class="token property">"cr"</span><span class="token operator">:</span> <span class="token string">"-0.05642405"</span>
+      <span class="token punctuation">}</span>
+    <span class="token punctuation">]</span>
+  <span class="token punctuation">}</span>
+<span class="token punctuation">}</span></code></pre></div></div></div> <div class="el-col el-col-24 el-col-xs-24 el-col-sm-24 el-col-md-24 el-col-lg-24 el-col-xl-24" style="padding-left: 5px; padding-right: 5px; margin-top: 5px;"><div><a class="el-link el-link--default is-underline" style="margin: 15px 0px; color: black;"><!----><span class="el-link--inner">cancel subscribe sample</span><!----></a> <div class="code-html demo-code" style="height: 44px;"><button type="button" class="code-copy-btn"><i class="el-icon-document-copy"></i>
+                Copy Code
+              </button> <pre class="language-json" tabindex="0"><code class="language-json"><span class="token punctuation">{</span><span class="token punctuation">}</span></code></pre></div></div></div> <div class="el-col el-col-24 el-col-xs-24 el-col-sm-24 el-col-md-24 el-col-lg-24 el-col-xl-24" style="padding-left: 5px; padding-right: 5px; margin-top: 5px;"><div style="padding-bottom: 20px;"><a class="el-link el-link--default is-underline" style="margin: 15px 0px; color: black;"><!----><span class="el-link--inner">error code</span><!----></a> <div class="el-table el-table--fit el-table--border el-table--enable-row-hover" header-height="30px"><div class="hidden-columns"><div></div> <div></div></div><div class="el-table__header-wrapper"><table cellspacing="0" cellpadding="0" border="0" class="el-table__header" style="width: 1272px;"><colgroup><col name="el-table_60_column_164" width="220"><col name="el-table_60_column_165" width="1052"><col name="gutter" width="0"></colgroup><thead class="has-gutter"><tr class=""><th colspan="1" rowspan="1" class="el-table_60_column_164     is-leaf el-table__cell"><div class="cell">error code</div></th><th colspan="1" rowspan="1" class="el-table_60_column_165     is-leaf el-table__cell"><div class="cell">error message</div></th><th class="el-table__cell gutter" style="width: 0px; display: none;"></th></tr></thead></table></div><div class="el-table__body-wrapper is-scrolling-none"><table cellspacing="0" cellpadding="0" border="0" class="el-table__body" style="width: 1272px;"><colgroup><col name="el-table_60_column_164" width="220"><col name="el-table_60_column_165" width="1052"></colgroup><tbody><!----></tbody></table><div class="el-table__empty-block" style="height: 100%; width: 1272px;"><span class="el-table__empty-text">No Data</span></div><!----></div><!----><!----><!----><!----><div class="el-table__column-resize-proxy" style="display: none;"></div></div> <div></div></div></div> <div class="el-col el-col-24 el-col-xs-24 el-col-sm-24 el-col-md-24 el-col-lg-24 el-col-xl-24" style="padding-left: 5px; padding-right: 5px; margin-top: 5px;"><div><a class="el-link el-link--default is-underline" style="margin: 15px 0px; color: black;"><!----><span class="el-link--inner">code demo</span><!----></a> <div class="el-tabs el-tabs--top"><div class="el-tabs__header is-top"><div class="el-tabs__nav-wrap is-top"><div class="el-tabs__nav-scroll"><div role="tablist" class="el-tabs__nav is-top" style="transform: translateX(0px);"><div class="el-tabs__active-bar is-top" style="width: 40px; transform: translateX(0px);"></div><div id="tab-python" aria-controls="pane-python" role="tab" aria-selected="true" tabindex="0" class="el-tabs__item is-top is-active">Python</div><div id="tab-golang" aria-controls="pane-golang" role="tab" tabindex="-1" class="el-tabs__item is-top">Golang</div><div id="tab-nodejs" aria-controls="pane-nodejs" role="tab" tabindex="-1" class="el-tabs__item is-top">Nodejs</div><div id="tab-java" aria-controls="pane-java" role="tab" tabindex="-1" class="el-tabs__item is-top">Java</div><div id="tab-csharp" aria-controls="pane-csharp" role="tab" tabindex="-1" class="el-tabs__item is-top">C#</div><div id="tab-php" aria-controls="pane-php" role="tab" tabindex="-1" class="el-tabs__item is-top">PHP</div></div></div></div></div><div class="el-tabs__content"><div role="tabpanel" id="pane-python" aria-labelledby="tab-python" class="el-tab-pane"></div> <div role="tabpanel" aria-hidden="true" id="pane-golang" aria-labelledby="tab-golang" class="el-tab-pane" style="display: none;"></div> <div role="tabpanel" aria-hidden="true" id="pane-nodejs" aria-labelledby="tab-nodejs" class="el-tab-pane" style="display: none;"></div> <div role="tabpanel" aria-hidden="true" id="pane-java" aria-labelledby="tab-java" class="el-tab-pane" style="display: none;"></div> <div role="tabpanel" aria-hidden="true" id="pane-csharp" aria-labelledby="tab-csharp" class="el-tab-pane" style="display: none;"></div> <div role="tabpanel" aria-hidden="true" id="pane-php" aria-labelledby="tab-php" class="el-tab-pane" style="display: none;"></div></div></div> <div class="code-html demo-code" style="height: 1075px;"><button type="button" class="code-copy-btn"><i class="el-icon-document-copy"></i>
+                Copy Code
+              </button> <pre class="language-python" tabindex="0">                    <code class="language-python">
+<span class="token keyword">import</span> json
+<span class="token keyword">import</span> websocket
+<span class="token keyword">import</span> gzip
+<span class="token keyword">import</span> io
+URL<span class="token operator">=</span><span class="token string">"wss://open-api-swap.bingx.com/swap-market?listenKey=a8ea75681542e66f1a50a1616dd06ed77dab61baa0c296bca03a9b13ee5f2dd7"</span> 
+
+<span class="token keyword">class</span> <span class="token class-name">Test</span><span class="token punctuation">(</span><span class="token builtin">object</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+
+    <span class="token keyword">def</span> <span class="token function">__init__</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        self<span class="token punctuation">.</span>url <span class="token operator">=</span> URL 
+        self<span class="token punctuation">.</span>ws <span class="token operator">=</span> <span class="token boolean">None</span>
+
+    <span class="token keyword">def</span> <span class="token function">on_open</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> ws<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">'WebSocket connected'</span><span class="token punctuation">)</span>
+        
+
+    <span class="token keyword">def</span> <span class="token function">on_data</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> ws<span class="token punctuation">,</span> string<span class="token punctuation">,</span> <span class="token builtin">type</span><span class="token punctuation">,</span> continue_flag<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        compressed_data <span class="token operator">=</span> gzip<span class="token punctuation">.</span>GzipFile<span class="token punctuation">(</span>fileobj<span class="token operator">=</span>io<span class="token punctuation">.</span>BytesIO<span class="token punctuation">(</span>string<span class="token punctuation">)</span><span class="token punctuation">,</span> mode<span class="token operator">=</span><span class="token string">'rb'</span><span class="token punctuation">)</span>
+        decompressed_data <span class="token operator">=</span> compressed_data<span class="token punctuation">.</span>read<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        utf8_data <span class="token operator">=</span> decompressed_data<span class="token punctuation">.</span>decode<span class="token punctuation">(</span><span class="token string">'utf-8'</span><span class="token punctuation">)</span>
+        <span class="token keyword">print</span><span class="token punctuation">(</span>utf8_data<span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">on_message</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> ws<span class="token punctuation">,</span> message<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        compressed_data <span class="token operator">=</span> gzip<span class="token punctuation">.</span>GzipFile<span class="token punctuation">(</span>fileobj<span class="token operator">=</span>io<span class="token punctuation">.</span>BytesIO<span class="token punctuation">(</span>message<span class="token punctuation">)</span><span class="token punctuation">,</span> mode<span class="token operator">=</span><span class="token string">'rb'</span><span class="token punctuation">)</span>
+        decompressed_data <span class="token operator">=</span> compressed_data<span class="token punctuation">.</span>read<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        utf8_data <span class="token operator">=</span> decompressed_data<span class="token punctuation">.</span>decode<span class="token punctuation">(</span><span class="token string">'utf-8'</span><span class="token punctuation">)</span>
+        <span class="token keyword">print</span><span class="token punctuation">(</span>utf8_data<span class="token punctuation">)</span>  <span class="token comment">#this is the message you need </span>
+        <span class="token keyword">if</span> utf8_data <span class="token operator">==</span> <span class="token string">"Ping"</span><span class="token punctuation">:</span> <span class="token comment"># this is very important , if you receive 'Ping' you need to send 'Pong' </span>
+           ws<span class="token punctuation">.</span>send<span class="token punctuation">(</span><span class="token string">"Pong"</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">on_error</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> ws<span class="token punctuation">,</span> error<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">print</span><span class="token punctuation">(</span>error<span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">on_close</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> ws<span class="token punctuation">,</span> close_status_code<span class="token punctuation">,</span> close_msg<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">print</span><span class="token punctuation">(</span><span class="token string">'The connection is closed!'</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">start</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        self<span class="token punctuation">.</span>ws <span class="token operator">=</span> websocket<span class="token punctuation">.</span>WebSocketApp<span class="token punctuation">(</span>
+            self<span class="token punctuation">.</span>url<span class="token punctuation">,</span>
+            on_open<span class="token operator">=</span>self<span class="token punctuation">.</span>on_open<span class="token punctuation">,</span>
+            on_message<span class="token operator">=</span>self<span class="token punctuation">.</span>on_message<span class="token punctuation">,</span>
+            <span class="token comment"># on_data=self.on_data,</span>
+            on_error<span class="token operator">=</span>self<span class="token punctuation">.</span>on_error<span class="token punctuation">,</span>
+            on_close<span class="token operator">=</span>self<span class="token punctuation">.</span>on_close<span class="token punctuation">,</span>
+        <span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>ws<span class="token punctuation">.</span>run_forever<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+
+<span class="token keyword">if</span> __name__ <span class="token operator">==</span> <span class="token string">"__main__"</span><span class="token punctuation">:</span>
+    test <span class="token operator">=</span> Test<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    test<span class="token punctuation">.</span>start<span class="token punctuation">(</span><span class="token punctuation">)</span></code>
+                </pre></div></div></div></div></div> <div class="el-col el-col-24 el-col-xs-4 el-col-sm-4 el-col-md-4 el-col-lg-2 el-col-xl-4" style="padding-left: 5px; padding-right: 5px;"><div class="fixed-sidebar"><div class="anchor-tabs el-tabs el-tabs--right" style="min-height: 500px; text-align: left;"><div class="el-tabs__header is-right"><div class="el-tabs__nav-wrap is-right"><div class="el-tabs__nav-scroll"><div role="tablist" class="el-tabs__nav is-right" style="transform: translateY(0px);"><div class="el-tabs__active-bar is-right" style="height: 51px; transform: translateY(0px);"></div><div id="tab-0" aria-controls="pane-0" role="tab" aria-selected="true" tabindex="0" class="el-tabs__item is-right is-active">Subscription Address</div><div id="tab-1" aria-controls="pane-1" role="tab" tabindex="-1" class="el-tabs__item is-right">Subscription Parameters</div><div id="tab-2" aria-controls="pane-2" role="tab" tabindex="-1" class="el-tabs__item is-right">Data Update</div><div id="tab-3" aria-controls="pane-3" role="tab" tabindex="-1" class="el-tabs__item is-right">Subscribe Sample</div><div id="tab-4" aria-controls="pane-4" role="tab" tabindex="-1" class="el-tabs__item is-right">Subscribe Success Sample</div><div id="tab-5" aria-controls="pane-5" role="tab" tabindex="-1" class="el-tabs__item is-right">Data Update Sample</div><div id="tab-6" aria-controls="pane-6" role="tab" tabindex="-1" class="el-tabs__item is-right">Cancel Subscribe Sample</div><div id="tab-7" aria-controls="pane-7" role="tab" tabindex="-1" class="el-tabs__item is-right">Error Code</div><div id="tab-8" aria-controls="pane-8" role="tab" tabindex="-1" class="el-tabs__item is-right">Code Demo</div></div></div></div></div><div class="el-tabs__content"><div role="tabpanel" id="pane-0" aria-labelledby="tab-0" class="el-tab-pane" style=""></div> <div role="tabpanel" aria-hidden="true" id="pane-1" aria-labelledby="tab-1" class="el-tab-pane" style="display: none;"></div> <div role="tabpanel" aria-hidden="true" id="pane-2" aria-labelledby="tab-2" class="el-tab-pane" style="display: none;"></div> <div role="tabpanel" aria-hidden="true" id="pane-3" aria-labelledby="tab-3" class="el-tab-pane" style="display: none;"></div> <div role="tabpanel" aria-hidden="true" id="pane-4" aria-labelledby="tab-4" class="el-tab-pane" style="display: none;"></div> <div role="tabpanel" aria-hidden="true" id="pane-5" aria-labelledby="tab-5" class="el-tab-pane" style="display: none;"></div> <div role="tabpanel" aria-hidden="true" id="pane-6" aria-labelledby="tab-6" class="el-tab-pane" style="display: none;"></div> <div role="tabpanel" aria-hidden="true" id="pane-7" aria-labelledby="tab-7" class="el-tab-pane" style="display: none;"></div> <div role="tabpanel" aria-hidden="true" id="pane-8" aria-labelledby="tab-8" class="el-tab-pane" style="display: none;"></div></div></div></div></div></div></div></div></div></div></main></section></section></div><script type="text/javascript" src="./Account balance and position update push_files/manifest.3ad1d5771e9b13dbdad2.js.Без названия"></script><script type="text/javascript" src="./Account balance and position update push_files/vendor.1b61d0acaf5a01954f42.js.Без названия"></script><script type="text/javascript" src="./Account balance and position update push_files/app.59f57926adfbcd4804b6.js.Без названия"></script><div data-lastpass-root="" style="position: absolute !important; top: 0px !important; left: 0px !important; height: 0px !important; width: 0px !important; display: initial !important;"><template shadowrootmode="closed"><div style="position: absolute; height: 100vh; width: 100vw; z-index: 2147483647; border-radius: 4px; top: 0px; left: 0px; max-height: 0px; max-width: 280px; min-width: auto;"><iframe data-lastpass-infield="true" allow="clipboard-write" src="chrome-extension://hdokiejnpimakedhajhdlcegeplioahd/webclient-infield.html" style="border: none; height: 100%; width: 100%;"></iframe></div></template></div></body></html>

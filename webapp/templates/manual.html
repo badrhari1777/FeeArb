@@ -8,9 +8,10 @@
   {% set settings = settings or {} %}
   {% set analysis_exchanges = settings.get('analysis_exchanges', {}) %}
   {% set manual_settings = settings.get('manual', {}) %}
+  {% set ws_health = manual_settings.get('ws_orders_health', {}) %}
   <script defer src="{{ url_for('static', path='/manual.js') }}?v={{ static_version }}"></script>
 </head>
-<body class="page">
+<body class="page page--manual">
   <header class="masthead">
     <div>
       <h1>Manual Arbitrage</h1>
@@ -132,32 +133,16 @@
           <input type="number" id="manual-spread-max" step="0.01" />
         </label>
         <label>
-          Min level notional (USDT)
-          <input type="number" id="manual-min-level-notional" min="0" step="0.01" />
-        </label>
-        <label>
-          Min level qty (base)
-          <input type="number" id="manual-min-level-qty" min="0" step="0.0001" />
-        </label>
-        <label>
           Max limit deviation (bps)
           <input type="number" id="manual-max-limit-dev" min="0" step="0.1" value="30" />
         </label>
         <label>
-          Min notional buffer (%)
-          <input type="number" id="manual-min-notional-buffer" min="0" step="0.1" value="2" />
-        </label>
-        {% for name, enabled in analysis_exchanges.items() %}
-          {% if enabled %}
-            <label>
-              Min notional (USDT) {{ name|upper }}
-              <input type="number" id="manual-min-notional-{{ name }}" data-min-notional-exchange="{{ name }}" min="0" step="0.01" />
-            </label>
-          {% endif %}
-        {% endfor %}
-        <label>
           Chunk qty (base)
           <input type="number" id="manual-chunk-qty" step="0.0001" min="0" />
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="manual-force-chunk" />
+          Force chunk qty
         </label>
         <label>
           Chunk notional (USDT)
@@ -183,17 +168,21 @@
           Max runtime (sec)
           <input type="number" id="manual-runtime" min="1" step="1" value="60" />
         </label>
+        <label class="manual-scope-enter-exit manual-scope-market">
+          Market refill bps
+          <input type="number" id="manual-market-refill-bps" min="0" step="0.1" value="10" />
+        </label>
+        <label class="manual-scope-enter-exit manual-scope-market">
+          Market refill buffer
+          <input type="number" id="manual-market-refill-buffer" min="0" step="0.01" value="0.15" />
+        </label>
+        <label class="manual-scope-enter-exit manual-scope-market">
+          Market refill max wait (sec)
+          <input type="number" id="manual-market-refill-max-wait" min="0" step="0.1" value="5" />
+        </label>
         <label>
           Timeout (sec, 0 = infinite)
           <input type="number" id="manual-timeout" min="0" step="1" value="15" />
-        </label>
-        <label>
-          Max unhedged time (sec)
-          <input type="number" id="manual-unhedged-sec" min="0" step="1" value="60" />
-        </label>
-        <label>
-          Max unhedged (%)
-          <input type="number" id="manual-unhedged-pct" min="0" step="1" value="15" />
         </label>
         <label>
           Hedge order type
@@ -240,6 +229,103 @@
             <option value="cross">Cross</option>
           </select>
         </label>
+        <div class="panel-label">WS order stream health</div>
+        <label>
+          Bybit heartbeat interval (sec)
+          <input type="number" id="manual-ws-bybit-heartbeat-interval" min="1" step="1" value="{{ ws_health.get('bybit', {}).get('heartbeat_interval', 15) }}" />
+        </label>
+        <label>
+          Bybit heartbeat timeout (sec)
+          <input type="number" id="manual-ws-bybit-heartbeat-timeout" min="1" step="1" value="{{ ws_health.get('bybit', {}).get('heartbeat_timeout', 45) }}" />
+        </label>
+        <label>
+          Bybit reconnect attempts
+          <input type="number" id="manual-ws-bybit-reconnect-attempts" min="0" step="1" value="{{ ws_health.get('bybit', {}).get('reconnect_attempts', 3) }}" />
+        </label>
+        <label>
+          Bybit reconnect grace (sec)
+          <input type="number" id="manual-ws-bybit-reconnect-grace" min="0" step="1" value="{{ ws_health.get('bybit', {}).get('reconnect_grace_sec', 12) }}" />
+        </label>
+        <label>
+          OKX heartbeat interval (sec)
+          <input type="number" id="manual-ws-okx-heartbeat-interval" min="1" step="1" value="{{ ws_health.get('okx', {}).get('heartbeat_interval', 15) }}" />
+        </label>
+        <label>
+          OKX heartbeat timeout (sec)
+          <input type="number" id="manual-ws-okx-heartbeat-timeout" min="1" step="1" value="{{ ws_health.get('okx', {}).get('heartbeat_timeout', 45) }}" />
+        </label>
+        <label>
+          OKX reconnect attempts
+          <input type="number" id="manual-ws-okx-reconnect-attempts" min="0" step="1" value="{{ ws_health.get('okx', {}).get('reconnect_attempts', 3) }}" />
+        </label>
+        <label>
+          OKX reconnect grace (sec)
+          <input type="number" id="manual-ws-okx-reconnect-grace" min="0" step="1" value="{{ ws_health.get('okx', {}).get('reconnect_grace_sec', 12) }}" />
+        </label>
+        <label>
+          Gate heartbeat interval (sec)
+          <input type="number" id="manual-ws-gate-heartbeat-interval" min="1" step="1" value="{{ ws_health.get('gate', {}).get('heartbeat_interval', 20) }}" />
+        </label>
+        <label>
+          Gate heartbeat timeout (sec)
+          <input type="number" id="manual-ws-gate-heartbeat-timeout" min="1" step="1" value="{{ ws_health.get('gate', {}).get('heartbeat_timeout', 60) }}" />
+        </label>
+        <label>
+          Gate reconnect attempts
+          <input type="number" id="manual-ws-gate-reconnect-attempts" min="0" step="1" value="{{ ws_health.get('gate', {}).get('reconnect_attempts', 3) }}" />
+        </label>
+        <label>
+          Gate reconnect grace (sec)
+          <input type="number" id="manual-ws-gate-reconnect-grace" min="0" step="1" value="{{ ws_health.get('gate', {}).get('reconnect_grace_sec', 15) }}" />
+        </label>
+        <label>
+          Bitget heartbeat interval (sec)
+          <input type="number" id="manual-ws-bitget-heartbeat-interval" min="1" step="1" value="{{ ws_health.get('bitget', {}).get('heartbeat_interval', 15) }}" />
+        </label>
+        <label>
+          Bitget heartbeat timeout (sec)
+          <input type="number" id="manual-ws-bitget-heartbeat-timeout" min="1" step="1" value="{{ ws_health.get('bitget', {}).get('heartbeat_timeout', 45) }}" />
+        </label>
+        <label>
+          Bitget reconnect attempts
+          <input type="number" id="manual-ws-bitget-reconnect-attempts" min="0" step="1" value="{{ ws_health.get('bitget', {}).get('reconnect_attempts', 3) }}" />
+        </label>
+        <label>
+          Bitget reconnect grace (sec)
+          <input type="number" id="manual-ws-bitget-reconnect-grace" min="0" step="1" value="{{ ws_health.get('bitget', {}).get('reconnect_grace_sec', 12) }}" />
+        </label>
+        <label>
+          Kucoin heartbeat interval (sec)
+          <input type="number" id="manual-ws-kucoin-heartbeat-interval" min="1" step="1" value="{{ ws_health.get('kucoin', {}).get('heartbeat_interval', 15) }}" />
+        </label>
+        <label>
+          Kucoin heartbeat timeout (sec)
+          <input type="number" id="manual-ws-kucoin-heartbeat-timeout" min="1" step="1" value="{{ ws_health.get('kucoin', {}).get('heartbeat_timeout', 45) }}" />
+        </label>
+        <label>
+          Kucoin reconnect attempts
+          <input type="number" id="manual-ws-kucoin-reconnect-attempts" min="0" step="1" value="{{ ws_health.get('kucoin', {}).get('reconnect_attempts', 3) }}" />
+        </label>
+        <label>
+          Kucoin reconnect grace (sec)
+          <input type="number" id="manual-ws-kucoin-reconnect-grace" min="0" step="1" value="{{ ws_health.get('kucoin', {}).get('reconnect_grace_sec', 12) }}" />
+        </label>
+        <label>
+          BingX heartbeat interval (sec)
+          <input type="number" id="manual-ws-bingx-heartbeat-interval" min="1" step="1" value="{{ ws_health.get('bingx', {}).get('heartbeat_interval', 30) }}" />
+        </label>
+        <label>
+          BingX heartbeat timeout (sec)
+          <input type="number" id="manual-ws-bingx-heartbeat-timeout" min="1" step="1" value="{{ ws_health.get('bingx', {}).get('heartbeat_timeout', 90) }}" />
+        </label>
+        <label>
+          BingX reconnect attempts
+          <input type="number" id="manual-ws-bingx-reconnect-attempts" min="0" step="1" value="{{ ws_health.get('bingx', {}).get('reconnect_attempts', 3) }}" />
+        </label>
+        <label>
+          BingX reconnect grace (sec)
+          <input type="number" id="manual-ws-bingx-reconnect-grace" min="0" step="1" value="{{ ws_health.get('bingx', {}).get('reconnect_grace_sec', 20) }}" />
+        </label>
         <label class="settings-checkbox manual-scope-enter-exit">
           <input type="checkbox" id="manual-live-orderbook" {% if manual_settings.get('live_orderbook', manual_settings.get('enter_live_orderbook')) %}checked{% endif %} />
           Show live orderbook
@@ -251,18 +337,48 @@
         <div class="settings-intervals">
           <button type="button" class="button" id="manual-dry-run">Dry-run</button>
           <button type="button" class="button" id="manual-execute">Execute now</button>
+          <button type="button" class="button" id="manual-stop" disabled>Stop</button>
           <span class="settings-status" id="manual-status" aria-live="polite"></span>
+          <span class="settings-status" id="manual-exec-id" aria-live="polite">Execution id: -</span>
         </div>
       </form>
       <div class="panel-muted">
         <div class="live-metrics manual-scope-enter-exit" id="manual-live">Live spread: -</div>
         <p class="muted manual-scope-enter-exit">Suggested expensive leg and liquidity metrics appear after dry-run.</p>
+        <div class="code-block-header manual-scope-enter-exit">
+          <div class="panel-label">Live orderbook</div>
+          <button type="button" class="button button--copy" data-copy-target="manual-live-book">Copy</button>
+        </div>
         <pre id="manual-live-book" class="code-block manual-scope-enter-exit"></pre>
+        <div class="code-block-header">
+          <div class="panel-label">Dry-run plan</div>
+          <button type="button" class="button button--copy" data-copy-target="manual-plan">Copy</button>
+        </div>
         <pre id="manual-plan" class="code-block"></pre>
-        <div class="panel-label">Order minimums</div>
-        <pre id="manual-minima" class="code-block">Order minimums will appear here after dry-run.</pre>
-        <div class="panel-label">Execution log</div>
-        <pre id="manual-exec-log" class="code-block code-block--log">Execution log will appear here after Execute now.</pre>
+        <div class="code-block-header">
+          <div class="panel-label">Execution log</div>
+          <button type="button" class="button button--copy" data-copy-target="manual-exec-log">Copy</button>
+        </div>
+        <pre id="manual-exec-log" class="code-block code-block--log code-block--wrap">Execution log will appear here after Execute now.</pre>
+        <div class="panel-label">WS order raw streams</div>
+        <div class="manual-ws-raw-grid">
+          <div>
+            <div class="code-block-header">
+              <div class="panel-label">Long leg</div>
+              <button type="button" class="button button--copy" data-copy-target="manual-ws-long-log">Copy</button>
+            </div>
+            <span class="settings-status" id="manual-ws-long-status" aria-live="polite"></span>
+            <pre id="manual-ws-long-log" class="code-block code-block--log"></pre>
+          </div>
+          <div>
+            <div class="code-block-header">
+              <div class="panel-label">Short leg</div>
+              <button type="button" class="button button--copy" data-copy-target="manual-ws-short-log">Copy</button>
+            </div>
+            <span class="settings-status" id="manual-ws-short-status" aria-live="polite"></span>
+            <pre id="manual-ws-short-log" class="code-block code-block--log"></pre>
+          </div>
+        </div>
       </div>
     </section>
   </main>

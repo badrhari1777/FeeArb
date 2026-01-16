@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 import json
 import time
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Mapping, Optional
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -71,6 +71,64 @@ def _strip_settle(symbol: str) -> str:
         if upper.endswith(suffix):
             return upper[: -len(suffix)]
     return upper
+
+
+def _normalize_manual_symbol(symbol: str | None) -> str:
+    """Normalize symbols from UI inputs (remove venue suffixes like -SWAP, USDTM)."""
+    normalized = normalize_symbol(symbol or "")
+    if not normalized:
+        return ""
+    for suffix in ("UMCBL", "DMCBL"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    if normalized.endswith("USDTM"):
+        normalized = normalized[:-1]
+    for suffix in ("SWAP", "PERP"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    return normalized
+
+
+def _symbol_match_values(symbol: str | None) -> set[str]:
+    normalized = _normalize_manual_symbol(symbol)
+    if not normalized:
+        return set()
+    return {normalized, _strip_settle(normalized)}
+
+
+def _position_matches_symbol(position: Mapping[str, Any], match_keys: set[str]) -> bool:
+    if not match_keys:
+        return False
+    for key in ("symbol_normalized", "symbol", "exchange_symbol"):
+        candidate = position.get(key)
+        if not candidate:
+            continue
+        for normalized in _symbol_match_values(str(candidate)):
+            if normalized in match_keys:
+                return True
+    return False
+
+
+def _manual_position_metrics(position: Mapping[str, Any]) -> dict[str, float | None]:
+    mark = _safe_float(position.get("mark_price"))
+    liq = _safe_float(position.get("liquidation_price"))
+    distance = None
+    distance_pct = None
+    if mark is not None and liq is not None and mark:
+        distance = abs(mark - liq)
+        distance_pct = abs(mark - liq) / abs(mark) * 100.0
+    return {
+        "mark_price": mark,
+        "liquidation_price": liq,
+        "liq_distance": distance,
+        "liq_distance_pct": distance_pct,
+        "margin_used": _safe_float(position.get("margin_used")),
+        "initial_margin": _safe_float(position.get("initial_margin")),
+        "maintenance_margin": _safe_float(position.get("maintenance_margin")),
+        "leverage": _safe_float(position.get("leverage")),
+    }
 
 
 def _ccxt_perp_symbol(symbol: str) -> str:
@@ -257,6 +315,7 @@ class DataService:
         self._parser_interval = self._settings_manager.current.parser_refresh_seconds
         self._exchange_interval = self._settings_manager.current.exchange_refresh_seconds
         self._account_interval = self._settings_manager.current.account_refresh_seconds
+        self._positions_market_interval = self._settings_manager.current.positions_market_refresh_seconds
         self._summary_interval = self._settings_manager.current.summary_refresh_seconds
         self._snapshot: Optional[DataSnapshot] = None
         self._cached_sources: Optional[SourceSnapshot] = None
@@ -285,6 +344,15 @@ class DataService:
             refresh_interval=self._account_interval,
             summary_interval=self._summary_interval,
         )
+        self._positions_market_lock = asyncio.Lock()
+        self._positions_market_cache: dict[tuple[str, str], MarketSnapshot] = {}
+        self._positions_market_cache_ts: dict[tuple[str, str], datetime] = {}
+        self._positions_market_last_refresh: Optional[datetime] = None
+        self._positions_market_last_error: Optional[str] = None
+        self._positions_market_last_key: tuple[str, ...] | None = None
+        self._positions_market_status: list[dict[str, Any]] = []
+        self._positions_market_diffs: list[dict[str, Any]] = []
+        self._positions_market_task: Optional[asyncio.Task] = None
         self._risk_config: RiskConfig = self._risk_config_from_settings()
         self._protective_manager = ProtectiveOrderManager(self._risk_config)
         self._last_protective: dict[tuple[str, str, str], dict[str, float | None]] = {}
@@ -301,8 +369,34 @@ class DataService:
 
     def _extend_universe_with_positions(self, sources: SourceSnapshot) -> SourceSnapshot:
         """Include symbols from live positions so market snapshots stay fresh for the UI."""
-        # Keep “universe” strictly for opportunity discovery; positions are handled separately.
-        return sources
+        positions = self._accounts.snapshot().get("positions") or []
+        if not positions:
+            return sources
+        existing = {str(entry.get("symbol") or "") for entry in sources.universe if entry.get("symbol")}
+        extras: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for pos in positions:
+            symbol = _dedupe_settle(
+                pos.get("symbol_normalized")
+                or normalize_symbol(pos.get("symbol"))
+            )
+            if not symbol or symbol in seen or symbol in existing:
+                continue
+            seen.add(symbol)
+            extras.append({"symbol": symbol, "sources": "positions"})
+        if not extras:
+            return sources
+        messages = list(sources.messages)
+        messages.append(f"Symbol universe extended with {len(extras)} position symbols.")
+        return SourceSnapshot(
+            generated_at=sources.generated_at,
+            screener_rows=list(sources.screener_rows),
+            coinglass_rows=list(sources.coinglass_rows),
+            universe=list(sources.universe) + extras,
+            screener_from_cache=sources.screener_from_cache,
+            coinglass_from_cache=sources.coinglass_from_cache,
+            messages=messages,
+        )
 
 
     async def startup(self) -> None:
@@ -316,11 +410,14 @@ class DataService:
         await self._accounts.start()
         # Do an immediate balance/positions pull before other work.
         await self._accounts.refresh_now(force_env=True)
+        await self._refresh_positions_market_snapshots(force=True)
         await self._maybe_sync_protective_orders()
         if self._task is None:
             await self._restart_scheduler()
         if self._bootstrap_task is None or self._bootstrap_task.done():
             self._bootstrap_task = asyncio.create_task(self.refresh_markets())
+        if self._positions_market_task is None:
+            self._positions_market_task = asyncio.create_task(self._positions_market_scheduler())
         if self._protective_task is None:
             self._protective_task = asyncio.create_task(self._protective_scheduler())
         await self._telemetry.start()
@@ -340,6 +437,13 @@ class DataService:
             except asyncio.CancelledError:
                 pass
             self._bootstrap_task = None
+        if self._positions_market_task:
+            self._positions_market_task.cancel()
+            try:
+                await self._positions_market_task
+            except asyncio.CancelledError:
+                pass
+            self._positions_market_task = None
         if self._protective_task:
             self._protective_task.cancel()
             try:
@@ -399,6 +503,28 @@ class DataService:
                 pass
             self._protective_task = None
         self._protective_task = asyncio.create_task(self._protective_scheduler())
+
+    async def _positions_market_scheduler(self) -> None:
+        """Refresh market snapshots for live positions on a separate cadence."""
+        try:
+            while True:
+                interval = max(30, int(self._positions_market_interval or self._account_interval))
+                await asyncio.sleep(interval)
+                await self._refresh_positions_market_snapshots()
+        except asyncio.CancelledError:
+            raise
+
+    async def _restart_positions_market_scheduler(self) -> None:
+        if self._loop is None or self._loop.is_closed():
+            return
+        if self._positions_market_task:
+            self._positions_market_task.cancel()
+            try:
+                await self._positions_market_task
+            except asyncio.CancelledError:
+                pass
+            self._positions_market_task = None
+        self._positions_market_task = asyncio.create_task(self._positions_market_scheduler())
 
     def _sources_due(self) -> bool:
         if self._cached_sources is None or self._last_source_refresh is None:
@@ -468,7 +594,6 @@ class DataService:
                 self._cached_sources = sources
                 self._last_source_refresh = sources.generated_at
 
-        sources = self._extend_universe_with_positions(sources)
         try:
             snapshot = await build_snapshot_from_sources(
                 sources,
@@ -516,6 +641,7 @@ class DataService:
             self._parser_interval = current.parser_refresh_seconds
             self._exchange_interval = current.exchange_refresh_seconds
             self._account_interval = current.account_refresh_seconds
+            self._positions_market_interval = current.positions_market_refresh_seconds
             self._summary_interval = current.summary_refresh_seconds
             self._risk_config = self._risk_config_from_settings()
             self._protective_manager.update_config(self._risk_config)
@@ -523,15 +649,17 @@ class DataService:
             self._apply_alert_settings()
         await self._restart_scheduler()
         await self._restart_protective_scheduler()
+        await self._restart_positions_market_scheduler()
         self._accounts.update_interval(self._account_interval)
         self._accounts.update_summary_interval(self._summary_interval)
         # Kick an async refresh so UI sees new cadence sooner.
         asyncio.create_task(self._accounts.refresh_now(force_env=True))
+        asyncio.create_task(self._refresh_positions_market_snapshots(force=True))
 
     async def manual_enter(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("dry_run"):
             payload = dict(payload)
-            payload.setdefault("constraints_exchanges", self._manual_constraints_exchanges())
+            payload.setdefault("constraints_exchanges", self._manual_pair_constraints(payload, action="enter"))
         if payload.get("dry_run") or not payload.get("async_run"):
             return await self._manual.enter(payload)
         return await self._start_manual_run("enter", payload, None)
@@ -540,7 +668,7 @@ class DataService:
         positions = self._accounts.snapshot().get("positions") or []
         if payload.get("dry_run"):
             payload = dict(payload)
-            payload.setdefault("constraints_exchanges", self._manual_constraints_exchanges())
+            payload.setdefault("constraints_exchanges", self._manual_pair_constraints(payload, action="exit"))
         if payload.get("dry_run") or not payload.get("async_run"):
             return await self._manual.exit(payload, positions)
         return await self._start_manual_run("exit", payload, positions)
@@ -549,19 +677,197 @@ class DataService:
         positions = self._accounts.snapshot().get("positions") or []
         if payload.get("dry_run"):
             payload = dict(payload)
-            payload.setdefault("constraints_exchanges", self._manual_constraints_exchanges())
+            payload.setdefault("constraints_exchanges", self._manual_pair_constraints(payload, action="roll"))
         if payload.get("dry_run") or not payload.get("async_run"):
             return await self._manual.roll(payload, positions)
         return await self._start_manual_run("roll", payload, positions)
 
     async def manual_analyze(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload)
-        payload.setdefault("constraints_exchanges", self._manual_constraints_exchanges())
+        payload.setdefault(
+            "constraints_exchanges",
+            self._manual_pair_constraints(payload, action=payload.get("action") or "enter"),
+        )
         return await self._manual.analyze(payload)
 
-    def _manual_constraints_exchanges(self) -> list[str]:
-        enabled = self._settings_manager.enabled_analysis_exchanges()
-        return [name for name, is_enabled in enabled.items() if is_enabled]
+    def _manual_pair_constraints(self, payload: Mapping[str, Any], *, action: str) -> list[str]:
+        exchanges: list[str] = []
+        if action == "roll":
+            exchanges.extend(
+                [
+                    normalize_exchange_name(str(payload.get("from_exchange") or "")),
+                    normalize_exchange_name(str(payload.get("to_exchange") or "")),
+                ]
+            )
+        else:
+            exchanges.extend(
+                [
+                    normalize_exchange_name(str(payload.get("long_exchange") or "")),
+                    normalize_exchange_name(str(payload.get("short_exchange") or "")),
+                ]
+            )
+        seen: set[str] = set()
+        unique: list[str] = []
+        for name in exchanges:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            unique.append(name)
+        return unique
+
+    async def manual_test_position(self, payload: dict[str, Any]) -> dict[str, Any]:
+        exchange = normalize_exchange_name(str(payload.get("exchange") or ""))
+        symbol = str(payload.get("symbol") or "").strip()
+        side = str(payload.get("side") or "").strip().lower()
+        if side in ("", "auto", "any", "none"):
+            side = ""
+
+        errors: list[str] = []
+        warnings: list[str] = []
+        if not exchange:
+            errors.append("exchange is required")
+        if not symbol:
+            errors.append("symbol is required")
+        if side and side not in ("long", "short"):
+            errors.append("side must be long/short or empty")
+        if errors:
+            return {"errors": errors}
+
+        gateway, error = await self._manual_test_gateway(exchange)
+        if not gateway:
+            return {"errors": [error or "gateway_unavailable"]}
+
+        try:
+            positions = await gateway.fetch_positions()
+        except Exception as exc:  # pylint: disable=broad-except
+            return {"errors": [str(exc)]}
+
+        position, pos_errors = self._manual_test_select_position(positions, symbol, side)
+        if pos_errors:
+            return {"errors": pos_errors}
+
+        balance = None
+        try:
+            balance = await gateway.fetch_balance()
+        except Exception as exc:  # pylint: disable=broad-except
+            warnings.append(f"{exchange}: balance fetch failed: {exc}")
+
+        metrics = _manual_position_metrics(position)
+        available = _safe_float(balance.get("available")) if isinstance(balance, dict) else None
+        margin_used = _safe_float(position.get("margin_used")) or metrics.get("initial_margin")
+        maintenance_margin = metrics.get("maintenance_margin")
+        max_reduce = None
+        if margin_used is not None and maintenance_margin is not None:
+            buffer = maintenance_margin * 1.05
+            max_reduce = max(0.0, margin_used - buffer)
+
+        return {
+            "exchange": exchange,
+            "symbol": symbol,
+            "side": position.get("side") or side or None,
+            "position": position,
+            "metrics": metrics,
+            "balance": balance,
+            "max_add_est": available,
+            "max_reduce_est": max_reduce,
+            "warnings": warnings,
+        }
+
+    async def manual_test_margin(self, payload: dict[str, Any], *, action: str) -> dict[str, Any]:
+        exchange = normalize_exchange_name(str(payload.get("exchange") or ""))
+        symbol = str(payload.get("symbol") or "").strip()
+        side = str(payload.get("side") or "").strip().lower()
+        if side in ("", "auto", "any", "none"):
+            side = ""
+        amount = _safe_float(payload.get("amount"))
+
+        errors: list[str] = []
+        warnings: list[str] = []
+        if not exchange:
+            errors.append("exchange is required")
+        if not symbol:
+            errors.append("symbol is required")
+        if side and side not in ("long", "short"):
+            errors.append("side must be long/short or empty")
+        if amount is None or amount <= 0:
+            errors.append("amount must be > 0")
+        if errors:
+            return {"errors": errors}
+
+        gateway, error = await self._manual_test_gateway(exchange)
+        if not gateway:
+            return {"errors": [error or "gateway_unavailable"]}
+
+        try:
+            positions = await gateway.fetch_positions()
+        except Exception as exc:  # pylint: disable=broad-except
+            return {"errors": [str(exc)]}
+
+        position, pos_errors = self._manual_test_select_position(positions, symbol, side)
+        if pos_errors:
+            return {"errors": pos_errors}
+
+        before_metrics = _manual_position_metrics(position)
+        before_balance = None
+        try:
+            before_balance = await gateway.fetch_balance()
+        except Exception as exc:  # pylint: disable=broad-except
+            warnings.append(f"{exchange}: balance fetch failed: {exc}")
+
+        result = await self._accounts._modify_margin(
+            exchange=exchange, position=position, amount=float(amount), action=action
+        )
+        if result.get("status") != "ok":
+            return {
+                "errors": [str(result.get("error") or "margin_update_failed")],
+                "exchange": exchange,
+                "symbol": symbol,
+                "side": position.get("side") or side or None,
+                "action": action,
+                "amount": amount,
+                "result": result,
+                "warnings": warnings,
+            }
+
+        after_position = None
+        after_metrics = None
+        try:
+            after_positions = await gateway.fetch_positions()
+            after_position, pos_errors = self._manual_test_select_position(
+                after_positions, symbol, side
+            )
+            if pos_errors:
+                warnings.extend(pos_errors)
+            if after_position:
+                after_metrics = _manual_position_metrics(after_position)
+        except Exception as exc:  # pylint: disable=broad-except
+            warnings.append(f"{exchange}: refresh failed: {exc}")
+
+        after_balance = None
+        try:
+            after_balance = await gateway.fetch_balance()
+        except Exception as exc:  # pylint: disable=broad-except
+            warnings.append(f"{exchange}: balance refresh failed: {exc}")
+
+        return {
+            "exchange": exchange,
+            "symbol": symbol,
+            "side": position.get("side") or side or None,
+            "action": action,
+            "amount": amount,
+            "before": {
+                "position": position,
+                "metrics": before_metrics,
+                "balance": before_balance,
+            },
+            "after": {
+                "position": after_position,
+                "metrics": after_metrics,
+                "balance": after_balance,
+            },
+            "result": result,
+            "warnings": warnings,
+        }
 
     async def manual_test_limit(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._manual_test_order(payload, order_type="limit")
@@ -593,6 +899,43 @@ class DataService:
             "status": "cancel_requested",
             "result": result,
         }
+
+    async def _manual_test_gateway(self, exchange: str) -> tuple[Any | None, str | None]:
+        gateway = self._accounts._gateways.get(exchange)
+        if gateway is None:
+            return None, f"{exchange}: gateway unavailable"
+        await gateway.refresh_credentials_async(force_env=True)
+        await gateway.ensure_client()
+        if not gateway.has_credentials:
+            return None, f"{exchange}: missing_credentials"
+        if not gateway.available:
+            return None, gateway.unavailable_reason or "client unavailable"
+        return gateway, None
+
+    def _manual_test_select_position(
+        self,
+        positions: list[dict[str, Any]],
+        symbol: str,
+        side: str,
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        match_keys = _symbol_match_values(symbol)
+        matches: list[dict[str, Any]] = []
+        for position in positions or []:
+            if side:
+                pos_side = str(position.get("side") or "").lower()
+                if pos_side != side:
+                    continue
+            if _position_matches_symbol(position, match_keys):
+                matches.append(position)
+        if not matches:
+            return None, [f"{symbol}: position not found"]
+        if len(matches) > 1:
+            options = []
+            for entry in matches:
+                opt = f"{entry.get('symbol')} ({entry.get('side')})"
+                options.append(opt)
+            return None, [f"{symbol}: multiple positions match: {', '.join(options)}"]
+        return matches[0], []
 
     async def _manual_test_client(self, exchange: str) -> tuple[Any | None, str | None]:
         gateway = self._manual._gateways.get(exchange)
@@ -812,6 +1155,24 @@ class DataService:
             "order_id": order.get("id") if isinstance(order, dict) else None,
         }
 
+    async def manual_exec_runs(self) -> dict[str, Any]:
+        self._prune_manual_runs()
+        runs: list[dict[str, Any]] = []
+        for exec_id, run in self._manual_runs.items():
+            runs.append(
+                {
+                    "execution_id": exec_id,
+                    "action": run.get("action"),
+                    "status": run.get("status"),
+                    "created_at": run.get("created_at"),
+                    "updated_at": run.get("updated_at"),
+                    "stop_requested": bool(run.get("stop_requested")),
+                    "logs": len(run.get("logs") or []),
+                }
+            )
+        runs.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+        return {"runs": runs}
+
     async def manual_exec_status(self, exec_id: str) -> dict[str, Any]:
         self._prune_manual_runs()
         run = self._manual_runs.get(exec_id)
@@ -822,9 +1183,41 @@ class DataService:
             "status": run.get("status"),
             "created_at": run.get("created_at"),
             "updated_at": run.get("updated_at"),
+            "stop_requested": bool(run.get("stop_requested")),
             "logs": list(run.get("logs") or []),
             "result": run.get("result"),
             "error": run.get("error"),
+        }
+
+    async def manual_exec_stop(self, exec_id: str) -> dict[str, Any]:
+        self._prune_manual_runs()
+        run = self._manual_runs.get(exec_id)
+        if not run:
+            return {"error": "execution_not_found"}
+        if run.get("status") != "running":
+            return {
+                "execution_id": exec_id,
+                "status": run.get("status"),
+                "stop_requested": bool(run.get("stop_requested")),
+            }
+        run["stop_requested"] = True
+        run["updated_at"] = datetime.now(timezone.utc).isoformat()
+        logs = run.get("logs")
+        if isinstance(logs, list):
+            logs.append(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "event": "stop",
+                    "message": "User stop requested",
+                    "data": {},
+                }
+            )
+            if len(logs) > 200:
+                del logs[:-200]
+        return {
+            "execution_id": exec_id,
+            "status": run.get("status"),
+            "stop_requested": True,
         }
 
     async def _start_manual_run(
@@ -846,6 +1239,7 @@ class DataService:
             "logs": [],
             "result": None,
             "error": None,
+            "stop_requested": False,
         }
         self._manual_runs[exec_id] = run
 
@@ -856,14 +1250,17 @@ class DataService:
                 del logs[:-200]
             run["updated_at"] = datetime.now(timezone.utc).isoformat()
 
+        def _stop_cb() -> bool:
+            return bool(run.get("stop_requested"))
+
         async def _runner() -> None:
             try:
                 if action == "enter":
-                    result = await self._manual.enter(payload, log_cb=_log_cb)
+                    result = await self._manual.enter(payload, log_cb=_log_cb, stop_cb=_stop_cb)
                 elif action == "exit":
-                    result = await self._manual.exit(payload, positions or [], log_cb=_log_cb)
+                    result = await self._manual.exit(payload, positions or [], log_cb=_log_cb, stop_cb=_stop_cb)
                 elif action == "roll":
-                    result = await self._manual.roll(payload, positions or [], log_cb=_log_cb)
+                    result = await self._manual.roll(payload, positions or [], log_cb=_log_cb, stop_cb=_stop_cb)
                 else:
                     result = {"errors": [f"unsupported manual action {action}"]}
                 run["result"] = result
@@ -915,6 +1312,12 @@ class DataService:
         account_interval = int(
             settings_payload.get("account_refresh_seconds", self._account_interval)
         )
+        positions_market_interval = int(
+            settings_payload.get(
+                "positions_market_refresh_seconds",
+                self._positions_market_interval,
+            )
+        )
         summary_interval = int(
             settings_payload.get("summary_refresh_seconds", getattr(self, "_summary_interval", 1800))
         )
@@ -924,6 +1327,7 @@ class DataService:
             "parser_refresh_interval": parser_interval,
             "exchange_refresh_interval": exchange_interval,
             "account_refresh_interval": account_interval,
+            "positions_market_refresh_interval": positions_market_interval,
             "summary_refresh_interval": summary_interval,
             "last_error": self._last_error,
             "last_updated": (
@@ -1068,15 +1472,40 @@ class DataService:
         positions = payload.get("positions") or []
         balances = self._sanitize_balances(payload.get("balances") or [])
         payload["balances"] = balances
-        market_lookup = self._market_snapshot_lookup()
+        market_lookup, market_ts_lookup = self._positions_market_snapshot_lookup()
         positions_by_symbol, grouped = self._positions_by_symbol(
             positions,
             return_grouped=True,
             market_lookup=market_lookup,
+            market_ts_lookup=market_ts_lookup,
         )
         payload["positions_by_symbol"] = positions_by_symbol
         payload["reduction_candidates"] = self._reduction_candidates(grouped, balances)
+        payload["positions_market"] = self._positions_market_state()
         return payload
+
+    def _positions_market_snapshot_lookup(
+        self,
+    ) -> tuple[dict[tuple[str, str], MarketSnapshot], dict[tuple[str, str], datetime]]:
+        return dict(self._positions_market_cache), dict(self._positions_market_cache_ts)
+
+    def _positions_market_state(self) -> dict[str, object]:
+        last_updated = (
+            self._positions_market_last_refresh.isoformat()
+            if self._positions_market_last_refresh
+            else None
+        )
+        symbols = len(self._positions_market_last_key or ())
+        positions = self._accounts.snapshot().get("positions") or []
+        return {
+            "last_updated": last_updated,
+            "last_error": self._positions_market_last_error,
+            "symbols": symbols,
+            "exchanges": len(self._positions_market_status),
+            "status": list(self._positions_market_status),
+            "diffs": list(self._positions_market_diffs),
+            "margin_issues": self._positions_margin_report(positions),
+        }
 
     @staticmethod
     def _sanitize_balances(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1095,15 +1524,280 @@ class DataService:
             cleaned.append(row)
         return cleaned
 
+    @staticmethod
+    def _parse_iso_ts(value: Any) -> datetime | None:
+        if value in (None, ""):
+            return None
+        try:
+            if isinstance(value, (int, float)):
+                return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            return datetime.fromisoformat(str(value)).astimezone(timezone.utc)
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+    def _collect_positions_market_symbols(
+        self, positions: list[dict[str, Any]]
+    ) -> dict[str, list[str]]:
+        by_exchange: dict[str, set[str]] = {}
+        for entry in positions:
+            exchange = normalize_exchange_name(str(entry.get("exchange") or ""))
+            if not exchange:
+                continue
+            symbol_norm = _dedupe_settle(
+                entry.get("symbol_normalized") or normalize_symbol(entry.get("symbol"))
+            )
+            if not symbol_norm:
+                continue
+            by_exchange.setdefault(exchange, set()).add(symbol_norm)
+        return {ex: sorted(symbols) for ex, symbols in by_exchange.items()}
+
+    async def _refresh_positions_market_snapshots(self, *, force: bool = False) -> None:
+        async with self._positions_market_lock:
+            positions = self._accounts.snapshot().get("positions") or []
+            symbols_by_exchange = self._collect_positions_market_symbols(positions)
+            now = datetime.now(timezone.utc)
+            interval = max(30, int(self._positions_market_interval or self._account_interval))
+            key_bits = [
+                f"{exchange}:{symbol}"
+                for exchange, symbols in sorted(symbols_by_exchange.items())
+                for symbol in symbols
+            ]
+            key = tuple(sorted(key_bits))
+            if (
+                not force
+                and self._positions_market_last_refresh
+                and key == (self._positions_market_last_key or ())
+            ):
+                age = (now - self._positions_market_last_refresh).total_seconds()
+                if age < interval:
+                    return
+
+            if not symbols_by_exchange:
+                self._positions_market_cache = {}
+                self._positions_market_cache_ts = {}
+                self._positions_market_last_refresh = now
+                self._positions_market_last_error = None
+                self._positions_market_last_key = ()
+                self._positions_market_status = []
+                self._positions_market_diffs = []
+                return
+
+            async def _fetch_exchange(exchange: str, symbols: list[str]) -> dict[str, Any]:
+                try:
+                    adapter = get_adapter(exchange)
+                except KeyError as exc:
+                    return {
+                        "exchange": exchange,
+                        "status": "missing_adapter",
+                        "symbols": len(symbols),
+                        "snapshots": [],
+                        "error": str(exc),
+                    }
+                try:
+                    snapshots = await adapter.fetch_market_snapshots_async(symbols)
+                    return {
+                        "exchange": exchange,
+                        "status": "ok",
+                        "symbols": len(symbols),
+                        "snapshots": snapshots,
+                    }
+                except Exception as exc:  # pylint: disable=broad-except
+                    return {
+                        "exchange": exchange,
+                        "status": "error",
+                        "symbols": len(symbols),
+                        "snapshots": [],
+                        "error": str(exc),
+                    }
+
+            tasks = [
+                asyncio.create_task(_fetch_exchange(exchange, symbols))
+                for exchange, symbols in symbols_by_exchange.items()
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            new_cache: dict[tuple[str, str], MarketSnapshot] = {}
+            new_ts: dict[tuple[str, str], datetime] = {}
+            status_rows: list[dict[str, Any]] = []
+            errors: list[str] = []
+            for exchange, result in zip(symbols_by_exchange.keys(), results):
+                if isinstance(result, Exception):
+                    status_rows.append(
+                        {
+                            "exchange": exchange,
+                            "status": "error",
+                            "symbols": len(symbols_by_exchange.get(exchange, [])),
+                            "error": str(result),
+                        }
+                    )
+                    errors.append(str(result))
+                    continue
+                status_rows.append(
+                    {
+                        "exchange": result.get("exchange", exchange),
+                        "status": result.get("status"),
+                        "symbols": result.get("symbols"),
+                        "count": len(result.get("snapshots") or []),
+                        "error": result.get("error"),
+                    }
+                )
+                if result.get("error"):
+                    errors.append(str(result.get("error")))
+                for snapshot in result.get("snapshots") or []:
+                    if not isinstance(snapshot, MarketSnapshot):
+                        continue
+                    snap_symbol = normalize_symbol(snapshot.symbol)
+                    if not snap_symbol:
+                        continue
+                    key_entry = (exchange, snap_symbol)
+                    new_cache[key_entry] = snapshot
+                    new_ts[key_entry] = now
+
+            self._positions_market_cache = new_cache
+            self._positions_market_cache_ts = new_ts
+            self._positions_market_last_refresh = now
+            self._positions_market_last_error = "; ".join(errors) if errors else None
+            self._positions_market_last_key = key
+            self._positions_market_status = status_rows
+            self._positions_market_diffs = self._positions_market_diff_report(
+                positions,
+                new_cache,
+                new_ts,
+            )
+
+    def _positions_market_diff_report(
+        self,
+        positions: list[dict[str, Any]],
+        market_cache: dict[tuple[str, str], MarketSnapshot],
+        market_ts_lookup: dict[tuple[str, str], datetime],
+        *,
+        max_rows: int = 12,
+    ) -> list[dict[str, Any]]:
+        diffs: list[dict[str, Any]] = []
+        for entry in positions:
+            exchange = normalize_exchange_name(str(entry.get("exchange") or ""))
+            if not exchange:
+                continue
+            symbol_norm = _dedupe_settle(
+                entry.get("symbol_normalized") or normalize_symbol(entry.get("symbol"))
+            )
+            if not symbol_norm:
+                continue
+            lookup_symbols = [symbol_norm]
+            base_symbol = _strip_settle(symbol_norm)
+            if base_symbol and base_symbol not in lookup_symbols:
+                lookup_symbols.append(base_symbol)
+            snapshot = None
+            snap_ts = None
+            for sym in lookup_symbols:
+                key = (exchange, sym)
+                snapshot = market_cache.get(key)
+                if snapshot:
+                    snap_ts = market_ts_lookup.get(key)
+                    break
+            if not snapshot:
+                continue
+
+            position_ts = self._parse_iso_ts(entry.get("timestamp"))
+            pos_mark = _safe_float(entry.get("mark_price"))
+            snap_mark = _safe_float(snapshot.mark_price)
+            if pos_mark is not None and snap_mark is not None and pos_mark != 0:
+                delta_pct = abs(snap_mark - pos_mark) / abs(pos_mark) * 100.0
+                if delta_pct >= 0.1:
+                    diffs.append(
+                        {
+                            "exchange": exchange,
+                            "symbol": symbol_norm,
+                            "field": "mark_price",
+                            "position": pos_mark,
+                            "snapshot": snap_mark,
+                            "delta_pct": delta_pct,
+                            "position_ts": position_ts.isoformat() if position_ts else None,
+                            "snapshot_ts": snap_ts.isoformat() if snap_ts else None,
+                        }
+                    )
+
+            pos_rate = _safe_float(entry.get("funding_rate") or entry.get("fundingRate"))
+            snap_rate = _safe_float(snapshot.funding_rate)
+            if pos_rate is not None and snap_rate is not None:
+                delta_rate = abs(snap_rate - pos_rate)
+                if delta_rate >= 0.0001:
+                    diffs.append(
+                        {
+                            "exchange": exchange,
+                            "symbol": symbol_norm,
+                            "field": "funding_rate",
+                            "position": pos_rate,
+                            "snapshot": snap_rate,
+                            "delta": delta_rate,
+                            "position_ts": position_ts.isoformat() if position_ts else None,
+                            "snapshot_ts": snap_ts.isoformat() if snap_ts else None,
+                        }
+                    )
+
+            if len(diffs) >= max_rows:
+                break
+        return diffs
+
+    def _positions_margin_report(
+        self,
+        positions: list[dict[str, Any]],
+        *,
+        max_rows: int = 12,
+    ) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        for entry in positions:
+            exchange = normalize_exchange_name(str(entry.get("exchange") or ""))
+            if not exchange:
+                continue
+            symbol_norm = _dedupe_settle(
+                entry.get("symbol_normalized") or normalize_symbol(entry.get("symbol"))
+            )
+            if not symbol_norm:
+                continue
+            side = str(entry.get("side") or "").lower() or None
+            margin_mode = entry.get("margin_mode")
+            margin_mode_source = entry.get("margin_mode_source")
+            leverage = _safe_float(entry.get("leverage"))
+            leverage_source = entry.get("leverage_source")
+            issue_bits: list[str] = []
+            if margin_mode is None:
+                issue_bits.append("mode:missing")
+            elif str(margin_mode).lower() != "isolated":
+                issue_bits.append(f"mode:{margin_mode}")
+            if leverage is None:
+                issue_bits.append("lev:missing")
+            elif abs(leverage - DEFAULT_MANUAL_LEVERAGE) > 0.05:
+                issue_bits.append(f"lev:{leverage:g}")
+            if not issue_bits:
+                continue
+            issues.append(
+                {
+                    "exchange": exchange,
+                    "symbol": symbol_norm,
+                    "side": side,
+                    "margin_mode": margin_mode,
+                    "margin_mode_source": margin_mode_source,
+                    "leverage": leverage,
+                    "leverage_source": leverage_source,
+                    "issues": issue_bits,
+                }
+            )
+            if len(issues) >= max_rows:
+                break
+        return issues
+
     def _positions_by_symbol(
         self,
         positions: List[dict[str, Any]],
         return_grouped: bool = False,
         market_lookup: Optional[dict[tuple[str, str], MarketSnapshot]] = None,
+        market_ts_lookup: Optional[dict[tuple[str, str], datetime]] = None,
     ) -> tuple[List[dict[str, Any]], dict[str, list[dict[str, Any]]]] | List[dict[str, Any]]:
         if not positions:
             return ([], {}) if return_grouped else []
         market_lookup = market_lookup or {}
+        market_ts_lookup = market_ts_lookup or {}
         grouped: dict[str, dict[str, Any]] = {}
         for entry in positions:
             symbol_norm = _dedupe_settle(
@@ -1124,36 +1818,53 @@ class DataService:
             next_funding_iso = None
             signed_coin = -coin_qty if side == "short" else coin_qty
             notional = float(entry.get("notional") or 0.0)
+            funding_rate = _safe_float(entry.get("funding_rate") or entry.get("fundingRate"))
+            next_funding_iso = (
+                entry.get("next_funding")
+                or entry.get("next_funding_time")
+                or entry.get("nextFunding")
+            )
+            if isinstance(next_funding_iso, datetime):
+                next_funding_iso = next_funding_iso.isoformat()
+            elif isinstance(next_funding_iso, (int, float)) and next_funding_iso > 0:
+                try:
+                    ts_val = float(next_funding_iso)
+                    if ts_val > 1e12:
+                        ts_val = ts_val / 1000.0
+                    next_funding_iso = datetime.fromtimestamp(ts_val, tz=timezone.utc).isoformat()
+                except Exception:  # pylint: disable=broad-except
+                    next_funding_iso = None
             snapshot = None
+            snapshot_ts = None
             for sym in lookup_symbols:
                 key = (str(entry.get("exchange")).lower(), sym)
                 snapshot = market_lookup.get(key)
                 if snapshot:
+                    snapshot_ts = market_ts_lookup.get(key)
                     break
             entry_price = entry.get("entry_price")
             mark_price = entry.get("mark_price")
             unrealized = entry.get("unrealized_pnl")
             if snapshot:
-                funding_rate = snapshot.funding_rate
-                next_funding_iso = (
-                    snapshot.next_funding_time.isoformat()
-                    if snapshot.next_funding_time
-                    else None
-                )
+                if funding_rate is None and snapshot.funding_rate is not None:
+                    funding_rate = snapshot.funding_rate
+                if next_funding_iso is None and snapshot.next_funding_time:
+                    next_funding_iso = snapshot.next_funding_time.isoformat()
                 if mark_price is None and snapshot.mark_price is not None:
                     mark_price = snapshot.mark_price
-            live_rate, live_next, live_mark = self._funding_live(
-                entry.get("exchange"),
-                entry.get("symbol"),
-                symbol_norm,
-                entry.get("exchange_symbol"),
-            )
-            if live_rate is not None:
-                funding_rate = live_rate
-            if live_next is not None:
-                next_funding_iso = live_next
-            if live_mark is not None:
-                mark_price = live_mark
+            if funding_rate is None or next_funding_iso is None:
+                rate_live, next_live, mark_live = self._funding_live(
+                    entry.get("exchange"),
+                    entry.get("symbol"),
+                    symbol_norm,
+                    raw_exchange_symbol=entry.get("symbol"),
+                )
+                if funding_rate is None:
+                    funding_rate = rate_live
+                if next_funding_iso is None:
+                    next_funding_iso = next_live
+                if mark_price is None and mark_live is not None:
+                    mark_price = mark_live
             if (
                 unrealized is None
                 and entry_price is not None
@@ -1749,18 +2460,44 @@ class DataService:
         warning_buffer = _safe_float(protective.get("warning_buffer_pct"))
         panic_buffer = _safe_float(protective.get("panic_buffer_pct"))
         min_free_abs = _safe_float(protective.get("min_free_balance_abs"))
+        min_free_rel = _safe_float(protective.get("min_free_balance_rel"))
+        target_buffer = _safe_float(protective.get("target_safe_buffer_pct"))
+        auto_margin_enabled = protective.get("auto_margin_enabled")
+        auto_margin_reduce_enabled = protective.get("auto_margin_reduce_enabled")
+        margin_add_pct = _safe_float(protective.get("margin_add_pct"))
+        margin_add_panic_pct = _safe_float(protective.get("margin_add_panic_pct"))
+        margin_reduce_pct = _safe_float(protective.get("margin_reduce_pct"))
+        margin_adjust_cooldown = protective.get("margin_adjust_cooldown_sec")
+        enforce_isolated_margin = protective.get("enforce_isolated_margin")
+        enforce_leverage = protective.get("enforce_leverage")
+        target_leverage = _safe_float(protective.get("target_leverage"))
         if warning_buffer is None:
             warning_buffer = self._risk_config.warning_buffer_pct
         if panic_buffer is None:
             panic_buffer = self._risk_config.panic_buffer_pct
         if min_free_abs is None:
             min_free_abs = self._risk_config.min_free_balance_abs
+        if min_free_rel is None:
+            min_free_rel = self._risk_config.min_free_balance_rel
+        if target_buffer is None:
+            target_buffer = self._risk_config.target_safe_buffer_pct
         self._accounts.update_alert_settings(
             send_margin_alerts=send_margin,
             send_missing_stop_alerts=bool(protective.get("send_missing_stop_alerts", True)),
             warning_buffer_pct=warning_buffer,
             panic_buffer_pct=panic_buffer,
             min_free_balance_abs=min_free_abs,
+            min_free_balance_rel=min_free_rel,
+            target_buffer_pct=target_buffer,
+            auto_margin_enabled=auto_margin_enabled if auto_margin_enabled is not None else None,
+            auto_margin_reduce_enabled=auto_margin_reduce_enabled if auto_margin_reduce_enabled is not None else None,
+            enforce_isolated_margin=enforce_isolated_margin if enforce_isolated_margin is not None else None,
+            enforce_leverage=enforce_leverage if enforce_leverage is not None else None,
+            target_leverage=target_leverage,
+            margin_add_pct=margin_add_pct,
+            margin_add_panic_pct=margin_add_panic_pct,
+            margin_reduce_pct=margin_reduce_pct,
+            margin_adjust_cooldown_sec=margin_adjust_cooldown,
         )
         self._send_missing_stop_alerts = bool(
             protective.get("send_missing_stop_alerts", self._send_missing_stop_alerts)

@@ -75,6 +75,7 @@ class AppSettings:
     exchange_refresh_seconds: int = 300  # Funding Opportunities refresh (5 minutes)
     table_refresh_seconds: int = 60  # Page refresh
     account_refresh_seconds: int = 90  # Account/positions refresh (1.5 minutes)
+    positions_market_refresh_seconds: int = 30  # Positions market snapshot refresh
     summary_refresh_seconds: int = 1800  # Balance digest (30 minutes)
     protective: Dict[str, object] = field(
         default_factory=lambda: {
@@ -83,10 +84,21 @@ class AppSettings:
             "anti_orphan_enabled": False,
             "send_margin_alerts": True,
             "send_missing_stop_alerts": True,
+            "auto_margin_enabled": True,
+            "auto_margin_reduce_enabled": True,
             "stop_gap_from_liq_pct": 0.07,
             "stop_requote_threshold_pct": 0.005,
             "fallback_liq_factor_long": 0.33,
             "fallback_liq_factor_short": 1.66,
+            "target_safe_buffer_pct": 0.25,
+            "warning_buffer_pct": 0.20,
+            "panic_buffer_pct": 0.15,
+            "min_free_balance_abs": 500.0,
+            "min_free_balance_rel": 0.10,
+            "margin_add_pct": 0.10,
+            "margin_add_panic_pct": 0.20,
+            "margin_reduce_pct": 0.10,
+            "margin_adjust_cooldown_sec": 300,
         }
     )
     manual: Dict[str, object] = field(
@@ -95,6 +107,44 @@ class AppSettings:
             "enter_live_depth": 5,
             "exit_live_orderbook": False,
             "exit_live_depth": 5,
+            "ws_orders_health": {
+                "bybit": {
+                    "heartbeat_interval": 15.0,
+                    "heartbeat_timeout": 45.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 12.0,
+                },
+                "okx": {
+                    "heartbeat_interval": 15.0,
+                    "heartbeat_timeout": 45.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 12.0,
+                },
+                "gate": {
+                    "heartbeat_interval": 20.0,
+                    "heartbeat_timeout": 60.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 15.0,
+                },
+                "bitget": {
+                    "heartbeat_interval": 15.0,
+                    "heartbeat_timeout": 45.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 12.0,
+                },
+                "kucoin": {
+                    "heartbeat_interval": 15.0,
+                    "heartbeat_timeout": 45.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 12.0,
+                },
+                "bingx": {
+                    "heartbeat_interval": 30.0,
+                    "heartbeat_timeout": 90.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 20.0,
+                },
+            },
         }
     )
 
@@ -140,13 +190,25 @@ class AppSettings:
         updated.account_refresh_seconds = int(
             payload.get("account_refresh_seconds", self.account_refresh_seconds)
         )
+        updated.positions_market_refresh_seconds = int(
+            payload.get(
+                "positions_market_refresh_seconds",
+                self.positions_market_refresh_seconds,
+            )
+        )
         # Allow optional summary_refresh_seconds; fall back to current value when omitted/None.
         summary_value = payload.get("summary_refresh_seconds", self.summary_refresh_seconds)
         if summary_value is None:
             summary_value = self.summary_refresh_seconds
         updated.summary_refresh_seconds = int(summary_value)
-        updated.protective = dict(payload.get("protective", self.protective))
-        updated.manual = dict(payload.get("manual", self.manual))
+        protective_value = payload.get("protective", self.protective)
+        if protective_value is None:
+            protective_value = self.protective
+        updated.protective = dict(protective_value)
+        manual_value = payload.get("manual", self.manual)
+        if manual_value is None:
+            manual_value = self.manual
+        updated.manual = dict(manual_value)
         return updated.normalised()
 
     def normalised(self) -> "AppSettings":
@@ -164,10 +226,21 @@ class AppSettings:
             "anti_orphan_enabled": False,
             "send_margin_alerts": True,
             "send_missing_stop_alerts": True,
+            "auto_margin_enabled": True,
+            "auto_margin_reduce_enabled": True,
             "stop_gap_from_liq_pct": 0.07,
             "stop_requote_threshold_pct": 0.005,
             "fallback_liq_factor_long": 0.33,
             "fallback_liq_factor_short": 1.66,
+            "target_safe_buffer_pct": 0.25,
+            "warning_buffer_pct": 0.20,
+            "panic_buffer_pct": 0.15,
+            "min_free_balance_abs": 500.0,
+            "min_free_balance_rel": 0.10,
+            "margin_add_pct": 0.10,
+            "margin_add_panic_pct": 0.20,
+            "margin_reduce_pct": 0.10,
+            "margin_adjust_cooldown_sec": 300,
         }
         merged = dict(defaults)
         if isinstance(self.protective, dict):
@@ -178,6 +251,44 @@ class AppSettings:
             "enter_live_depth": 5,
             "exit_live_orderbook": False,
             "exit_live_depth": 5,
+            "ws_orders_health": {
+                "bybit": {
+                    "heartbeat_interval": 15.0,
+                    "heartbeat_timeout": 45.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 12.0,
+                },
+                "okx": {
+                    "heartbeat_interval": 15.0,
+                    "heartbeat_timeout": 45.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 12.0,
+                },
+                "gate": {
+                    "heartbeat_interval": 20.0,
+                    "heartbeat_timeout": 60.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 15.0,
+                },
+                "bitget": {
+                    "heartbeat_interval": 15.0,
+                    "heartbeat_timeout": 45.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 12.0,
+                },
+                "kucoin": {
+                    "heartbeat_interval": 15.0,
+                    "heartbeat_timeout": 45.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 12.0,
+                },
+                "bingx": {
+                    "heartbeat_interval": 30.0,
+                    "heartbeat_timeout": 90.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 20.0,
+                },
+            },
         }
         manual = dict(manual_defaults)
         if isinstance(self.manual, dict):
@@ -198,6 +309,7 @@ class AppSettings:
             or self.table_refresh_seconds < MIN_REFRESH_SECONDS
             or self.exchange_refresh_seconds < MIN_REFRESH_SECONDS
             or self.account_refresh_seconds < MIN_REFRESH_SECONDS
+            or self.positions_market_refresh_seconds < MIN_REFRESH_SECONDS
             or self.summary_refresh_seconds < MIN_REFRESH_SECONDS
         ):
             raise ValueError(
@@ -208,6 +320,7 @@ class AppSettings:
             or self.table_refresh_seconds > MAX_REFRESH_SECONDS
             or self.exchange_refresh_seconds > MAX_REFRESH_SECONDS
             or self.account_refresh_seconds > MAX_REFRESH_SECONDS
+            or self.positions_market_refresh_seconds > MAX_REFRESH_SECONDS
             or self.summary_refresh_seconds > MAX_REFRESH_SECONDS
         ):
             raise ValueError(
@@ -231,6 +344,7 @@ class AppSettings:
             "exchange_refresh_seconds": self.exchange_refresh_seconds,
             "table_refresh_seconds": self.table_refresh_seconds,
             "account_refresh_seconds": self.account_refresh_seconds,
+            "positions_market_refresh_seconds": self.positions_market_refresh_seconds,
             "summary_refresh_seconds": self.summary_refresh_seconds,
             "protective": dict(self.protective),
             "manual": dict(self.manual),

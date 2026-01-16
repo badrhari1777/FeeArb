@@ -192,6 +192,125 @@
     return number.toFixed(places);
   }
 
+  function copyTextToClipboard(text, callback) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        callback(true);
+      }).catch(function () {
+        fallbackCopy(text, callback);
+      });
+      return;
+    }
+    fallbackCopy(text, callback);
+  }
+
+  function fallbackCopy(text, callback) {
+    var textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.top = '0';
+    textarea.style.left = '0';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    var ok = false;
+    try {
+      ok = document.execCommand('copy');
+    } catch (_err) {
+      ok = false;
+    }
+    document.body.removeChild(textarea);
+    callback(ok);
+  }
+
+  function flashCopyButton(button, success) {
+    var original = button.getAttribute('data-copy-label') || button.textContent;
+    button.setAttribute('data-copy-label', original);
+    button.textContent = success ? 'Copied' : 'Copy failed';
+    button.disabled = true;
+    setTimeout(function () {
+      button.textContent = original;
+      button.disabled = false;
+    }, 1200);
+  }
+
+  function bindCopyButtons() {
+    var buttons = document.querySelectorAll('[data-copy-target]');
+    for (var i = 0; i < buttons.length; i += 1) {
+      bindCopyButton(buttons[i]);
+    }
+  }
+
+  function bindCopyButton(button) {
+    if (!button) {
+      return;
+    }
+    button.addEventListener('click', function () {
+      var targetId = button.getAttribute('data-copy-target');
+      var target = targetId ? document.getElementById(targetId) : null;
+      var text = target ? target.textContent : '';
+      if (!text) {
+        flashCopyButton(button, false);
+        return;
+      }
+      copyTextToClipboard(text, function (ok) {
+        flashCopyButton(button, ok);
+      });
+    });
+  }
+
+  function normalizeInputSymbol(value) {
+    var text = (value || '').trim().toUpperCase();
+    if (text.indexOf(':') >= 0) {
+      text = text.split(':')[0];
+    }
+    if (text.indexOf('/') >= 0) {
+      text = text.replace('/', '');
+    }
+    text = text.replace(/[-_]/g, '');
+    if (text.endsWith('USDTM')) {
+      text = text.slice(0, -1);
+    }
+    if (text.endsWith('UMCBL') || text.endsWith('DMCBL')) {
+      text = text.slice(0, -5);
+    }
+    if (text.endsWith('SWAP')) {
+      text = text.slice(0, -4);
+    }
+    if (text.endsWith('PERP')) {
+      text = text.slice(0, -4);
+    }
+    if (text.endsWith('USDT') || text.endsWith('USD')) {
+      return text;
+    }
+    return text ? text + 'USDT' : text;
+  }
+
+  function normalizeGateSymbol(value) {
+    var symbol = normalizeInputSymbol(value);
+    if (symbol.endsWith('USDT')) {
+      return symbol.slice(0, -4) + '_USDT';
+    }
+    return symbol;
+  }
+
+  function normalizeKucoinSymbol(value) {
+    var symbol = normalizeInputSymbol(value);
+    if (symbol.endsWith('USDT')) {
+      var base = symbol.slice(0, -4);
+      if (base === 'BTC') {
+        base = 'XBT';
+      }
+      return base + 'USDTM';
+    }
+    return symbol;
+  }
+
+  function normalizeBitgetSymbol(value) {
+    return normalizeInputSymbol(value);
+  }
+
   function formatPlan(plan) {
     if (!plan) {
       return 'No data.';
@@ -272,24 +391,15 @@
           lines.push('  funding_rate=' + formatNumber(fund.funding_rate, 6) +
             ' minutes_to_funding=' + formatNumber(fund.minutes_to_funding, 2));
         }
-        if (plan.market_constraints && plan.market_constraints[exch]) {
-          var constraints = plan.market_constraints[exch] || {};
-          lines.push('  min_qty=' + formatNumber(constraints.min_qty, 6) +
-            ' min_notional=' + formatNumber(constraints.min_notional, 2));
-          lines.push('  amount_step=' + formatNumber(constraints.amount_step, 8) +
-            ' price_step=' + formatNumber(constraints.price_step, 8) +
-            ' contract_size=' + formatNumber(constraints.contract_size, 6));
-          if (constraints.min_qty_required) {
-            lines.push('  min_qty_required=' + formatNumber(constraints.min_qty_required, 6));
-          }
-        }
       });
     }
     if (plan.actions && plan.actions.length) {
       lines.push('');
       lines.push('Actions:');
       plan.actions.forEach(function (action) {
-        var line = '  - ' + (action.exchange || '-') + ' ' + (action.status || '-') +
+        var ts = action.ts || action.timestamp || action.time;
+        var line = '  - ' + (ts ? ('[' + ts + '] ') : '') +
+          (action.exchange || '-') + ' ' + (action.status || '-') +
           ' filled=' + formatNumber(action.filled_qty, 6) +
           ' avg=' + formatNumber(action.avg_price, 4);
         if (action.error) {
@@ -305,46 +415,6 @@
     return lines.join('\n');
   }
 
-  function formatConstraintsAll(constraints) {
-    if (!constraints) {
-      return '';
-    }
-    var exchanges = Object.keys(constraints || {}).sort();
-    if (!exchanges.length) {
-      return '';
-    }
-    var lines = [];
-    exchanges.forEach(function (exchange) {
-      var entry = constraints[exchange] || {};
-      lines.push(exchange.toUpperCase());
-      if (entry.error) {
-        lines.push('  error=' + entry.error);
-        lines.push('');
-        return;
-      }
-      lines.push('  min_qty=' + formatNumber(entry.min_qty, 6) +
-        ' min_notional=' + formatNumber(entry.min_notional, 2));
-      if (entry.min_notional_override !== undefined && entry.min_notional_override !== null) {
-        lines.push('  min_notional_override=' + formatNumber(entry.min_notional_override, 2));
-      }
-      if (entry.min_notional_effective !== undefined && entry.min_notional_effective !== null) {
-        lines.push('  min_notional_effective=' + formatNumber(entry.min_notional_effective, 2));
-      }
-      if (entry.min_notional_buffer_pct !== undefined && entry.min_notional_buffer_pct !== null) {
-        lines.push('  min_notional_buffer_pct=' + formatNumber(entry.min_notional_buffer_pct, 2));
-      }
-      lines.push('  amount_step=' + formatNumber(entry.amount_step, 8) +
-        ' price_step=' + formatNumber(entry.price_step, 8));
-      lines.push('  contract_size=' + formatNumber(entry.contract_size, 6) +
-        ' min_qty_required=' + formatNumber(entry.min_qty_required, 6));
-      if (entry.price_hint !== undefined && entry.price_hint !== null) {
-        lines.push('  price_hint=' + formatNumber(entry.price_hint, 6));
-      }
-      lines.push('');
-    });
-    return lines.join('\n').trim();
-  }
-
   function formatExecLogs(logs) {
     if (!logs || !logs.length) {
       return '';
@@ -355,9 +425,24 @@
     }
     return slice.map(function (entry) {
       var ts = entry.ts ? ('[' + entry.ts + '] ') : '';
-      var event = entry.event ? (entry.event + ': ') : '';
       var message = entry.message || '';
+      if (entry.event === 'payload') {
+        var header = ts + 'payload: ' + message;
+        var payloadText = '';
+        if (entry.data && Object.keys(entry.data).length) {
+          try {
+            payloadText = JSON.stringify(entry.data, null, 2);
+          } catch (err) {
+            payloadText = String(entry.data);
+          }
+        }
+        return payloadText ? (header + '\n' + payloadText) : header;
+      }
       var data = entry.data && Object.keys(entry.data).length ? (' ' + JSON.stringify(entry.data)) : '';
+      if (entry.event === 'story') {
+        return ts + message;
+      }
+      var event = entry.event ? (entry.event + ': ') : '';
       return ts + event + message + data;
     }).join('\n');
   }
@@ -424,8 +509,12 @@
     var action = currentAction();
     var showEnterExit = action !== 'roll';
     var showRoll = action === 'roll';
+    var modeEl = document.getElementById('manual-mode');
+    var mode = modeEl ? modeEl.value : '';
+    var showMarket = showEnterExit && mode === 'fast';
     toggleScope('manual-scope-enter-exit', showEnterExit);
     toggleScope('manual-scope-roll', showRoll);
+    toggleScope('manual-scope-market', showMarket);
   }
 
   function toggleScope(className, show) {
@@ -440,68 +529,59 @@
     }
   }
 
-  function readMinNotionalOverrides() {
-    var overrides = {};
-    var inputs = document.querySelectorAll('[data-min-notional-exchange]');
-    for (var i = 0; i < inputs.length; i += 1) {
-      var el = inputs[i];
-      var exchange = el.getAttribute('data-min-notional-exchange');
-      var value = parseFloat(el.value);
-      if (exchange && !isNaN(value) && value > 0) {
-        overrides[exchange] = value;
-      }
-    }
-    return overrides;
-  }
-
   function applyPlanDefaults(prefix, plan) {
     if (!plan || !plan.auto_limit_defaults) {
       return;
     }
     var defaults = plan.auto_limit_defaults || {};
-    setIfEmpty(prefix + '-min-level-notional', defaults.min_level_notional);
-    setIfEmpty(prefix + '-min-level-qty', defaults.min_level_qty);
     setIfEmpty(prefix + '-max-limit-dev', defaults.max_limit_deviation_bps);
     var chunkEl = document.getElementById(prefix + '-chunk-qty');
     if (chunkEl) {
-      var currentChunk = parseFloat(chunkEl.value);
-      var hasChunk = chunkEl.value !== '' && !isNaN(currentChunk);
-      if (!hasChunk) {
-        if (plan.recommended_chunk_qty) {
-          chunkEl.value = plan.recommended_chunk_qty;
-        } else if (plan.min_chunk_qty) {
-          chunkEl.value = plan.min_chunk_qty;
-        }
-      } else if (plan.min_chunk_qty && currentChunk < plan.min_chunk_qty) {
-        chunkEl.value = plan.min_chunk_qty;
+      var forceEl = document.getElementById(prefix + '-force-chunk');
+      var forceChunk = forceEl ? !!forceEl.checked : false;
+      var planChunk = null;
+      if (plan.recommended_chunk_qty) {
+        planChunk = plan.recommended_chunk_qty;
+      } else if (plan.min_chunk_qty) {
+        planChunk = plan.min_chunk_qty;
+      }
+      if (!forceChunk && planChunk !== null && planChunk !== undefined) {
+        chunkEl.value = planChunk;
       }
     }
   }
 
-  function pollExecution(execId, prefix, planEl, logEl, statusEl, minimaEl) {
+  function pollExecution(execId, prefix, planEl, logEl, statusEl, stopBtn, execIdEl) {
     function tick() {
       request('GET', '/api/manual/exec/' + execId, null, function (err, data) {
         if (err) {
           setStatus(statusEl, err.message, 'error');
           return;
         }
+        if (execIdEl) {
+          var execLabel = 'Execution id: ' + execId;
+          if (data && data.status) {
+            execLabel += ' (' + data.status + ')';
+          }
+          execIdEl.textContent = execLabel;
+        }
         if (logEl) {
           logEl.textContent = formatExecLogs(data.logs || []);
+        }
+        if (data.stop_requested) {
+          setStatus(statusEl, 'Stop requested; waiting for current orders...', 'info');
         }
         if (data.result) {
           planEl.textContent = formatPlan(data.result);
           applyPlanDefaults(prefix, data.result);
-          if (minimaEl) {
-            var minimaText = formatConstraintsAll(data.result ? data.result.constraints_all : null);
-            if (minimaText) {
-              minimaEl.textContent = minimaText;
-            }
-          }
         }
         if (data.status === 'running') {
           setStatus(statusEl, 'Execution running...', 'info');
           setTimeout(tick, 1000);
           return;
+        }
+        if (stopBtn) {
+          stopBtn.disabled = true;
         }
         if (data.status === 'completed_with_errors') {
           setStatus(statusEl, 'Completed with errors', 'error');
@@ -553,6 +633,46 @@
       var parsed = parseFloat(text);
       return isNaN(parsed) ? null : parsed;
     }
+    function parseOptionalInt(value) {
+      if (value === null || value === undefined) {
+        return null;
+      }
+      var text = String(value).trim();
+      if (!text) {
+        return null;
+      }
+      var parsed = parseInt(text, 10);
+      return isNaN(parsed) ? null : parsed;
+    }
+    function readWsHealth(exchange) {
+      var interval = parseOptionalNumber(getValue('ws-' + exchange + '-heartbeat-interval'));
+      var timeout = parseOptionalNumber(getValue('ws-' + exchange + '-heartbeat-timeout'));
+      var attempts = parseOptionalInt(getValue('ws-' + exchange + '-reconnect-attempts'));
+      var grace = parseOptionalNumber(getValue('ws-' + exchange + '-reconnect-grace'));
+      var cfg = {};
+      if (interval !== null) {
+        cfg.heartbeat_interval = interval;
+      }
+      if (timeout !== null) {
+        cfg.heartbeat_timeout = timeout;
+      }
+      if (attempts !== null) {
+        cfg.reconnect_attempts = attempts;
+      }
+      if (grace !== null) {
+        cfg.reconnect_grace_sec = grace;
+      }
+      return Object.keys(cfg).length ? cfg : null;
+    }
+    var wsHealth = {};
+    var exchanges = ['bybit', 'okx', 'gate', 'bitget', 'kucoin', 'bingx'];
+    for (var i = 0; i < exchanges.length; i += 1) {
+      var exchange = exchanges[i];
+      var cfg = readWsHealth(exchange);
+      if (cfg) {
+        wsHealth[exchange] = cfg;
+      }
+    }
     return {
       symbol: (getValue('symbol') || '').trim().toUpperCase(),
       qty: parseOptionalNumber(getValue('qty')),
@@ -565,8 +685,7 @@
       reprice_sec: parseOptionalNumber(getValue('reprice')),
       chunk_qty: parseOptionalNumber(getValue('chunk-qty')),
       chunk_notional: parseOptionalNumber(getValue('chunk-notional')),
-      max_unhedged_sec: parseOptionalNumber(getValue('unhedged-sec')),
-      max_unhedged_pct: parseOptionalNumber(getValue('unhedged-pct')),
+      force_chunk_qty: getChecked('force-chunk'),
       hedge_order_type: getValue('hedge-type') || null,
       hedge_offset_bps: parseOptionalNumber(getValue('hedge-bps')),
       hedge_offset_ticks: parseOptionalNumber(getValue('hedge-ticks')),
@@ -576,14 +695,14 @@
       hedge_reprice_min_sec: parseOptionalNumber(getValue('hedge-reprice-min')),
       limit_offset_bps: parseOptionalNumber(getValue('limit-bps')),
       limit_offset_ticks: parseOptionalNumber(getValue('limit-ticks')),
-      min_level_notional: parseOptionalNumber(getValue('min-level-notional')),
-      min_level_qty: parseOptionalNumber(getValue('min-level-qty')),
       max_limit_deviation_bps: parseOptionalNumber(getValue('max-limit-dev')),
+      market_refill_bps: parseOptionalNumber(getValue('market-refill-bps')),
+      market_refill_buffer: parseOptionalNumber(getValue('market-refill-buffer')),
+      market_refill_max_wait_sec: parseOptionalNumber(getValue('market-refill-max-wait')),
       use_orderbook_check: getChecked('orderbook-check'),
       fallback_to_market: getChecked('fallback'),
       margin_mode: getValue('margin-mode') || null,
-      min_notional_buffer_pct: parseOptionalNumber(getValue('min-notional-buffer')),
-      min_notional_overrides: readMinNotionalOverrides()
+      ws_orders_health: Object.keys(wsHealth).length ? wsHealth : null
     };
   }
 
@@ -591,7 +710,31 @@
     var planEl = document.getElementById('manual-plan');
     var statusEl = document.getElementById('manual-status');
     var logEl = document.getElementById('manual-exec-log');
-    var minimaEl = document.getElementById('manual-minima');
+    var stopBtn = document.getElementById('manual-stop');
+    var execIdEl = document.getElementById('manual-exec-id');
+    var currentExecId = null;
+
+    function setExecId(execId, status) {
+      if (!execIdEl) {
+        return;
+      }
+      if (!execId) {
+        execIdEl.textContent = 'Execution id: -';
+        return;
+      }
+      var label = 'Execution id: ' + execId;
+      if (status) {
+        label += ' (' + status + ')';
+      }
+      execIdEl.textContent = label;
+    }
+
+    function setStopEnabled(enabled) {
+      if (!stopBtn) {
+        return;
+      }
+      stopBtn.disabled = !enabled;
+    }
 
     function buildPayload() {
       var payload = payloadCommon('manual-');
@@ -625,6 +768,9 @@
       var payload = buildPayload();
       payload.dry_run = dryRun;
       payload.async_run = !dryRun;
+      currentExecId = null;
+      setStopEnabled(false);
+      setExecId(null);
       setStatus(statusEl, dryRun ? 'Running dry-run...' : 'Submitting orders...', 'info');
       if (logEl && !dryRun) {
         logEl.textContent = '';
@@ -635,16 +781,15 @@
           return;
         }
         if (!dryRun && data && data.execution_id) {
+          currentExecId = data.execution_id;
+          setStopEnabled(true);
+          setExecId(currentExecId, 'running');
           setStatus(statusEl, 'Execution started...', 'info');
-          pollExecution(data.execution_id, 'manual', planEl, logEl, statusEl, minimaEl);
+          pollExecution(data.execution_id, 'manual', planEl, logEl, statusEl, stopBtn, execIdEl);
           return;
         }
         planEl.textContent = formatPlan(data);
         applyPlanDefaults('manual', data);
-        if (minimaEl) {
-          var minimaText = formatConstraintsAll(data ? data.constraints_all : null);
-          minimaEl.textContent = minimaText || 'Order minimums will appear here after dry-run.';
-        }
         if (data && data.errors && data.errors.length) {
           setStatus(statusEl, 'Completed with errors', 'error');
         } else if (dryRun) {
@@ -657,6 +802,45 @@
 
     document.getElementById('manual-dry-run').addEventListener('click', function () { submit(true); });
     document.getElementById('manual-execute').addEventListener('click', function () { submit(false); });
+    if (stopBtn) {
+      stopBtn.addEventListener('click', function () {
+        if (!currentExecId) {
+          return;
+        }
+        setStatus(statusEl, 'Stop requested...', 'info');
+        request('POST', '/api/manual/exec/' + currentExecId + '/stop', {}, function () {});
+      });
+    }
+    function loadActiveRuns() {
+      request('GET', '/api/manual/exec', null, function (err, data) {
+        if (err || !data || !data.runs || currentExecId) {
+          if (!currentExecId) {
+            setExecId(null);
+          }
+          return;
+        }
+        var runs = data.runs || [];
+        var running = null;
+        for (var i = 0; i < runs.length; i++) {
+          if (runs[i].status === 'running') {
+            running = runs[i];
+            break;
+          }
+        }
+        if (!running) {
+          setExecId(null);
+          return;
+        }
+        currentExecId = running.execution_id;
+        setExecId(currentExecId, running.status);
+        setStopEnabled(true);
+        setStatus(statusEl, 'Execution running...', 'info');
+        pollExecution(currentExecId, 'manual', planEl, logEl, statusEl, stopBtn, execIdEl);
+      });
+    }
+
+    loadActiveRuns();
+
     var hedgeType = document.getElementById('manual-hedge-type');
     if (hedgeType) {
       hedgeType.addEventListener('change', function () { toggleHedgeFields('manual'); });
@@ -666,6 +850,10 @@
     if (actionEl) {
       actionEl.addEventListener('change', toggleActionFields);
     }
+    var modeEl = document.getElementById('manual-mode');
+    if (modeEl) {
+      modeEl.addEventListener('change', toggleActionFields);
+    }
     toggleActionFields();
   }
 
@@ -674,7 +862,9 @@
     bindManual();
     bindFormPersistence('manual');
     applyLivePrefs('manual');
+    bindCopyButtons();
     setupLiveFeed('manual', 'manual-long-exchange', 'manual-short-exchange', 'manual-live');
+    setupWsOrderRawLogs();
     toggleActionFields();
   }
 
@@ -890,5 +1080,278 @@
         return '    ' + formatNumber(level[0], 4) + ' x ' + formatNumber(level[1], 4);
       });
     }
+  }
+
+  function setupWsOrderRawLogs() {
+    var longLogEl = document.getElementById('manual-ws-long-log');
+    var shortLogEl = document.getElementById('manual-ws-short-log');
+    var longStatusEl = document.getElementById('manual-ws-long-status');
+    var shortStatusEl = document.getElementById('manual-ws-short-status');
+    var symbolEl = document.getElementById('manual-symbol');
+    if (!longLogEl || !shortLogEl) {
+      return;
+    }
+
+    var maxLines = 500;
+    var longLogger = createRawLogger(longLogEl, maxLines);
+    var shortLogger = createRawLogger(shortLogEl, maxLines);
+
+    var longClient = createWsOrderRawClient(longLogger, longStatusEl);
+    var shortClient = createWsOrderRawClient(shortLogger, shortStatusEl);
+
+    function resolveExchange(side) {
+      var action = currentAction();
+      if (action === 'roll') {
+        if (side === 'long') {
+          return getSelectValue('manual-to-exchange');
+        }
+        return getSelectValue('manual-from-exchange');
+      }
+      if (side === 'long') {
+        return getSelectValue('manual-long-exchange');
+      }
+      return getSelectValue('manual-short-exchange');
+    }
+
+    function updateClients() {
+      var symbol = symbolEl ? symbolEl.value : '';
+      longClient.connect(resolveExchange('long'), symbol);
+      shortClient.connect(resolveExchange('short'), symbol);
+    }
+
+    var form = document.getElementById('manual-form');
+    if (form) {
+      form.addEventListener('change', updateClients);
+    }
+    if (symbolEl) {
+      symbolEl.addEventListener('input', updateClients);
+    }
+    updateClients();
+
+    function getSelectValue(id) {
+      var el = document.getElementById(id);
+      return el ? String(el.value || '').toLowerCase() : '';
+    }
+  }
+
+  function createRawLogger(el, maxLines) {
+    var buffer = [];
+    function append(line) {
+      if (!el) {
+        return;
+      }
+      buffer.push(line);
+      if (buffer.length > maxLines) {
+        buffer = buffer.slice(buffer.length - maxLines);
+      }
+      el.textContent = buffer.join('\n');
+      el.scrollTop = el.scrollHeight;
+    }
+    append.clear = function () {
+      buffer = [];
+      if (el) {
+        el.textContent = '';
+      }
+    };
+    return append;
+  }
+
+  function createWsOrderRawClient(logLine, statusEl) {
+    var ws = null;
+    var currentExchange = null;
+    var currentSymbol = '';
+    var subscribed = false;
+
+    function connect(exchange, symbol) {
+      var nextExchange = String(exchange || '').toLowerCase();
+      var nextSymbol = String(symbol || '');
+      if (nextExchange === currentExchange && nextSymbol === currentSymbol && ws && ws.readyState === 1) {
+        return;
+      }
+      disconnect();
+      currentExchange = nextExchange;
+      currentSymbol = nextSymbol;
+      if (logLine && logLine.clear) {
+        logLine.clear();
+      }
+      if (!currentExchange) {
+        setStatus(statusEl, 'Select exchange', 'info');
+        return;
+      }
+      var config = wsOrderConfig(currentExchange);
+      if (!config) {
+        setStatus(statusEl, 'WS raw not supported', 'error');
+        return;
+      }
+      subscribed = false;
+      ws = new WebSocket(wsUrl(config.endpoint));
+      setStatus(statusEl, 'Connecting...', 'info');
+      ws.onopen = function () {
+        send({ action: 'connect' });
+      };
+      ws.onmessage = function (evt) {
+        var text = String(evt.data || '');
+        logLine(text);
+        if (!subscribed && shouldSubscribe(currentExchange, text)) {
+          var sent = sendSubscriptions(currentExchange, currentSymbol);
+          subscribed = true;
+          if (sent) {
+            setStatus(statusEl, 'Subscribed', 'success');
+          } else {
+            setStatus(statusEl, 'Connected', 'success');
+          }
+        }
+      };
+      ws.onclose = function () {
+        setStatus(statusEl, 'Disconnected', 'error');
+      };
+      ws.onerror = function () {
+        setStatus(statusEl, 'WS error', 'error');
+      };
+    }
+
+    function disconnect() {
+      if (ws) {
+        try {
+          send({ action: 'disconnect' });
+        } catch (_err) {
+          // ignore
+        }
+        try {
+          ws.close();
+        } catch (_err2) {
+          // ignore
+        }
+        ws = null;
+      }
+    }
+
+    function send(message) {
+      if (!ws || ws.readyState !== 1) {
+        return;
+      }
+      ws.send(JSON.stringify(message));
+    }
+
+    function sendSubscriptions(exchange, symbol) {
+      var payloads = buildOrderSubscriptions(exchange, symbol);
+      if (!payloads.length) {
+        if (requiresSymbol(exchange) && !normalizeInputSymbol(symbol)) {
+          setStatus(statusEl, 'Enter symbol', 'info');
+        }
+        return false;
+      }
+      payloads.forEach(function (payload) {
+        send({ action: 'send', payload: payload });
+      });
+      return true;
+    }
+
+    function wsUrl(path) {
+      var proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      return proto + window.location.host + path;
+    }
+
+    function shouldSubscribe(exchange, line) {
+      var config = wsOrderConfig(exchange);
+      if (!config) {
+        return false;
+      }
+      if (!config.loginRequired) {
+        return line.indexOf('[sys] connected') !== -1;
+      }
+      var payload = parseJsonFromLine(line);
+      if (!payload) {
+        return false;
+      }
+      if (exchange === 'bybit') {
+        return payload.op === 'auth' && (payload.success === true || payload.retCode === 0);
+      }
+      if (exchange === 'okx') {
+        return payload.event === 'login' && String(payload.code) === '0';
+      }
+      if (exchange === 'bitget') {
+        return payload.event === 'login' && String(payload.code) === '0';
+      }
+      if (exchange === 'gate') {
+        return payload.header &&
+          payload.header.channel === 'futures.login' &&
+          String(payload.header.status) === '200';
+      }
+      return false;
+    }
+
+    function parseJsonFromLine(line) {
+      var idx = line.indexOf('{');
+      if (idx < 0) {
+        return null;
+      }
+      var text = line.slice(idx);
+      try {
+        return JSON.parse(text);
+      } catch (_err) {
+        return null;
+      }
+    }
+
+    return { connect: connect, disconnect: disconnect };
+  }
+
+  function wsOrderConfig(exchange) {
+    var configs = {
+      bybit: { endpoint: '/ws/trade-private-raw', loginRequired: true },
+      okx: { endpoint: '/ws/trade-okx-raw', loginRequired: true },
+      gate: { endpoint: '/ws/trade-gate-raw', loginRequired: true },
+      bitget: { endpoint: '/ws/trade-bitget-raw', loginRequired: true },
+      kucoin: { endpoint: '/ws/trade-kucoin-raw', loginRequired: false },
+      bingx: { endpoint: '/ws/trade-bingx-raw', loginRequired: false }
+    };
+    return configs[exchange] || null;
+  }
+
+  function requiresSymbol(exchange) {
+    return exchange === 'gate' || exchange === 'kucoin';
+  }
+
+  function buildOrderSubscriptions(exchange, rawSymbol) {
+    if (exchange === 'bybit') {
+      return [{ op: 'subscribe', args: ['order', 'execution'] }];
+    }
+    if (exchange === 'okx') {
+      return [{ op: 'subscribe', args: [{ channel: 'orders', instType: 'SWAP' }] }];
+    }
+    if (exchange === 'gate') {
+      var gateSymbol = normalizeGateSymbol(rawSymbol);
+      if (!gateSymbol) {
+        return [];
+      }
+      return [
+        { channel: 'futures.orders', event: 'subscribe', payload: [gateSymbol] },
+        { channel: 'futures.usertrades', event: 'subscribe', payload: [gateSymbol] }
+      ];
+    }
+    if (exchange === 'bitget') {
+      var bitgetSymbol = normalizeBitgetSymbol(rawSymbol);
+      return [
+        {
+          op: 'subscribe',
+          args: [{ instType: 'USDT-FUTURES', channel: 'orders', instId: bitgetSymbol || 'default' }]
+        }
+      ];
+    }
+    if (exchange === 'kucoin') {
+      var kucoinSymbol = normalizeKucoinSymbol(rawSymbol);
+      var topic = kucoinSymbol ? '/contractMarket/tradeOrders:' + kucoinSymbol : '/contractMarket/tradeOrders';
+      return [
+        {
+          id: String(Date.now()),
+          type: 'subscribe',
+          topic: topic,
+          privateChannel: true,
+          response: true
+        }
+      ];
+    }
+    return [];
   }
 })();

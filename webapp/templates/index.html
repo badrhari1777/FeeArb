@@ -20,6 +20,7 @@
 {% set parser_interval = settings.get('parser_refresh_seconds', state.get('parser_refresh_interval', refresh_interval)) %}
 {% set exchange_interval = settings.get('exchange_refresh_seconds', state.get('exchange_refresh_interval', parser_interval)) %}
 {% set account_interval = settings.get('account_refresh_seconds', state.get('account_refresh_interval', 90)) %}
+{% set positions_market_interval = settings.get('positions_market_refresh_seconds', state.get('positions_market_refresh_interval', 30)) %}
   {% set exchange_status_rows = state.get('exchange_status', []) %}
   {% set events = state.get('events', []) %}
   {% set last_event = events[-1] if events %}
@@ -111,7 +112,7 @@
       </dl>
       <button id="refresh-button" class="button" type="button">Manual refresh</button>
       <a class="button" href="/manual">Manual trading</a>
-      <p class="hint">UI refresh: {{ refresh_interval }} s | Parser: {{ parser_interval }} s | Exchange poll: {{ exchange_interval }} s | Account refresh: {{ account_interval }} s</p>
+      <p class="hint">UI refresh: {{ refresh_interval }} s | Parser: {{ parser_interval }} s | Exchange poll: {{ exchange_interval }} s | Account refresh: {{ account_interval }} s | Positions market: {{ positions_market_interval }} s</p>
     </div>
   </header>
 
@@ -186,6 +187,10 @@
           <label>
             Account refresh (seconds)
             <input type="number" id="account-interval" min="30" max="86400" step="1" value="{{ account_interval }}" />
+          </label>
+          <label>
+            Positions market refresh (seconds)
+            <input type="number" id="positions-market-interval" min="30" max="86400" step="1" value="{{ positions_market_interval }}" />
           </label>
         </div>
         <p class="settings-note muted">Keep at least one source and one exchange enabled.</p>
@@ -609,6 +614,8 @@
           {% endif %}
         </tbody>
       </table>
+      <div class="muted" id="symbol-positions-meta">Positions market diagnostics will appear after the first refresh.</div>
+      <div class="muted" id="symbol-positions-diffs"></div>
     </section>
 
     <section class="panel" id="candidate-testing-panel">

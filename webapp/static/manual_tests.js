@@ -4,6 +4,8 @@
 (function () {
   'use strict';
 
+  var WS_TRADE_LOG_VERSION = '2026-01-09-rawlog-1';
+
   function request(method, url, payload, callback) {
     var xhr = new XMLHttpRequest();
     xhr.open(method, url, true);
@@ -52,6 +54,71 @@
     var parsed = parseFloat(value);
     return isNaN(parsed) ? null : parsed;
   }
+
+  function normalizeInputSymbol(value) {
+    var text = (value || '').trim().toUpperCase();
+    if (text.indexOf(':') >= 0) {
+      text = text.split(':')[0];
+    }
+    if (text.indexOf('/') >= 0) {
+      text = text.replace('/', '');
+    }
+    text = text.replace(/[-_]/g, '');
+    if (text.endsWith('USDTM')) {
+      text = text.slice(0, -1);
+    }
+    if (text.endsWith('UMCBL') || text.endsWith('DMCBL')) {
+      text = text.slice(0, -5);
+    }
+    if (text.endsWith('SWAP')) {
+      text = text.slice(0, -4);
+    }
+    if (text.endsWith('PERP')) {
+      text = text.slice(0, -4);
+    }
+    if (text.endsWith('USDT') || text.endsWith('USD')) {
+      return text;
+    }
+    return text ? text + 'USDT' : text;
+  }
+
+  function normalizeBingxSymbol(value) {
+    var symbol = normalizeInputSymbol(value);
+    if (symbol.endsWith('USDT')) {
+      return symbol.slice(0, -4) + '-USDT';
+    }
+    return symbol;
+  }
+
+  function normalizeGateSymbol(value) {
+    var symbol = normalizeInputSymbol(value);
+    if (symbol.endsWith('USDT')) {
+      return symbol.slice(0, -4) + '_USDT';
+    }
+    return symbol;
+  }
+
+  function normalizeKucoinSymbol(value) {
+    var symbol = normalizeInputSymbol(value);
+    if (symbol.endsWith('USDT')) {
+      var base = symbol.slice(0, -4);
+      if (base === 'BTC') {
+        base = 'XBT';
+      }
+      return base + 'USDTM';
+    }
+    return symbol;
+  }
+
+  var marginSymbolHints = {
+    bingx: 'BTC-USDT',
+    gate: 'BTC_USDT',
+    kucoin: 'BTCUSDTM',
+    okx: 'BTC-USDT-SWAP',
+    bybit: 'BTCUSDT',
+    bitget: 'BTCUSDT',
+    mexc: 'BTCUSDT'
+  };
 
   function setStatus(el, message, level) {
     if (!el) {
@@ -118,6 +185,304 @@
     return lines.join('\n');
   }
 
+  function nowIso() {
+    return new Date().toISOString();
+  }
+
+  function createScriptLogger(logEl) {
+    return function (message, data) {
+      if (!logEl) {
+        return;
+      }
+      var line = '[' + nowIso() + '] ' + message;
+      if (data) {
+        line += ' ' + pretty(data);
+      }
+      logEl.textContent += line + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    };
+  }
+
+  function createWsMonitor(opts) {
+    var statusEl = opts.statusEl;
+    var scriptLog = opts.scriptLog;
+    var silenceEl = opts.silenceEl;
+    var autoProbeEl = opts.autoProbeEl;
+    var probeBtn = opts.probeBtn;
+    var sendPing = opts.sendPing;
+    var defaultThreshold = opts.defaultThreshold || 30;
+    var probeTimeoutSec = opts.probeTimeoutSec || 10;
+    var connected = false;
+    var lastRx = 0;
+    var connectedAt = 0;
+    var lastPing = 0;
+    var lastPong = 0;
+    var probeInFlight = false;
+    var probeSentAt = 0;
+    var timer = null;
+
+    function readThreshold() {
+      var value = silenceEl ? parseOptionalNumber(silenceEl.value) : null;
+      return value && value > 0 ? value : defaultThreshold;
+    }
+
+    function ageMs(value, now) {
+      if (!value) {
+        return null;
+      }
+      return (now - value) / 1000.0;
+    }
+
+    function updateStatus() {
+      if (!statusEl) {
+        return;
+      }
+      if (!connected) {
+        statusEl.textContent = 'Monitor: disconnected';
+        return;
+      }
+      var now = Date.now();
+      var rxAge = ageMs(lastRx || connectedAt, now);
+      var pingAge = ageMs(lastPing, now);
+      var pongAge = ageMs(lastPong, now);
+      var threshold = readThreshold();
+      var healthy = rxAge !== null && rxAge <= threshold;
+      var parts = [];
+      parts.push('Last RX: ' + (rxAge !== null ? rxAge.toFixed(1) + 's' : '-'));
+      parts.push('Last Ping: ' + (pingAge !== null ? pingAge.toFixed(1) + 's' : '-'));
+      parts.push('Last Pong: ' + (pongAge !== null ? pongAge.toFixed(1) + 's' : '-'));
+      parts.push('Health: ' + (healthy ? 'LIVE' : 'STALE'));
+      statusEl.textContent = parts.join(' | ');
+    }
+
+    function markRx() {
+      lastRx = Date.now();
+      if (probeInFlight) {
+        probeInFlight = false;
+        if (scriptLog) {
+          scriptLog('probe response received');
+        }
+      }
+    }
+
+    function splitLogLine(line) {
+      if (!line || line.charAt(0) !== '[') {
+        return null;
+      }
+      var idx = line.indexOf(']');
+      if (idx <= 1) {
+        return null;
+      }
+      return {
+        tag: line.slice(1, idx),
+        payload: line.slice(idx + 1).trim()
+      };
+    }
+
+    function tryParseJson(payload) {
+      if (!payload) {
+        return null;
+      }
+      var first = payload.charAt(0);
+      if (first !== '{' && first !== '[') {
+        return null;
+      }
+      try {
+        return JSON.parse(payload);
+      } catch (_err) {
+        return null;
+      }
+    }
+
+    function recordPing() {
+      lastPing = Date.now();
+    }
+
+    function recordPong() {
+      lastPong = Date.now();
+    }
+
+    function detectPingPong(tag, payload, obj) {
+      var text = String(payload || '').trim();
+      var lower = text.toLowerCase();
+      if (lower === 'ping') {
+        recordPing();
+        return;
+      }
+      if (lower === 'pong') {
+        recordPong();
+        return;
+      }
+      if (obj && typeof obj === 'object') {
+        var op = obj.op || obj.type || obj.event || obj.channel;
+        if (typeof op === 'string') {
+          var opLower = op.toLowerCase();
+          if (opLower === 'ping' || opLower.indexOf('ping') >= 0 && opLower.indexOf('pong') < 0) {
+            recordPing();
+          }
+          if (opLower === 'pong' || opLower.indexOf('pong') >= 0) {
+            recordPong();
+          }
+        }
+      }
+      if (tag === 'tx' && lower.indexOf('ping') >= 0) {
+        recordPing();
+      }
+    }
+
+    function detectAck(obj) {
+      if (!obj || typeof obj !== 'object') {
+        return;
+      }
+      var event = obj.event || obj.op || obj.type;
+      var channel = obj.channel || (obj.arg && obj.arg.channel) || '';
+      if (typeof channel !== 'string') {
+        channel = '';
+      }
+      if (event === 'login' || event === 'auth' || channel.indexOf('login') >= 0) {
+        if (scriptLog) {
+          scriptLog('login response', { event: event || 'login', channel: channel || null });
+        }
+      }
+      if (event === 'subscribe' || event === 'subscribed' || event === 'ack') {
+        if (scriptLog) {
+          scriptLog('subscribe ack', { channel: channel || null });
+        }
+      }
+    }
+
+    function onLine(line) {
+      var parts = splitLogLine(line);
+      if (!parts) {
+        return;
+      }
+      var tag = parts.tag;
+      var payload = parts.payload;
+      if (tag.indexOf('rx') === 0) {
+        markRx();
+      }
+      var obj = tryParseJson(payload);
+      detectPingPong(tag, payload, obj);
+      detectAck(obj);
+      if (tag === 'err' && scriptLog) {
+        scriptLog('remote error', { message: payload });
+      }
+      if (tag === 'sys' && payload.indexOf('remote ws closed') >= 0 && scriptLog) {
+        scriptLog('remote ws closed');
+      }
+    }
+
+    function sendProbe(manual, silenceSec) {
+      if (!sendPing) {
+        return;
+      }
+      var ok = sendPing();
+      if (!ok) {
+        if (scriptLog) {
+          scriptLog('probe ping skipped: not connected');
+        }
+        return;
+      }
+      probeInFlight = true;
+      probeSentAt = Date.now();
+      if (scriptLog) {
+        scriptLog(
+          manual ? 'manual probe ping sent' : 'probe ping sent',
+          { silence_sec: silenceSec !== undefined ? silenceSec : null }
+        );
+      }
+    }
+
+    function tick() {
+      if (!connected) {
+        updateStatus();
+        return;
+      }
+      var now = Date.now();
+      var threshold = readThreshold();
+      var rxAge = ageMs(lastRx || connectedAt, now);
+      if (autoProbeEl && autoProbeEl.checked && connectedAt && rxAge !== null && rxAge >= threshold) {
+        if (!probeInFlight && (!probeSentAt || (now - probeSentAt) / 1000.0 >= threshold)) {
+          sendProbe(false, rxAge !== null ? rxAge.toFixed(1) : null);
+        }
+      }
+      if (probeInFlight && (now - probeSentAt) / 1000.0 >= probeTimeoutSec) {
+        probeInFlight = false;
+        if (scriptLog) {
+          scriptLog('probe timeout', { silence_sec: rxAge !== null ? rxAge.toFixed(1) : null });
+        }
+      }
+      updateStatus();
+    }
+
+    function startTimer() {
+      if (timer) {
+        return;
+      }
+      timer = window.setInterval(tick, 1000);
+    }
+
+    function stopTimer() {
+      if (!timer) {
+        return;
+      }
+      window.clearInterval(timer);
+      timer = null;
+    }
+
+    function onOpen() {
+      connected = true;
+      lastRx = 0;
+      connectedAt = Date.now();
+      lastPing = 0;
+      lastPong = 0;
+      probeInFlight = false;
+      probeSentAt = 0;
+      if (scriptLog) {
+        scriptLog('ws connected; waiting for login/subscription');
+      }
+      startTimer();
+      updateStatus();
+    }
+
+    function onClose() {
+      connected = false;
+      connectedAt = 0;
+      stopTimer();
+      updateStatus();
+      if (scriptLog) {
+        scriptLog('ws closed');
+      }
+    }
+
+    if (probeBtn) {
+      probeBtn.addEventListener('click', function () {
+        sendProbe(true, null);
+      });
+    }
+    if (autoProbeEl) {
+      autoProbeEl.addEventListener('change', function () {
+        updateStatus();
+      });
+    }
+    if (silenceEl) {
+      silenceEl.addEventListener('change', function () {
+        updateStatus();
+      });
+    }
+
+    return {
+      onOpen: onOpen,
+      onClose: onClose,
+      onLine: onLine,
+      logAction: function (message, data) {
+        if (scriptLog) {
+          scriptLog(message, data);
+        }
+      }
+    };
+  }
+
   function buildPayload() {
     return {
       exchange: (getValue('test-exchange') || '').trim(),
@@ -173,6 +538,133 @@
       };
       setStatus(statusEl, 'Canceling order...', 'info');
       request('POST', '/api/manual/test/cancel', payload, handleResponse);
+    });
+  }
+
+  function bindMarginTests() {
+    var cards = document.querySelectorAll('[data-margin-exchange]');
+    if (!cards || !cards.length) {
+      return;
+    }
+    Array.prototype.forEach.call(cards, function (card) {
+      var exchange = (card.getAttribute('data-margin-exchange') || '').trim();
+      var symbolEl = card.querySelector('[data-margin-symbol]');
+      var sideEl = card.querySelector('[data-margin-side]');
+      var amountEl = card.querySelector('[data-margin-amount]');
+      var statusEl = card.querySelector('[data-margin-status]');
+      var resultEl = card.querySelector('[data-margin-result]');
+      var logEl = card.querySelector('[data-margin-log]');
+      var fetchBtn = card.querySelector('[data-margin-fetch]');
+      var addBtn = card.querySelector('[data-margin-add]');
+      var reduceBtn = card.querySelector('[data-margin-reduce]');
+      var scriptLog = createScriptLogger(logEl);
+
+      if (symbolEl && marginSymbolHints[exchange]) {
+        symbolEl.placeholder = marginSymbolHints[exchange];
+      }
+
+      function readSymbol() {
+        return (symbolEl ? symbolEl.value : '').trim().toUpperCase();
+      }
+
+      function readSide() {
+        var side = (sideEl ? sideEl.value : '').trim().toLowerCase();
+        if (!side || side === 'auto') {
+          return null;
+        }
+        return side;
+      }
+
+      function readAmount() {
+        return amountEl ? parseOptionalNumber(amountEl.value) : null;
+      }
+
+      function setResult(data) {
+        if (!resultEl) {
+          return;
+        }
+        resultEl.textContent = pretty(data || {});
+      }
+
+      function handleResponse(err, data) {
+        if (err) {
+          setStatus(statusEl, err.message, 'error');
+          setResult({ error: err.message });
+          return;
+        }
+        setResult(data);
+        if (data && data.errors && data.errors.length) {
+          setStatus(statusEl, 'Completed with errors', 'error');
+        } else {
+          setStatus(statusEl, 'Completed', 'success');
+        }
+      }
+
+      function sendRequest(label, url, payload) {
+        setStatus(statusEl, label + '...', 'info');
+        scriptLog(label.toLowerCase() + ' requested', payload);
+        request('POST', url, payload, handleResponse);
+      }
+
+      function fetchPosition() {
+        var symbol = readSymbol();
+        if (!symbol) {
+          setStatus(statusEl, 'Symbol required', 'error');
+          return;
+        }
+        var payload = {
+          exchange: exchange,
+          symbol: symbol
+        };
+        var side = readSide();
+        if (side) {
+          payload.side = side;
+        }
+        sendRequest('Fetching position', '/api/manual/test/position', payload);
+      }
+
+      function updateMargin(action) {
+        var symbol = readSymbol();
+        if (!symbol) {
+          setStatus(statusEl, 'Symbol required', 'error');
+          return;
+        }
+        var amount = readAmount();
+        if (!amount || amount <= 0) {
+          setStatus(statusEl, 'Amount must be > 0', 'error');
+          return;
+        }
+        var payload = {
+          exchange: exchange,
+          symbol: symbol,
+          amount: amount
+        };
+        var side = readSide();
+        if (side) {
+          payload.side = side;
+        }
+        sendRequest(
+          action === 'add' ? 'Adding margin' : 'Reducing margin',
+          action === 'add' ? '/api/manual/test/margin/add' : '/api/manual/test/margin/reduce',
+          payload
+        );
+      }
+
+      if (fetchBtn) {
+        fetchBtn.addEventListener('click', function () {
+          fetchPosition();
+        });
+      }
+      if (addBtn) {
+        addBtn.addEventListener('click', function () {
+          updateMargin('add');
+        });
+      }
+      if (reduceBtn) {
+        reduceBtn.addEventListener('click', function () {
+          updateMargin('reduce');
+        });
+      }
     });
   }
 
@@ -323,16 +815,36 @@
       ws = null;
     }
 
+    function reconnect() {
+      setStatus(statusEl, 'Reconnecting...', 'info');
+      monitor.logAction('reconnect requested');
+      disconnect();
+      window.setTimeout(function () {
+        connect();
+      }, 200);
+    }
+
+    function reconnect() {
+      setStatus(statusEl, 'Reconnecting...', 'info');
+      monitor.logAction('reconnect requested');
+      disconnect();
+      window.setTimeout(function () {
+        connect();
+      }, 200);
+    }
+
     var connectBtn = document.getElementById('ws-connect');
     var disconnectBtn = document.getElementById('ws-disconnect');
     if (connectBtn) {
       connectBtn.addEventListener('click', function () {
         setStatus(statusEl, 'Connecting...', 'info');
+        monitor.logAction('connect button pressed');
         connect();
       });
     }
     if (disconnectBtn) {
       disconnectBtn.addEventListener('click', function () {
+        monitor.logAction('disconnect requested');
         disconnect();
       });
     }
@@ -345,8 +857,1988 @@
     }
   }
 
+  function bindWsTradeTest() {
+    var statusEl = document.getElementById('ws-trade-status');
+    var logEl = document.getElementById('ws-trade-log');
+    var logRxEl = document.getElementById('ws-trade-log-rx');
+    var lastIdEl = document.getElementById('ws-trade-last-id');
+    var versionEl = document.getElementById('ws-trade-log-version');
+    var ws = null;
+    var lastOrderId = '';
+
+    if (versionEl) {
+      versionEl.textContent = WS_TRADE_LOG_VERSION;
+    }
+
+    function wsUrl() {
+      var proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      return proto + window.location.host + '/ws/manual-trade';
+    }
+
+    function logLine(el, payload) {
+      if (!el) {
+        return;
+      }
+      var text = pretty(payload);
+      el.textContent += text + '\n';
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function currentConfig() {
+      return {
+        action: 'connect',
+        exchange: (getValue('ws-trade-exchange') || '').trim(),
+        symbol: (getValue('ws-trade-symbol') || '').trim().toUpperCase()
+      };
+    }
+
+    function send(payload) {
+      if (!ws || ws.readyState !== 1) {
+        setStatus(statusEl, 'Not connected', 'error');
+        logLine(logEl, { type: 'client', error: 'ws_not_connected', payload: payload });
+        return;
+      }
+      logLine(logRxEl, { type: 'tx', ts: new Date().toISOString(), payload: payload });
+      ws.send(JSON.stringify(payload));
+    }
+
+    function placeOrder(orderType, priceMode) {
+      var payload = {
+        action: 'order',
+        exchange: (getValue('ws-trade-exchange') || '').trim(),
+        symbol: (getValue('ws-trade-symbol') || '').trim().toUpperCase(),
+        side: (getValue('ws-trade-side') || '').trim().toLowerCase(),
+        qty: parseOptionalNumber(getValue('ws-trade-qty')),
+        order_type: orderType,
+        price: parseOptionalNumber(getValue('ws-trade-price')),
+        price_mode: priceMode || '',
+        offset_bps: parseOptionalNumber(getValue('ws-trade-offset-bps')) || 0,
+        offset_ticks: parseOptionalNumber(getValue('ws-trade-offset-ticks')) || 0,
+        reduce_only: getChecked('ws-trade-reduce-only'),
+        position_side: (getValue('ws-trade-position-side') || '').trim().toLowerCase()
+      };
+      send(payload);
+    }
+
+    function connect() {
+      if (ws && ws.readyState === 1) {
+        return;
+      }
+      ws = new WebSocket(wsUrl());
+      ws.onopen = function () {
+        setStatus(statusEl, 'Connected', 'success');
+        logLine(logRxEl, { type: 'status', ts: new Date().toISOString(), status: 'ws_open' });
+        send(currentConfig());
+      };
+      ws.onmessage = function (evt) {
+        logLine(logRxEl, { ts: new Date().toISOString(), raw: evt.data });
+        var data = null;
+        try {
+          data = JSON.parse(evt.data);
+        } catch (_err) {
+          return;
+        }
+        if (!data) {
+          return;
+        }
+        if (data.type === 'order_ack' && data.order_id) {
+          lastOrderId = data.order_id;
+          var orderIdEl = document.getElementById('ws-trade-order-id');
+          if (lastIdEl) {
+            lastIdEl.value = data.order_id;
+          }
+          if (orderIdEl && !orderIdEl.value) {
+            orderIdEl.value = data.order_id;
+          }
+        }
+        if (data.type === 'rx' && data.payload && data.payload.op === 'order.create') {
+          var ack = data.payload;
+          if (ack.data && ack.data.orderId) {
+            lastOrderId = ack.data.orderId;
+            var rxOrderIdEl = document.getElementById('ws-trade-order-id');
+            if (lastIdEl) {
+              lastIdEl.value = ack.data.orderId;
+            }
+            if (rxOrderIdEl && !rxOrderIdEl.value) {
+              rxOrderIdEl.value = ack.data.orderId;
+            }
+          }
+        }
+        if (data.type === 'error') {
+          setStatus(statusEl, data.error || 'Error', 'error');
+        }
+        if (data.type === 'tx' && data.source) {
+          logLine(logEl, data);
+        }
+      };
+      ws.onclose = function () {
+        setStatus(statusEl, 'Disconnected', 'info');
+        logLine(logRxEl, { type: 'status', ts: new Date().toISOString(), status: 'ws_closed' });
+      };
+      ws.onerror = function () {
+        setStatus(statusEl, 'WebSocket error', 'error');
+        logLine(logRxEl, { type: 'status', ts: new Date().toISOString(), status: 'ws_error' });
+      };
+    }
+
+    function disconnect() {
+      if (!ws) {
+        return;
+      }
+      try {
+        ws.close();
+      } catch (_err) {
+        // ignore close errors
+      }
+      ws = null;
+    }
+
+    var connectBtn = document.getElementById('ws-trade-connect');
+    var disconnectBtn = document.getElementById('ws-trade-disconnect');
+    var limitFillBtn = document.getElementById('ws-trade-limit-fill');
+    var limitRestBtn = document.getElementById('ws-trade-limit-rest');
+    var marketBtn = document.getElementById('ws-trade-market');
+    var cancelBtn = document.getElementById('ws-trade-cancel');
+    var fetchBtn = document.getElementById('ws-trade-fetch');
+    var useLastBtn = document.getElementById('ws-trade-use-last');
+    var copyLastBtn = document.getElementById('ws-trade-copy-last');
+
+    if (connectBtn) {
+      connectBtn.addEventListener('click', function () {
+        setStatus(statusEl, 'Connecting...', 'info');
+        monitor.logAction('connect button pressed');
+        connect();
+      });
+    }
+    if (disconnectBtn) {
+      disconnectBtn.addEventListener('click', function () {
+        monitor.logAction('disconnect requested');
+        disconnect();
+      });
+    }
+    if (limitFillBtn) {
+      limitFillBtn.addEventListener('click', function () {
+        placeOrder('limit', 'marketable');
+      });
+    }
+    if (limitRestBtn) {
+      limitRestBtn.addEventListener('click', function () {
+        placeOrder('limit', 'passive');
+      });
+    }
+    if (marketBtn) {
+      marketBtn.addEventListener('click', function () {
+        placeOrder('market', '');
+      });
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        var orderId = (getValue('ws-trade-order-id') || '').trim() || lastOrderId;
+        send({
+          action: 'cancel',
+          exchange: (getValue('ws-trade-exchange') || '').trim(),
+          symbol: (getValue('ws-trade-symbol') || '').trim().toUpperCase(),
+          order_id: orderId
+        });
+      });
+    }
+    if (fetchBtn) {
+      fetchBtn.addEventListener('click', function () {
+        var orderId = (getValue('ws-trade-order-id') || '').trim() || lastOrderId;
+        send({
+          action: 'fetch',
+          exchange: (getValue('ws-trade-exchange') || '').trim(),
+          symbol: (getValue('ws-trade-symbol') || '').trim().toUpperCase(),
+          order_id: orderId
+        });
+      });
+    }
+    if (useLastBtn) {
+      useLastBtn.addEventListener('click', function () {
+        var orderIdEl = document.getElementById('ws-trade-order-id');
+        if (orderIdEl && lastOrderId) {
+          orderIdEl.value = lastOrderId;
+          setStatus(statusEl, 'Order id set', 'success');
+        }
+      });
+    }
+    if (copyLastBtn) {
+      copyLastBtn.addEventListener('click', function () {
+        if (!lastOrderId) {
+          return;
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(lastOrderId).then(function () {
+            setStatus(statusEl, 'Copied', 'success');
+          }).catch(function () {
+            setStatus(statusEl, 'Copy failed', 'error');
+          });
+        } else {
+          var temp = document.createElement('textarea');
+          temp.value = lastOrderId;
+          document.body.appendChild(temp);
+          temp.select();
+          try {
+            document.execCommand('copy');
+            setStatus(statusEl, 'Copied', 'success');
+          } catch (_err) {
+            setStatus(statusEl, 'Copy failed', 'error');
+          }
+          document.body.removeChild(temp);
+        }
+      });
+    }
+  }
+
+  function bindWsTradeRaw() {
+    var statusEl = document.getElementById('ws-trade-raw-status');
+    var logEl = document.getElementById('ws-trade-raw-log');
+    var monitorEl = document.getElementById('ws-trade-raw-monitor');
+    var scriptEl = document.getElementById('ws-trade-raw-script-log');
+    var silenceEl = document.getElementById('ws-trade-raw-silence');
+    var autoProbeEl = document.getElementById('ws-trade-raw-auto-probe');
+    var probeBtn = document.getElementById('ws-trade-raw-probe');
+    var payloadEl = document.getElementById('ws-trade-raw-payload');
+    var symbolEl = document.getElementById('ws-trade-raw-symbol');
+    var sideEl = document.getElementById('ws-trade-raw-side');
+    var qtyEl = document.getElementById('ws-trade-raw-qty');
+    var priceEl = document.getElementById('ws-trade-raw-price');
+    var orderIdEl = document.getElementById('ws-trade-raw-order-id');
+    var ws = null;
+    var scriptLog = createScriptLogger(scriptEl);
+    var monitor = createWsMonitor({
+      statusEl: monitorEl,
+      scriptLog: scriptLog,
+      silenceEl: silenceEl,
+      autoProbeEl: autoProbeEl,
+      probeBtn: probeBtn,
+      defaultThreshold: 45,
+      sendPing: function () {
+        if (!ws || ws.readyState !== 1) {
+          return false;
+        }
+        send('send', { op: 'ping' });
+        return true;
+      }
+    });
+
+    function wsUrl() {
+      var proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      return proto + window.location.host + '/ws/trade-raw';
+    }
+
+    function logLine(text) {
+      if (!logEl) {
+        return;
+      }
+      logEl.textContent += text + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function send(action, payload) {
+      if (!ws || ws.readyState !== 1) {
+        setStatus(statusEl, 'Not connected', 'error');
+        logLine('[client] not connected');
+        return;
+      }
+      var message = { action: action };
+      if (payload) {
+        if (typeof payload === 'string') {
+          message.raw = payload;
+        } else {
+          message.payload = payload;
+        }
+      }
+      ws.send(JSON.stringify(message));
+    }
+
+    function connect() {
+      if (ws && ws.readyState === 1) {
+        return;
+      }
+      ws = new WebSocket(wsUrl());
+      ws.onopen = function () {
+        setStatus(statusEl, 'Connected', 'success');
+        logLine('[client] ws_open');
+        monitor.onOpen();
+        monitor.logAction('connect requested; auth is handled server-side');
+        send('connect');
+      };
+      ws.onmessage = function (evt) {
+        monitor.onLine(evt.data);
+        logLine(evt.data);
+      };
+      ws.onclose = function () {
+        setStatus(statusEl, 'Disconnected', 'info');
+        logLine('[client] ws_closed');
+        monitor.onClose();
+      };
+      ws.onerror = function () {
+        setStatus(statusEl, 'WebSocket error', 'error');
+        logLine('[client] ws_error');
+      };
+    }
+
+    function disconnect() {
+      if (!ws) {
+        return;
+      }
+      try {
+        send('close');
+      } catch (_err) {
+        // ignore
+      }
+      try {
+        ws.close();
+      } catch (_err2) {
+        // ignore
+      }
+      ws = null;
+    }
+
+    function reconnect() {
+      setStatus(statusEl, 'Reconnecting...', 'info');
+      monitor.logAction('reconnect requested');
+      disconnect();
+      window.setTimeout(function () {
+        connect();
+      }, 200);
+    }
+
+    function sendRaw() {
+      var raw = payloadEl ? String(payloadEl.value || '').trim() : '';
+      if (!raw) {
+        setStatus(statusEl, 'Raw payload required', 'error');
+        return;
+      }
+      monitor.logAction('raw payload sent');
+      send('send', raw);
+    }
+
+    function sendOrder() {
+      var symbol = symbolEl ? String(symbolEl.value || '').trim().toUpperCase() : '';
+      var side = sideEl ? String(sideEl.value || '').trim().toLowerCase() : '';
+      var qty = qtyEl ? parseOptionalNumber(qtyEl.value) : null;
+      var price = priceEl ? parseOptionalNumber(priceEl.value) : null;
+      if (!symbol || !side || !qty || !price) {
+        setStatus(statusEl, 'Symbol/side/qty/price required', 'error');
+        return;
+      }
+      var ts = String(Date.now());
+      var reqId = 'req-' + ts;
+      var payload = {
+        op: 'order.create',
+        reqId: reqId,
+        header: {
+          'X-BAPI-TIMESTAMP': ts,
+          'X-BAPI-RECV-WINDOW': '5000'
+        },
+        args: [
+          {
+            category: 'linear',
+            symbol: symbol,
+            side: side === 'buy' ? 'Buy' : 'Sell',
+            orderType: 'Limit',
+            qty: String(qty),
+            price: String(price),
+            timeInForce: 'GTC',
+            apiTimestamp: ts,
+            recvWindow: 5000
+          }
+        ]
+      };
+      monitor.logAction('order.create sent', { symbol: symbol, side: side, qty: qty, price: price });
+      send('send', payload);
+    }
+
+    function sendCancel() {
+      var symbol = symbolEl ? String(symbolEl.value || '').trim().toUpperCase() : '';
+      var orderId = orderIdEl ? String(orderIdEl.value || '').trim() : '';
+      if (!symbol || !orderId) {
+        setStatus(statusEl, 'Symbol/orderId required', 'error');
+        return;
+      }
+      var ts = String(Date.now());
+      var payload = {
+        op: 'order.cancel',
+        header: {
+          'X-BAPI-TIMESTAMP': ts,
+          'X-BAPI-RECV-WINDOW': '5000'
+        },
+        args: [
+          {
+            category: 'linear',
+            symbol: symbol,
+            orderId: orderId,
+            apiTimestamp: ts,
+            recvWindow: 5000
+          }
+        ]
+      };
+      monitor.logAction('order.cancel sent', { symbol: symbol, order_id: orderId });
+      send('send', payload);
+    }
+
+    var connectBtn = document.getElementById('ws-trade-raw-connect');
+    var disconnectBtn = document.getElementById('ws-trade-raw-disconnect');
+    var reconnectBtn = document.getElementById('ws-trade-raw-reconnect');
+    var sendBtn = document.getElementById('ws-trade-raw-send');
+    var orderBtn = document.getElementById('ws-trade-raw-order');
+    var cancelBtn = document.getElementById('ws-trade-raw-cancel');
+
+    if (connectBtn) {
+      connectBtn.addEventListener('click', function () {
+        setStatus(statusEl, 'Connecting...', 'info');
+        monitor.logAction('connect button pressed');
+        connect();
+      });
+    }
+    if (disconnectBtn) {
+      disconnectBtn.addEventListener('click', function () {
+        monitor.logAction('disconnect requested');
+        disconnect();
+      });
+    }
+    if (reconnectBtn) {
+      reconnectBtn.addEventListener('click', function () {
+        reconnect();
+      });
+    }
+    if (sendBtn) {
+      sendBtn.addEventListener('click', function () {
+        sendRaw();
+      });
+    }
+    if (orderBtn) {
+      orderBtn.addEventListener('click', function () {
+        sendOrder();
+      });
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        sendCancel();
+      });
+    }
+  }
+
+  function bindWsTradePrivateRaw() {
+    var statusEl = document.getElementById('ws-trade-private-raw-status');
+    var logEl = document.getElementById('ws-trade-private-raw-log');
+    var monitorEl = document.getElementById('ws-trade-private-raw-monitor');
+    var scriptEl = document.getElementById('ws-trade-private-raw-script-log');
+    var silenceEl = document.getElementById('ws-trade-private-raw-silence');
+    var autoProbeEl = document.getElementById('ws-trade-private-raw-auto-probe');
+    var probeBtn = document.getElementById('ws-trade-private-raw-probe');
+    var payloadEl = document.getElementById('ws-trade-private-raw-payload');
+    var ws = null;
+    var scriptLog = createScriptLogger(scriptEl);
+    var monitor = createWsMonitor({
+      statusEl: monitorEl,
+      scriptLog: scriptLog,
+      silenceEl: silenceEl,
+      autoProbeEl: autoProbeEl,
+      probeBtn: probeBtn,
+      defaultThreshold: 45,
+      sendPing: function () {
+        if (!ws || ws.readyState !== 1) {
+          return false;
+        }
+        send('send', { op: 'ping' });
+        return true;
+      }
+    });
+
+    function wsUrl() {
+      var proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      return proto + window.location.host + '/ws/trade-private-raw';
+    }
+
+    function logLine(text) {
+      if (!logEl) {
+        return;
+      }
+      logEl.textContent += text + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function send(action, payload) {
+      if (!ws || ws.readyState !== 1) {
+        setStatus(statusEl, 'Not connected', 'error');
+        logLine('[client] not connected');
+        return;
+      }
+      var message = { action: action };
+      if (payload) {
+        if (typeof payload === 'string') {
+          message.raw = payload;
+        } else {
+          message.payload = payload;
+        }
+      }
+      ws.send(JSON.stringify(message));
+    }
+
+    function connect() {
+      if (ws && ws.readyState === 1) {
+        return;
+      }
+      ws = new WebSocket(wsUrl());
+      ws.onopen = function () {
+        setStatus(statusEl, 'Connected', 'success');
+        logLine('[client] ws_open');
+        monitor.onOpen();
+        monitor.logAction('connect requested; auth is handled server-side');
+        send('connect');
+      };
+      ws.onmessage = function (evt) {
+        monitor.onLine(evt.data);
+        logLine(evt.data);
+      };
+      ws.onclose = function () {
+        setStatus(statusEl, 'Disconnected', 'info');
+        logLine('[client] ws_closed');
+        monitor.onClose();
+      };
+      ws.onerror = function () {
+        setStatus(statusEl, 'WebSocket error', 'error');
+        logLine('[client] ws_error');
+      };
+    }
+
+    function disconnect() {
+      if (!ws) {
+        return;
+      }
+      try {
+        send('close');
+      } catch (_err) {
+        // ignore
+      }
+      try {
+        ws.close();
+      } catch (_err2) {
+        // ignore
+      }
+      ws = null;
+    }
+
+    function reconnect() {
+      setStatus(statusEl, 'Reconnecting...', 'info');
+      monitor.logAction('reconnect requested');
+      disconnect();
+      window.setTimeout(function () {
+        connect();
+      }, 200);
+    }
+
+    function sendRaw() {
+      var raw = payloadEl ? String(payloadEl.value || '').trim() : '';
+      if (!raw) {
+        setStatus(statusEl, 'Raw payload required', 'error');
+        return;
+      }
+      monitor.logAction('raw payload sent');
+      send('send', raw);
+    }
+
+    function sendSubscribe(topic) {
+      var payload = { op: 'subscribe', args: [topic] };
+      monitor.logAction('subscribe requested', { topic: topic });
+      send('send', payload);
+    }
+
+    var connectBtn = document.getElementById('ws-trade-private-raw-connect');
+    var disconnectBtn = document.getElementById('ws-trade-private-raw-disconnect');
+    var reconnectBtn = document.getElementById('ws-trade-private-raw-reconnect');
+    var sendBtn = document.getElementById('ws-trade-private-raw-send');
+    var subOrderBtn = document.getElementById('ws-trade-private-sub-order');
+    var subExecFastBtn = document.getElementById('ws-trade-private-sub-exec-fast');
+    var subPositionBtn = document.getElementById('ws-trade-private-sub-position');
+
+    if (connectBtn) {
+      connectBtn.addEventListener('click', function () {
+        setStatus(statusEl, 'Connecting...', 'info');
+        monitor.logAction('connect button pressed');
+        connect();
+      });
+    }
+    if (disconnectBtn) {
+      disconnectBtn.addEventListener('click', function () {
+        monitor.logAction('disconnect requested');
+        disconnect();
+      });
+    }
+    if (reconnectBtn) {
+      reconnectBtn.addEventListener('click', function () {
+        reconnect();
+      });
+    }
+    if (sendBtn) {
+      sendBtn.addEventListener('click', function () {
+        sendRaw();
+      });
+    }
+    if (subOrderBtn) {
+      subOrderBtn.addEventListener('click', function () {
+        sendSubscribe('order');
+      });
+    }
+    if (subExecFastBtn) {
+      subExecFastBtn.addEventListener('click', function () {
+        sendSubscribe('execution.fast');
+      });
+    }
+    if (subPositionBtn) {
+      subPositionBtn.addEventListener('click', function () {
+        sendSubscribe('position');
+      });
+    }
+  }
+
+  function bindWsTradeOkxRaw() {
+    var statusEl = document.getElementById('ws-trade-okx-raw-status');
+    var logEl = document.getElementById('ws-trade-okx-raw-log');
+    var monitorEl = document.getElementById('ws-trade-okx-raw-monitor');
+    var scriptEl = document.getElementById('ws-trade-okx-raw-script-log');
+    var silenceEl = document.getElementById('ws-trade-okx-raw-silence');
+    var autoProbeEl = document.getElementById('ws-trade-okx-raw-auto-probe');
+    var probeBtn = document.getElementById('ws-trade-okx-raw-probe');
+    var payloadEl = document.getElementById('ws-trade-okx-raw-payload');
+    var instIdEl = document.getElementById('ws-trade-okx-instid');
+    var sideEl = document.getElementById('ws-trade-okx-side');
+    var qtyEl = document.getElementById('ws-trade-okx-qty');
+    var priceEl = document.getElementById('ws-trade-okx-price');
+    var orderIdEl = document.getElementById('ws-trade-okx-order-id');
+    var ws = null;
+    var scriptLog = createScriptLogger(scriptEl);
+    var monitor = createWsMonitor({
+      statusEl: monitorEl,
+      scriptLog: scriptLog,
+      silenceEl: silenceEl,
+      autoProbeEl: autoProbeEl,
+      probeBtn: probeBtn,
+      defaultThreshold: 45,
+      sendPing: function () {
+        if (!ws || ws.readyState !== 1) {
+          return false;
+        }
+        send('send', 'ping');
+        return true;
+      }
+    });
+
+    function wsUrl() {
+      var proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      return proto + window.location.host + '/ws/trade-okx-raw';
+    }
+
+    function logLine(text) {
+      if (!logEl) {
+        return;
+      }
+      logEl.textContent += text + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function send(action, payload) {
+      if (!ws || ws.readyState !== 1) {
+        setStatus(statusEl, 'Not connected', 'error');
+        logLine('[client] not connected');
+        return;
+      }
+      var message = { action: action };
+      if (payload) {
+        if (typeof payload === 'string') {
+          message.raw = payload;
+        } else {
+          message.payload = payload;
+        }
+      }
+      ws.send(JSON.stringify(message));
+    }
+
+    function connect() {
+      if (ws && ws.readyState === 1) {
+        return;
+      }
+      ws = new WebSocket(wsUrl());
+      ws.onopen = function () {
+        setStatus(statusEl, 'Connected', 'success');
+        logLine('[client] ws_open');
+        monitor.onOpen();
+        monitor.logAction('connect requested; auth is handled server-side');
+        send('connect');
+      };
+      ws.onmessage = function (evt) {
+        monitor.onLine(evt.data);
+        logLine(evt.data);
+      };
+      ws.onclose = function () {
+        setStatus(statusEl, 'Disconnected', 'info');
+        logLine('[client] ws_closed');
+        monitor.onClose();
+      };
+      ws.onerror = function () {
+        setStatus(statusEl, 'WebSocket error', 'error');
+        logLine('[client] ws_error');
+      };
+    }
+
+    function disconnect() {
+      if (!ws) {
+        return;
+      }
+      try {
+        send('close');
+      } catch (_err) {
+        // ignore
+      }
+      try {
+        ws.close();
+      } catch (_err2) {
+        // ignore
+      }
+      ws = null;
+    }
+
+    function reconnect() {
+      setStatus(statusEl, 'Reconnecting...', 'info');
+      monitor.logAction('reconnect requested');
+      disconnect();
+      window.setTimeout(function () {
+        connect();
+      }, 200);
+    }
+
+    function sendRaw() {
+      var raw = payloadEl ? String(payloadEl.value || '').trim() : '';
+      if (!raw) {
+        setStatus(statusEl, 'Raw payload required', 'error');
+        return;
+      }
+      monitor.logAction('raw payload sent');
+      send('send', raw);
+    }
+
+    function sendOrder() {
+      var instId = instIdEl ? String(instIdEl.value || '').trim() : '';
+      var side = sideEl ? String(sideEl.value || '').trim().toLowerCase() : '';
+      var qty = qtyEl ? parseOptionalNumber(qtyEl.value) : null;
+      var price = priceEl ? parseOptionalNumber(priceEl.value) : null;
+      if (!instId || !side || !qty || !price) {
+        setStatus(statusEl, 'InstId/side/qty/price required', 'error');
+        return;
+      }
+      var reqId = String(Date.now());
+      var payload = {
+        id: reqId,
+        op: 'order',
+        args: [
+          {
+            instId: instId,
+            tdMode: 'isolated',
+            side: side,
+            ordType: 'limit',
+            sz: String(qty),
+            px: String(price)
+          }
+        ]
+      };
+      monitor.logAction('order request sent', { instId: instId, side: side, qty: qty, price: price });
+      send('send', payload);
+    }
+
+    function sendCancel() {
+      var instId = instIdEl ? String(instIdEl.value || '').trim() : '';
+      var orderId = orderIdEl ? String(orderIdEl.value || '').trim() : '';
+      if (!instId || !orderId) {
+        setStatus(statusEl, 'InstId/orderId required', 'error');
+        return;
+      }
+      var reqId = String(Date.now());
+      var payload = {
+        id: reqId,
+        op: 'cancel-order',
+        args: [
+          {
+            instId: instId,
+            ordId: orderId
+          }
+        ]
+      };
+      monitor.logAction('cancel request sent', { instId: instId, order_id: orderId });
+      send('send', payload);
+    }
+
+    function sendSubscribe(channel) {
+      var payload = {
+        op: 'subscribe',
+        args: [
+          {
+            channel: channel,
+            instType: 'SWAP'
+          }
+        ]
+      };
+      monitor.logAction('subscribe requested', { channel: channel });
+      send('send', payload);
+    }
+
+    var connectBtn = document.getElementById('ws-trade-okx-raw-connect');
+    var disconnectBtn = document.getElementById('ws-trade-okx-raw-disconnect');
+    var reconnectBtn = document.getElementById('ws-trade-okx-raw-reconnect');
+    var sendBtn = document.getElementById('ws-trade-okx-raw-send');
+    var orderBtn = document.getElementById('ws-trade-okx-order');
+    var cancelBtn = document.getElementById('ws-trade-okx-cancel');
+    var subOrdersBtn = document.getElementById('ws-trade-okx-sub-orders');
+    var subPositionsBtn = document.getElementById('ws-trade-okx-sub-positions');
+
+    if (connectBtn) {
+      connectBtn.addEventListener('click', function () {
+        setStatus(statusEl, 'Connecting...', 'info');
+        monitor.logAction('connect button pressed');
+        connect();
+      });
+    }
+    if (disconnectBtn) {
+      disconnectBtn.addEventListener('click', function () {
+        monitor.logAction('disconnect requested');
+        disconnect();
+      });
+    }
+    if (reconnectBtn) {
+      reconnectBtn.addEventListener('click', function () {
+        reconnect();
+      });
+    }
+    if (sendBtn) {
+      sendBtn.addEventListener('click', function () {
+        sendRaw();
+      });
+    }
+    if (orderBtn) {
+      orderBtn.addEventListener('click', function () {
+        sendOrder();
+      });
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        sendCancel();
+      });
+    }
+    if (subOrdersBtn) {
+      subOrdersBtn.addEventListener('click', function () {
+        sendSubscribe('orders');
+      });
+    }
+    if (subPositionsBtn) {
+      subPositionsBtn.addEventListener('click', function () {
+        sendSubscribe('positions');
+      });
+    }
+  }
+
+  function bindWsTradeBitgetRaw() {
+    var statusEl = document.getElementById('ws-trade-bitget-raw-status');
+    var logEl = document.getElementById('ws-trade-bitget-raw-log');
+    var monitorEl = document.getElementById('ws-trade-bitget-raw-monitor');
+    var scriptEl = document.getElementById('ws-trade-bitget-raw-script-log');
+    var silenceEl = document.getElementById('ws-trade-bitget-raw-silence');
+    var autoProbeEl = document.getElementById('ws-trade-bitget-raw-auto-probe');
+    var probeBtn = document.getElementById('ws-trade-bitget-raw-probe');
+    var payloadEl = document.getElementById('ws-trade-bitget-raw-payload');
+    var symbolEl = document.getElementById('ws-trade-bitget-symbol');
+    var sideEl = document.getElementById('ws-trade-bitget-side');
+    var qtyEl = document.getElementById('ws-trade-bitget-qty');
+    var priceEl = document.getElementById('ws-trade-bitget-price');
+    var orderIdEl = document.getElementById('ws-trade-bitget-order-id');
+    var ws = null;
+    var scriptLog = createScriptLogger(scriptEl);
+    var monitor = createWsMonitor({
+      statusEl: monitorEl,
+      scriptLog: scriptLog,
+      silenceEl: silenceEl,
+      autoProbeEl: autoProbeEl,
+      probeBtn: probeBtn,
+      defaultThreshold: 45,
+      sendPing: function () {
+        if (!ws || ws.readyState !== 1) {
+          return false;
+        }
+        send('send', 'ping');
+        return true;
+      }
+    });
+
+    function wsUrl() {
+      var proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      return proto + window.location.host + '/ws/trade-bitget-raw';
+    }
+
+    function logLine(text) {
+      if (!logEl) {
+        return;
+      }
+      logEl.textContent += text + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function send(action, payload) {
+      if (!ws || ws.readyState !== 1) {
+        setStatus(statusEl, 'Not connected', 'error');
+        logLine('[client] not connected');
+        return;
+      }
+      var message = { action: action };
+      if (payload) {
+        if (typeof payload === 'string') {
+          message.raw = payload;
+        } else {
+          message.payload = payload;
+        }
+      }
+      ws.send(JSON.stringify(message));
+    }
+
+    function connect() {
+      if (ws && ws.readyState === 1) {
+        return;
+      }
+      ws = new WebSocket(wsUrl());
+      ws.onopen = function () {
+        setStatus(statusEl, 'Connected', 'success');
+        logLine('[client] ws_open');
+        monitor.onOpen();
+        monitor.logAction('connect requested; auth is handled server-side');
+        send('connect');
+      };
+      ws.onmessage = function (evt) {
+        monitor.onLine(evt.data);
+        logLine(evt.data);
+      };
+      ws.onclose = function () {
+        setStatus(statusEl, 'Disconnected', 'info');
+        logLine('[client] ws_closed');
+        monitor.onClose();
+      };
+      ws.onerror = function () {
+        setStatus(statusEl, 'WebSocket error', 'error');
+        logLine('[client] ws_error');
+      };
+    }
+
+    function disconnect() {
+      if (!ws) {
+        return;
+      }
+      try {
+        send('close');
+      } catch (_err) {
+        // ignore
+      }
+      try {
+        ws.close();
+      } catch (_err2) {
+        // ignore
+      }
+      ws = null;
+    }
+
+    function reconnect() {
+      setStatus(statusEl, 'Reconnecting...', 'info');
+      monitor.logAction('reconnect requested');
+      disconnect();
+      window.setTimeout(function () {
+        connect();
+      }, 200);
+    }
+
+    function sendRaw() {
+      var raw = payloadEl ? String(payloadEl.value || '').trim() : '';
+      if (!raw) {
+        setStatus(statusEl, 'Raw payload required', 'error');
+        return;
+      }
+      monitor.logAction('raw payload sent');
+      send('send', raw);
+    }
+
+    function sendOrder() {
+      var symbol = normalizeInputSymbol(symbolEl ? symbolEl.value : '');
+      var side = sideEl ? String(sideEl.value || '').trim().toLowerCase() : '';
+      var qty = qtyEl ? parseOptionalNumber(qtyEl.value) : null;
+      var price = priceEl ? parseOptionalNumber(priceEl.value) : null;
+      if (!symbol || !side || !qty || !price) {
+        setStatus(statusEl, 'Symbol/side/qty/price required', 'error');
+        return;
+      }
+      var requestId = 'req-' + String(Date.now());
+      var clientOid = 'oid-' + String(Date.now());
+      var payload = {
+        op: 'trade',
+        args: [
+          {
+            id: requestId,
+            instType: 'USDT-FUTURES',
+            instId: symbol,
+            channel: 'place-order',
+            params: {
+              orderType: 'limit',
+              side: side,
+              size: String(qty),
+              force: 'gtc',
+              price: String(price),
+              marginCoin: 'USDT',
+              marginMode: 'isolated',
+              clientOid: clientOid
+            }
+          }
+        ]
+      };
+      monitor.logAction('order request sent', { symbol: symbol, side: side, qty: qty, price: price });
+      send('send', payload);
+    }
+
+    function sendCancel() {
+      var symbol = normalizeInputSymbol(symbolEl ? symbolEl.value : '');
+      var orderId = orderIdEl ? String(orderIdEl.value || '').trim() : '';
+      if (!symbol || !orderId) {
+        setStatus(statusEl, 'Symbol/orderId required', 'error');
+        return;
+      }
+      var requestId = 'req-' + String(Date.now());
+      var payload = {
+        op: 'trade',
+        args: [
+          {
+            id: requestId,
+            instType: 'USDT-FUTURES',
+            instId: symbol,
+            channel: 'cancel-order',
+            params: {
+              orderId: orderId
+            }
+          }
+        ]
+      };
+      monitor.logAction('cancel request sent', { symbol: symbol, order_id: orderId });
+      send('send', payload);
+    }
+
+    function sendSubscribe(channel) {
+      var symbol = normalizeInputSymbol(symbolEl ? symbolEl.value : '');
+      var args = [];
+      if (channel === 'account') {
+        args = [{ instType: 'USDT-FUTURES', channel: 'account', coin: 'default' }];
+      } else if (channel === 'positions') {
+        args = [{ instType: 'USDT-FUTURES', channel: 'positions', instId: 'default' }];
+      } else if (channel === 'orders' || channel === 'fill') {
+        args = [
+          {
+            instType: 'USDT-FUTURES',
+            channel: channel,
+            instId: symbol || 'default'
+          }
+        ];
+      } else {
+        args = [{ instType: 'USDT-FUTURES', channel: channel }];
+      }
+      monitor.logAction('subscribe requested', { channel: channel, symbol: symbol || null });
+      send('send', { op: 'subscribe', args: args });
+    }
+
+    var connectBtn = document.getElementById('ws-trade-bitget-raw-connect');
+    var disconnectBtn = document.getElementById('ws-trade-bitget-raw-disconnect');
+    var reconnectBtn = document.getElementById('ws-trade-bitget-raw-reconnect');
+    var sendBtn = document.getElementById('ws-trade-bitget-raw-send');
+    var orderBtn = document.getElementById('ws-trade-bitget-order');
+    var cancelBtn = document.getElementById('ws-trade-bitget-cancel');
+    var subOrdersBtn = document.getElementById('ws-trade-bitget-sub-orders');
+    var subPositionsBtn = document.getElementById('ws-trade-bitget-sub-positions');
+    var subFillsBtn = document.getElementById('ws-trade-bitget-sub-fills');
+    var subAccountBtn = document.getElementById('ws-trade-bitget-sub-account');
+
+    if (connectBtn) {
+      connectBtn.addEventListener('click', function () {
+        setStatus(statusEl, 'Connecting...', 'info');
+        monitor.logAction('connect button pressed');
+        connect();
+      });
+    }
+    if (disconnectBtn) {
+      disconnectBtn.addEventListener('click', function () {
+        monitor.logAction('disconnect requested');
+        disconnect();
+      });
+    }
+    if (reconnectBtn) {
+      reconnectBtn.addEventListener('click', function () {
+        reconnect();
+      });
+    }
+    if (sendBtn) {
+      sendBtn.addEventListener('click', function () {
+        sendRaw();
+      });
+    }
+    if (orderBtn) {
+      orderBtn.addEventListener('click', function () {
+        sendOrder();
+      });
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        sendCancel();
+      });
+    }
+    if (subOrdersBtn) {
+      subOrdersBtn.addEventListener('click', function () {
+        sendSubscribe('orders');
+      });
+    }
+    if (subPositionsBtn) {
+      subPositionsBtn.addEventListener('click', function () {
+        sendSubscribe('positions');
+      });
+    }
+    if (subFillsBtn) {
+      subFillsBtn.addEventListener('click', function () {
+        sendSubscribe('fill');
+      });
+    }
+    if (subAccountBtn) {
+      subAccountBtn.addEventListener('click', function () {
+        sendSubscribe('account');
+      });
+    }
+  }
+
+  function bindWsTradeGateRaw() {
+    var statusEl = document.getElementById('ws-trade-gate-raw-status');
+    var logEl = document.getElementById('ws-trade-gate-raw-log');
+    var monitorEl = document.getElementById('ws-trade-gate-raw-monitor');
+    var scriptEl = document.getElementById('ws-trade-gate-raw-script-log');
+    var silenceEl = document.getElementById('ws-trade-gate-raw-silence');
+    var autoProbeEl = document.getElementById('ws-trade-gate-raw-auto-probe');
+    var probeBtn = document.getElementById('ws-trade-gate-raw-probe');
+    var payloadEl = document.getElementById('ws-trade-gate-raw-payload');
+    var symbolEl = document.getElementById('ws-trade-gate-symbol');
+    var sideEl = document.getElementById('ws-trade-gate-side');
+    var qtyEl = document.getElementById('ws-trade-gate-qty');
+    var priceEl = document.getElementById('ws-trade-gate-price');
+    var orderIdEl = document.getElementById('ws-trade-gate-order-id');
+    var ws = null;
+    var scriptLog = createScriptLogger(scriptEl);
+    var monitor = createWsMonitor({
+      statusEl: monitorEl,
+      scriptLog: scriptLog,
+      silenceEl: silenceEl,
+      autoProbeEl: autoProbeEl,
+      probeBtn: probeBtn,
+      defaultThreshold: 60,
+      sendPing: function () {
+        if (!ws || ws.readyState !== 1) {
+          return false;
+        }
+        send('send', { time: Math.floor(Date.now() / 1000), channel: 'futures.ping' });
+        return true;
+      }
+    });
+
+    function wsUrl() {
+      var proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      return proto + window.location.host + '/ws/trade-gate-raw';
+    }
+
+    function logLine(text) {
+      if (!logEl) {
+        return;
+      }
+      logEl.textContent += text + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function send(action, payload) {
+      if (!ws || ws.readyState !== 1) {
+        setStatus(statusEl, 'Not connected', 'error');
+        logLine('[client] not connected');
+        return;
+      }
+      var message = { action: action };
+      if (payload) {
+        if (typeof payload === 'string') {
+          message.raw = payload;
+        } else {
+          message.payload = payload;
+        }
+      }
+      ws.send(JSON.stringify(message));
+    }
+
+    function connect() {
+      if (ws && ws.readyState === 1) {
+        return;
+      }
+      ws = new WebSocket(wsUrl());
+      ws.onopen = function () {
+        setStatus(statusEl, 'Connected', 'success');
+        logLine('[client] ws_open');
+        monitor.onOpen();
+        monitor.logAction('connect requested; login is handled server-side');
+        send('connect');
+      };
+      ws.onmessage = function (evt) {
+        monitor.onLine(evt.data);
+        logLine(evt.data);
+      };
+      ws.onclose = function () {
+        setStatus(statusEl, 'Disconnected', 'info');
+        logLine('[client] ws_closed');
+        monitor.onClose();
+      };
+      ws.onerror = function () {
+        setStatus(statusEl, 'WebSocket error', 'error');
+        logLine('[client] ws_error');
+      };
+    }
+
+    function disconnect() {
+      if (!ws) {
+        return;
+      }
+      try {
+        send('close');
+      } catch (_err) {
+        // ignore
+      }
+      try {
+        ws.close();
+      } catch (_err2) {
+        // ignore
+      }
+      ws = null;
+    }
+
+    function reconnect() {
+      setStatus(statusEl, 'Reconnecting...', 'info');
+      monitor.logAction('reconnect requested');
+      disconnect();
+      window.setTimeout(function () {
+        connect();
+      }, 200);
+    }
+
+    function sendRaw() {
+      var raw = payloadEl ? String(payloadEl.value || '').trim() : '';
+      if (!raw) {
+        setStatus(statusEl, 'Raw payload required', 'error');
+        return;
+      }
+      monitor.logAction('raw payload sent');
+      send('send', raw);
+    }
+
+    function sendOrder() {
+      var symbol = normalizeGateSymbol(symbolEl ? symbolEl.value : '');
+      var side = sideEl ? String(sideEl.value || '').trim().toLowerCase() : '';
+      var qty = qtyEl ? parseOptionalNumber(qtyEl.value) : null;
+      var price = priceEl ? parseOptionalNumber(priceEl.value) : null;
+      if (!symbol || !side || !qty || !price) {
+        setStatus(statusEl, 'Symbol/side/qty/price required', 'error');
+        return;
+      }
+      var size = side === 'sell' ? -Math.abs(qty) : Math.abs(qty);
+      var payload = {
+        channel: 'futures.order_place',
+        event: 'api',
+        payload: {
+          req_id: String(Date.now()),
+          req_param: {
+            contract: symbol,
+            size: String(size),
+            iceberg: '0',
+            price: String(price),
+            tif: 'gtc'
+          }
+        }
+      };
+      monitor.logAction('order request sent', { symbol: symbol, side: side, qty: qty, price: price });
+      send('send', payload);
+    }
+
+    function sendCancel() {
+      var orderId = orderIdEl ? String(orderIdEl.value || '').trim() : '';
+      if (!orderId) {
+        setStatus(statusEl, 'Order id required', 'error');
+        return;
+      }
+      var payload = {
+        channel: 'futures.order_cancel',
+        event: 'api',
+        payload: {
+          req_id: String(Date.now()),
+          req_param: {
+            order_id: orderId
+          }
+        }
+      };
+      monitor.logAction('cancel request sent', { order_id: orderId });
+      send('send', payload);
+    }
+
+    function sendSubscribe(channel) {
+      var symbol = normalizeGateSymbol(symbolEl ? symbolEl.value : '');
+      var payload = {
+        channel: channel,
+        event: 'subscribe',
+        payload: symbol ? [symbol] : []
+      };
+      monitor.logAction('subscribe requested', { channel: channel, symbol: symbol || null });
+      send('send', payload);
+    }
+
+    var connectBtn = document.getElementById('ws-trade-gate-raw-connect');
+    var disconnectBtn = document.getElementById('ws-trade-gate-raw-disconnect');
+    var reconnectBtn = document.getElementById('ws-trade-gate-raw-reconnect');
+    var sendBtn = document.getElementById('ws-trade-gate-raw-send');
+    var orderBtn = document.getElementById('ws-trade-gate-order');
+    var cancelBtn = document.getElementById('ws-trade-gate-cancel');
+    var subOrdersBtn = document.getElementById('ws-trade-gate-sub-orders');
+    var subPositionsBtn = document.getElementById('ws-trade-gate-sub-positions');
+    var subFillsBtn = document.getElementById('ws-trade-gate-sub-fills');
+
+    if (connectBtn) {
+      connectBtn.addEventListener('click', function () {
+        setStatus(statusEl, 'Connecting...', 'info');
+        monitor.logAction('connect button pressed');
+        connect();
+      });
+    }
+    if (disconnectBtn) {
+      disconnectBtn.addEventListener('click', function () {
+        monitor.logAction('disconnect requested');
+        disconnect();
+      });
+    }
+    if (reconnectBtn) {
+      reconnectBtn.addEventListener('click', function () {
+        reconnect();
+      });
+    }
+    if (sendBtn) {
+      sendBtn.addEventListener('click', function () {
+        sendRaw();
+      });
+    }
+    if (orderBtn) {
+      orderBtn.addEventListener('click', function () {
+        sendOrder();
+      });
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        sendCancel();
+      });
+    }
+    if (subOrdersBtn) {
+      subOrdersBtn.addEventListener('click', function () {
+        sendSubscribe('futures.orders');
+      });
+    }
+    if (subPositionsBtn) {
+      subPositionsBtn.addEventListener('click', function () {
+        sendSubscribe('futures.positions');
+      });
+    }
+    if (subFillsBtn) {
+      subFillsBtn.addEventListener('click', function () {
+        sendSubscribe('futures.usertrades');
+      });
+    }
+  }
+
+  function bindWsTradeKucoinRaw() {
+    var statusEl = document.getElementById('ws-trade-kucoin-raw-status');
+    var logEl = document.getElementById('ws-trade-kucoin-raw-log');
+    var monitorEl = document.getElementById('ws-trade-kucoin-raw-monitor');
+    var scriptEl = document.getElementById('ws-trade-kucoin-raw-script-log');
+    var silenceEl = document.getElementById('ws-trade-kucoin-raw-silence');
+    var autoProbeEl = document.getElementById('ws-trade-kucoin-raw-auto-probe');
+    var probeBtn = document.getElementById('ws-trade-kucoin-raw-probe');
+    var payloadEl = document.getElementById('ws-trade-kucoin-raw-payload');
+    var symbolEl = document.getElementById('ws-trade-kucoin-symbol');
+    var sideEl = document.getElementById('ws-trade-kucoin-side');
+    var qtyEl = document.getElementById('ws-trade-kucoin-qty');
+    var priceEl = document.getElementById('ws-trade-kucoin-price');
+    var orderIdEl = document.getElementById('ws-trade-kucoin-order-id');
+    var ws = null;
+    var scriptLog = createScriptLogger(scriptEl);
+    var monitor = createWsMonitor({
+      statusEl: monitorEl,
+      scriptLog: scriptLog,
+      silenceEl: silenceEl,
+      autoProbeEl: autoProbeEl,
+      probeBtn: probeBtn,
+      defaultThreshold: 45,
+      sendPing: function () {
+        if (!ws || ws.readyState !== 1) {
+          return false;
+        }
+        send('send', { id: 'ping-' + String(Date.now()), type: 'ping' });
+        return true;
+      }
+    });
+
+    function wsUrl() {
+      var proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      return proto + window.location.host + '/ws/trade-kucoin-raw';
+    }
+
+    function logLine(text) {
+      if (!logEl) {
+        return;
+      }
+      logEl.textContent += text + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function send(action, payload) {
+      if (!ws || ws.readyState !== 1) {
+        setStatus(statusEl, 'Not connected', 'error');
+        logLine('[client] not connected');
+        return;
+      }
+      var message = { action: action };
+      if (payload) {
+        if (typeof payload === 'string') {
+          message.raw = payload;
+        } else {
+          message.payload = payload;
+        }
+      }
+      ws.send(JSON.stringify(message));
+    }
+
+    function connect() {
+      if (ws && ws.readyState === 1) {
+        return;
+      }
+      ws = new WebSocket(wsUrl());
+      ws.onopen = function () {
+        setStatus(statusEl, 'Connected', 'success');
+        logLine('[client] ws_open');
+        monitor.onOpen();
+        monitor.logAction('connect requested; bullet-private token fetched server-side');
+        send('connect');
+      };
+      ws.onmessage = function (evt) {
+        monitor.onLine(evt.data);
+        logLine(evt.data);
+      };
+      ws.onclose = function () {
+        setStatus(statusEl, 'Disconnected', 'info');
+        logLine('[client] ws_closed');
+        monitor.onClose();
+      };
+      ws.onerror = function () {
+        setStatus(statusEl, 'WebSocket error', 'error');
+        logLine('[client] ws_error');
+      };
+    }
+
+    function disconnect() {
+      if (!ws) {
+        return;
+      }
+      try {
+        send('close');
+      } catch (_err) {
+        // ignore
+      }
+      try {
+        ws.close();
+      } catch (_err2) {
+        // ignore
+      }
+      ws = null;
+    }
+
+    function sendRaw() {
+      var raw = payloadEl ? String(payloadEl.value || '').trim() : '';
+      if (!raw) {
+        setStatus(statusEl, 'Raw payload required', 'error');
+        return;
+      }
+      monitor.logAction('raw payload sent');
+      send('send', raw);
+    }
+
+    function extendListenKey() {
+      setStatus(statusEl, 'Extending listenKey...', 'info');
+      send('extend_listen_key');
+    }
+
+    function closeListenKey() {
+      setStatus(statusEl, 'Closing listenKey...', 'info');
+      send('close_listen_key');
+    }
+
+    function restOrder(orderType) {
+      var symbol = normalizeInputSymbol(symbolEl ? symbolEl.value : '');
+      var side = sideEl ? String(sideEl.value || '').trim().toLowerCase() : '';
+      var qty = qtyEl ? parseOptionalNumber(qtyEl.value) : null;
+      var price = priceEl ? parseOptionalNumber(priceEl.value) : null;
+      if (!symbol || !side || !qty) {
+        setStatus(statusEl, 'Symbol/side/qty required', 'error');
+        return;
+      }
+      if (orderType === 'limit' && (!price || price <= 0)) {
+        setStatus(statusEl, 'Price required for limit order', 'error');
+        return;
+      }
+      var payload = {
+        exchange: 'kucoin',
+        symbol: symbol,
+        side: side,
+        qty: qty
+      };
+      if (orderType === 'limit') {
+        payload.price = price;
+      }
+      setStatus(statusEl, 'Submitting ' + orderType + ' (REST)...', 'info');
+      monitor.logAction('rest order requested', { type: orderType, symbol: symbol, side: side, qty: qty });
+      request(
+        'POST',
+        orderType === 'limit' ? '/api/manual/test/limit' : '/api/manual/test/market',
+        payload,
+        function (err, data) {
+          if (err) {
+            setStatus(statusEl, err.message, 'error');
+            logLine('[rest] ' + err.message);
+            return;
+          }
+          logLine('[rest] ' + pretty(data));
+          if (data && data.order_id && orderIdEl && !orderIdEl.value) {
+            orderIdEl.value = data.order_id;
+          }
+          if (data && data.errors && data.errors.length) {
+            setStatus(statusEl, 'Completed with errors', 'error');
+          } else {
+            setStatus(statusEl, 'Completed', 'success');
+          }
+        }
+      );
+    }
+
+    function restCancel() {
+      var symbol = normalizeInputSymbol(symbolEl ? symbolEl.value : '');
+      var orderId = orderIdEl ? String(orderIdEl.value || '').trim() : '';
+      if (!symbol || !orderId) {
+        setStatus(statusEl, 'Symbol/order id required', 'error');
+        return;
+      }
+      var payload = {
+        exchange: 'kucoin',
+        symbol: symbol,
+        order_id: orderId
+      };
+      setStatus(statusEl, 'Canceling order (REST)...', 'info');
+      monitor.logAction('rest cancel requested', { symbol: symbol, order_id: orderId });
+      request('POST', '/api/manual/test/cancel', payload, function (err, data) {
+        if (err) {
+          setStatus(statusEl, err.message, 'error');
+          logLine('[rest] ' + err.message);
+          return;
+        }
+        logLine('[rest] ' + pretty(data));
+        if (data && data.errors && data.errors.length) {
+          setStatus(statusEl, 'Completed with errors', 'error');
+        } else {
+          setStatus(statusEl, 'Completed', 'success');
+        }
+      });
+    }
+
+    function subscribeOrders() {
+      var symbol = normalizeKucoinSymbol(symbolEl ? symbolEl.value : '');
+      var topic = symbol ? '/contractMarket/tradeOrders:' + symbol : '/contractMarket/tradeOrders';
+      var payload = {
+        id: String(Date.now()),
+        type: 'subscribe',
+        topic: topic,
+        privateChannel: true,
+        response: true
+      };
+      monitor.logAction('subscribe requested', { topic: topic });
+      send('send', payload);
+    }
+
+    function subscribePositions() {
+      var symbol = normalizeKucoinSymbol(symbolEl ? symbolEl.value : '');
+      var topic = symbol ? '/contract/position:' + symbol : '/contract/positionAll';
+      var payload = {
+        id: String(Date.now()),
+        type: 'subscribe',
+        topic: topic,
+        privateChannel: true,
+        response: true
+      };
+      monitor.logAction('subscribe requested', { topic: topic });
+      send('send', payload);
+    }
+
+    function subscribeFills() {
+      var payload = {
+        id: String(Date.now()),
+        type: 'subscribe',
+        topic: '/contractAccount/wallet',
+        privateChannel: true,
+        response: true
+      };
+      monitor.logAction('subscribe requested', { topic: '/contractAccount/wallet' });
+      send('send', payload);
+    }
+
+    var connectBtn = document.getElementById('ws-trade-kucoin-raw-connect');
+    var disconnectBtn = document.getElementById('ws-trade-kucoin-raw-disconnect');
+    var reconnectBtn = document.getElementById('ws-trade-kucoin-raw-reconnect');
+    var sendBtn = document.getElementById('ws-trade-kucoin-raw-send');
+    var orderBtn = document.getElementById('ws-trade-kucoin-order');
+    var marketBtn = document.getElementById('ws-trade-kucoin-market');
+    var cancelBtn = document.getElementById('ws-trade-kucoin-cancel');
+    var subOrdersBtn = document.getElementById('ws-trade-kucoin-sub-orders');
+    var subPositionsBtn = document.getElementById('ws-trade-kucoin-sub-positions');
+    var subFillsBtn = document.getElementById('ws-trade-kucoin-sub-fills');
+
+    if (connectBtn) {
+      connectBtn.addEventListener('click', function () {
+        setStatus(statusEl, 'Connecting...', 'info');
+        monitor.logAction('connect button pressed');
+        connect();
+      });
+    }
+    if (disconnectBtn) {
+      disconnectBtn.addEventListener('click', function () {
+        monitor.logAction('disconnect requested');
+        disconnect();
+      });
+    }
+    if (reconnectBtn) {
+      reconnectBtn.addEventListener('click', function () {
+        reconnect();
+      });
+    }
+    if (sendBtn) {
+      sendBtn.addEventListener('click', function () {
+        sendRaw();
+      });
+    }
+    if (orderBtn) {
+      orderBtn.addEventListener('click', function () {
+        restOrder('limit');
+      });
+    }
+    if (marketBtn) {
+      marketBtn.addEventListener('click', function () {
+        restOrder('market');
+      });
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        restCancel();
+      });
+    }
+    if (subOrdersBtn) {
+      subOrdersBtn.addEventListener('click', function () {
+        subscribeOrders();
+      });
+    }
+    if (subPositionsBtn) {
+      subPositionsBtn.addEventListener('click', function () {
+        subscribePositions();
+      });
+    }
+    if (subFillsBtn) {
+      subFillsBtn.addEventListener('click', function () {
+        subscribeFills();
+      });
+    }
+  }
+
+  function bindWsTradeBingxRaw() {
+    var statusEl = document.getElementById('ws-trade-bingx-raw-status');
+    var logEl = document.getElementById('ws-trade-bingx-raw-log');
+    var monitorEl = document.getElementById('ws-trade-bingx-raw-monitor');
+    var scriptEl = document.getElementById('ws-trade-bingx-raw-script-log');
+    var silenceEl = document.getElementById('ws-trade-bingx-raw-silence');
+    var autoProbeEl = document.getElementById('ws-trade-bingx-raw-auto-probe');
+    var probeBtn = document.getElementById('ws-trade-bingx-raw-probe');
+    var payloadEl = document.getElementById('ws-trade-bingx-raw-payload');
+    var symbolEl = document.getElementById('ws-trade-bingx-symbol');
+    var sideEl = document.getElementById('ws-trade-bingx-side');
+    var qtyEl = document.getElementById('ws-trade-bingx-qty');
+    var priceEl = document.getElementById('ws-trade-bingx-price');
+    var orderIdEl = document.getElementById('ws-trade-bingx-order-id');
+    var ws = null;
+    var scriptLog = createScriptLogger(scriptEl);
+    var monitor = createWsMonitor({
+      statusEl: monitorEl,
+      scriptLog: scriptLog,
+      silenceEl: silenceEl,
+      autoProbeEl: autoProbeEl,
+      probeBtn: probeBtn,
+      defaultThreshold: 90,
+      sendPing: function () {
+        if (!ws || ws.readyState !== 1) {
+          return false;
+        }
+        send('send', 'Ping');
+        return true;
+      }
+    });
+
+    function wsUrl() {
+      var proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      return proto + window.location.host + '/ws/trade-bingx-raw';
+    }
+
+    function logLine(text) {
+      if (!logEl) {
+        return;
+      }
+      logEl.textContent += text + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function send(action, payload) {
+      if (!ws || ws.readyState !== 1) {
+        setStatus(statusEl, 'Not connected', 'error');
+        logLine('[client] not connected');
+        return;
+      }
+      var message = { action: action };
+      if (payload) {
+        if (typeof payload === 'string') {
+          message.raw = payload;
+        } else {
+          message.payload = payload;
+        }
+      }
+      ws.send(JSON.stringify(message));
+    }
+
+    function connect() {
+      if (ws && ws.readyState === 1) {
+        return;
+      }
+      ws = new WebSocket(wsUrl());
+      ws.onopen = function () {
+        setStatus(statusEl, 'Connected', 'success');
+        logLine('[client] ws_open');
+        monitor.onOpen();
+        monitor.logAction('connect requested; listenKey handled server-side');
+        send('connect');
+      };
+      ws.onmessage = function (evt) {
+        monitor.onLine(evt.data);
+        logLine(evt.data);
+      };
+      ws.onclose = function () {
+        setStatus(statusEl, 'Disconnected', 'info');
+        logLine('[client] ws_closed');
+        monitor.onClose();
+      };
+      ws.onerror = function () {
+        setStatus(statusEl, 'WebSocket error', 'error');
+        logLine('[client] ws_error');
+      };
+    }
+
+    function disconnect() {
+      if (!ws) {
+        return;
+      }
+      try {
+        send('close');
+      } catch (_err) {
+        // ignore
+      }
+      try {
+        ws.close();
+      } catch (_err2) {
+        // ignore
+      }
+      ws = null;
+    }
+
+    function sendRaw() {
+      var raw = payloadEl ? String(payloadEl.value || '').trim() : '';
+      if (!raw) {
+        setStatus(statusEl, 'Raw payload required', 'error');
+        return;
+      }
+      monitor.logAction('raw payload sent');
+      send('send', raw);
+    }
+
+    function extendListenKey() {
+      setStatus(statusEl, 'Extending listenKey...', 'info');
+      monitor.logAction('listenKey extend requested');
+      send('extend_listen_key');
+    }
+
+    function closeListenKey() {
+      setStatus(statusEl, 'Closing listenKey...', 'info');
+      monitor.logAction('listenKey close requested');
+      send('close_listen_key');
+    }
+
+    function restOrder(orderType) {
+      var symbol = normalizeInputSymbol(symbolEl ? symbolEl.value : '');
+      var side = sideEl ? String(sideEl.value || '').trim().toLowerCase() : '';
+      var qty = qtyEl ? parseOptionalNumber(qtyEl.value) : null;
+      var price = priceEl ? parseOptionalNumber(priceEl.value) : null;
+      if (!symbol || !side || !qty) {
+        setStatus(statusEl, 'Symbol/side/qty required', 'error');
+        return;
+      }
+      if (orderType === 'limit' && (!price || price <= 0)) {
+        setStatus(statusEl, 'Price required for limit order', 'error');
+        return;
+      }
+      var payload = {
+        exchange: 'bingx',
+        symbol: symbol,
+        side: side,
+        qty: qty
+      };
+      if (orderType === 'limit') {
+        payload.price = price;
+      }
+      setStatus(statusEl, 'Submitting ' + orderType + ' (REST)...', 'info');
+      monitor.logAction('rest order requested', { type: orderType, symbol: symbol, side: side, qty: qty });
+      request(
+        'POST',
+        orderType === 'limit' ? '/api/manual/test/limit' : '/api/manual/test/market',
+        payload,
+        function (err, data) {
+          if (err) {
+            setStatus(statusEl, err.message, 'error');
+            logLine('[rest] ' + err.message);
+            return;
+          }
+          logLine('[rest] ' + pretty(data));
+          if (data && data.order_id && orderIdEl && !orderIdEl.value) {
+            orderIdEl.value = data.order_id;
+          }
+          if (data && data.errors && data.errors.length) {
+            setStatus(statusEl, 'Completed with errors', 'error');
+          } else {
+            setStatus(statusEl, 'Completed', 'success');
+          }
+        }
+      );
+    }
+
+    function restCancel() {
+      var symbol = normalizeInputSymbol(symbolEl ? symbolEl.value : '');
+      var orderId = orderIdEl ? String(orderIdEl.value || '').trim() : '';
+      if (!symbol || !orderId) {
+        setStatus(statusEl, 'Symbol/order id required', 'error');
+        return;
+      }
+      var payload = {
+        exchange: 'bingx',
+        symbol: symbol,
+        order_id: orderId
+      };
+      setStatus(statusEl, 'Canceling order (REST)...', 'info');
+      monitor.logAction('rest cancel requested', { symbol: symbol, order_id: orderId });
+      request('POST', '/api/manual/test/cancel', payload, function (err, data) {
+        if (err) {
+          setStatus(statusEl, err.message, 'error');
+          logLine('[rest] ' + err.message);
+          return;
+        }
+        logLine('[rest] ' + pretty(data));
+        if (data && data.errors && data.errors.length) {
+          setStatus(statusEl, 'Completed with errors', 'error');
+        } else {
+          setStatus(statusEl, 'Completed', 'success');
+        }
+      });
+    }
+
+    var connectBtn = document.getElementById('ws-trade-bingx-raw-connect');
+    var disconnectBtn = document.getElementById('ws-trade-bingx-raw-disconnect');
+    var reconnectBtn = document.getElementById('ws-trade-bingx-raw-reconnect');
+    var sendBtn = document.getElementById('ws-trade-bingx-raw-send');
+    var orderBtn = document.getElementById('ws-trade-bingx-order');
+    var marketBtn = document.getElementById('ws-trade-bingx-market');
+    var cancelBtn = document.getElementById('ws-trade-bingx-cancel');
+    var extendBtn = document.getElementById('ws-trade-bingx-extend');
+    var closeBtn = document.getElementById('ws-trade-bingx-close');
+
+    if (connectBtn) {
+      connectBtn.addEventListener('click', function () {
+        setStatus(statusEl, 'Connecting...', 'info');
+        monitor.logAction('connect button pressed');
+        connect();
+      });
+    }
+    if (disconnectBtn) {
+      disconnectBtn.addEventListener('click', function () {
+        monitor.logAction('disconnect requested');
+        disconnect();
+      });
+    }
+    if (reconnectBtn) {
+      reconnectBtn.addEventListener('click', function () {
+        reconnect();
+      });
+    }
+    if (sendBtn) {
+      sendBtn.addEventListener('click', function () {
+        sendRaw();
+      });
+    }
+    if (extendBtn) {
+      extendBtn.addEventListener('click', function () {
+        extendListenKey();
+      });
+    }
+    if (closeBtn) {
+      closeBtn.addEventListener('click', function () {
+        closeListenKey();
+      });
+    }
+    if (orderBtn) {
+      orderBtn.addEventListener('click', function () {
+        restOrder('limit');
+      });
+    }
+    if (marketBtn) {
+      marketBtn.addEventListener('click', function () {
+        restOrder('market');
+      });
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        restCancel();
+      });
+    }
+  }
+
   document.addEventListener('DOMContentLoaded', function () {
     bind();
+    bindMarginTests();
     bindWsTest();
+    bindWsTradeRaw();
+    bindWsTradePrivateRaw();
+    bindWsTradeOkxRaw();
+    bindWsTradeBitgetRaw();
+    bindWsTradeGateRaw();
+    bindWsTradeKucoinRaw();
+    bindWsTradeBingxRaw();
   });
 })();

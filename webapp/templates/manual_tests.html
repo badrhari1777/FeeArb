@@ -14,6 +14,7 @@
     <div>
       <h1>Manual Exchange Tests</h1>
       <p class="subtitle">Place/cancel test orders per exchange (perps only).</p>
+      <p class="subtitle">Build: {{ static_version }}</p>
     </div>
     <div class="status-block">
       <dl>
@@ -101,6 +102,50 @@
     </section>
 
     <section class="panel">
+      <h2>Margin & leverage tests</h2>
+      <p class="settings-note">Fetch a live position and adjust isolated margin per exchange.</p>
+      <div class="grid-list">
+        {% for name, enabled in analysis_exchanges.items() %}
+          {% if enabled %}
+            <div class="grid-card" data-margin-exchange="{{ name }}">
+              <h3>{{ name|upper }}</h3>
+              <div class="analysis-form">
+                <label>
+                  Symbol
+                  <input type="text" data-margin-symbol placeholder="BTCUSDT" autocomplete="off" />
+                </label>
+                <label>
+                  Side
+                  <select data-margin-side>
+                    <option value="">Auto</option>
+                    <option value="long">Long</option>
+                    <option value="short">Short</option>
+                  </select>
+                </label>
+                <label>
+                  Amount (USDT)
+                  <input type="number" data-margin-amount step="0.01" min="0" value="5" />
+                </label>
+              </div>
+              <div class="settings-actions">
+                <button type="button" class="button" data-margin-fetch>Fetch position</button>
+                <button type="button" class="button" data-margin-add>Add margin</button>
+                <button type="button" class="button" data-margin-reduce>Reduce margin</button>
+                <span class="settings-status" data-margin-status aria-live="polite"></span>
+              </div>
+              <div class="panel-muted">
+                <pre class="code-block" data-margin-result></pre>
+              </div>
+              <div class="panel-muted">
+                <pre class="code-block" data-margin-log></pre>
+              </div>
+            </div>
+          {% endif %}
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="panel">
       <h2>WebSocket spread test</h2>
       <form id="ws-test-form" class="analysis-form">
         <label>
@@ -150,6 +195,459 @@
         <pre id="ws-live-book" class="code-block"></pre>
       </div>
     </section>
+
+    <section class="panel">
+      <h2>WS Trade Raw (Bybit)</h2>
+      <form id="ws-trade-raw-form" class="analysis-form">
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-raw-connect">Connect</button>
+          <button type="button" class="button" id="ws-trade-raw-disconnect">Disconnect</button>
+          <button type="button" class="button" id="ws-trade-raw-reconnect">Reconnect</button>
+          <span class="settings-status" id="ws-trade-raw-status" aria-live="polite"></span>
+        </div>
+        <div class="settings-intervals">
+          <label>
+            Silence threshold (sec)
+            <input type="number" id="ws-trade-raw-silence" min="1" step="1" value="45" />
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="ws-trade-raw-auto-probe" checked />
+            Auto probe ping
+          </label>
+          <button type="button" class="button" id="ws-trade-raw-probe">Probe ping</button>
+          <span class="settings-status" id="ws-trade-raw-monitor" aria-live="polite"></span>
+        </div>
+        <label>
+          Symbol
+          <input type="text" id="ws-trade-raw-symbol" placeholder="RIVERUSDT" autocomplete="off" />
+        </label>
+        <label>
+          Side
+          <select id="ws-trade-raw-side">
+            <option value="buy">Buy</option>
+            <option value="sell">Sell</option>
+          </select>
+        </label>
+        <label>
+          Qty
+          <input type="number" id="ws-trade-raw-qty" step="0.0001" min="0" value="1" />
+        </label>
+        <label>
+          Price
+          <input type="number" id="ws-trade-raw-price" step="0.0001" min="0" value="11" />
+        </label>
+        <label>
+          Order id (cancel)
+          <input type="text" id="ws-trade-raw-order-id" placeholder="orderId" autocomplete="off" />
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-raw-order">Send order</button>
+          <button type="button" class="button" id="ws-trade-raw-cancel">Cancel order</button>
+        </div>
+        <label>
+          Raw JSON (send)
+          <textarea id="ws-trade-raw-payload" rows="4" placeholder='{"op":"order.create","args":[...]}'></textarea>
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-raw-send">Send</button>
+        </div>
+      </form>
+      <div class="panel-muted">
+        <pre id="ws-trade-raw-script-log" class="code-block"></pre>
+      </div>
+      <div class="panel-muted">
+        <pre id="ws-trade-raw-log" class="code-block"></pre>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>WS Trade Private Raw (Bybit)</h2>
+      <form id="ws-trade-private-raw-form" class="analysis-form">
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-private-raw-connect">Connect</button>
+          <button type="button" class="button" id="ws-trade-private-raw-disconnect">Disconnect</button>
+          <button type="button" class="button" id="ws-trade-private-raw-reconnect">Reconnect</button>
+          <span class="settings-status" id="ws-trade-private-raw-status" aria-live="polite"></span>
+        </div>
+        <div class="settings-intervals">
+          <label>
+            Silence threshold (sec)
+            <input type="number" id="ws-trade-private-raw-silence" min="1" step="1" value="45" />
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="ws-trade-private-raw-auto-probe" checked />
+            Auto probe ping
+          </label>
+          <button type="button" class="button" id="ws-trade-private-raw-probe">Probe ping</button>
+          <span class="settings-status" id="ws-trade-private-raw-monitor" aria-live="polite"></span>
+        </div>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-private-sub-order">Subscribe order</button>
+          <button type="button" class="button" id="ws-trade-private-sub-exec-fast">Subscribe execution.fast</button>
+          <button type="button" class="button" id="ws-trade-private-sub-position">Subscribe position</button>
+        </div>
+        <label>
+          Raw JSON (send)
+          <textarea id="ws-trade-private-raw-payload" rows="4" placeholder='{"op":"subscribe","args":["order"]}'></textarea>
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-private-raw-send">Send</button>
+        </div>
+      </form>
+      <div class="panel-muted">
+        <pre id="ws-trade-private-raw-script-log" class="code-block"></pre>
+      </div>
+      <div class="panel-muted">
+        <pre id="ws-trade-private-raw-log" class="code-block"></pre>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>WS Trade Raw (OKX)</h2>
+      <form id="ws-trade-okx-raw-form" class="analysis-form">
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-okx-raw-connect">Connect</button>
+          <button type="button" class="button" id="ws-trade-okx-raw-disconnect">Disconnect</button>
+          <button type="button" class="button" id="ws-trade-okx-raw-reconnect">Reconnect</button>
+          <span class="settings-status" id="ws-trade-okx-raw-status" aria-live="polite"></span>
+        </div>
+        <div class="settings-intervals">
+          <label>
+            Silence threshold (sec)
+            <input type="number" id="ws-trade-okx-raw-silence" min="1" step="1" value="45" />
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="ws-trade-okx-raw-auto-probe" checked />
+            Auto probe ping
+          </label>
+          <button type="button" class="button" id="ws-trade-okx-raw-probe">Probe ping</button>
+          <span class="settings-status" id="ws-trade-okx-raw-monitor" aria-live="polite"></span>
+        </div>
+        <label>
+          InstId
+          <input type="text" id="ws-trade-okx-instid" placeholder="RIVER-USDT-SWAP" autocomplete="off" />
+        </label>
+        <label>
+          Side
+          <select id="ws-trade-okx-side">
+            <option value="buy">Buy</option>
+            <option value="sell">Sell</option>
+          </select>
+        </label>
+        <label>
+          Qty
+          <input type="number" id="ws-trade-okx-qty" step="0.0001" min="0" value="1" />
+        </label>
+        <label>
+          Price
+          <input type="number" id="ws-trade-okx-price" step="0.0001" min="0" value="11" />
+        </label>
+        <label>
+          Order id (cancel)
+          <input type="text" id="ws-trade-okx-order-id" placeholder="ordId" autocomplete="off" />
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-okx-order">Send order</button>
+          <button type="button" class="button" id="ws-trade-okx-cancel">Cancel order</button>
+        </div>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-okx-sub-orders">Subscribe orders</button>
+          <button type="button" class="button" id="ws-trade-okx-sub-positions">Subscribe positions</button>
+        </div>
+        <label>
+          Raw JSON (send)
+          <textarea id="ws-trade-okx-raw-payload" rows="4" placeholder='{"op":"order","args":[...]}'></textarea>
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-okx-raw-send">Send</button>
+        </div>
+      </form>
+      <div class="panel-muted">
+        <pre id="ws-trade-okx-raw-script-log" class="code-block"></pre>
+      </div>
+      <div class="panel-muted">
+        <pre id="ws-trade-okx-raw-log" class="code-block"></pre>
+      </div>
+    </section>
+
+      <section class="panel">
+        <h2>WS Trade Raw (Bitget)</h2>
+        <form id="ws-trade-bitget-raw-form" class="analysis-form">
+          <div class="settings-intervals">
+            <button type="button" class="button" id="ws-trade-bitget-raw-connect">Connect</button>
+            <button type="button" class="button" id="ws-trade-bitget-raw-disconnect">Disconnect</button>
+            <button type="button" class="button" id="ws-trade-bitget-raw-reconnect">Reconnect</button>
+            <span class="settings-status" id="ws-trade-bitget-raw-status" aria-live="polite"></span>
+        </div>
+        <div class="settings-intervals">
+          <label>
+            Silence threshold (sec)
+            <input type="number" id="ws-trade-bitget-raw-silence" min="1" step="1" value="45" />
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="ws-trade-bitget-raw-auto-probe" checked />
+            Auto probe ping
+          </label>
+          <button type="button" class="button" id="ws-trade-bitget-raw-probe">Probe ping</button>
+          <span class="settings-status" id="ws-trade-bitget-raw-monitor" aria-live="polite"></span>
+        </div>
+        <label>
+          Symbol
+          <input type="text" id="ws-trade-bitget-symbol" placeholder="BTCUSDT" autocomplete="off" />
+        </label>
+        <label>
+          Side
+          <select id="ws-trade-bitget-side">
+            <option value="buy">Buy</option>
+            <option value="sell">Sell</option>
+          </select>
+        </label>
+        <label>
+          Qty
+          <input type="number" id="ws-trade-bitget-qty" step="0.0001" min="0" value="1" />
+        </label>
+        <label>
+          Price
+          <input type="number" id="ws-trade-bitget-price" step="0.0001" min="0" value="11" />
+        </label>
+        <label>
+          Order id (cancel)
+          <input type="text" id="ws-trade-bitget-order-id" placeholder="orderId" autocomplete="off" />
+        </label>
+          <div class="settings-intervals">
+            <button type="button" class="button" id="ws-trade-bitget-order">Send order</button>
+            <button type="button" class="button" id="ws-trade-bitget-cancel">Cancel order</button>
+          </div>
+          <div class="settings-intervals">
+            <button type="button" class="button" id="ws-trade-bitget-sub-orders">Subscribe orders</button>
+            <button type="button" class="button" id="ws-trade-bitget-sub-positions">Subscribe positions</button>
+            <button type="button" class="button" id="ws-trade-bitget-sub-fills">Subscribe fills</button>
+            <button type="button" class="button" id="ws-trade-bitget-sub-account">Subscribe account</button>
+          </div>
+          <label>
+            Raw JSON (send)
+            <textarea id="ws-trade-bitget-raw-payload" rows="4" placeholder='{"op":"subscribe","args":[...]}'></textarea>
+          </label>
+          <div class="settings-intervals">
+            <button type="button" class="button" id="ws-trade-bitget-raw-send">Send</button>
+          </div>
+        </form>
+        <div class="panel-muted">
+          <pre id="ws-trade-bitget-raw-script-log" class="code-block"></pre>
+        </div>
+        <div class="panel-muted">
+          <pre id="ws-trade-bitget-raw-log" class="code-block"></pre>
+        </div>
+      </section>
+
+    <section class="panel">
+      <h2>WS Trade Raw (Gate)</h2>
+      <form id="ws-trade-gate-raw-form" class="analysis-form">
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-gate-raw-connect">Connect</button>
+          <button type="button" class="button" id="ws-trade-gate-raw-disconnect">Disconnect</button>
+          <button type="button" class="button" id="ws-trade-gate-raw-reconnect">Reconnect</button>
+          <span class="settings-status" id="ws-trade-gate-raw-status" aria-live="polite"></span>
+        </div>
+        <div class="settings-intervals">
+          <label>
+            Silence threshold (sec)
+            <input type="number" id="ws-trade-gate-raw-silence" min="1" step="1" value="60" />
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="ws-trade-gate-raw-auto-probe" checked />
+            Auto probe ping
+          </label>
+          <button type="button" class="button" id="ws-trade-gate-raw-probe">Probe ping</button>
+          <span class="settings-status" id="ws-trade-gate-raw-monitor" aria-live="polite"></span>
+        </div>
+        <label>
+          Symbol
+          <input type="text" id="ws-trade-gate-symbol" placeholder="BTC_USDT" autocomplete="off" />
+        </label>
+        <label>
+          Side
+          <select id="ws-trade-gate-side">
+            <option value="buy">Buy</option>
+            <option value="sell">Sell</option>
+          </select>
+        </label>
+        <label>
+          Qty
+          <input type="number" id="ws-trade-gate-qty" step="0.0001" min="0" value="1" />
+        </label>
+        <label>
+          Price
+          <input type="number" id="ws-trade-gate-price" step="0.0001" min="0" value="11" />
+        </label>
+        <label>
+          Order id (cancel)
+          <input type="text" id="ws-trade-gate-order-id" placeholder="orderId" autocomplete="off" />
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-gate-order">Send order</button>
+          <button type="button" class="button" id="ws-trade-gate-cancel">Cancel order</button>
+        </div>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-gate-sub-orders">Subscribe orders</button>
+          <button type="button" class="button" id="ws-trade-gate-sub-positions">Subscribe positions</button>
+          <button type="button" class="button" id="ws-trade-gate-sub-fills">Subscribe fills</button>
+        </div>
+        <label>
+          Raw JSON (send)
+          <textarea id="ws-trade-gate-raw-payload" rows="4" placeholder='{"channel":"futures.orders","event":"subscribe","payload":[...]}'></textarea>
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-gate-raw-send">Send</button>
+        </div>
+      </form>
+      <div class="panel-muted">
+        <pre id="ws-trade-gate-raw-script-log" class="code-block"></pre>
+      </div>
+      <div class="panel-muted">
+        <pre id="ws-trade-gate-raw-log" class="code-block"></pre>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>WS Trade Raw (Kucoin)</h2>
+      <form id="ws-trade-kucoin-raw-form" class="analysis-form">
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-kucoin-raw-connect">Connect</button>
+          <button type="button" class="button" id="ws-trade-kucoin-raw-disconnect">Disconnect</button>
+          <button type="button" class="button" id="ws-trade-kucoin-raw-reconnect">Reconnect</button>
+          <span class="settings-status" id="ws-trade-kucoin-raw-status" aria-live="polite"></span>
+        </div>
+        <div class="settings-intervals">
+          <label>
+            Silence threshold (sec)
+            <input type="number" id="ws-trade-kucoin-raw-silence" min="1" step="1" value="45" />
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="ws-trade-kucoin-raw-auto-probe" checked />
+            Auto probe ping
+          </label>
+          <button type="button" class="button" id="ws-trade-kucoin-raw-probe">Probe ping</button>
+          <span class="settings-status" id="ws-trade-kucoin-raw-monitor" aria-live="polite"></span>
+        </div>
+        <label>
+          Symbol
+          <input type="text" id="ws-trade-kucoin-symbol" placeholder="BTCUSDTM" autocomplete="off" />
+        </label>
+        <label>
+          Side
+          <select id="ws-trade-kucoin-side">
+            <option value="buy">Buy</option>
+            <option value="sell">Sell</option>
+          </select>
+        </label>
+        <label>
+          Qty
+          <input type="number" id="ws-trade-kucoin-qty" step="0.0001" min="0" value="1" />
+        </label>
+        <label>
+          Price
+          <input type="number" id="ws-trade-kucoin-price" step="0.0001" min="0" value="1" />
+        </label>
+        <label>
+          Order id (cancel)
+          <input type="text" id="ws-trade-kucoin-order-id" placeholder="orderId" autocomplete="off" />
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-kucoin-order">Place limit (REST)</button>
+          <button type="button" class="button" id="ws-trade-kucoin-market">Place market (REST)</button>
+          <button type="button" class="button" id="ws-trade-kucoin-cancel">Cancel order (REST)</button>
+        </div>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-kucoin-sub-orders">Subscribe orders</button>
+          <button type="button" class="button" id="ws-trade-kucoin-sub-positions">Subscribe positions</button>
+          <button type="button" class="button" id="ws-trade-kucoin-sub-fills">Subscribe wallet</button>
+        </div>
+        <label>
+          Raw JSON (send)
+          <textarea id="ws-trade-kucoin-raw-payload" rows="4" placeholder='{"type":"subscribe","topic":"/contractMarket/tradeOrders","privateChannel":true,"response":true}'></textarea>
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-kucoin-raw-send">Send</button>
+        </div>
+      </form>
+      <div class="panel-muted">
+        <pre id="ws-trade-kucoin-raw-script-log" class="code-block"></pre>
+      </div>
+      <div class="panel-muted">
+        <pre id="ws-trade-kucoin-raw-log" class="code-block"></pre>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>WS Trade Raw (BingX)</h2>
+      <form id="ws-trade-bingx-raw-form" class="analysis-form">
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-bingx-raw-connect">Connect</button>
+          <button type="button" class="button" id="ws-trade-bingx-raw-disconnect">Disconnect</button>
+          <button type="button" class="button" id="ws-trade-bingx-raw-reconnect">Reconnect</button>
+          <span class="settings-status" id="ws-trade-bingx-raw-status" aria-live="polite"></span>
+        </div>
+        <div class="settings-intervals">
+          <label>
+            Silence threshold (sec)
+            <input type="number" id="ws-trade-bingx-raw-silence" min="1" step="1" value="90" />
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="ws-trade-bingx-raw-auto-probe" checked />
+            Auto probe ping
+          </label>
+          <button type="button" class="button" id="ws-trade-bingx-raw-probe">Probe ping</button>
+          <span class="settings-status" id="ws-trade-bingx-raw-monitor" aria-live="polite"></span>
+        </div>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-bingx-extend">Extend listenKey</button>
+          <button type="button" class="button" id="ws-trade-bingx-close">Close listenKey</button>
+        </div>
+        <label>
+          Symbol
+          <input type="text" id="ws-trade-bingx-symbol" placeholder="BTCUSDT" autocomplete="off" />
+        </label>
+        <label>
+          Side
+          <select id="ws-trade-bingx-side">
+            <option value="buy">Buy</option>
+            <option value="sell">Sell</option>
+          </select>
+        </label>
+        <label>
+          Qty
+          <input type="number" id="ws-trade-bingx-qty" step="0.0001" min="0" value="1" />
+        </label>
+        <label>
+          Price
+          <input type="number" id="ws-trade-bingx-price" step="0.0001" min="0" value="1" />
+        </label>
+        <label>
+          Order id (cancel)
+          <input type="text" id="ws-trade-bingx-order-id" placeholder="orderId" autocomplete="off" />
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-bingx-order">Place limit (REST)</button>
+          <button type="button" class="button" id="ws-trade-bingx-market">Place market (REST)</button>
+          <button type="button" class="button" id="ws-trade-bingx-cancel">Cancel order (REST)</button>
+        </div>
+        <label>
+          Raw JSON (send)
+          <textarea id="ws-trade-bingx-raw-payload" rows="4" placeholder='{"id":"test","reqType":"sub","dataType":"BTC-USDT@depth"}'></textarea>
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-bingx-raw-send">Send</button>
+        </div>
+      </form>
+      <div class="panel-muted">
+        <pre id="ws-trade-bingx-raw-script-log" class="code-block"></pre>
+      </div>
+      <div class="panel-muted">
+        <pre id="ws-trade-bingx-raw-log" class="code-block"></pre>
+      </div>
+    </section>
+
   </main>
 </body>
 </html>

@@ -1,0 +1,129 @@
+(() => {
+  const AppTheme = {
+    Light: 'light',
+    Dark: 'dark',
+    System: 'system',
+  };
+  const InternalClassName = {
+    BrandLogoImg: '_brand-logo-img_24bb',
+  };
+
+  function __setDocsTheme(themePrimarySettings, logoSettings, currentTheme) {
+    const html = document.documentElement;
+
+    html.setAttribute('data-theme', currentTheme);
+    const isOldSafari = (() => {
+      if (/Safari/i.test(navigator.userAgent) && navigator.userAgent.includes('Version/')) {
+        const version = navigator.userAgent.split('Version/')?.[1]?.split(' ')?.[0] ?? '';
+        const [major, minor] = version.split('.');
+        if (major && minor) {
+          const majorNumber = parseInt(major, 10);
+          const minorNumber = parseInt(minor, 10);
+          if (majorNumber > 18 || (majorNumber === 18 && minorNumber >= 4)) {
+            return false;
+          }
+        }
+        return true;
+      }
+      return false;
+    })();
+    if (isOldSafari) {
+      html.classList.add('old-safari');
+    }
+
+    const { accentColor } = themePrimarySettings[currentTheme] ?? {};
+    html.setAttribute('data-accent-color', accentColor || 'purple');
+
+    window.__updateThemeElement = () => {
+      const logo = logoSettings[currentTheme];
+      if (logo) {
+        const brandLogos = [...document.getElementsByClassName(InternalClassName.BrandLogoImg)];
+        brandLogos.forEach((brandLogo) => {
+          if (brandLogo && brandLogo?.src !== logo) {
+            brandLogo.src = logo;
+          }
+        });
+      }
+    };
+    window.__updateThemeElement();
+
+    window.__currentTheme = currentTheme;
+  }
+  window.__setDocsTheme = __setDocsTheme;
+
+  let isAddEventListener = false;
+  let isResetDocsTheme = false;
+  function __prepareDocsConfigScript(config = {}) {
+    const LocalStorageKey = {
+      get OnlineTheme() {
+        return `onlineShare.theme.${config.id || '0'}`;
+      },
+      get UserTheme() {
+        return `user.theme.${config.id || '0'}`;
+      },
+    };
+    if (!config || typeof config !== 'object') {
+      return;
+    }
+    window.__subdirectory = config.subdirectory;
+    const theme = config.theme || AppTheme.System;
+
+    const localOnlineTheme = (() => {
+      const localStorageTheme = localStorage.getItem(LocalStorageKey.OnlineTheme);
+      if (localStorageTheme && Object.values(AppTheme).includes(localStorageTheme)) {
+        return localStorageTheme;
+      }
+      return AppTheme.System;
+    })();
+    const localUserTheme = (() => {
+      const localStorageTheme = localStorage.getItem(LocalStorageKey.UserTheme);
+      if (
+        localStorageTheme &&
+        localStorageTheme !== AppTheme.System &&
+        Object.values(AppTheme).includes(localStorageTheme)
+      ) {
+        return localStorageTheme;
+      }
+      return undefined;
+    })();
+
+    const currentTheme = (() => {
+      if (localOnlineTheme === theme && localUserTheme) {
+        return localUserTheme;
+      }
+
+      if (theme === AppTheme.System) {
+        const media = window.matchMedia('(prefers-color-scheme: dark)');
+        return media.matches ? AppTheme.Dark : AppTheme.Light;
+      } else {
+        return theme;
+      }
+    })();
+
+    __setDocsTheme(config.themePrimarySettings, config.logoSettings, currentTheme);
+
+    if (!isAddEventListener) {
+      isAddEventListener = true;
+      window.addEventListener('error', (e) => {
+        if (
+          e.message.startsWith('Uncaught Error: Minified React error #418;') ||
+          e.message.startsWith('Uncaught Error: Minified React error #423;')
+        ) {
+          if (!isResetDocsTheme) {
+            isResetDocsTheme = true;
+            __setDocsTheme(config.themePrimarySettings, config.logoSettings, currentTheme);
+
+            const iconLink = document.head.querySelector('link[rel="icon"]');
+            if (iconLink) {
+              const iconLinkHref = iconLink.getAttribute('href');
+              if (typeof iconLinkHref === 'string') {
+                iconLink.setAttribute('href', iconLinkHref);
+              }
+            }
+          }
+        }
+      });
+    }
+  }
+  window.__prepareDocsConfigScript = __prepareDocsConfigScript;
+})();

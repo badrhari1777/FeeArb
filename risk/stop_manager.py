@@ -487,9 +487,31 @@ class ProtectiveOrderManager:
                 actions["error"] = str(exc)
                 logger.info("Protective order sync timeout for %s %s: %s", target.exchange, target.symbol, exc)
             else:
-                actions["status"] = "error"
-                actions["error"] = str(exc)
-                logger.warning("Protective order sync failed for %s %s: %s", target.exchange, target.symbol, exc, exc_info=True)
+                msg = str(exc)
+                is_no_position = False
+                if target.exchange == "bingx" and ("110424" in msg or "available amount of 0" in msg):
+                    is_no_position = True
+                if target.exchange == "bitget" and ("22002" in msg or "No position to close" in msg):
+                    is_no_position = True
+                if is_no_position:
+                    actions["status"] = "skipped_no_position"
+                    actions["error"] = msg
+                    logger.info(
+                        "Protective order skipped (no position) for %s %s: %s",
+                        target.exchange,
+                        target.symbol,
+                        msg,
+                    )
+                else:
+                    actions["status"] = "error"
+                    actions["error"] = msg
+                    logger.warning(
+                        "Protective order sync failed for %s %s: %s",
+                        target.exchange,
+                        target.symbol,
+                        msg,
+                        exc_info=True,
+                    )
         finally:
             if gw and gw.requires_cycle_close():
                 try:
@@ -863,11 +885,13 @@ class ProtectiveOrderManager:
         # Exchange-specific hints
         if gateway.slug == "bitget":
             margin_coin = "USDT" if symbol.upper().endswith("USDT") else None
+            # Bitget one-way mode expects holdSide=buy/sell (not long/short).
+            hold_side = "buy" if target.side == "long" else "sell"
             params.update(
                 {
                     "stopLossPrice": rounded,
                     "slTriggerType": "market_price",
-                    "holdSide": "long" if target.side == "long" else "short",
+                    "holdSide": hold_side,
                     "triggerType": "market_price",
                     "tpslMode": "full",
                 }
@@ -876,6 +900,10 @@ class ProtectiveOrderManager:
                 params["marginCoin"] = margin_coin
         elif gateway.slug == "okx":
             params["stopLossPrice"] = rounded
+            if target.side in ("long", "short"):
+                params["posSide"] = target.side
+            if target.margin_mode in ("isolated", "cross"):
+                params["tdMode"] = target.margin_mode
         elif gateway.slug == "kucoin":
             trigger = "down" if target.side == "long" else "up"
             params.update(
@@ -912,11 +940,13 @@ class ProtectiveOrderManager:
         }
         if gateway.slug == "bitget":
             margin_coin = "USDT" if symbol.upper().endswith("USDT") else None
+            # Bitget one-way mode expects holdSide=buy/sell (not long/short).
+            hold_side = "buy" if target.side == "long" else "sell"
             params.update(
                 {
                     "takeProfitPrice": rounded,
                     "tpTriggerType": "market_price",
-                    "holdSide": "long" if target.side == "long" else "short",
+                    "holdSide": hold_side,
                     "triggerType": "market_price",
                     "tpslMode": "full",
                 }
@@ -925,6 +955,10 @@ class ProtectiveOrderManager:
                 params["marginCoin"] = margin_coin
         elif gateway.slug == "okx":
             params["takeProfitPrice"] = rounded
+            if target.side in ("long", "short"):
+                params["posSide"] = target.side
+            if target.margin_mode in ("isolated", "cross"):
+                params["tdMode"] = target.margin_mode
         elif gateway.slug == "kucoin":
             trigger = "up" if target.side == "long" else "down"
             params.update(

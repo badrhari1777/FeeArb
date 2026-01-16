@@ -16,10 +16,19 @@ from project_settings import MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS, SettingsM
 
 from .services import DataService
 from .manual_stream import ManualSpreadStream
+from .manual_trade_stream import ManualTradeStream
+from .ws_trade_raw import WsTradeRawStream
+from .ws_trade_private_raw import WsTradePrivateRawStream
+from .ws_trade_okx_raw import WsTradeOkxRawStream
+from .ws_trade_bitget_raw import WsTradeBitgetRawStream
+from .ws_trade_bitget_trade_raw import WsTradeBitgetTradeRawStream
+from .ws_trade_bingx_raw import WsTradeBingxRawStream
+from .ws_trade_gate_raw import WsTradeGateRawStream
+from .ws_trade_kucoin_raw import WsTradeKucoinRawStream
 
 BASE_DIR = Path(__file__).resolve().parent
 
-STATIC_VERSION = "v2026-01-07-04"
+STATIC_VERSION = "v2026-01-09-13"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -37,6 +46,7 @@ class SettingsPayload(BaseModel):
     exchange_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
     table_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
     account_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
+    positions_market_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
     summary_refresh_seconds: Optional[int] = Field(
         default=None, ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS
     )
@@ -57,29 +67,32 @@ class ManualBasePayload(BaseModel):
     reprice_sec: Optional[float] = Field(default=None, ge=0)
     chunk_qty: Optional[float] = Field(default=None, gt=0)
     chunk_notional: Optional[float] = Field(default=None, gt=0)
-    max_unhedged_sec: Optional[float] = Field(default=None, ge=0)
-    max_unhedged_pct: Optional[float] = Field(default=None, ge=0)
+    force_chunk_qty: Optional[bool] = None
     hedge_order_type: Optional[str] = None
     hedge_offset_bps: Optional[float] = Field(default=None, ge=0)
     hedge_offset_ticks: Optional[int] = Field(default=None, ge=0)
+    hedge_improve_ticks: Optional[int] = Field(default=None, ge=0)
     hedge_limit_mode: Optional[str] = None
     hedge_favorable_bps: Optional[float] = Field(default=None, ge=0)
     hedge_adverse_bps: Optional[float] = Field(default=None, ge=0)
     hedge_reprice_min_sec: Optional[float] = Field(default=None, ge=0)
     limit_offset_bps: Optional[float] = Field(default=None, ge=0)
     limit_offset_ticks: Optional[int] = Field(default=None, ge=0)
+    limit_improve_ticks: Optional[int] = Field(default=None, ge=0)
     auto_limit_price: bool = True
     min_level_notional: Optional[float] = Field(default=None, ge=0)
     min_level_qty: Optional[float] = Field(default=None, ge=0)
+    min_level_chunk_pct: Optional[float] = Field(default=None, ge=0)
     max_limit_deviation_bps: Optional[float] = Field(default=None, ge=0)
     use_orderbook_check: bool = True
     fallback_to_market: bool = False
-    async_run: bool = False
+    async_run: bool = True
     dry_run: bool = False
     limit_price_long: Optional[float] = None
     limit_price_short: Optional[float] = None
     expensive_leg: Optional[str] = None
     margin_mode: Optional[str] = None
+    ws_orders_health: Optional[Dict[str, Dict[str, object]]] = None
 
 
 class ManualEnterPayload(ManualBasePayload):
@@ -122,6 +135,19 @@ class ManualTestCancelPayload(BaseModel):
     exchange: str
     symbol: str
     order_id: str
+
+
+class ManualTestPositionPayload(BaseModel):
+    exchange: str
+    symbol: str
+    side: Optional[str] = None
+
+
+class ManualTestMarginPayload(BaseModel):
+    exchange: str
+    symbol: str
+    amount: float = Field(..., gt=0)
+    side: Optional[str] = None
 
 
 @app.on_event("startup")
@@ -241,6 +267,92 @@ async def manual_stream(websocket: WebSocket) -> None:
     except WebSocketDisconnect:
         pass
 
+@app.websocket("/ws/manual-trade")
+async def manual_trade_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    stream = ManualTradeStream(websocket)
+    try:
+        await stream.run()
+    except WebSocketDisconnect:
+        pass
+
+@app.websocket("/ws/trade-raw")
+async def trade_raw_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    stream = WsTradeRawStream(websocket)
+    try:
+        await stream.run()
+    except WebSocketDisconnect:
+        pass
+
+@app.websocket("/ws/trade-private-raw")
+async def trade_private_raw_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    stream = WsTradePrivateRawStream(websocket)
+    try:
+        await stream.run()
+    except WebSocketDisconnect:
+        pass
+
+@app.websocket("/ws/trade-okx-raw")
+async def trade_okx_raw_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    stream = WsTradeOkxRawStream(websocket)
+    try:
+        await stream.run()
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/ws/trade-bitget-raw")
+async def trade_bitget_raw_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    stream = WsTradeBitgetRawStream(websocket)
+    try:
+        await stream.run()
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/ws/trade-bitget-trade-raw")
+async def trade_bitget_trade_raw_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    stream = WsTradeBitgetTradeRawStream(websocket)
+    try:
+        await stream.run()
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/ws/trade-bingx-raw")
+async def trade_bingx_raw_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    stream = WsTradeBingxRawStream(websocket)
+    try:
+        await stream.run()
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/ws/trade-gate-raw")
+async def trade_gate_raw_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    stream = WsTradeGateRawStream(websocket)
+    try:
+        await stream.run()
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/ws/trade-kucoin-raw")
+async def trade_kucoin_raw_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    stream = WsTradeKucoinRawStream(websocket)
+    try:
+        await stream.run()
+    except WebSocketDisconnect:
+        pass
+
 @app.post("/api/settings")
 async def update_settings(payload: SettingsPayload) -> JSONResponse:
     try:
@@ -257,6 +369,7 @@ async def update_settings(payload: SettingsPayload) -> JSONResponse:
 
 @app.post("/api/manual/enter")
 async def manual_enter(payload: ManualEnterPayload) -> JSONResponse:
+    logger.info("manual enter request %s", payload.dict())
     try:
         result = await service.manual_enter(payload.dict())
     except Exception as exc:  # pylint: disable=broad-except
@@ -266,6 +379,7 @@ async def manual_enter(payload: ManualEnterPayload) -> JSONResponse:
 
 @app.post("/api/manual/exit")
 async def manual_exit(payload: ManualExitPayload) -> JSONResponse:
+    logger.info("manual exit request %s", payload.dict())
     try:
         result = await service.manual_exit(payload.dict())
     except Exception as exc:  # pylint: disable=broad-except
@@ -275,6 +389,7 @@ async def manual_exit(payload: ManualExitPayload) -> JSONResponse:
 
 @app.post("/api/manual/roll")
 async def manual_roll(payload: ManualRollPayload) -> JSONResponse:
+    logger.info("manual roll request %s", payload.dict())
     try:
         result = await service.manual_roll(payload.dict())
     except Exception as exc:  # pylint: disable=broad-except
@@ -284,6 +399,7 @@ async def manual_roll(payload: ManualRollPayload) -> JSONResponse:
 
 @app.post("/api/manual/analyze")
 async def manual_analyze(payload: ManualAnalyzePayload) -> JSONResponse:
+    logger.info("manual analyze request %s", payload.dict())
     try:
         result = await service.manual_analyze(payload.dict())
     except Exception as exc:  # pylint: disable=broad-except
@@ -310,6 +426,24 @@ async def manual_test_cancel(payload: ManualTestCancelPayload) -> JSONResponse:
     return JSONResponse(jsonable_encoder(result))
 
 
+@app.post("/api/manual/test/position")
+async def manual_test_position(payload: ManualTestPositionPayload) -> JSONResponse:
+    result = await service.manual_test_position(payload.dict())
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/manual/test/margin/add")
+async def manual_test_margin_add(payload: ManualTestMarginPayload) -> JSONResponse:
+    result = await service.manual_test_margin(payload.dict(), action="add")
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/manual/test/margin/reduce")
+async def manual_test_margin_reduce(payload: ManualTestMarginPayload) -> JSONResponse:
+    result = await service.manual_test_margin(payload.dict(), action="reduce")
+    return JSONResponse(jsonable_encoder(result))
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
     logger.exception("Unhandled error %s %s: %s", request.method, request.url.path, exc)
@@ -318,9 +452,21 @@ async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
         status_code=500,
     )
 
+@app.get("/api/manual/exec")
+async def manual_exec_list() -> JSONResponse:
+    result = await service.manual_exec_runs()
+    return JSONResponse(jsonable_encoder(result))
+
 @app.get("/api/manual/exec/{exec_id}")
 async def manual_exec_status(exec_id: str) -> JSONResponse:
     result = await service.manual_exec_status(exec_id)
+    if result.get("error"):
+        raise HTTPException(status_code=404, detail=result["error"])
+    return JSONResponse(jsonable_encoder(result))
+
+@app.post("/api/manual/exec/{exec_id}/stop")
+async def manual_exec_stop(exec_id: str) -> JSONResponse:
+    result = await service.manual_exec_stop(exec_id)
     if result.get("error"):
         raise HTTPException(status_code=404, detail=result["error"])
     return JSONResponse(jsonable_encoder(result))
