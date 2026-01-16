@@ -37,7 +37,7 @@ EXCHANGE_COMMISSIONS: Final[Dict[str, Dict[str, float]]] = {
 }
 
 # Cached scraper payloads remain valid for this many seconds.
-PARSE_CACHE_TTL_SECONDS: Final[int] = 300
+PARSE_CACHE_TTL_SECONDS: Final[int] = 1200
 
 # Base directory for lightweight cache files.
 CACHE_DIR: Final[Path] = BASE_DIR / "data" / "cache"

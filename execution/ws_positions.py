@@ -9,6 +9,7 @@ import json
 import logging
 import time
 from typing import Any, Mapping, Optional
+import zlib
 
 import websockets
 
@@ -30,12 +31,30 @@ def _decode_gzip_message(message: object) -> str | None:
             return gzip.decompress(message).decode("utf-8")
         except Exception:
             try:
-                return message.decode("utf-8")
+                return zlib.decompress(message, 16 + zlib.MAX_WBITS).decode("utf-8")
             except Exception:
-                return None
+                try:
+                    return zlib.decompress(message).decode("utf-8")
+                except Exception:
+                    try:
+                        return message.decode("utf-8")
+                    except Exception:
+                        return None
+        return None
     if isinstance(message, str):
         return message
     return None
+
+
+def _bingx_is_ping_message(text: str, payload: object) -> bool:
+    if isinstance(payload, dict) and "ping" in payload:
+        return True
+    stripped = text.strip().lower()
+    if stripped == "ping":
+        return True
+    if '"ping"' in stripped and '"pong"' not in stripped:
+        return True
+    return False
 
 
 def _gate_sign_auth_message(
@@ -647,14 +666,20 @@ class BingxPositionStream(_BasePositionStream):
             text = _decode_gzip_message(message)
             if not text:
                 continue
-            if text.strip() == "Ping":
-                self._mark_live()
-                await self._ws.send("Pong")
-                continue
             try:
                 payload = json.loads(text)
             except Exception:
                 payload = None
+            if _bingx_is_ping_message(text, payload):
+                self._mark_live()
+                await self._ws.send("Pong")
+                continue
+            if isinstance(payload, dict) and "pong" in payload:
+                self._mark_live()
+                continue
+            if text.strip().lower() == "pong":
+                self._mark_live()
+                continue
             if not isinstance(payload, dict):
                 continue
             if payload.get("e") != "ACCOUNT_UPDATE":

@@ -38,6 +38,9 @@ from exchanges import get_adapter, normalize_exchange_name
 from .market_data import MarketDataBus
 from uuid import uuid4
 
+FUNDING_CACHE_TTL_SEC = 120
+POSITIONS_MARKET_CONCURRENCY = 3
+
 RefreshResult = Literal["completed", "in_progress", "failed"]
 
 logger = logging.getLogger(__name__)
@@ -352,7 +355,9 @@ class DataService:
         self._positions_market_last_key: tuple[str, ...] | None = None
         self._positions_market_status: list[dict[str, Any]] = []
         self._positions_market_diffs: list[dict[str, Any]] = []
+        self._positions_market_last_account_update: str | None = None
         self._positions_market_task: Optional[asyncio.Task] = None
+        self._positions_market_sem = asyncio.Semaphore(POSITIONS_MARKET_CONCURRENCY)
         self._risk_config: RiskConfig = self._risk_config_from_settings()
         self._protective_manager = ProtectiveOrderManager(self._risk_config)
         self._last_protective: dict[tuple[str, str, str], dict[str, float | None]] = {}
@@ -366,38 +371,6 @@ class DataService:
         self._last_mexc_alert: dict[tuple[str, str], float] = {}
         self._send_missing_stop_alerts = True
         self._apply_alert_settings()
-
-    def _extend_universe_with_positions(self, sources: SourceSnapshot) -> SourceSnapshot:
-        """Include symbols from live positions so market snapshots stay fresh for the UI."""
-        positions = self._accounts.snapshot().get("positions") or []
-        if not positions:
-            return sources
-        existing = {str(entry.get("symbol") or "") for entry in sources.universe if entry.get("symbol")}
-        extras: list[dict[str, object]] = []
-        seen: set[str] = set()
-        for pos in positions:
-            symbol = _dedupe_settle(
-                pos.get("symbol_normalized")
-                or normalize_symbol(pos.get("symbol"))
-            )
-            if not symbol or symbol in seen or symbol in existing:
-                continue
-            seen.add(symbol)
-            extras.append({"symbol": symbol, "sources": "positions"})
-        if not extras:
-            return sources
-        messages = list(sources.messages)
-        messages.append(f"Symbol universe extended with {len(extras)} position symbols.")
-        return SourceSnapshot(
-            generated_at=sources.generated_at,
-            screener_rows=list(sources.screener_rows),
-            coinglass_rows=list(sources.coinglass_rows),
-            universe=list(sources.universe) + extras,
-            screener_from_cache=sources.screener_from_cache,
-            coinglass_from_cache=sources.coinglass_from_cache,
-            messages=messages,
-        )
-
 
     async def startup(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -1553,7 +1526,15 @@ class DataService:
 
     async def _refresh_positions_market_snapshots(self, *, force: bool = False) -> None:
         async with self._positions_market_lock:
-            positions = self._accounts.snapshot().get("positions") or []
+            accounts_snapshot = self._accounts.snapshot()
+            positions = accounts_snapshot.get("positions") or []
+            account_last_updated = accounts_snapshot.get("last_updated")
+            if (
+                not force
+                and account_last_updated
+                and account_last_updated == self._positions_market_last_account_update
+            ):
+                return
             symbols_by_exchange = self._collect_positions_market_symbols(positions)
             now = datetime.now(timezone.utc)
             interval = max(30, int(self._positions_market_interval or self._account_interval))
@@ -1578,37 +1559,39 @@ class DataService:
                 self._positions_market_last_refresh = now
                 self._positions_market_last_error = None
                 self._positions_market_last_key = ()
+                self._positions_market_last_account_update = account_last_updated
                 self._positions_market_status = []
                 self._positions_market_diffs = []
                 return
 
             async def _fetch_exchange(exchange: str, symbols: list[str]) -> dict[str, Any]:
-                try:
-                    adapter = get_adapter(exchange)
-                except KeyError as exc:
-                    return {
-                        "exchange": exchange,
-                        "status": "missing_adapter",
-                        "symbols": len(symbols),
-                        "snapshots": [],
-                        "error": str(exc),
-                    }
-                try:
-                    snapshots = await adapter.fetch_market_snapshots_async(symbols)
-                    return {
-                        "exchange": exchange,
-                        "status": "ok",
-                        "symbols": len(symbols),
-                        "snapshots": snapshots,
-                    }
-                except Exception as exc:  # pylint: disable=broad-except
-                    return {
-                        "exchange": exchange,
-                        "status": "error",
-                        "symbols": len(symbols),
-                        "snapshots": [],
-                        "error": str(exc),
-                    }
+                async with self._positions_market_sem:
+                    try:
+                        adapter = get_adapter(exchange)
+                    except KeyError as exc:
+                        return {
+                            "exchange": exchange,
+                            "status": "missing_adapter",
+                            "symbols": len(symbols),
+                            "snapshots": [],
+                            "error": str(exc),
+                        }
+                    try:
+                        snapshots = await adapter.fetch_market_snapshots_async(symbols)
+                        return {
+                            "exchange": exchange,
+                            "status": "ok",
+                            "symbols": len(symbols),
+                            "snapshots": snapshots,
+                        }
+                    except Exception as exc:  # pylint: disable=broad-except
+                        return {
+                            "exchange": exchange,
+                            "status": "error",
+                            "symbols": len(symbols),
+                            "snapshots": [],
+                            "error": str(exc),
+                        }
 
             tasks = [
                 asyncio.create_task(_fetch_exchange(exchange, symbols))
@@ -1658,6 +1641,7 @@ class DataService:
             self._positions_market_last_refresh = now
             self._positions_market_last_error = "; ".join(errors) if errors else None
             self._positions_market_last_key = key
+            self._positions_market_last_account_update = account_last_updated
             self._positions_market_status = status_rows
             self._positions_market_diffs = self._positions_market_diff_report(
                 positions,
@@ -2072,6 +2056,11 @@ class DataService:
 
         key = (normalize_exchange_name(exchange), exchange_symbol or canonical_symbol)
         now_ts = datetime.now(tz=timezone.utc).timestamp()
+        cached = self._funding_cache.get(key)
+        if cached:
+            rate, next_iso, mark_val, cached_ts = cached
+            if now_ts - cached_ts <= FUNDING_CACHE_TTL_SEC:
+                return rate, next_iso, mark_val
 
         logger.info(
             "funding fetch start exchange=%s key=%s canonical=%s candidates=%s",
@@ -2437,14 +2426,8 @@ class DataService:
             cfg.panic_buffer_pct = float(protective.get("panic_buffer_pct", cfg.panic_buffer_pct))
             cfg.min_free_balance_abs = float(protective.get("min_free_balance_abs", cfg.min_free_balance_abs))
             cfg.min_free_balance_rel = float(protective.get("min_free_balance_rel", cfg.min_free_balance_rel))
-            cfg.balance_check_interval_sec = int(
-                protective.get("balance_check_interval_sec", cfg.balance_check_interval_sec)
-            )
             cfg.position_check_interval_sec = int(
                 protective.get("position_check_interval_sec", cfg.position_check_interval_sec)
-            )
-            cfg.panic_close_batch_size = int(
-                protective.get("panic_close_batch_size", cfg.panic_close_batch_size)
             )
             cfg.telegram_alert_chat_id = str(protective.get("telegram_alert_chat_id", cfg.telegram_alert_chat_id))
             cfg.send_missing_stop_alerts = bool(

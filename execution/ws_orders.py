@@ -10,6 +10,7 @@ import json
 import logging
 import time
 from typing import Any, Iterable, Mapping, Optional
+import zlib
 
 import websockets
 
@@ -77,12 +78,39 @@ def _decode_gzip_message(message: object) -> str | None:
             return gzip.decompress(message).decode("utf-8")
         except Exception:
             try:
-                return message.decode("utf-8")
+                return zlib.decompress(message, 16 + zlib.MAX_WBITS).decode("utf-8")
             except Exception:
-                return None
+                try:
+                    return zlib.decompress(message).decode("utf-8")
+                except Exception:
+                    try:
+                        return message.decode("utf-8")
+                    except Exception:
+                        return None
+        return None
     if isinstance(message, str):
         return message
     return None
+
+
+def _bingx_is_ping_message(text: str, payload: object) -> bool:
+    if isinstance(payload, dict) and "ping" in payload:
+        return True
+    stripped = text.strip().lower()
+    if stripped == "ping":
+        return True
+    if '"ping"' in stripped and '"pong"' not in stripped:
+        return True
+    return False
+
+
+def _bingx_is_pong_message(text: str, payload: object) -> bool:
+    if isinstance(payload, dict) and "pong" in payload:
+        return True
+    stripped = text.strip().lower()
+    if stripped == "pong":
+        return True
+    return False
 
 
 def _gate_sign_auth_message(
@@ -1189,17 +1217,17 @@ class BingxOrderStream(_BaseOrderStream):
             if not text:
                 continue
             self._mark_live()
-            if text.strip() == "Ping":
-                self._mark_live("ping")
-                await self._ws.send("Pong")
-                continue
-            if text.strip() == "Pong":
-                self._mark_pong()
-                continue
             try:
                 payload = json.loads(text)
             except Exception:
                 payload = None
+            if _bingx_is_ping_message(text, payload):
+                self._mark_live("ping")
+                await self._ws.send("Pong")
+                continue
+            if _bingx_is_pong_message(text, payload):
+                self._mark_pong()
+                continue
             if not isinstance(payload, dict):
                 continue
             event = payload.get("e")

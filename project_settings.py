@@ -71,11 +71,11 @@ class AppSettings:
     analysis_exchanges: Dict[str, bool] = field(
         default_factory=lambda: dict(DEFAULT_ANALYSIS_EXCHANGES)
     )
-    parser_refresh_seconds: int = 600  # 10 minutes
+    parser_refresh_seconds: int = 1200  # 20 minutes
     exchange_refresh_seconds: int = 300  # Funding Opportunities refresh (5 minutes)
     table_refresh_seconds: int = 60  # Page refresh
-    account_refresh_seconds: int = 90  # Account/positions refresh (1.5 minutes)
-    positions_market_refresh_seconds: int = 30  # Positions market snapshot refresh
+    account_refresh_seconds: int = 60  # Account/positions refresh (1 minute)
+    positions_market_refresh_seconds: int = 60  # Positions market snapshot refresh
     summary_refresh_seconds: int = 1800  # Balance digest (30 minutes)
     protective: Dict[str, object] = field(
         default_factory=lambda: {
@@ -416,10 +416,3 @@ class SettingsManager:
 
     def enabled_analysis_exchanges(self) -> Dict[str, bool]:
         return dict(self._settings.analysis_exchanges)
-
-    def refresh_intervals(self) -> tuple[int, int, int]:
-        return (
-            self._settings.parser_refresh_seconds,
-            self._settings.table_refresh_seconds,
-            self._settings.exchange_refresh_seconds,
-        )

@@ -28,12 +28,11 @@ from orchestrator.opportunities import (
     format_opportunity_table,
 )
 from parsers import arbitragescanner, coinglass
-from pipeline.source_cache import fetch_with_cache_async
 from utils.sources import get_cached_source, upsert_cached_source
 from utils import load_cache, save_cache
 
 logger = logging.getLogger(__name__)
-FRESH_CACHE_SECONDS = 600  # 10 minutes
+FRESH_CACHE_SECONDS = 1200  # 20 minutes
 
 
 @dataclass
@@ -113,7 +112,7 @@ async def collect_sources_async(
             if cached:
                 screener_rows = _normalize_screener_rows(cached.get("data", []))
                 screener_from_cache = True
-                screener_warning = "ArbitrageScanner cache <10m; live fetch skipped."
+                screener_warning = "ArbitrageScanner cache <20m; live fetch skipped."
             else:
                 _emit(
                     "screener:start",
@@ -165,7 +164,7 @@ async def collect_sources_async(
                 try:
                     coinglass_rows = [_coinglass_row_from_cache(item) for item in cached["data"]]
                     coinglass_from_cache = True
-                    coinglass_warning = "Coinglass cache <10m; live fetch skipped."
+                    coinglass_warning = "Coinglass cache <20m; live fetch skipped."
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.warning("Cached Coinglass payload invalid: %s", exc)
             if not coinglass_rows:

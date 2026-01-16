@@ -18,9 +18,7 @@ class RiskConfig:
     min_free_balance_abs: float = 500.0
     min_free_balance_rel: float = 0.10    # 10% of used margin
 
-    balance_check_interval_sec: int = 60
-    position_check_interval_sec: int = 60
-    panic_close_batch_size: int = 2
+    position_check_interval_sec: int = 600
 
     protective_warn_cooldown_sec: int = 600
 

@@ -70,6 +70,8 @@ class ProtectiveOrderManager:
         self._blocked = {ex.lower() for ex in (blocked_exchanges or {"mexc"})}
         self._lock = asyncio.Lock()
         self._warned_at: dict[str, float] = {}
+        self._existing_cache: dict[tuple[str, str, str | None, str | None, float | None, float | None], tuple[dict[str, Any], float]] = {}
+        self._existing_cache_ttl = 30.0
 
     def update_config(self, risk_config: RiskConfig) -> None:
         self._risk_config = risk_config
@@ -299,6 +301,13 @@ class ProtectiveOrderManager:
                 "symbol": target.symbol,
                 "status": "skipped",
                 "reason": "zero_quantity",
+            }
+        if target.stop is None and not target.takes:
+            return {
+                "exchange": target.exchange,
+                "symbol": target.symbol,
+                "status": "skipped",
+                "reason": "no_targets",
             }
         if target.exchange in self._blocked:
             existing: dict[str, Any] = {"order_ids": []}
@@ -544,6 +553,19 @@ class ProtectiveOrderManager:
         mark_price: float | None = None,
         entry_price: float | None = None,
     ) -> dict[str, Any]:
+        cache_key = self._existing_cache_key(
+            gateway.slug,
+            symbol,
+            position_id,
+            side,
+            mark_price,
+            entry_price,
+        )
+        cached = self._existing_cache.get(cache_key)
+        if cached:
+            payload, ts = cached
+            if time.time() - ts <= self._existing_cache_ttl:
+                return self._clone_existing(payload)
         orders: list[dict[str, Any]] = []
         try:
             # KuCoin stop orders live in a separate endpoint; fetch both.
@@ -705,7 +727,7 @@ class ProtectiveOrderManager:
             else:
                 stop_val = min(stop_candidates)
                 take_val = max(stop_candidates)
-        return {
+        result = {
             "stop": stop_val,
             "take": take_val,
             "stop_orders": stop_orders,
@@ -714,6 +736,50 @@ class ProtectiveOrderManager:
             "order_ids": order_ids,
             "algo_order_ids": algo_order_ids,
             "invalid_side": invalid_side,
+        }
+        if len(self._existing_cache) > 500:
+            self._existing_cache.clear()
+        self._existing_cache[cache_key] = (self._clone_existing(result), time.time())
+        return result
+
+    @staticmethod
+    def _round_cache_value(value: float | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            return round(float(value), 4)
+        except Exception:
+            return None
+
+    def _existing_cache_key(
+        self,
+        exchange: str,
+        symbol: str,
+        position_id: str | None,
+        side: str | None,
+        mark_price: float | None,
+        entry_price: float | None,
+    ) -> tuple[str, str, str | None, str | None, float | None, float | None]:
+        return (
+            exchange,
+            symbol,
+            position_id,
+            side,
+            self._round_cache_value(mark_price),
+            self._round_cache_value(entry_price),
+        )
+
+    @staticmethod
+    def _clone_existing(payload: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "stop": payload.get("stop"),
+            "take": payload.get("take"),
+            "stop_orders": list(payload.get("stop_orders") or []),
+            "take_orders": list(payload.get("take_orders") or []),
+            "unknown_orders": list(payload.get("unknown_orders") or []),
+            "order_ids": list(payload.get("order_ids") or []),
+            "algo_order_ids": list(payload.get("algo_order_ids") or []),
+            "invalid_side": bool(payload.get("invalid_side")),
         }
 
     def _is_protective_order(

@@ -102,6 +102,7 @@ Recent Changes
 - Fixed dry-run crash when liquidity check passed (guarded missing message in `execution/manual.py`).
 - Smart-exit no longer does pre-exit position alignment via market orders; market submits now include explicit `reason=` in logs (`execution/manual.py`).
 Recent Changes
+- BingX order/position WS now decode zlib/gzip frames and treat ping/pong messages as live signals, responding to ping variants (`execution/ws_orders.py`, `execution/ws_positions.py`).
 - Live order/trade WS tracking added in `execution/ws_orders.py` for Bybit/OKX/Gate/Bitget/Kucoin/BingX.
 - Smart enter/exit now sync primary fills and hedge control via WS order updates (REST only when WS is stale).
 - Fast enter/exit (market) now waits for WS order fills and orderbook refill before next chunk; final reconcile uses REST positions.
@@ -223,6 +224,13 @@ Recent Changes
 - Smart-exit final reconcile now compares start vs end deltas to only market-close the lagging leg.
 - Manual execution logs now include the initial manual payload in execution logs.
 - Manual UI log blocks are compacted for single-screen visibility (smaller log heights, no-wrap logs).
+- Created code backup at `backups/feeArb-20260115-163416.zip` (excluded `.git`, `.venv`, `__pycache__`, `.pytest_cache`, `logs`, `data`, `snapshots`, `state`, `.env`) ahead of refactor analysis.
+- Agreed timing updates: `parser_refresh_seconds=1200`, `exchange_refresh_seconds=300`, `account_refresh_seconds=60`, `positions_market_refresh_seconds=60`, `position_check_interval_sec=600` (stops).
+- Aligned candidates cache TTLs to 20 minutes (`PARSE_CACHE_TTL_SECONDS=1200`, `FRESH_CACHE_SECONDS=1200`) to reduce source polling.
+- Positions-market refresh now skips when accounts snapshot hasn't changed; funding live fetches use a short in-memory cache to avoid repeated API calls (`webapp/services.py`).
+- Protective stop sync now skips legs with no targets and caches existing open-order fetches briefly to reduce duplicate API calls; positions-market fetches are concurrency-limited for stability (`risk/stop_manager.py`, `webapp/services.py`).
+- Backups created before cleanup: `backups/feeArb-20260116-135855.zip` and `backups/deadcode-files-20260116-135920.zip`.
+- Removed unused modules/settings: `pipeline/source_cache.py`, `orchestrator/realtime_validator.py`, `webapp/services.py:_extend_universe_with_positions`, `project_settings.py:refresh_intervals`, and deprecated risk settings (`balance_check_interval_sec`, `panic_close_batch_size`).
 
 Next Steps (Planned)
 - Review and possibly trim dry-run scope (constraints collection and exchange set).
