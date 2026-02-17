@@ -49,9 +49,11 @@ def build_top(
     rows: Iterable[dict],
     *,
     exclude: tuple[str, ...] = ("binance",),
+    include: tuple[str, ...] | None = None,
     limit: int = 10,
 ) -> list[dict]:
     excludes = tuple(s.lower() for s in (exclude or ()))
+    includes = tuple(s.lower() for s in (include or ()))
     results: list[dict] = []
 
     for row in rows:
@@ -65,7 +67,10 @@ def build_top(
             if isinstance(item, dict)
             and "exchange" in item
             and "rate" in item
-            and not any(ex in str(item["exchange"]).lower() for ex in excludes)
+            and (
+                (includes and any(inc in str(item["exchange"]).lower() for inc in includes))
+                or (not includes and not any(ex in str(item["exchange"]).lower() for ex in excludes))
+            )
         ]
         if len(filtered) < 2 or not symbol:
             continue

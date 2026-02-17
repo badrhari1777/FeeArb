@@ -11,7 +11,7 @@ from typing import Optional
 
 import websockets
 from fastapi import WebSocket
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from config import BASE_DIR
 from execution.accounts import EXCHANGE_SPECS, ExchangeGateway, _bootstrap_env
@@ -45,8 +45,18 @@ class WsTradePrivateRawStream:
 
     async def run(self) -> None:
         try:
+            if self._websocket.application_state == WebSocketState.CONNECTING:
+                await self._websocket.accept()
             while True:
-                message = await self._websocket.receive_json()
+                if (
+                    self._websocket.application_state != WebSocketState.CONNECTED
+                    or self._websocket.client_state != WebSocketState.CONNECTED
+                ):
+                    break
+                try:
+                    message = await self._websocket.receive_json()
+                except (WebSocketDisconnect, RuntimeError):
+                    break
                 action = str(message.get("action") or "")
                 if action == "connect":
                     await self._connect()

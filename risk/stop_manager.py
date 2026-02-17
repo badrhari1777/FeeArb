@@ -10,19 +10,25 @@ halt the main refresh loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from execution.accounts import EXCHANGE_SPECS, ExchangeGateway, normalize_symbol, _safe_float
+from exchanges import get_adapter
 try:  # ccxt is optional for typing; handled at runtime.
     from ccxt.base.errors import RequestTimeout  # type: ignore
 except Exception:  # pragma: no cover - fallback when ccxt missing
     RequestTimeout = tuple()  # type: ignore
 from risk.config import RiskConfig
-from utils.cache_db import get_or_fetch_symbol_meta
+from utils.cache_db import SymbolMeta, get_or_fetch_symbol_meta, upsert_symbol_meta
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -39,6 +45,23 @@ protective_logger.setLevel(logging.INFO)
 protective_logger.propagate = False
 
 
+def _fetch_json(url: str) -> dict:
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+    try:
+        with urlopen(req, timeout=10) as resp:  # nosec
+            return json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        try:
+            payload = exc.read()
+            if payload:
+                return json.loads(payload.decode("utf-8"))
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return {"code": exc.code, "msg": str(exc)}
+    except URLError as exc:
+        return {"code": "url_error", "msg": str(exc)}
+
+
 @dataclass(slots=True)
 class ProtectiveTarget:
     stop: float | None
@@ -49,6 +72,7 @@ class ProtectiveTarget:
     symbol: str
     position_id: str | None
     margin_mode: str | None = None
+    pos_side: str | None = None
     mark_price: float | None = None
     entry_price: float | None = None
 
@@ -57,6 +81,14 @@ class ProtectiveTarget:
 class TakeTarget:
     price: float
     quantity: float
+
+
+class InvalidProtectivePrice(ValueError):
+    """Raised when a computed stop/take price is invalid for placement."""
+
+
+def _as_bool_text(value: bool) -> str:
+    return "true" if value else "false"
 
 
 class ProtectiveOrderManager:
@@ -73,14 +105,134 @@ class ProtectiveOrderManager:
         self._existing_cache: dict[tuple[str, str, str | None, str | None, float | None, float | None], tuple[dict[str, Any], float]] = {}
         self._existing_cache_ttl = 30.0
 
+    def _refresh_symbol_meta(self, gateway: ExchangeGateway, symbol: str) -> SymbolMeta | None:
+        if gateway.slug != "binance":
+            return None
+        try:
+            adapter = get_adapter("binance")
+        except Exception:
+            return None
+        exch_symbol = adapter.map_symbol(symbol) or symbol
+        url = f"{getattr(adapter, 'base_url', 'https://fapi.binance.com')}/fapi/v1/exchangeInfo?"
+        payload = _fetch_json(url + urlencode({"symbol": exch_symbol}))
+        if payload.get("code") not in (None, 0):
+            return None
+        items = payload.get("symbols") or []
+        info = items[0] if items else None
+        if not info:
+            return None
+        filters = {item.get("filterType"): item for item in info.get("filters") or []}
+        price_filter = filters.get("PRICE_FILTER") or {}
+        lot_filter = filters.get("LOT_SIZE") or filters.get("MARKET_LOT_SIZE") or {}
+        notional_filter = filters.get("MIN_NOTIONAL") or {}
+        meta = SymbolMeta(
+            exchange=gateway.slug,
+            symbol=exch_symbol,
+            contract_size=_safe_float(info.get("contractSize")) or 1.0,
+            price_step=_safe_float(price_filter.get("tickSize")),
+            qty_step=_safe_float(lot_filter.get("stepSize")),
+            min_qty=_safe_float(lot_filter.get("minQty")),
+            max_qty=_safe_float(lot_filter.get("maxQty")),
+            min_notional=_safe_float(notional_filter.get("notional") or notional_filter.get("minNotional")),
+            max_leverage=_safe_float(info.get("maxLeverage")),
+            tick_size=_safe_float(price_filter.get("tickSize")),
+        )
+        upsert_symbol_meta(meta)
+        return meta
+
+    async def _binance_algo_request(
+        self,
+        gateway: ExchangeGateway,
+        *,
+        method: str,
+        path: str,
+        params: Mapping[str, Any],
+    ) -> Any:
+        client = gateway.client
+        if client is None:
+            raise RuntimeError("client_unavailable")
+        return await client.request(path, "fapiPrivate", method, dict(params))
+
+    async def _cancel_binance_algo_order(
+        self,
+        gateway: ExchangeGateway,
+        *,
+        algo_id: str,
+    ) -> None:
+        await self._binance_algo_request(
+            gateway,
+            method="DELETE",
+            path="algoOrder",
+            params={"algoId": algo_id},
+        )
+
+    async def _fetch_binance_open_algo_orders(
+        self,
+        gateway: ExchangeGateway,
+        symbol: str,
+    ) -> list[dict[str, Any]]:
+        exch_symbol = gateway.map_symbol(symbol) or symbol
+        payload = await self._binance_algo_request(
+            gateway,
+            method="GET",
+            path="openAlgoOrders",
+            params={"symbol": exch_symbol},
+        )
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            return list(payload.get("orders") or payload.get("data") or payload.get("rows") or [])
+        return []
+
+    async def _place_binance_algo_conditional(
+        self,
+        gateway: ExchangeGateway,
+        target: ProtectiveTarget,
+        *,
+        order_type: str,
+        trigger_price: float,
+        quantity: float,
+    ) -> None:
+        client = gateway.client
+        if client is None:
+            raise RuntimeError("client_unavailable")
+        exch_symbol = gateway.map_symbol(target.symbol) or target.symbol
+        side = "SELL" if target.side == "long" else "BUY"
+        params: dict[str, Any] = {
+            "algoType": "CONDITIONAL",
+            "symbol": exch_symbol,
+            "side": side,
+            "type": order_type,
+        }
+        symbol_for_precision = target.symbol
+        try:
+            params["triggerPrice"] = client.price_to_precision(symbol_for_precision, trigger_price)
+        except Exception:
+            params["triggerPrice"] = trigger_price
+        try:
+            params["quantity"] = client.amount_to_precision(symbol_for_precision, quantity)
+        except Exception:
+            params["quantity"] = quantity
+        pos_side = str(target.pos_side or "").strip().lower()
+        if pos_side in ("long", "short"):
+            params["positionSide"] = pos_side.upper()
+        elif pos_side in ("net", "both"):
+            params["positionSide"] = "BOTH"
+        if params.get("positionSide") in (None, "", "BOTH"):
+            params["reduceOnly"] = _as_bool_text(True)
+        await self._binance_algo_request(
+            gateway,
+            method="POST",
+            path="algoOrder",
+            params=params,
+        )
+
     def update_config(self, risk_config: RiskConfig) -> None:
         self._risk_config = risk_config
 
     async def sync_protective_orders(
         self,
         positions: Iterable[Mapping[str, Any]],
-        *,
-        anti_orphan_enabled: bool = False,
     ) -> list[dict[str, Any]]:
         """Compute and place protective orders for the supplied positions."""
         async with self._lock:
@@ -92,7 +244,7 @@ class ProtectiveOrderManager:
                 for target in targets:
                     tasks.append(
                         asyncio.create_task(
-                            self._sync_leg(target, anti_orphan_enabled=anti_orphan_enabled)
+                            self._sync_leg(target)
                         )
                     )
             if tasks:
@@ -116,6 +268,25 @@ class ProtectiveOrderManager:
     def _compute_targets(self, symbol: str, legs: list[Mapping[str, Any]]) -> list[ProtectiveTarget]:
         if not legs:
             return []
+
+        def _extract_pos_side(leg: Mapping[str, Any]) -> str | None:
+            raw = leg.get("raw") or {}
+            info = raw.get("info") if isinstance(raw, dict) else {}
+            candidates = [
+                leg.get("posSide"),
+                leg.get("positionSide"),
+                raw.get("posSide") if isinstance(raw, dict) else None,
+                raw.get("positionSide") if isinstance(raw, dict) else None,
+                info.get("posSide") if isinstance(info, dict) else None,
+                info.get("positionSide") if isinstance(info, dict) else None,
+            ]
+            for value in candidates:
+                if not value:
+                    continue
+                text = str(value).strip().lower()
+                if text in ("net", "long", "short"):
+                    return text
+            return None
 
         def _leg_qty(leg: Mapping[str, Any]) -> float:
             qty = _safe_float(leg.get("contracts"))
@@ -230,6 +401,7 @@ class ProtectiveOrderManager:
                     symbol=str(leg.get("symbol") or ""),
                     position_id=str(leg.get("position_id") or leg.get("id") or "") or None,
                     margin_mode=str(leg.get("marginMode") or leg.get("margin_mode") or leg.get("marginType") or leg.get("margin_type") or "").lower() or None,
+                    pos_side=_extract_pos_side(leg),
                     mark_price=_safe_float(info.get("mark")),
                     entry_price=_safe_float(info.get("entry")),
                 )
@@ -253,6 +425,7 @@ class ProtectiveOrderManager:
                     symbol=str(leg.get("symbol") or ""),
                     position_id=str(leg.get("position_id") or leg.get("id") or "") or None,
                     margin_mode=str(leg.get("marginMode") or leg.get("margin_mode") or leg.get("marginType") or leg.get("margin_type") or "").lower() or None,
+                    pos_side=_extract_pos_side(leg),
                     mark_price=_safe_float(info.get("mark")),
                     entry_price=_safe_float(info.get("entry")),
                 )
@@ -287,8 +460,6 @@ class ProtectiveOrderManager:
     async def _sync_leg(
         self,
         target: ProtectiveTarget,
-        *,
-        anti_orphan_enabled: bool,
     ) -> dict[str, Any]:
         gw = self._gateways.get(target.exchange)
         threshold = max(0.0, float(self._risk_config.stop_requote_threshold_pct))
@@ -451,6 +622,8 @@ class ProtectiveOrderManager:
                 to_cancel = [oid for oid in to_cancel if not (oid in seen or seen.add(oid))]
 
         take_skipped_min = False
+        stop_skipped_invalid = False
+        take_skipped_invalid = False
         try:
             if to_cancel:
                 algo_ids = set(existing.get("algo_order_ids") or [])
@@ -461,19 +634,31 @@ class ProtectiveOrderManager:
                             cancel_params["stop"] = True
                         if gw.slug == "gate":
                             cancel_params["trigger"] = True
+                        if gw.slug == "binance" and oid in algo_ids:
+                            await self._cancel_binance_algo_order(gw, algo_id=oid)
+                            continue
                         if gw.slug == "okx" and oid in algo_ids:
                             cancel_params["trigger"] = True
                         await gw.client.cancel_order(oid, target.symbol, params=cancel_params)
                     except Exception:  # pragma: no cover - defensive
                         logger.debug("%s cancel %s failed", target.exchange, oid)
             if target.stop and stop_diff:
-                await self._place_stop(gw, target, target.stop)
+                try:
+                    await self._place_stop(gw, target, target.stop)
+                except InvalidProtectivePrice as exc:
+                    stop_skipped_invalid = True
+                    actions["error"] = str(exc)
+                    logger.info("Skipping stop placement (invalid price) for %s %s: %s", target.exchange, target.symbol, exc)
             if target.takes and take_diff:
                 for take in target.takes:
                     if take.quantity <= 0:
                         continue
                     try:
                         await self._place_take(gw, target, take.price, quantity=take.quantity)
+                    except InvalidProtectivePrice as exc:
+                        take_skipped_invalid = True
+                        actions["error"] = str(exc)
+                        logger.info("Skipping take placement (invalid price) for %s %s: %s", target.exchange, target.symbol, exc)
                     except Exception as exc:  # pylint: disable=broad-except
                         msg = str(exc)
                         # Bybit enforces TP >=10% of position size; degrade gracefully.
@@ -483,10 +668,11 @@ class ProtectiveOrderManager:
                             logger.info("Skipping take placement (min-size) for %s %s: %s", target.exchange, target.symbol, msg)
                         else:
                             raise
-            if anti_orphan_enabled and target.takes and target.stop and not take_diff:
-                # Ensure we always have both sides when requested.
-                await self._ensure_dual_orders(gw, target, existing)
-            if take_skipped_min:
+            if stop_skipped_invalid:
+                actions["status"] = "stop_skipped_invalid_price"
+            elif take_skipped_invalid:
+                actions["status"] = "take_skipped_invalid_price"
+            elif take_skipped_min:
                 actions["status"] = "take_skipped_min_size"
             else:
                 actions["status"] = "updated" if (stop_diff or take_diff) else "unchanged"
@@ -573,6 +759,52 @@ class ProtectiveOrderManager:
                 default_orders = await gateway.client.fetch_open_orders(symbol)  # type: ignore[union-attr]
                 stop_orders = await gateway.client.fetch_open_orders(symbol, params={"stop": True})  # type: ignore[union-attr]
                 orders = (default_orders or []) + (stop_orders or [])
+            elif gateway.slug == "binance":
+                orders = []
+                try:
+                    orders += await gateway.client.fetch_open_orders(symbol)  # type: ignore[union-attr]
+                except Exception:
+                    pass
+                try:
+                    algo_payload = await self._fetch_binance_open_algo_orders(gateway, symbol)
+                    for item in algo_payload or []:
+                        if not isinstance(item, dict):
+                            continue
+                        info = dict(item)
+                        algo_id = str(
+                            info.get("algoId")
+                            or info.get("algoOrderId")
+                            or info.get("id")
+                            or info.get("clientAlgoId")
+                            or ""
+                        )
+                        if not algo_id:
+                            continue
+                        if "algoId" not in info:
+                            info["algoId"] = algo_id
+                        order_type = str(info.get("orderType") or info.get("type") or "").lower()
+                        algo_side = str(info.get("side") or "").lower()
+                        qty = _safe_float(
+                            info.get("quantity") or info.get("origQty") or info.get("amount")
+                        )
+                        trigger = _safe_float(
+                            info.get("triggerPrice")
+                            or info.get("stopPrice")
+                            or info.get("triggerPx")
+                        )
+                        orders.append(
+                            {
+                                "id": algo_id,
+                                "type": order_type,
+                                "side": algo_side,
+                                "amount": qty,
+                                "stopPrice": trigger,
+                                "reduceOnly": info.get("reduceOnly"),
+                                "info": info,
+                            }
+                        )
+                except Exception:
+                    pass
             elif gateway.slug == "okx":
                 default_orders = await gateway.client.fetch_open_orders(symbol)  # type: ignore[union-attr]
                 trigger_orders = await gateway.client.fetch_open_orders(  # type: ignore[union-attr]
@@ -643,9 +875,36 @@ class ProtectiveOrderManager:
             trigger_info = info.get("trigger")
             if not isinstance(trigger_info, dict):
                 trigger_info = {}
+            def _coerce_dict(value: object) -> dict[str, Any] | None:
+                if isinstance(value, dict):
+                    return value
+                if isinstance(value, str):
+                    text = value.strip()
+                    if text.startswith("{") and text.endswith("}"):
+                        try:
+                            parsed = json.loads(text)
+                        except Exception:
+                            return None
+                        if isinstance(parsed, dict):
+                            return parsed
+                return None
+
+            def _extract_trigger_price(payload: dict[str, Any]) -> float | None:
+                return _safe_float(
+                    payload.get("stopPrice")
+                    or payload.get("triggerPrice")
+                    or payload.get("stopLossPrice")
+                    or payload.get("takeProfitPrice")
+                    or payload.get("stopLoss")
+                    or payload.get("takeProfit")
+                    or payload.get("price")
+                )
             stop_px = _safe_float(
-                info.get("stopLossPrice")
+                order.get("stopLossPrice")
+                or order.get("stopLoss")
+                or info.get("stopLossPrice")
                 or info.get("stopLoss")
+                or info.get("stopLossEntrustPrice")
                 or info.get("slTriggerPx")
                 or order.get("stopPrice")
                 or order.get("triggerPrice")
@@ -655,18 +914,28 @@ class ProtectiveOrderManager:
                 or trigger_info.get("price")
                 or trigger_info.get("trigger_price")
             )
+            if stop_px is None:
+                stop_payload = _coerce_dict(order.get("stopLoss")) or _coerce_dict(info.get("stopLoss"))
+                if stop_payload:
+                    stop_px = _extract_trigger_price(stop_payload)
             take_info = info.get("takeProfit")
             if not isinstance(take_info, dict):
                 take_info = {}
             take_px = _safe_float(
-                info.get("takeProfitPrice")
+                order.get("takeProfitPrice")
+                or order.get("takeProfit")
+                or info.get("takeProfitPrice")
                 or info.get("takeProfitEntrustPrice")
                 or info.get("tpTriggerPx")
             )
             if take_px is None:
-                take_px = _safe_float(info.get("takeProfit"))
+                take_px = _safe_float(order.get("takeProfit") or info.get("takeProfit"))
             if take_px is None:
                 take_px = _safe_float(take_info.get("stopPrice"))
+            if take_px is None:
+                take_payload = _coerce_dict(order.get("takeProfit")) or _coerce_dict(info.get("takeProfit"))
+                if take_payload:
+                    take_px = _extract_trigger_price(take_payload)
             reduce_flag = info.get("reduceOnly") or info.get("reduce_only") or order.get("reduceOnly")
             is_protective = self._is_protective_order(gateway.slug, order, info, stop_px, take_px, otype)
             if not is_protective:
@@ -674,6 +943,13 @@ class ProtectiveOrderManager:
             oid = str(order.get("id") or "")
             if oid:
                 order_ids.append(oid)
+            if gateway.slug == "binance":
+                algo_id = str(info.get("algoId") or "")
+                if algo_id:
+                    if algo_id not in algo_order_ids:
+                        algo_order_ids.append(algo_id)
+                    if algo_id not in order_ids:
+                        order_ids.append(algo_id)
             if gateway.slug == "okx":
                 algo_id = str(info.get("algoId") or "")
                 if algo_id:
@@ -944,12 +1220,37 @@ class ProtectiveOrderManager:
 
     async def _place_stop(self, gateway: ExchangeGateway, target: ProtectiveTarget, price: float) -> None:
         symbol = gateway.map_symbol(target.symbol)
-        rounded = await self._round_price(gateway, symbol, price)
+        rounded, tick = await self._round_price(gateway, symbol, price)
+        if rounded is None or not math.isfinite(rounded) or rounded <= 0:
+            raise InvalidProtectivePrice(
+                f"invalid_stop_price exchange={gateway.slug} symbol={symbol} price={price}"
+            )
+        if gateway.slug == "binance" and tick and rounded <= tick:
+            raise InvalidProtectivePrice(
+                f"invalid_stop_price exchange=binance symbol={symbol} price={rounded} min_tick={tick}"
+            )
         params = {
             "reduceOnly": True,
         }
+        order_type = "market"
         # Exchange-specific hints
-        if gateway.slug == "bitget":
+        if gateway.slug == "bybit":
+            params.update(
+                {
+                    "stopLossPrice": rounded,
+                    "tpslMode": "Full",
+                }
+            )
+        elif gateway.slug == "binance":
+            await self._place_binance_algo_conditional(
+                gateway,
+                target,
+                order_type="STOP_MARKET",
+                trigger_price=rounded,
+                quantity=target.quantity,
+            )
+            return
+        elif gateway.slug == "bitget":
             margin_coin = "USDT" if symbol.upper().endswith("USDT") else None
             # Bitget one-way mode expects holdSide=buy/sell (not long/short).
             hold_side = "buy" if target.side == "long" else "sell"
@@ -966,8 +1267,9 @@ class ProtectiveOrderManager:
                 params["marginCoin"] = margin_coin
         elif gateway.slug == "okx":
             params["stopLossPrice"] = rounded
-            if target.side in ("long", "short"):
-                params["posSide"] = target.side
+            pos_side = target.pos_side or target.side
+            if pos_side in ("net", "long", "short"):
+                params["posSide"] = pos_side
             if target.margin_mode in ("isolated", "cross"):
                 params["tdMode"] = target.margin_mode
         elif gateway.slug == "kucoin":
@@ -985,7 +1287,7 @@ class ProtectiveOrderManager:
             params["stopLossPrice"] = rounded
         await gateway.client.create_order(  # type: ignore[union-attr]
             symbol=symbol,
-            type="market",
+            type=order_type,
             side="sell" if target.side == "long" else "buy",
             amount=target.quantity,
             params=params,
@@ -1000,11 +1302,37 @@ class ProtectiveOrderManager:
         quantity: float | None = None,
     ) -> None:
         symbol = gateway.map_symbol(target.symbol)
-        rounded = await self._round_price(gateway, symbol, price)
+        rounded, tick = await self._round_price(gateway, symbol, price)
+        if rounded is None or not math.isfinite(rounded) or rounded <= 0:
+            raise InvalidProtectivePrice(
+                f"invalid_take_price exchange={gateway.slug} symbol={symbol} price={price}"
+            )
+        if gateway.slug == "binance" and tick and rounded <= tick:
+            raise InvalidProtectivePrice(
+                f"invalid_take_price exchange=binance symbol={symbol} price={rounded} min_tick={tick}"
+            )
         params = {
             "reduceOnly": True,
         }
-        if gateway.slug == "bitget":
+        order_type = "market"
+        if gateway.slug == "bybit":
+            params.update(
+                {
+                    "takeProfitPrice": rounded,
+                    "tpslMode": "Full",
+                }
+            )
+        elif gateway.slug == "binance":
+            order_qty = quantity if quantity is not None else target.quantity
+            await self._place_binance_algo_conditional(
+                gateway,
+                target,
+                order_type="TAKE_PROFIT_MARKET",
+                trigger_price=rounded,
+                quantity=order_qty,
+            )
+            return
+        elif gateway.slug == "bitget":
             margin_coin = "USDT" if symbol.upper().endswith("USDT") else None
             # Bitget one-way mode expects holdSide=buy/sell (not long/short).
             hold_side = "buy" if target.side == "long" else "sell"
@@ -1021,8 +1349,9 @@ class ProtectiveOrderManager:
                 params["marginCoin"] = margin_coin
         elif gateway.slug == "okx":
             params["takeProfitPrice"] = rounded
-            if target.side in ("long", "short"):
-                params["posSide"] = target.side
+            pos_side = target.pos_side or target.side
+            if pos_side in ("net", "long", "short"):
+                params["posSide"] = pos_side
             if target.margin_mode in ("isolated", "cross"):
                 params["tdMode"] = target.margin_mode
         elif gateway.slug == "kucoin":
@@ -1041,38 +1370,41 @@ class ProtectiveOrderManager:
         order_qty = quantity if quantity is not None else target.quantity
         await gateway.client.create_order(  # type: ignore[union-attr]
             symbol=symbol,
-            type="market",
+            type=order_type,
             side="sell" if target.side == "long" else "buy",
             amount=order_qty,
             params=params,
         )
 
-    async def _ensure_dual_orders(
+    async def _round_price(
         self,
         gateway: ExchangeGateway,
-        target: ProtectiveTarget,
-        existing: Mapping[str, Any],
-    ) -> None:
-        """If only one side exists, re-place the missing leg."""
-        if target.stop and not (existing.get("stop_orders") or []):
-            await self._place_stop(gateway, target, target.stop)
-        if target.takes and not (existing.get("take_orders") or []):
-            for take in target.takes:
-                if take.quantity <= 0:
-                    continue
-                await self._place_take(gateway, target, take.price, quantity=take.quantity)
-
-    async def _round_price(self, gateway: ExchangeGateway, symbol: str, price: float) -> float:
+        symbol: str,
+        price: float,
+    ) -> tuple[float | None, float | None]:
         """Round price to tick size when metadata is available."""
         sym_meta = get_or_fetch_symbol_meta(gateway.slug, gateway.map_symbol(symbol) or symbol, lambda: None)
         tick = getattr(sym_meta, "tick_size", None) if sym_meta else None
         if not tick or tick <= 0:
-            return price
+            return price, None
         try:
+            if price > 0 and tick >= price:
+                refreshed = self._refresh_symbol_meta(gateway, symbol)
+                tick = refreshed.tick_size if refreshed else tick
+                if not tick or tick <= 0 or tick >= price:
+                    return price, None
             steps = round(price / tick)
-            return steps * tick
+            if steps <= 0:
+                refreshed = self._refresh_symbol_meta(gateway, symbol)
+                tick = refreshed.tick_size if refreshed else tick
+                if not tick or tick <= 0:
+                    return price, None
+                steps = round(price / tick)
+                if steps <= 0:
+                    return price, None
+            return steps * tick, tick
         except Exception:
-            return price
+            return price, tick
 
     def _fallback_take_price(
         self, side: str, *, mark_price: float | None, entry_price: float | None, ratio: float

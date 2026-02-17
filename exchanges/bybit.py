@@ -12,7 +12,7 @@ from orchestrator.models import MarketSnapshot
 from .base import ExchangeAdapter
 from utils.missing_symbols import is_recently_missing, record_missing
 from utils.cache_db import SymbolMeta, get_or_fetch_symbol_meta, get_or_fetch_funding_history
-from utils.cache_db import SymbolMeta, get_or_fetch_symbol_meta
+from utils.funding import enrich_history_intervals, parse_timestamp_ms
 
 
 logger = logging.getLogger(__name__)
@@ -151,7 +151,7 @@ class BybitAdapter(ExchangeAdapter):
         )
 
     def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
-        """Return cached funding history (8h interval) with ~2m refresh TTL."""
+        """Return cached funding history with ~2m refresh TTL."""
         exchange_symbol = self.map_symbol(symbol) or symbol
 
         def _fetch() -> list[dict]:
@@ -173,16 +173,16 @@ class BybitAdapter(ExchangeAdapter):
             items = payload.get("result", {}).get("list") or []
             out: list[dict] = []
             for item in items:
-                ts = _to_float(item.get("fundingRateTimestamp"))
+                ts_ms = parse_timestamp_ms(item.get("fundingRateTimestamp"))
                 out.append(
                     {
-                        "ts_ms": int(ts) if ts is not None else 0,
+                        "ts_ms": ts_ms or 0,
                         "rate": _to_float(item.get("fundingRate")),
-                        "interval_hours": 8.0,
+                        "interval_hours": None,
                         "mark_price": _to_float(item.get("markPrice")),
                     }
                 )
-            return out
+            return enrich_history_intervals(out)
 
         return get_or_fetch_funding_history(
             self.name,

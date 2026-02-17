@@ -16,6 +16,7 @@ from execution.manual import spread_pct
 from execution.accounts import _safe_float
 from exchanges import normalize_exchange_name
 from .manual_symbols import (
+    _normalize_binance_symbol,
     _normalize_bingx_symbol,
     _normalize_bitget_symbol,
     _normalize_bybit_symbol,
@@ -28,6 +29,7 @@ from .manual_symbols import (
 logger = logging.getLogger(__name__)
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
+BINANCE_WS_URL = "wss://fstream.binance.com/ws"
 BINGX_WS_URL = "wss://open-api-swap.bingx.com/swap-market"
 MEXC_WS_URL = "wss://contract.mexc.com/edge"
 BITGET_WS_URL = "wss://ws.bitget.com/v2/ws/public"
@@ -176,6 +178,8 @@ class ManualSpreadStream:
         self._subscriptions = self._build_subscriptions(symbol, exchanges)
         if "bybit" in exchanges:
             self._tasks.append(asyncio.create_task(self._bybit_loop(symbol)))
+        if "binance" in exchanges:
+            self._tasks.append(asyncio.create_task(self._binance_loop(symbol)))
         if "bingx" in exchanges:
             self._tasks.append(asyncio.create_task(self._bingx_loop(symbol)))
         if "mexc" in exchanges:
@@ -330,6 +334,39 @@ class ManualSpreadStream:
                         )
             except Exception as exc:
                 logger.debug("Bybit WS error: %s", exc)
+                await asyncio.sleep(1.0)
+
+    async def _binance_loop(self, symbol: str) -> None:
+        stream_symbol = _normalize_binance_symbol(symbol).lower()
+        if not stream_symbol:
+            return
+        ws_url = f"{BINANCE_WS_URL}/{stream_symbol}@depth20@100ms"
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(
+                    ws_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_size=1_000_000,
+                ) as ws:
+                    while not self._stop.is_set():
+                        message = await ws.recv()
+                        text = _decode_message(message)
+                        if not text:
+                            continue
+                        payload = json.loads(text)
+                        bids = _parse_levels(payload.get("b") or [], side="bid", allow_zero=True)
+                        asks = _parse_levels(payload.get("a") or [], side="ask", allow_zero=True)
+                        if not bids or not asks:
+                            continue
+                        await self._queue.put(
+                            {
+                                "exchange": "binance",
+                                "book": OrderBookLite(bids=bids, asks=asks),
+                            }
+                        )
+            except Exception as exc:
+                logger.debug("Binance WS error: %s", exc)
                 await asyncio.sleep(1.0)
 
     async def _bingx_loop(self, symbol: str) -> None:
@@ -661,6 +698,9 @@ class ManualSpreadStream:
         if "bybit" in exchanges:
             bybit_symbol = _normalize_bybit_symbol(symbol)
             subs["bybit"] = f"bybit orderbook.50.{bybit_symbol}"
+        if "binance" in exchanges:
+            binance_symbol = _normalize_binance_symbol(symbol).lower()
+            subs["binance"] = f"binance depth20 {binance_symbol}"
         if "bingx" in exchanges:
             bingx_symbol = _normalize_bingx_symbol(symbol)
             interval = "200ms" if bingx_symbol in ("BTC-USDT", "ETH-USDT") else "500ms"

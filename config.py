@@ -19,14 +19,19 @@ STATE_DIR: Final[Path] = BASE_DIR / "state"
 
 # Exchanges we currently support across the pipeline.
 SUPPORTED_EXCHANGES: Final[List[str]] = [
+    "binance",
+    "okx",
     "bybit",
+    "gate",
+    "bitget",
+    "bingx",
     "mexc",
     "kucoin",
-    # Remaining adapters stay registered but are inactive by default.
 ]
 
 # Default maker/taker commission rates (VIP 0) for perp contracts.
 EXCHANGE_COMMISSIONS: Final[Dict[str, Dict[str, float]]] = {
+    "binance": {"maker": 0.0002, "taker": 0.0004},
     "bybit": {"maker": 0.000324, "taker": 0.0009},
     "okx": {"maker": 0.0002, "taker": 0.0005},
     "bingx": {"maker": 0.0002, "taker": 0.0005},

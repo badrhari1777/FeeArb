@@ -82,6 +82,78 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Funding interval/next-funding refactor completed across adapters + services: added shared helpers for timestamp normalization, interval inference, stale-next detection, and future-slot projection; removed hard-coded `8h` fallbacks from history paths; fixed BingX seconds-vs-milliseconds timestamp parsing bug; updated manual funding test + live funding fallback to compute `next_funding` from resolved interval/history instead of fixed defaults (`utils/funding.py`, `exchanges/binance.py`, `exchanges/bybit.py`, `exchanges/okx.py`, `exchanges/gate.py`, `exchanges/bitget.py`, `exchanges/mexc.py`, `exchanges/bingx.py`, `webapp/services.py`).
+- Added regression tests for funding time/interval logic, service-layer interval resolution, and per-exchange history parsing (`tests/test_funding_utils.py`, `tests/test_webapp_funding_helpers.py`, `tests/test_funding_history_adapters.py`).
+- Telegram position digest freshness and completeness improved: hourly send window widened to `:40..:59` (send once per hour slot after latest account refresh), summary now tries live per-leg `fetch_funding_rate` when funding is missing in raw positions, and duplicated settle suffixes are normalized in symbols (e.g., `RIVERUSDTUSDT` -> `RIVERUSDT`) (`execution/accounts.py`, `tests/test_account_monitor.py`).
+- Telegram periodic summary is now a position digest (variant 3) instead of balance lines: per symbol it prints long-first exchange abbreviations, symbol, nominal, spread delta, funding delta %, and optional non-zero quantity delta (`qDelta`); margin/stop alert paths remain unchanged (`execution/accounts.py`, `tests/test_account_monitor.py`).
+- Added a dedicated mobile UI route `/mobile` with phone-first quick actions (analyze/execute/stop), execution log polling, and per-position auto-exit controls using existing manual/auto-exit APIs; desktop headers now link to Mobile UI, and static build version was bumped to `v2026-02-15-01` (`webapp/templates/mobile.html`, `webapp/static/mobile.js`, `webapp/static/styles.css`, `webapp/app.py`, `webapp/templates/index.html`, `webapp/templates/manual.html`, `webapp/templates/manual_tests.html`, `webapp/templates/spread_monitor.html`).
+- Static assets are now referenced via relative `/static/...` paths in templates (instead of `url_for('static')`) to avoid mixed-content / wrong-scheme issues behind HTTPS reverse proxies (notably Tailscale Funnel), so the UI renders identically on `http://127.0.0.1:8000` and `https://<machine>.<tailnet>.ts.net` (`webapp/templates/index.html`, `webapp/templates/manual.html`, `webapp/templates/manual_tests.html`, `webapp/templates/spread_monitor.html`, `webapp/templates/coin.html`).
+- Added Windows ops docs + scripts to autostart a public Funnel-proxied UI with BasicAuth (Caddy on `127.0.0.1:18080` -> FeeArb on `127.0.0.1:8000`, Funnel points to Caddy). Scripts install a Scheduled Task running as SYSTEM at boot (`docs/ops/tailscale_funnel_autostart_windows.md`, `scripts/windows/start_feearb_public.ps1`, `scripts/windows/install_autostart_task.ps1`, `scripts/windows/uninstall_autostart_task.ps1`).
+- Binance time-drift hardening: exchange gateway now runs signed `fetch_balance`/`fetch_positions` via time-sync-aware retry (on `-1021`/timestamp recvWindow errors it calls `load_time_difference()` and retries once), and Binance leverage precheck in manual execution now does the same for direct `fetch_positions` calls (`execution/accounts.py`, `execution/manual.py`).
+- Manual Tests now includes a dedicated Coin Analysis block and backend endpoint `/api/manual/test/coin-analysis` (symbol/window/funding_points + optional full candles series), returning both compact summary and full analysis payload for candidate validation; static build bumped to `v2026-02-14-03` (`webapp/templates/manual_tests.html`, `webapp/static/manual_tests.js`, `webapp/app.py`, `webapp/services.py`).
+- Coin analysis switched to on-demand historical pull (no pre-recording assumptions): core exchanges are Binance+OKX, defaults are now 72h (`4320` minutes) with larger funding history depth; API now returns pair-level spread analytics, funding-interval matching, OI history (ccxt 1h where available), and a `bot_logic` recommendation block (`webapp/services.py`, `webapp/app.py`, `webapp/static/coin.js`, `webapp/templates/coin.html`, `webapp/templates/index.html`, `webapp/static/app.js`).
+- Auto-exit agent polling now treats `404 execution_not_found` as stale state: it clears the missing exec id, suppresses re-selection of that stale id from historical events, and stops repeated `/api/manual/exec/{id}` 404 spam; dashboard XHR errors now include HTTP status/detail metadata, and static asset version was bumped to `v2026-02-14-01` (`webapp/static/app.js`, `webapp/app.py`).
+- Binance leverage/margin precheck now cancels Binance conditional/algo orders (`openAlgoOrders`) in addition to regular open orders before retrying margin-mode updates, preventing false `-4067` failures when TP/SL triggers remain open (`execution/manual.py`, `tests/test_manual_trader.py`).
+- Fixed Binance protective-order side validation: `_fetch_existing` no longer overwrites the position `side` while parsing algo payload rows, preventing false `invalid_side=true` and unnecessary cancel/recreate loops (`risk/stop_manager.py`).
+- Added regression test covering Binance algo-order side parsing so a valid long-close `SELL` stop is not flagged as invalid side (`tests/test_stop_manager.py`).
+- Auto-margin top-up now derives `margin_used` from fallback fields (`initial_margin`, raw/info `positionInitialMargin`/`isolatedWallet`/`positionBalance`) when leverage is missing, so Binance isolated positions with `leverage=null` no longer skip top-up as `margin_used_missing` (`execution/accounts.py`, `tests/test_account_monitor.py`).
+- Smart-enter/smart-exit pending-cancel loops now sanitize pending order ids and skip queuing null ids after WS terminal fills, preventing infinite `pending:[null]` waits and invalid REST status checks (`execution/manual.py`).
+- Manual exit/roll precheck now normalizes position symbols (`-SWAP`, `USDTM`, duplicated settle suffixes like `USDTUSDT`) and side aliases (`buy/sell/net` -> `long/short`), plus logs a precheck position snapshot to diagnose false "expected ... found none" errors (`execution/manual.py`, `tests/test_manual_trader.py`).
+- Manual exit precheck now infers side from position quantity sign when side is missing, preventing false “expected long/short found none” errors (execution/manual.py).
+- Binance leverage/margin precheck now skips changes when an open position exists, and proactively cancels stale open orders when settings need adjustment; leverage set retries after order-cancel if blocked (`execution/manual.py`).
+- Saved Cloudflare Tunnel + Access setup instructions to `docs/cloudflare_tunnel_setup.md`.
+- Hedge adverse threshold now auto-floors to just over 1 tick (bps) so passive hedge orders don’t flip to market on a stationary 1‑tick spread (`execution/manual.py`).
+- Auto-margin top-up now targets the buffer threshold (default 25%) without reserving free balance; any available funds are used and alerts reflect the new logic (`execution/accounts.py`).
+- Saved long-term automation roadmap to `docs/automation_plan.md` for future use once Coinglass API is available.
+- Auto-exit log now includes a clickable “log” link for the blocking execution when a cycle is skipped (`webapp/static/app.js`, `webapp/static/styles.css`).
+- Auto-exit log now shows the blocking execution id/action when a cycle is skipped due to another run (`webapp/services.py`, `webapp/static/app.js`).
+- Auto-exit agent now exposes a per-execution log endpoint and “Open log” button; manual exec logs can be viewed via `/api/manual/exec/{id}/log` (`webapp/app.py`, `webapp/services.py`, `webapp/templates/index.html`, `webapp/static/app.js`).
+- Auto-exit agent panel now surfaces per-execution errors and log file path; manual executions also write a per-run log file under `logs/manual_exec` (`webapp/services.py`, `webapp/templates/index.html`, `webapp/static/app.js`, `webapp/static/styles.css`).
+- Auto-exit now auto-clears rules after a short no-position/multi-leg window so stale rules don’t spam logs when the UI has no toggle (`webapp/services.py`).
+- Added a link to the Spread Monitor page from the Manual header (`webapp/templates/manual.html`).
+- Added a dedicated Spread Monitor page (`/spread-monitor`) with up to 3 live pair panels showing orderbooks + spreads via `/ws/manual` (`webapp/templates/spread_monitor.html`, `webapp/static/spread_monitor.js`, `webapp/app.py`).
+- Added auto-exit v0: per-position auto-exit rules + settings UI, persisted rules store, and a head loop that triggers smart-exit using live WS orderbooks (single execution at a time) (`webapp/templates/index.html`, `webapp/static/app.js`, `webapp/static/styles.css`, `webapp/app.py`, `webapp/services.py`).
+- Symbol Positions now show live spread (WS) alongside auto-exit controls, and the main page includes an Auto Exit Log panel; positions-market diagnostics were removed from the UI (`webapp/templates/index.html`, `webapp/static/app.js`, `webapp/static/styles.css`, `webapp/services.py`).
+- Auto-exit logging now includes skip/wait reasons (cooldown, no legs, live missing, below target, execution running), with rate-limited log entries for readability (`webapp/services.py`, `webapp/static/app.js`).
+- Auto-exit live spread now allows a looser WS freshness window (15s) to populate even on slower books (`webapp/market_data.py`, `webapp/services.py`).
+- Fixed auto-exit UI state normalization to include live spreads + events so the Live Spread column and log panel update correctly (`webapp/static/app.js`).
+- Auto-exit live spread now uses the same sign convention as the rest of the app, and the main page adds scrollable/copyable Auto Exit Log plus an Auto Exit Agent panel with live execution logs and a Stop button (`webapp/services.py`, `webapp/templates/index.html`, `webapp/static/app.js`, `webapp/static/styles.css`).
+- Hedge limit monitoring now falls back to REST when WS reports a terminal status with zero filled qty, preventing false “filled=0” on Kucoin from skipping hedges (`execution/manual.py`).
+- Kucoin margin-mode precheck now checks existing mode via positions and uses lowercase `isolated/cross` when setting, avoiding false failures (`execution/manual.py`).
+- Manual precheck now attempts to set Kucoin margin mode (defaults to isolated) before execution and stops early if it cannot be set (`execution/manual.py`).
+- Manual exec runs now expire based on `updated_at_ts` and never prune active (`running`) executions, preventing long-wait manual exits from returning `execution_not_found` (`webapp/services.py`).
+- Smart enter/exit now allow repricing when WS misses the active order and REST confirms open; small deviations keep the order until price moves beyond `max_limit_deviation_bps` (`execution/manual.py`).
+- Binance manual precheck now skips setting margin/leverage when current settings already match (isolated + 3x), using `fetch_positions` to read symbol settings and avoiding open-order margin-mode errors (`execution/manual.py`).
+- Binance margin-mode precheck now cancels open orders for the symbol and retries if Binance blocks the change due to existing orders (e.g., old TP/SL), reducing `-4067` failures (`execution/manual.py`).
+- Restored hedge adverse bps input (ticks removed from UI), added tick_bps hint in dry-run plan output, and bumped static build to `v2026-02-04-05` (`webapp/templates/manual.html`, `webapp/static/manual.js`, `webapp/app.py`).
+- Removed hedge adverse bps control from manual UI (ticks only) and added `price_step` to dry-run plan output; bumped static build to `v2026-02-04-04` (`webapp/templates/manual.html`, `webapp/static/manual.js`, `webapp/app.py`).
+- Added `hedge_adverse_ticks` (ticks override bps) for manual execution, updated UI, and bumped static build to `v2026-02-04-03` (`execution/manual.py`, `webapp/templates/manual.html`, `webapp/static/manual.js`, `webapp/app.py`).
+- Added a precheck log entry when `exit_allow_flip` skips position capping (`execution/manual.py`).
+- Exit allow-flip now skips precheck position capping and no longer hard-fails on position fetch errors during `_handle_pair` (`execution/manual.py`).
+- Fixed manual Exit payload building so `exit_allow_flip` no longer crashes the Execute button, and bumped static build to `v2026-02-04-02` (`webapp/static/manual.js`, `webapp/app.py`).
+- Smart-exit now checks if the active order is missing from WS and forces a REST status check (prevents silent fills/double submits when order stream is stale but ping/pong is alive) (`execution/manual.py`).
+- Fixed smart-exit/smart-enter UnboundLocalError on `active_order_id` in REST sync, and added a safe post-cancel pause helper to smart-exit (`execution/manual.py`).
+- Binance manual execution now sets margin mode + leverage in a hard precheck (with no-op allowance for “already set”), and skips per-order margin-mode calls for Binance (`execution/manual.py`).
+- Added a Binance-only leverage test button/endpoint (symbol-only set, no position required) and bumped static build to `v2026-02-03-02` (`webapp/templates/manual_tests.html`, `webapp/static/manual_tests.js`, `webapp/app.py`, `webapp/services.py`).
+- Bumped static build version to `v2026-02-03-01` so manual tests UI cache refreshes (`webapp/app.py`).
+- Manual tests leverage card now includes margin mode and uses it for Binance before set_leverage (`webapp/templates/manual_tests.html`, `webapp/static/manual_tests.js`, `webapp/services.py`).
+- Manual tests leverage now always uses symbol-based set for Binance (no position required) (`webapp/services.py`).
+- Manual tests leverage setter now supports Binance without an open position (sets leverage by symbol), and Binance precheck uses `{}` params to avoid NoneType errors (`webapp/services.py`, `execution/manual.py`).
+- Binance leverage now uses a hard precheck per symbol (execution stops on failure), and per-order leverage calls are skipped for Binance; background leverage enforcement skips Binance open positions (`execution/manual.py`, `execution/accounts.py`).
+- Fixed smart-exit crash by initializing `pending_ws_rest_checked_at` (used when cancel is pending) (`execution/manual.py`).
+- Roll mode now defaults to smart-roll (UI fallback + backend default), so roll uses smart chunking unless explicitly overridden (`webapp/static/manual.js`, `execution/manual.py`).
+- BingX leverage sets now retry with `side=BOTH` when `LONG/SHORT` returns invalid-params (manual execution + leverage enforcement), and leverage params read BingX `positionSide/ps` when present (`execution/manual.py`, `execution/accounts.py`).
+- Positions now fall back to avg/entry price fields (including BingX info payload) so unrealized PnL can compute when `entryPrice` is missing (`execution/accounts.py`).
+- BingX market snapshots now use `/quote/ticker` for live prices, and Symbol Positions prefers BingX snapshot marks when they diverge from position data (`exchanges/bingx.py`, `webapp/services.py`).
+- Kucoin funding snapshots now derive funding interval hours from contract granularity fields (preferring the smaller of current/standard) to reflect hourly cadence when present (`exchanges/kucoin.py`).
+- Kucoin funding history now uses `from/to` time range (required by the API) and reads `timepoint` payloads; raw funding tests now hit the same time-range endpoint (`exchanges/kucoin.py`, `webapp/services.py`).
+- Kucoin funding history now carries interval hours derived from contract granularity instead of hard-coded 8h (`exchanges/kucoin.py`).
+- Kucoin funding history bypasses the outer cached loader to avoid stale interval data and uses the adapterвЂ™s cached fetch instead (`webapp/services.py`).
+- OKX raw WS stream now accepts the client socket before reading messages to avoid "WebSocket is not connected" errors (`webapp/ws_trade_okx_raw.py`).
+- OKX protective orders now derive `posSide` from raw position data (net/long/short) to avoid invalid posSide errors in algo orders (`risk/stop_manager.py`).
+- BingX order WS now treats `listenKeyExpired` as a reconnect trigger and renews listen keys more frequently to prevent silent staleness (`execution/ws_orders.py`, `webapp/ws_trade_bingx_raw.py`).
+- WS order streams now reset state on forced reconnects and suppress `CancelledError` from heartbeat/keepalive tasks to make reconnect/shutdown resilient (`execution/ws_orders.py`).
+- Funding tests now include an optional raw API response toggle that returns fresh per-exchange snapshot/history payloads alongside the aggregated result (`webapp/templates/manual_tests.html`, `webapp/static/manual_tests.js`, `webapp/app.py`, `webapp/services.py`).
 - Smart enter/exit now run chunks sequentially (primary fill -> hedge -> next chunk) and wait for cancel confirmations before new limit orders (`execution/manual.py`).
 - Smart enter/exit now clear active primary order state on terminal statuses (WS/REST), unblocking hedge placement after fills (`execution/manual.py`).
 - Smart enter/exit now hedge strictly per-chunk and drop sub-min hedge remainders (no cross-chunk `unhedged_qty` carry); hedging blocks next chunk until done (`execution/manual.py`).
@@ -187,6 +259,14 @@ Recent Changes
 - Gate WS auth signing now follows Gate v4 docs (`channel=<channel>&event=<event>&time=<time>`), and WS order/cancel use `futures.order_place`/`futures.order_cancel` with `event: api` + signed payload.
 - Gate WS now sends `futures.login` (`event: api`) on connect so `futures.order_place` works without "Not login" errors.
 - Gate WS login now tracks server time from `time_ms`/`header.response_time`, retries on timestamp errors, and uses server-time offsets for signing.
+- Smart-enter now enforces `reprice_sec >= 3s`, adds 1s pause after cancel, and waits for a fresh WS order update before continuing (to reduce overfill on stale WS) (`execution/manual.py`).
+- Smart-enter now blocks new submits when WS misses the active order id; waits for WS and then does a single REST check on the active order before continuing (prevents duplicate orders after WS reconnects) (`execution/manual.py`).
+- Manual UI request errors now include method/url/status (and a short response snippet) instead of generic "Request failed" (`webapp/static/manual.js`).
+- Fixed smart-exit runtime error from leftover `_require_fresh_ws_update` call (`execution/manual.py`).
+- Manual execute now prechecks BingX leverage before trading; if not 3x it attempts to set leverage and fails fast on error (only for non-reduce-only legs). Also removed `marginMode` from BingX `set_leverage` params to match ccxt requirements (`execution/manual.py`).
+- Raw WS streams for Bybit private and BingX now defensively accept the websocket inside `run()` to avoid "Need to call accept first" errors after reconnects (`webapp/ws_trade_private_raw.py`, `webapp/ws_trade_bingx_raw.py`).
+- Protective order sync now reads stop/take prices from top-level order fields (e.g., BingX `stopLossPrice`/`takeProfitPrice`) so existing TP/SL are detected and not duplicated (`risk/stop_manager.py`).
+- Bitget raw WS disconnect fixed by removing duplicate websocket accept that closed the socket (`webapp/ws_trade_bitget_raw.py`).
 - Gate WS flow validated: `futures.login` + `futures.orders`/`futures.positions`/`futures.usertrades` subscriptions work; `futures.order_place`/`futures.order_cancel` via `event: api` return ack + result, and WS updates reflect open/filled/canceled states plus position/usertrades updates.
 - Kucoin WS raw now reads key version from `ExchangeGateway.spec.options` to avoid crashes when `gateway.options` is missing.
 - Kucoin classic WS flow validated: REST limit orders (manual tests) emit tradeOrders updates (open/match/filled), position changes on `/contract/position:SYMBOL`, and wallet updates.
@@ -231,9 +311,92 @@ Recent Changes
 - Protective stop sync now skips legs with no targets and caches existing open-order fetches briefly to reduce duplicate API calls; positions-market fetches are concurrency-limited for stability (`risk/stop_manager.py`, `webapp/services.py`).
 - Backups created before cleanup: `backups/feeArb-20260116-135855.zip` and `backups/deadcode-files-20260116-135920.zip`.
 - Removed unused modules/settings: `pipeline/source_cache.py`, `orchestrator/realtime_validator.py`, `webapp/services.py:_extend_universe_with_positions`, `project_settings.py:refresh_intervals`, and deprecated risk settings (`balance_check_interval_sec`, `panic_close_batch_size`).
+- Backed up and removed likely-unused artifacts/scripts: `scripts/futures_metrics_probe.py`, `scripts/wsbybit.py`, `scripts/ws_order_health_probe.py`, `scripts/test_mexc_ws_login.py`, `coinglass_arbitrage_scraper.py`, `contract_doc.html`, `temp_coinglass.html`, `temp_coinglass_app.js`, `_app.js`, `_app.pretty.js` (backup: `backups/probably-unused-files-20260116-143818.zip`).
+- Exchange snapshot refresh now skips when sources/exchange set are unchanged, reusing the last snapshot to reduce API polling (`webapp/services.py`).
+- Manual tests now include per-exchange funding checks (rate/interval/next funding) with a new `/api/manual/test/funding` endpoint and funding diagnostics logged to `logs/funding_tests.log` (`webapp/templates/manual_tests.html`, `webapp/static/manual_tests.js`, `webapp/app.py`, `webapp/services.py`).
+- Manual margin/leverage tests now return parsed position views (margin mode/leverage awareness) alongside raw payloads, and the UI adds per-exchange leverage setters (`webapp/templates/manual_tests.html`, `webapp/static/manual_tests.js`, `webapp/app.py`, `webapp/services.py`).
+- Bybit margin-mode detection now treats numeric strings (`"0"/"1"`) as cross/isolated, and add-margin uses `positionIdx` from the raw `info` payload to avoid one-way mode mismatches (`execution/accounts.py`).
+- Bybit margin-mode detection now avoids generic `tradeMode` parsing and uses a heuristic to flag isolated when `positionBalance` ~= `positionIM` despite `tradeMode=0`, aligning with UI observations (`execution/accounts.py`).
+- Bybit reduce-margin now uses `/v5/position/add-margin` with negative margin amounts instead of returning unsupported (`execution/accounts.py`).
+- Manual tests now estimate withdrawable margin using `equity_est - maintenance_margin * 1.2` (buffered) and show max add/reduce in the position view output (`webapp/services.py`).
+- Bybit max-reduce estimate now uses `positionBalance - positionIMByMp` (when available) to match UI withdrawable behavior; generic buffer math remains fallback (`webapp/services.py`).
+- Added `docs/exchanges/margin_leverage.md` to log per-exchange margin/leverage findings.
+- Bybit min-required margin now uses `positionValue/leverage * (1 + 1% buffer)` (simple model) to estimate withdrawable margin; tests expose this in `position_view` (`webapp/services.py`, `docs/exchanges/margin_leverage.md`).
+- Bybit manual tests validated: add margin, reduce margin, set leverage; isolated margin inferred via positionBalance vs positionIM hints.
+- Bybit production references captured in `docs/exchanges/margin_leverage.md` (isolated inference, negative add-margin for reduce, max-reduce estimate).
+- Margin test estimates now use the simple `positionValue/leverage * (1 + buffer)` formula across exchanges with per-exchange buffers (Bybit 1%, Bitget 1%) (`webapp/services.py`, `docs/exchanges/margin_leverage.md`).
+- Bitget leverage set observed: exchange UI updates to target leverage even when manual tests UI returns HTTP 500; investigate server error if recurring (`docs/exchanges/margin_leverage.md`).
+- Fixed `/api/manual/test/leverage` crash by defining `before_estimates` and correcting error-path response (`webapp/services.py`).
+- Leverage test now always builds `before_estimates` in `manual_test_leverage` to avoid NameError (`webapp/services.py`).
+- Reapplied `before_estimates` assignment in `manual_test_leverage` after it was missing in the live file (`webapp/services.py`).
+- Added `before_estimates` inside the actual `manual_test_leverage` path (was only in margin test), fixing the NameError (`webapp/services.py`).
+- OKX margin adjust now uses raw `posSide` (net/long/short) to avoid "Position does not exist" errors on one-way positions (`execution/accounts.py`, `docs/exchanges/margin_leverage.md`).
+- OKX margin reduce now uses initial margin (buffer 0%) as the minimum required, matching UI withdrawable calculations (`webapp/services.py`, `docs/exchanges/margin_leverage.md`).
+- Kucoin margin reduce buffer set to ~0.15% for test calculations (based on AXSUSDT screenshot) (`webapp/services.py`, `docs/exchanges/margin_leverage.md`).
+- Kucoin margin reduce estimates now target leverage 3x for max-reduce calculations (min margin = positionValue/3 + 0.15% buffer) and expose `target_leverage` in `position_view` (`webapp/services.py`, `docs/exchanges/margin_leverage.md`).
+- Kucoin reduce margin now uses raw `margin/withdrawMargin` request because ccxt lacks `reduceMargin`; requires extra API permissions (`execution/accounts.py`, `docs/exchanges/margin_leverage.md`).
+- Kucoin leverage enforcement no longer calls `set_leverage` for isolated positions; it adjusts isolated margin to reach the target leverage (positionValue/target + 0.15% buffer) via add/reduce (`execution/accounts.py`).
+- Manual execution now retries position fetches before all actions and fails fast if positions cannot be fetched; enter precheck validates balances/mark price (5% buffer) and scales qty/chunks down when needed, while exit/roll prechecks validate position sides and clamp qty to available (`execution/manual.py`).
+- Margin control UI split: Protective stops no longer exposes anti-orphan or low-margin alerts; new Margin control block provides auto add/reduce + Telegram alerts for failed top-ups, and account-level low-balance alerts were removed (position-only) (`webapp/templates/index.html`, `webapp/static/app.js`, `execution/accounts.py`, `risk/stop_manager.py`).
+- Manual live spread now stays enabled for roll mode, mapping roll legs to long/to and short/from for spread + orderbook display (`webapp/static/manual.js`).
+- Kucoin manual/test orders now include `leverage=3` in order params and skip `set_leverage`/`set_margin_mode` calls to avoid 1x opens (`execution/manual.py`, `webapp/services.py`, `docs/exchanges/margin_leverage.md`).
+- Kucoin manual/test orders now default to one-way mode by sending `positionSide=BOTH` in order params (`execution/manual.py`, `webapp/services.py`, `docs/exchanges/margin_leverage.md`).
+- BingX margin add/reduce now passes `positionId` and `positionSide` from raw positions to satisfy API requirements (`execution/accounts.py`, `docs/exchanges/margin_leverage.md`).
+- BingX reduce estimates now use `info.margin` and `info.maxMarginReduction` to match UI withdrawable values (`webapp/services.py`, `docs/exchanges/margin_leverage.md`).
+- Gate reduce estimates now prefer `info.margin` and `info.initial_margin` with a 3% buffer to align with UI max withdrawable (`webapp/services.py`, `docs/exchanges/margin_leverage.md`).
+- Reduce margin now retries with smaller amounts on failure (10% then 5% additional reduction) across exchanges (`execution/accounts.py`).
+- Manual Bitget raw WS no longer double-accepts the FastAPI socket (prevents immediate disconnects in the manual page raw stream) (`webapp/ws_trade_bitget_raw.py`).
+- Smart-enter now pauses 1s after cancel, requires a fresh WS order update before resuming, and enforces >=3s reprice interval to reduce overfills (execution/manual.py).
+- Raw WS streams (bingx/private) now stop cleanly when the client disconnects or receive_json throws, avoiding "accept first" errors (webapp/ws_trade_bingx_raw.py, webapp/ws_trade_private_raw.py).
+- Manual execution now blocks order submit/cancel after BingX listenKey errors and forces WS reconnection before continuing (`execution/manual.py`).
+- BingX raw WS stream now auto-reconnects on listenKeyExpired/404 keepalive or remote close to keep the manual tests stream live (`webapp/ws_trade_bingx_raw.py`).
+- Hedge adverse fallback now waits for cancel confirmation before switching to market to avoid duplicate hedge orders (`execution/manual.py`).
+- Smart enter/exit now forces a REST status check for pending primary cancels after a WS wait to avoid overlapping orders when WS updates lag (`execution/manual.py`).
+- Positions-market refresh now still runs on interval even if accounts snapshot hasn't changed, so mark prices keep updating (`webapp/services.py`).
+- Symbol Positions now prefer positions-market snapshot funding rate/next funding when available, so funding stays fresh (`webapp/services.py`).
+- Account monitor now logs explicit margin add/reduce decisions and a per-refresh вЂњisolated margin check okвЂќ summary with min buffer, plus risk summary counts (`execution/accounts.py`).
+- Manual tests funding UI now splits per exchange into snapshot/history subblocks with symbol examples, raw request/response panels, and history points; funding test endpoint now returns `funding_history` and honors `history_limit` (`webapp/templates/manual_tests.html`, `webapp/static/manual_tests.js`, `webapp/app.py`, `webapp/services.py`).
+- OKX raw WS stream now guards accept/receive with WebSocketState checks and handles RuntimeError to avoid "Need to call accept first" errors (`webapp/ws_trade_okx_raw.py`).
+- Symbol Positions now rechecks live funding when the positions-market snapshot is missing or stale (age > 2x interval / 90s) to avoid stuck funding on venues like BingX (`webapp/services.py`).
+- Symbol Positions now treat positions-market funding as stale when snapshot age exceeds the refresh interval or next_funding_time is >5m in the past, forcing a live funding refresh (`webapp/services.py`).
+- Binance reduce-margin estimates now prefer isolated wallet/margin fields and maintenance margin (no buffer), and maintMargin is parsed for positions (`webapp/services.py`, `execution/accounts.py`).
+- Roll now supports `smart-roll` (smart chunked limit + hedge) and auto-switches to it when chunking is requested; roll UI exposes the new mode (`execution/manual.py`, `webapp/templates/manual.html`).
+- Protective stop/take rounding now ignores cached tick sizes that are >= price (or that round to 0), preventing false invalid-price skips on low-priced symbols (`risk/stop_manager.py`).
+- Binance protective price rounding now refreshes symbol meta from exchange info when cached tick sizes look invalid, to avoid stale tick errors (`risk/stop_manager.py`).
+- Binance protective TP/SL now uses the futures algo conditional endpoints (create/list/cancel) instead of standard order endpoints, so stops/takes are placed as true conditional orders (`risk/stop_manager.py`).
+- Fixed smart-exit crash by initializing pending WS REST retry state (`execution/manual.py`).
+- Manual execution now requires start positions (errors if unavailable), retries end-position fetch once, and falls back to observed fills for final reconcile when positions are still missing; smart/fast enter/exit track hedge/observed fills for this fallback (`execution/manual.py`).
+- Smart enter/exit now log positions snapshot at start and end (in addition to pre-final reconcile), for clearer visibility of what positions were seen (`execution/manual.py`).
+- Fixed smart-exit hedge fill tracking variable binding after adding observed-fill reconcile (`execution/manual.py`).
+- Manual exit now supports an "allow flip / skip position check" toggle (UI + payload), which disables reduce-only for exit; positions-based reconcile is still used when positions are available, with observed fills as fallback only if positions cannot be fetched (`execution/manual.py`, `webapp/templates/manual.html`, `webapp/static/manual.js`, `webapp/app.py`).
+
+- Added Binance USDT-M adapter with premium index + book ticker snapshots, funding history, and symbol meta caching (`exchanges/binance.py`, `exchanges/__init__.py`).
+- Added Binance to supported exchanges/defaults, commission map, env example, and analysis defaults (`config.py`, `project_settings.py`, `.env.example`, `webapp/static/app.js`).
+- Added Binance orderbook WS support for manual spread + market data bus and symbol normalization helpers (`webapp/manual_stream.py`, `webapp/market_data.py`, `webapp/manual_symbols.py`).
+- Added Binance raw WS trade panel + backend listenKey stream and JS wiring (`webapp/ws_trade_binance_raw.py`, `webapp/app.py`, `webapp/templates/manual_tests.html`, `webapp/static/manual_tests.js`).
+- Funding test raw payloads now include Binance endpoints and manual tests show Binance symbol hints/examples (`webapp/services.py`, `webapp/static/manual_tests.js`).
+- ArbitrageScanner candidate filtering now respects enabled exchanges (include list), and defaults focus on Binance/OKX (`parsers/arbitragescanner.py`, `pipeline/data_pipeline.py`, `webapp/services.py`, `project_settings.py`).
+- WS order tracker now supports Binance listenKey streams for ORDER_TRADE_UPDATE with keepalive and health defaults (`execution/ws_orders.py`, `project_settings.py`).
+- Verified Binance API keys via ccxt `fetch_balance` (USDT-M) on 2026-02-01.
+- Accounts monitor now skips Binance margin-mode enforcement on open positions and passes explicit leverage param + validation to avoid Binance set_leverage errors (`execution/accounts.py`).
+- Binance adapter now sanitizes input symbols (separators, double USDT suffix) and tolerates HTTP errors by parsing error payloads instead of raising on 400s (`exchanges/binance.py`).
+- Protective stop/take placement now skips invalid prices (incl. Binance min tick) with clear status instead of raising, preventing stop sync crashes on tiny prices (`risk/stop_manager.py`).
+- Binance protective stop/take now uses STOP_MARKET / TAKE_PROFIT_MARKET with stopPrice to satisfy Binance algo endpoints (`risk/stop_manager.py`).
+- BingX protective sync now parses stopLoss/takeProfit JSON payloads and stopLossEntrustPrice to detect existing TP/SL orders and avoid duplicate placements (`risk/stop_manager.py`).
+
+- Bybit protective stop/take now forces `tpslMode=Full` to avoid `slSize` max market size errors for market stops (`risk/stop_manager.py`).
+- Added protective auto-rebalance agent (limit -> market fallback, chunking, cooldown/delta thresholds, MEXC excluded) with UI settings and execution wiring (`webapp/templates/index.html`, `webapp/static/app.js`, `webapp/services.py`, `execution/manual.py`, `project_settings.py`).
+- Bumped UI static asset version to force refresh (`webapp/app.py`).
 
 Next Steps (Planned)
 - Review and possibly trim dry-run scope (constraints collection and exchange set).
 - Align dry-run latency with real trading needs (two-exchange focus).
 - Re-evaluate which orderbook sources are required for dry-run vs live execution.
 - Run manual margin/leverage tests per exchange (fetch position by symbol, add/reduce margin, capture liq/limits + logs).
+- Head decision engine plan drafted in `docs/head_decision_plan.md` (auto-exit by spread, coordinator, concurrency rules).
+- Plan: build a main "Head" decision module on the homepage to rank candidates by spread history stability, funding trend, liquidity/slippage, and available balances; select symbol/exchanges and hand off to a ManualTrade-like execution agent.
+- Plan: design an Exit module with explicit stop/take criteria (spread compression/expansion vs entry, funding deterioration, time-in-trade, liquidity/market move guards) using positions-market cache + orderbook for sizing/exit pacing.
+
+Planned Modules
+- Head decision module (main page): rank candidates by spread history stability, funding trend, liquidity, and balances; select symbol/exchanges and hand off to a ManualTrade-like agent.
+- Exit module: explicit stop/take criteria for spread compression/expansion and funding deterioration using positions-market cache + orderbook.

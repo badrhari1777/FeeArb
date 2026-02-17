@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
+import math
+from pathlib import Path
 import time
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional
 from urllib.error import URLError
@@ -29,22 +31,51 @@ from execution.accounts import _safe_float
 from execution.allocator import Allocator
 from execution.lifecycle import LifecycleController
 from execution.settings import ExecutionSettings
+from execution.storage import JsonStateStore
 from execution.accounts import AccountMonitor, normalize_symbol
 from risk.config import default_risk_config, RiskConfig
 from risk.stop_manager import ProtectiveOrderManager
 from utils import purge_expired
 from utils.cache_db import get_or_fetch_funding_history
+from utils.funding import (
+    enrich_history_intervals,
+    infer_funding_interval_hours,
+    is_stale_next_funding_iso,
+    parse_timestamp_ms,
+    project_next_funding_time_iso,
+)
 from exchanges import get_adapter, normalize_exchange_name
+from config import BASE_DIR, STATE_DIR
 from .market_data import MarketDataBus
+from .manual_symbols import _normalize_input_symbol
 from uuid import uuid4
 
 FUNDING_CACHE_TTL_SEC = 120
 POSITIONS_MARKET_CONCURRENCY = 3
+AUTO_EXIT_POLL_SEC = 2.0
+AUTO_EXIT_LOG_COOLDOWN_SEC = 30.0
+AUTO_EXIT_DEFAULTS = {
+    "max_runtime_sec": 600,
+    "cooldown_sec": 300,
+    "require_live": True,
+    "auto_clear_no_position_sec": 120,
+}
+AUTO_EXIT_STATE_PATH = STATE_DIR / "auto_exit_rules.json"
+MANUAL_EXEC_LOG_DIR = BASE_DIR / "logs" / "manual_exec"
+COIN_ANALYSIS_CORE_EXCHANGES: tuple[str, ...] = ("binance", "okx")
 
 RefreshResult = Literal["completed", "in_progress", "failed"]
 
 logger = logging.getLogger(__name__)
 DEFAULT_MANUAL_LEVERAGE = 3.0
+MANUAL_MARGIN_REDUCE_BUFFER_MULT = 1.2
+BINANCE_MIN_MARGIN_BUFFER_PCT = 0.0
+BYBIT_MIN_MARGIN_BUFFER_PCT = 0.01
+BITGET_MIN_MARGIN_BUFFER_PCT = 0.01
+GATE_MIN_MARGIN_BUFFER_PCT = 0.03
+OKX_MIN_MARGIN_BUFFER_PCT = 0.0
+KUCOIN_MIN_MARGIN_BUFFER_PCT = 0.0015
+DEFAULT_MIN_MARGIN_BUFFER_PCT = 0.01
 funding_logger = logging.getLogger("funding")
 if not funding_logger.handlers:
     handler = logging.StreamHandler()
@@ -53,6 +84,16 @@ if not funding_logger.handlers:
     funding_logger.addHandler(handler)
 funding_logger.setLevel(logging.INFO)
 funding_logger.propagate = False
+
+funding_test_logger = logging.getLogger("funding_tests")
+if not funding_test_logger.handlers:
+    log_path = BASE_DIR / "logs" / "funding_tests.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    funding_test_logger.addHandler(handler)
+    funding_test_logger.setLevel(logging.INFO)
+    funding_test_logger.propagate = False
 
 
 def _dedupe_settle(symbol: str | None) -> str:
@@ -92,6 +133,28 @@ def _normalize_manual_symbol(symbol: str | None) -> str:
             normalized = normalized[: -len(suffix)]
             break
     return normalized
+
+
+def _funding_history_ts_ms(value: object) -> int | None:
+    return parse_timestamp_ms(value)
+
+
+def _funding_eta(next_funding_iso: str | None) -> tuple[int | None, str | None]:
+    if not next_funding_iso:
+        return None, None
+    try:
+        dt = datetime.fromisoformat(next_funding_iso)
+    except Exception:
+        return None, None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    delta = (dt - datetime.now(timezone.utc)).total_seconds()
+    seconds = int(delta)
+    if seconds < 0:
+        return seconds, "passed"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    return seconds, f"{hours}h {minutes:02d}m"
 
 
 def _symbol_match_values(symbol: str | None) -> set[str]:
@@ -134,6 +197,244 @@ def _manual_position_metrics(position: Mapping[str, Any]) -> dict[str, float | N
     }
 
 
+def _manual_position_view(
+    position: Mapping[str, Any] | None,
+    *,
+    estimates: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not position:
+        return None
+    margin_mode = position.get("margin_mode")
+    leverage = _safe_float(position.get("leverage"))
+    view: dict[str, Any] = {
+        "symbol": position.get("symbol"),
+        "exchange_symbol": position.get("exchange_symbol"),
+        "side": position.get("side"),
+        "margin_mode": margin_mode,
+        "margin_mode_source": position.get("margin_mode_source"),
+        "margin_mode_known": margin_mode is not None,
+        "leverage": leverage,
+        "leverage_source": position.get("leverage_source"),
+        "leverage_known": leverage is not None,
+    }
+    notes: list[str] = []
+    if margin_mode is None:
+        notes.append("margin_mode_unknown")
+    if leverage is None:
+        notes.append("leverage_unknown")
+    if notes:
+        view["notes"] = notes
+    if estimates:
+        view.update(estimates)
+    return view
+
+
+def _manual_margin_estimates(
+    position: Mapping[str, Any] | None,
+    balance: Mapping[str, Any] | None,
+    *,
+    buffer_mult: float = MANUAL_MARGIN_REDUCE_BUFFER_MULT,
+) -> dict[str, Any]:
+    if not position:
+        return {
+            "equity_est": None,
+            "base_margin_est": None,
+            "base_margin_source": None,
+            "max_reduce_est": None,
+            "max_add_est": _safe_float(balance.get("available")) if balance else None,
+            "reduce_buffer_mult": buffer_mult,
+            "max_reduce_source": None,
+        }
+    exchange = normalize_exchange_name(str(position.get("exchange") or ""))
+    raw = position.get("raw") if isinstance(position, dict) else None
+    info = raw.get("info") if isinstance(raw, dict) else None
+
+    base_margin = None
+    base_source = None
+    if isinstance(raw, dict):
+        base_margin = _safe_float(raw.get("positionBalance")) or _safe_float(raw.get("collateral"))
+        if base_margin is not None:
+            base_source = "raw.positionBalance" if raw.get("positionBalance") is not None else "raw.collateral"
+    if base_margin is None and isinstance(info, dict):
+        base_margin = _safe_float(info.get("positionBalance")) or _safe_float(info.get("positionIM"))
+        if base_margin is not None:
+            base_source = (
+                "info.positionBalance" if info.get("positionBalance") is not None else "info.positionIM"
+            )
+    if base_margin is None:
+        base_margin = _safe_float(position.get("margin_used")) or _safe_float(position.get("initial_margin"))
+        if base_margin is not None:
+            base_source = (
+                "position.margin_used" if position.get("margin_used") is not None else "position.initial_margin"
+            )
+
+    unrealized = _safe_float(position.get("unrealized_pnl"))
+    if unrealized is None and isinstance(raw, dict):
+        unrealized = _safe_float(raw.get("unrealizedPnl"))
+    if unrealized is None and isinstance(info, dict):
+        unrealized = _safe_float(info.get("unrealisedPnl"))
+
+    maintenance = _safe_float(position.get("maintenance_margin"))
+    equity = None
+    if base_margin is not None:
+        equity = base_margin + (unrealized or 0.0)
+
+    max_reduce = None
+    max_reduce_source = None
+    reduce_buffer_mult = buffer_mult
+    min_required = None
+    min_required_source: list[str] = []
+
+    position_value = None
+    if isinstance(info, dict):
+        position_value = _safe_float(info.get("positionValue"))
+    if position_value is None and isinstance(raw, dict):
+        position_value = _safe_float(raw.get("positionValue"))
+    if position_value is None:
+        position_value = _safe_float(position.get("notional"))
+
+    leverage = _safe_float(position.get("leverage"))
+    if leverage is None and isinstance(info, dict):
+        leverage = _safe_float(info.get("leverage"))
+
+    buffer_pct = DEFAULT_MIN_MARGIN_BUFFER_PCT
+    if exchange == "binance":
+        buffer_pct = BINANCE_MIN_MARGIN_BUFFER_PCT
+    elif exchange == "bybit":
+        buffer_pct = BYBIT_MIN_MARGIN_BUFFER_PCT
+    elif exchange == "bitget":
+        buffer_pct = BITGET_MIN_MARGIN_BUFFER_PCT
+    elif exchange == "gate":
+        buffer_pct = GATE_MIN_MARGIN_BUFFER_PCT
+    elif exchange == "okx":
+        buffer_pct = OKX_MIN_MARGIN_BUFFER_PCT
+    elif exchange == "kucoin":
+        buffer_pct = KUCOIN_MIN_MARGIN_BUFFER_PCT
+
+    target_leverage = leverage
+    if exchange == "kucoin":
+        target_leverage = DEFAULT_MANUAL_LEVERAGE
+
+    if position_value is not None and target_leverage:
+        min_required = abs(position_value) / target_leverage * (1.0 + buffer_pct)
+        min_required_source.append("positionValue/target_leverage+buffer")
+        min_required_source.append(f"buffer_pct={buffer_pct:.4f}")
+        if exchange == "kucoin":
+            min_required_source.append(f"target_leverage={DEFAULT_MANUAL_LEVERAGE:g}")
+
+    if exchange == "okx":
+        initial_margin = _safe_float(position.get("initial_margin"))
+        if initial_margin is None and isinstance(raw, dict):
+            initial_margin = _safe_float(raw.get("initialMargin"))
+        if initial_margin is not None:
+            min_required = initial_margin * (1.0 + OKX_MIN_MARGIN_BUFFER_PCT)
+            min_required_source = [
+                "position.initial_margin",
+                f"buffer_pct={OKX_MIN_MARGIN_BUFFER_PCT:.4f}",
+            ]
+
+    if exchange == "gate" and isinstance(info, dict):
+        info_margin = _safe_float(
+            info.get("margin")
+            or info.get("position_margin")
+            or info.get("positionMargin")
+        )
+        info_initial = _safe_float(
+            info.get("initialMargin")
+            or info.get("initial_margin")
+            or info.get("initMargin")
+            or info.get("init_margin")
+        )
+        if info_margin is not None:
+            base_margin = info_margin
+            base_source = "info.margin"
+            equity = base_margin + (unrealized or 0.0)
+        if info_initial is not None:
+            min_required = info_initial * (1.0 + GATE_MIN_MARGIN_BUFFER_PCT)
+            min_required_source = [
+                "info.initial_margin",
+                f"buffer_pct={GATE_MIN_MARGIN_BUFFER_PCT:.4f}",
+            ]
+
+    if exchange == "binance":
+        info_margin = None
+        info_margin_source = None
+        if isinstance(raw, dict):
+            info_margin = _safe_float(raw.get("isolatedWallet") or raw.get("isolatedMargin"))
+            if info_margin is not None:
+                info_margin_source = (
+                    "raw.isolatedWallet" if raw.get("isolatedWallet") is not None else "raw.isolatedMargin"
+                )
+        if info_margin is None and isinstance(info, dict):
+            info_margin = _safe_float(info.get("isolatedWallet") or info.get("isolatedMargin"))
+            if info_margin is not None:
+                info_margin_source = (
+                    "info.isolatedWallet" if info.get("isolatedWallet") is not None else "info.isolatedMargin"
+                )
+        if info_margin is not None:
+            base_margin = info_margin
+            base_source = info_margin_source
+            equity = base_margin + (unrealized or 0.0)
+        if maintenance is None:
+            if isinstance(raw, dict):
+                maintenance = _safe_float(
+                    raw.get("maintMargin")
+                    or raw.get("maintenanceMargin")
+                    or raw.get("positionMaintMargin")
+                    or raw.get("positionMaintenanceMargin")
+                )
+            if maintenance is None and isinstance(info, dict):
+                maintenance = _safe_float(
+                    info.get("maintMargin")
+                    or info.get("maintenanceMargin")
+                    or info.get("positionMaintMargin")
+                    or info.get("positionMaintenanceMargin")
+                )
+        if maintenance is not None:
+            min_required = maintenance * (1.0 + BINANCE_MIN_MARGIN_BUFFER_PCT)
+            min_required_source = [
+                "maintenance_margin",
+                f"buffer_pct={BINANCE_MIN_MARGIN_BUFFER_PCT:.4f}",
+            ]
+
+    if exchange == "bingx" and isinstance(info, dict):
+        info_margin = _safe_float(info.get("margin"))
+        max_reduction = _safe_float(info.get("maxMarginReduction"))
+        if info_margin is not None:
+            base_margin = info_margin
+            base_source = "info.margin"
+            equity = base_margin + (unrealized or 0.0)
+        if max_reduction is not None:
+            max_reduce = max(0.0, max_reduction)
+            max_reduce_source = "info.maxMarginReduction"
+            reduce_buffer_mult = 1.0
+            if base_margin is not None:
+                min_required = max(0.0, base_margin - max_reduce)
+                min_required_source = ["info.margin - info.maxMarginReduction"]
+
+    if max_reduce is None and base_margin is not None and min_required is not None:
+        max_reduce = max(0.0, base_margin - min_required)
+        max_reduce_source = "base_margin_minus_min_required"
+        reduce_buffer_mult = 1.0 + buffer_pct
+
+    if max_reduce is None and equity is not None and maintenance is not None:
+        max_reduce = max(0.0, equity - maintenance * buffer_mult)
+        max_reduce_source = "equity_minus_maintenance_buffer"
+
+    return {
+        "equity_est": equity,
+        "base_margin_est": base_margin,
+        "base_margin_source": base_source,
+        "min_required_margin_est": min_required,
+        "min_required_margin_source": min_required_source or None,
+        "target_leverage": target_leverage if exchange == "kucoin" else None,
+        "max_reduce_est": max_reduce,
+        "max_add_est": _safe_float(balance.get("available")) if balance else None,
+        "reduce_buffer_mult": reduce_buffer_mult,
+        "max_reduce_source": max_reduce_source,
+    }
+
+
 def _ccxt_perp_symbol(symbol: str) -> str:
     """Best-effort CCXT perp notation (e.g. BTCUSDT -> BTC/USDT:USDT)."""
     normalized = normalize_symbol(symbol)
@@ -149,6 +450,32 @@ def _fetch_json(url: str) -> dict:
     req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urlopen(req, timeout=15) as resp:
         return json.load(resp)
+
+
+def _fetch_json_any(url: str) -> Any:
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+    with urlopen(req, timeout=15) as resp:
+        return json.load(resp)
+
+
+def _filter_payload_list(payload: Any, key: str, match_value: str) -> tuple[Any, bool]:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            filtered = [
+                item for item in data if isinstance(item, dict) and item.get(key) == match_value
+            ]
+            if filtered != data:
+                trimmed = dict(payload)
+                trimmed["data"] = filtered
+                return trimmed, True
+    if isinstance(payload, list):
+        filtered = [
+            item for item in payload if isinstance(item, dict) and item.get(key) == match_value
+        ]
+        if filtered != payload:
+            return filtered, True
+    return payload, False
 
 
 def _fetch_bybit_candles(symbol: str, limit: int) -> list[dict[str, Any]]:
@@ -215,6 +542,8 @@ def _ccxt_client(exchange: str):
         return ccxt.kucoinfutures(opts)
     if name == "bybit":
         return ccxt.bybit(opts)
+    if name == "binance":
+        return ccxt.binanceusdm(opts)
     if name == "mexc":
         return ccxt.mexc(opts)
     if name == "bitget":
@@ -260,26 +589,62 @@ def _fetch_candles_ccxt(exchange: str, canonical_symbol: str, limit: int) -> lis
         if not cand or cand in seen:
             continue
         seen.add(cand)
-        try:
-            ohlcv = client.fetch_ohlcv(cand, timeframe="1m", limit=limit)
-        except Exception:  # pylint: disable=broad-except
-            continue
-        candles: list[dict[str, Any]] = []
-        for row in ohlcv or []:
-            if not isinstance(row, (list, tuple)) or len(row) < 6:
-                continue
-            candles.append(
-                {
-                    "ts_ms": int(row[0]),
+        candles_map: dict[int, dict[str, Any]] = {}
+
+        def _ingest(rows: list[Any]) -> None:
+            for row in rows or []:
+                if not isinstance(row, (list, tuple)) or len(row) < 6:
+                    continue
+                ts_ms = _funding_history_ts_ms(row[0])
+                if ts_ms is None:
+                    continue
+                candles_map[ts_ms] = {
+                    "ts_ms": int(ts_ms),
                     "open": _safe_float(row[1]),
                     "high": _safe_float(row[2]),
                     "low": _safe_float(row[3]),
                     "close": _safe_float(row[4]),
                     "volume": _safe_float(row[5]),
                 }
-            )
-        if candles:
-            return candles
+
+        # Try paginated pull first so large windows (e.g. 72h of 1m bars) are not truncated.
+        try:
+            now_ms = int(time.time() * 1000)
+            minute_ms = 60 * 1000
+            since_ms = now_ms - int(limit * minute_ms)
+            cursor = since_ms
+            guard = 0
+            while guard < 16 and len(candles_map) < limit:
+                guard += 1
+                batch_limit = min(1000, max(100, limit - len(candles_map)))
+                batch = client.fetch_ohlcv(cand, timeframe="1m", since=cursor, limit=batch_limit)
+                if not batch:
+                    break
+                _ingest(batch)
+                last_ts = _funding_history_ts_ms(batch[-1][0]) if isinstance(batch[-1], (list, tuple)) else None
+                if last_ts is None:
+                    break
+                next_cursor = int(last_ts + minute_ms)
+                if next_cursor <= cursor:
+                    break
+                cursor = next_cursor
+                if cursor > now_ms + minute_ms:
+                    break
+            if candles_map:
+                ordered = [candles_map[key] for key in sorted(candles_map.keys(), reverse=True)]
+                return ordered[:limit]
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+        # Fallback: single-shot fetch.
+        try:
+            ohlcv = client.fetch_ohlcv(cand, timeframe="1m", limit=limit)
+        except Exception:  # pylint: disable=broad-except
+            continue
+        _ingest(ohlcv or [])
+        if candles_map:
+            ordered = [candles_map[key] for key in sorted(candles_map.keys(), reverse=True)]
+            return ordered[:limit]
     return []
 
 
@@ -291,6 +656,12 @@ def _load_funding_history_cached(
     adapter: Any,
 ) -> list[dict]:
     """Fetch funding history with caching, falling back to adapter hook."""
+    exchange_name = normalize_exchange_name(exchange)
+    if exchange_name == "kucoin" and hasattr(adapter, "funding_history"):
+        try:
+            return adapter.funding_history(canonical_symbol, limit=max(limit * 2, limit))
+        except Exception:  # pylint: disable=broad-except
+            return []
 
     def _fetch() -> list[dict]:
         if hasattr(adapter, "funding_history"):
@@ -310,6 +681,123 @@ def _load_funding_history_cached(
         )
     except Exception:  # pylint: disable=broad-except
         return []
+
+
+def _percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    if percentile <= 0:
+        return min(values)
+    if percentile >= 100:
+        return max(values)
+    ordered = sorted(values)
+    rank = (len(ordered) - 1) * (percentile / 100.0)
+    low = int(math.floor(rank))
+    high = int(math.ceil(rank))
+    if low == high:
+        return ordered[low]
+    frac = rank - low
+    return ordered[low] * (1.0 - frac) + ordered[high] * frac
+
+
+def _resolve_funding_interval_hours(
+    history: list[dict[str, Any]],
+    snapshot_interval: float | None,
+) -> float | None:
+    return infer_funding_interval_hours(history, snapshot_interval=snapshot_interval)
+
+
+def _spread_series_from_candles(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+) -> list[dict[str, float]]:
+    left_map: dict[int, float] = {}
+    right_map: dict[int, float] = {}
+    for row in left or []:
+        ts_ms = _funding_history_ts_ms(row.get("ts_ms"))
+        close = _safe_float(row.get("close"))
+        if ts_ms and close is not None and close > 0:
+            left_map[ts_ms] = close
+    for row in right or []:
+        ts_ms = _funding_history_ts_ms(row.get("ts_ms"))
+        close = _safe_float(row.get("close"))
+        if ts_ms and close is not None and close > 0:
+            right_map[ts_ms] = close
+    common = sorted(set(left_map.keys()) & set(right_map.keys()), reverse=True)
+    series: list[dict[str, float]] = []
+    for ts_ms in common:
+        left_px = left_map[ts_ms]
+        right_px = right_map[ts_ms]
+        mid = (left_px + right_px) / 2.0
+        if mid <= 0:
+            continue
+        spread_pct = (left_px - right_px) / mid * 100.0
+        series.append(
+            {
+                "ts_ms": float(ts_ms),
+                "left_close": left_px,
+                "right_close": right_px,
+                "spread_pct": spread_pct,
+            }
+        )
+    return series
+
+
+def _weighted_mean_recent(
+    series: list[dict[str, float]],
+    *,
+    value_key: str,
+    now_ts_ms: int,
+    half_life_hours: float = 24.0,
+) -> float | None:
+    if not series:
+        return None
+    if half_life_hours <= 0:
+        half_life_hours = 24.0
+    lam = math.log(2.0) / half_life_hours
+    weighted_sum = 0.0
+    weights = 0.0
+    for row in series:
+        val = _safe_float(row.get(value_key))
+        ts_ms = _funding_history_ts_ms(row.get("ts_ms"))
+        if val is None or ts_ms is None:
+            continue
+        age_h = max(0.0, (now_ts_ms - ts_ms) / 1000.0 / 3600.0)
+        w = math.exp(-lam * age_h)
+        weighted_sum += val * w
+        weights += w
+    if weights <= 0:
+        return None
+    return weighted_sum / weights
+
+
+def _oi_change_pct(history: list[dict[str, Any]], hours: int) -> float | None:
+    if not history:
+        return None
+    ordered = sorted(
+        history,
+        key=lambda item: _funding_history_ts_ms(item.get("ts_ms") or item.get("timestamp")) or 0,
+        reverse=True,
+    )
+    latest = ordered[0]
+    latest_ts = _funding_history_ts_ms(latest.get("ts_ms") or latest.get("timestamp"))
+    latest_val = _safe_float(latest.get("open_interest_notional") or latest.get("open_interest_contracts"))
+    if latest_ts is None or latest_val is None or latest_val == 0:
+        return None
+    target_ts = latest_ts - int(hours * 3600 * 1000)
+    baseline = None
+    for row in ordered[1:]:
+        ts_ms = _funding_history_ts_ms(row.get("ts_ms") or row.get("timestamp"))
+        if ts_ms is None:
+            continue
+        if ts_ms <= target_ts:
+            baseline = _safe_float(
+                row.get("open_interest_notional") or row.get("open_interest_contracts")
+            )
+            break
+    if baseline is None or baseline == 0:
+        return None
+    return (latest_val - baseline) / abs(baseline) * 100.0
 
 
 class DataService:
@@ -334,6 +822,10 @@ class DataService:
         self._events: List[dict[str, Any]] = []
         self._exchange_status: Dict[str, dict[str, Any]] = {}
         self._funding_cache: dict[tuple[str, str], tuple[float | None, str | None, float | None, float]] = {}
+        self._last_snapshot_sources_at: Optional[datetime] = None
+        self._last_snapshot_universe_key: tuple[str, ...] | None = None
+        self._last_snapshot_exchanges_key: tuple[str, ...] | None = None
+        self._last_source_flags_key: tuple[tuple[str, bool], ...] | None = None
         self._exec_settings_manager = ExecutionSettingsManager()
         self._execution_settings: ExecutionSettings = self._exec_settings_manager.current
         self._wallet = WalletService(self._execution_settings.balance.initial_balances)
@@ -363,10 +855,24 @@ class DataService:
         self._last_protective: dict[tuple[str, str, str], dict[str, float | None]] = {}
         self._protective_interval = getattr(self._risk_config, "position_check_interval_sec", 180)
         self._protective_task: Optional[asyncio.Task] = None
+        self._rebalance_prev_positions: dict[tuple[str, str, str], float] = {}
+        self._rebalance_last: dict[tuple[str, str], float] = {}
+        self._rebalance_blocked_exchanges: set[str] = {"mexc"}
         self._market_data = MarketDataBus()
         self._manual = ManualTradeManager(orderbook_provider=self._market_data)
         self._manual_runs: Dict[str, dict[str, Any]] = {}
         self._manual_run_ttl = 3600
+        self._auto_exit_store = JsonStateStore(AUTO_EXIT_STATE_PATH)
+        self._auto_exit: dict[str, Any] = self._load_auto_exit_config()
+        self._auto_exit_lock = asyncio.Lock()
+        self._auto_exit_task: Optional[asyncio.Task] = None
+        self._auto_exit_poll_sec = AUTO_EXIT_POLL_SEC
+        self._auto_exit_inflight = False
+        self._auto_exit_live_spreads: dict[str, float] = {}
+        self._auto_exit_events: list[dict[str, Any]] = []
+        self._auto_exit_event_limit = 60
+        self._auto_exit_last_log_ts: dict[str, float] = {}
+        self._auto_exit_log_cooldown_sec = AUTO_EXIT_LOG_COOLDOWN_SEC
         self._mexc_alert_cooldown = 600  # seconds
         self._last_mexc_alert: dict[tuple[str, str], float] = {}
         self._send_missing_stop_alerts = True
@@ -393,6 +899,8 @@ class DataService:
             self._positions_market_task = asyncio.create_task(self._positions_market_scheduler())
         if self._protective_task is None:
             self._protective_task = asyncio.create_task(self._protective_scheduler())
+        if self._auto_exit_task is None:
+            self._auto_exit_task = asyncio.create_task(self._auto_exit_scheduler())
         await self._telemetry.start()
 
     async def shutdown(self) -> None:
@@ -417,6 +925,13 @@ class DataService:
             except asyncio.CancelledError:
                 pass
             self._positions_market_task = None
+        if self._auto_exit_task:
+            self._auto_exit_task.cancel()
+            try:
+                await self._auto_exit_task
+            except asyncio.CancelledError:
+                pass
+            self._auto_exit_task = None
         if self._protective_task:
             self._protective_task.cancel()
             try:
@@ -509,6 +1024,9 @@ class DataService:
         async with self._lock:
             if self._in_progress:
                 return "in_progress"
+            prev_exchange_status = dict(self._exchange_status)
+            prev_snapshot = self._snapshot
+            prev_last_refreshed = self._last_refreshed
             self._in_progress = True
             self._status = "pending"
             self._last_error = None
@@ -526,17 +1044,23 @@ class DataService:
         source_flags = dict(current_settings.sources)
         exchange_flags = dict(current_settings.exchanges)
         sources: Optional[SourceSnapshot] = self._cached_sources
+        source_flags_key = tuple(sorted((name, bool(enabled)) for name, enabled in source_flags.items()))
+        source_flags_changed = (
+            self._last_source_flags_key is not None and source_flags_key != self._last_source_flags_key
+        )
 
         need_sources = (
             force_sources
             or sources is None
             or self._sources_due()
+            or source_flags_changed
         )
         if need_sources:
             try:
                 sources = await collect_sources_async(
                     progress_cb,
                     source_settings=source_flags,
+                    exchange_settings=exchange_flags,
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception("Source refresh raised an error")
@@ -566,6 +1090,42 @@ class DataService:
             else:
                 self._cached_sources = sources
                 self._last_source_refresh = sources.generated_at
+                self._last_source_flags_key = source_flags_key
+        if sources is None:
+            async with self._lock:
+                self._last_error = "sources_unavailable"
+                self._status = "error"
+            return "failed"
+
+        symbols = [str(entry.get("symbol") or "") for entry in sources.universe if entry.get("symbol")]
+        universe_key = tuple(sorted(symbols))
+        exchanges_key = tuple(sorted(name for name, enabled in exchange_flags.items() if enabled))
+        skip_exchange_refresh = (
+            not need_sources
+            and self._snapshot is not None
+            and self._last_snapshot_sources_at is not None
+            and sources.generated_at == self._last_snapshot_sources_at
+            and universe_key == (self._last_snapshot_universe_key or ())
+            and exchanges_key == (self._last_snapshot_exchanges_key or ())
+        )
+        if skip_exchange_refresh:
+            self._record_event(
+                "refresh:skipped",
+                {
+                    "message": "Snapshot refresh skipped (sources unchanged)",
+                    "reason": "sources_unchanged",
+                    "generated_at": sources.generated_at.isoformat(),
+                },
+            )
+            async with self._lock:
+                self._snapshot = prev_snapshot
+                self._status = "ready" if prev_snapshot else "idle"
+                self._last_error = None
+                self._last_refreshed = prev_last_refreshed
+                self._exchange_status = prev_exchange_status
+            async with self._lock:
+                self._in_progress = False
+            return "completed"
 
         try:
             snapshot = await build_snapshot_from_sources(
@@ -602,6 +1162,9 @@ class DataService:
                     entry.get("exchange", f"exchange-{idx}"): entry
                     for idx, entry in enumerate(snapshot.exchange_status)
                 }
+                self._last_snapshot_sources_at = sources.generated_at
+                self._last_snapshot_universe_key = universe_key
+                self._last_snapshot_exchanges_key = exchanges_key
         finally:
             async with self._lock:
                 self._in_progress = False
@@ -688,6 +1251,206 @@ class DataService:
             unique.append(name)
         return unique
 
+    def _funding_raw_payload(
+        self,
+        exchange: str,
+        symbol: str,
+        exchange_symbol: str,
+        adapter: Any,
+        *,
+        history_limit: int = 12,
+    ) -> dict[str, Any]:
+        name = normalize_exchange_name(exchange)
+        raw: dict[str, Any] = {
+            "exchange": name,
+            "symbol": symbol,
+            "exchange_symbol": exchange_symbol,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "snapshot": [],
+            "history": [],
+        }
+
+        def add_entry(
+            target: str,
+            label: str,
+            url: str,
+            *,
+            payload: Any = None,
+            error: str | None = None,
+            filtered: bool = False,
+            note: str | None = None,
+        ) -> None:
+            entry: dict[str, Any] = {"label": label, "url": url}
+            if filtered:
+                entry["filtered"] = True
+            if note:
+                entry["note"] = note
+            if error:
+                entry["error"] = error
+            else:
+                entry["payload"] = payload
+            raw[target].append(entry)
+
+        def fetch_and_add(
+            target: str,
+            label: str,
+            url: str,
+            *,
+            filter_key: str | None = None,
+            filter_value: str | None = None,
+            note: str | None = None,
+        ) -> None:
+            try:
+                payload = _fetch_json_any(url)
+                filtered = False
+                if filter_key and filter_value:
+                    payload, filtered = _filter_payload_list(payload, filter_key, filter_value)
+                add_entry(
+                    target,
+                    label,
+                    url,
+                    payload=payload,
+                    filtered=filtered,
+                    note=note,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                add_entry(target, label, url, error=str(exc), note=note)
+
+        if name == "bybit":
+            base_url = getattr(adapter, "base_url", "https://api.bybit.com")
+            category = "linear" if exchange_symbol.endswith("USDT") else "inverse"
+            tickers_url = f"{base_url}/v5/market/tickers?" + urlencode(
+                {"category": category, "symbol": exchange_symbol}
+            )
+            fetch_and_add("snapshot", "tickers", tickers_url)
+            history_url = f"{base_url}/v5/market/funding/history?" + urlencode(
+                {"category": category, "symbol": exchange_symbol, "limit": history_limit}
+            )
+            fetch_and_add("history", "funding_history", history_url)
+        elif name == "binance":
+            base_url = getattr(adapter, "base_url", "https://fapi.binance.com")
+            premium_url = f"{base_url}/fapi/v1/premiumIndex?" + urlencode(
+                {"symbol": exchange_symbol}
+            )
+            fetch_and_add("snapshot", "premium_index", premium_url)
+            book_url = f"{base_url}/fapi/v1/ticker/bookTicker?" + urlencode(
+                {"symbol": exchange_symbol}
+            )
+            fetch_and_add("snapshot", "book_ticker", book_url)
+            history_url = f"{base_url}/fapi/v1/fundingRate?" + urlencode(
+                {"symbol": exchange_symbol, "limit": history_limit}
+            )
+            fetch_and_add("history", "funding_rate", history_url)
+        elif name == "bingx":
+            base_url = getattr(adapter, "base_url", "https://open-api.bingx.com")
+            contracts_url = f"{base_url}/openApi/swap/v2/quote/contracts"
+            fetch_and_add(
+                "snapshot",
+                "contracts",
+                contracts_url,
+                filter_key="symbol",
+                filter_value=exchange_symbol,
+                note="filtered to symbol",
+            )
+            funding_url = f"{base_url}/openApi/swap/v2/quote/fundingRate?" + urlencode(
+                {"symbol": exchange_symbol}
+            )
+            fetch_and_add(
+                "snapshot",
+                "funding_rate",
+                funding_url,
+                note="also used for history",
+            )
+        elif name == "bitget":
+            base_url = getattr(adapter, "base_url", "https://api.bitget.com")
+            ticker_url = f"{base_url}/api/mix/v2/market/ticker?" + urlencode(
+                {"symbol": exchange_symbol}
+            )
+            fetch_and_add("snapshot", "ticker", ticker_url)
+            funding_url = f"{base_url}/api/mix/v2/market/current-fundRate?" + urlencode(
+                {"symbol": exchange_symbol}
+            )
+            fetch_and_add("snapshot", "current_fundRate", funding_url)
+            history_url = f"{base_url}/api/mix/v2/market/history-fundRate?" + urlencode(
+                {"symbol": exchange_symbol, "pageSize": history_limit}
+            )
+            fetch_and_add("history", "history_fundRate", history_url)
+        elif name == "okx":
+            base_url = getattr(adapter, "base_url", "https://www.okx.com")
+            funding_url = f"{base_url}/api/v5/public/funding-rate?" + urlencode(
+                {"instId": exchange_symbol}
+            )
+            fetch_and_add("snapshot", "funding_rate", funding_url)
+            ticker_url = f"{base_url}/api/v5/market/ticker?" + urlencode(
+                {"instId": exchange_symbol}
+            )
+            fetch_and_add("snapshot", "ticker", ticker_url)
+            history_url = f"{base_url}/api/v5/public/funding-rate-history?" + urlencode(
+                {"instId": exchange_symbol, "limit": history_limit}
+            )
+            fetch_and_add("history", "funding_rate_history", history_url)
+        elif name == "gate":
+            base_url = getattr(adapter, "base_url", "https://api.gateio.ws/api/v4")
+            ticker_url = f"{base_url}/futures/usdt/tickers?" + urlencode(
+                {"contract": exchange_symbol}
+            )
+            fetch_and_add("snapshot", "tickers", ticker_url)
+            contract_url = f"{base_url}/futures/usdt/contracts/{exchange_symbol}"
+            fetch_and_add("snapshot", "contract", contract_url)
+            history_url = f"{base_url}/futures/usdt/funding_rate?" + urlencode(
+                {"contract": exchange_symbol, "limit": history_limit}
+            )
+            fetch_and_add("history", "funding_rate", history_url)
+        elif name == "mexc":
+            ticker_url = getattr(
+                adapter, "ticker_url", "https://contract.mexc.com/api/v1/contract/ticker"
+            )
+            fetch_and_add(
+                "snapshot",
+                "ticker",
+                ticker_url,
+                filter_key="symbol",
+                filter_value=exchange_symbol,
+                note="filtered to symbol",
+            )
+            funding_tpl = getattr(
+                adapter,
+                "funding_url_tpl",
+                "https://contract.mexc.com/api/v1/contract/funding_rate/{symbol}",
+            )
+            funding_url = funding_tpl.format(symbol=exchange_symbol)
+            fetch_and_add("snapshot", "funding_rate", funding_url)
+            history_url = (
+                "https://contract.mexc.com/api/v1/contract/funding_rate/history/"
+                + exchange_symbol
+            )
+            fetch_and_add("history", "funding_rate_history", history_url)
+        elif name == "kucoin":
+            base_url = getattr(adapter, "base_url", "https://api-futures.kucoin.com")
+            contracts_url = f"{base_url}/api/v1/contracts/active"
+            fetch_and_add(
+                "snapshot",
+                "contracts",
+                contracts_url,
+                filter_key="symbol",
+                filter_value=exchange_symbol,
+                note="filtered to symbol",
+            )
+            ticker_url = f"{base_url}/api/v1/ticker?" + urlencode(
+                {"symbol": exchange_symbol}
+            )
+            fetch_and_add("snapshot", "ticker", ticker_url)
+            now_ms = int(time.time() * 1000)
+            from_ms = now_ms - 7 * 24 * 3600 * 1000
+            history_url = f"{base_url}/api/v1/contract/funding-rates?" + urlencode(
+                {"symbol": exchange_symbol, "from": from_ms, "to": now_ms}
+            )
+            fetch_and_add("history", "funding_rates", history_url)
+        else:
+            raw["errors"] = [f"{exchange}: raw funding fetch not implemented"]
+
+        return raw
+
     async def manual_test_position(self, payload: dict[str, Any]) -> dict[str, Any]:
         exchange = normalize_exchange_name(str(payload.get("exchange") or ""))
         symbol = str(payload.get("symbol") or "").strip()
@@ -710,6 +1473,38 @@ class DataService:
         if not gateway:
             return {"errors": [error or "gateway_unavailable"]}
 
+        if exchange == "binance":
+            client = gateway.client
+            if client is None:
+                return {"errors": ["client_unavailable"]}
+            ccxt_symbol = await self._manual._resolve_market_symbol(client, symbol)
+            if not ccxt_symbol:
+                return {"errors": [f"{exchange}: unable to resolve symbol {symbol}"]}
+            if margin_mode:
+                try:
+                    await client.set_margin_mode(margin_mode, ccxt_symbol)
+                except Exception as exc:  # pylint: disable=broad-except
+                    return {
+                        "errors": [str(exc)],
+                        "exchange": exchange,
+                        "symbol": symbol,
+                        "margin_mode": margin_mode,
+                    }
+            try:
+                target = int(round(float(leverage)))
+                result = await client.set_leverage(target, ccxt_symbol, {})
+            except Exception as exc:  # pylint: disable=broad-except
+                return {"errors": [str(exc)], "exchange": exchange, "symbol": symbol}
+            return {
+                "exchange": exchange,
+                "symbol": symbol,
+                "side": side or None,
+                "margin_mode": margin_mode or None,
+                "target_leverage": leverage,
+                "result": result,
+                "warnings": ["binance leverage set by symbol"],
+            }
+
         try:
             positions = await gateway.fetch_positions()
         except Exception as exc:  # pylint: disable=broad-except
@@ -726,19 +1521,17 @@ class DataService:
             warnings.append(f"{exchange}: balance fetch failed: {exc}")
 
         metrics = _manual_position_metrics(position)
-        available = _safe_float(balance.get("available")) if isinstance(balance, dict) else None
-        margin_used = _safe_float(position.get("margin_used")) or metrics.get("initial_margin")
-        maintenance_margin = metrics.get("maintenance_margin")
-        max_reduce = None
-        if margin_used is not None and maintenance_margin is not None:
-            buffer = maintenance_margin * 1.05
-            max_reduce = max(0.0, margin_used - buffer)
+        estimates = _manual_margin_estimates(position, balance)
+        available = estimates.get("max_add_est")
+        max_reduce = estimates.get("max_reduce_est")
 
         return {
             "exchange": exchange,
             "symbol": symbol,
             "side": position.get("side") or side or None,
             "position": position,
+            "position_view": _manual_position_view(position, estimates=estimates),
+            "position_raw": position.get("raw"),
             "metrics": metrics,
             "balance": balance,
             "max_add_est": available,
@@ -786,6 +1579,7 @@ class DataService:
             before_balance = await gateway.fetch_balance()
         except Exception as exc:  # pylint: disable=broad-except
             warnings.append(f"{exchange}: balance fetch failed: {exc}")
+        before_estimates = _manual_margin_estimates(position, before_balance)
 
         result = await self._accounts._modify_margin(
             exchange=exchange, position=position, amount=float(amount), action=action
@@ -798,12 +1592,20 @@ class DataService:
                 "side": position.get("side") or side or None,
                 "action": action,
                 "amount": amount,
+                "before": {
+                    "position": position,
+                    "position_view": _manual_position_view(position, estimates=before_estimates),
+                    "position_raw": position.get("raw"),
+                    "metrics": before_metrics,
+                    "balance": before_balance,
+                },
                 "result": result,
                 "warnings": warnings,
             }
 
         after_position = None
         after_metrics = None
+        after_estimates = None
         try:
             after_positions = await gateway.fetch_positions()
             after_position, pos_errors = self._manual_test_select_position(
@@ -821,6 +1623,8 @@ class DataService:
             after_balance = await gateway.fetch_balance()
         except Exception as exc:  # pylint: disable=broad-except
             warnings.append(f"{exchange}: balance refresh failed: {exc}")
+        if after_position:
+            after_estimates = _manual_margin_estimates(after_position, after_balance)
 
         return {
             "exchange": exchange,
@@ -830,17 +1634,579 @@ class DataService:
             "amount": amount,
             "before": {
                 "position": position,
+                "position_view": _manual_position_view(position, estimates=before_estimates),
+                "position_raw": position.get("raw"),
                 "metrics": before_metrics,
                 "balance": before_balance,
             },
             "after": {
                 "position": after_position,
+                "position_view": _manual_position_view(after_position, estimates=after_estimates),
+                "position_raw": after_position.get("raw") if after_position else None,
                 "metrics": after_metrics,
                 "balance": after_balance,
             },
             "result": result,
             "warnings": warnings,
         }
+
+    async def manual_test_leverage(self, payload: dict[str, Any]) -> dict[str, Any]:
+        exchange = normalize_exchange_name(str(payload.get("exchange") or ""))
+        symbol = str(payload.get("symbol") or "").strip()
+        side = str(payload.get("side") or "").strip().lower()
+        if side in ("", "auto", "any", "none"):
+            side = ""
+        leverage = _safe_float(payload.get("leverage"))
+        margin_mode = str(payload.get("margin_mode") or "").strip().lower()
+        if margin_mode in ("", "auto", "any", "none"):
+            margin_mode = ""
+
+        errors: list[str] = []
+        warnings: list[str] = []
+        if not exchange:
+            errors.append("exchange is required")
+        if not symbol:
+            errors.append("symbol is required")
+        if side and side not in ("long", "short"):
+            errors.append("side must be long/short or empty")
+        if leverage is None or leverage <= 0:
+            errors.append("leverage must be > 0")
+        if margin_mode and margin_mode not in ("isolated", "cross"):
+            warnings.append("margin_mode must be isolated/cross or empty")
+            margin_mode = ""
+        if errors:
+            return {"errors": errors}
+
+        gateway, error = await self._manual_test_gateway(exchange)
+        if not gateway:
+            return {"errors": [error or "gateway_unavailable"]}
+
+        try:
+            positions = await gateway.fetch_positions()
+        except Exception as exc:  # pylint: disable=broad-except
+            return {"errors": [str(exc)]}
+
+        position, pos_errors = self._manual_test_select_position(positions, symbol, side)
+        if pos_errors:
+            return {"errors": pos_errors}
+
+        before_metrics = _manual_position_metrics(position)
+        before_balance = None
+        try:
+            before_balance = await gateway.fetch_balance()
+        except Exception as exc:  # pylint: disable=broad-except
+            warnings.append(f"{exchange}: balance fetch failed: {exc}")
+        before_estimates = _manual_margin_estimates(position, before_balance)
+
+        effective_margin_mode = margin_mode or str(position.get("margin_mode") or "")
+        if effective_margin_mode:
+            effective_margin_mode = effective_margin_mode.lower()
+        if not effective_margin_mode or effective_margin_mode not in ("isolated", "cross"):
+            warnings.append("margin_mode defaulted to isolated")
+            effective_margin_mode = "isolated"
+
+        result = await self._accounts._set_leverage(
+            exchange=exchange,
+            position=position,
+            margin_mode=effective_margin_mode,
+            leverage=float(leverage),
+        )
+        if result.get("status") != "ok":
+            return {
+                "errors": [str(result.get("error") or "leverage_update_failed")],
+                "exchange": exchange,
+                "symbol": symbol,
+                "side": position.get("side") or side or None,
+                "margin_mode": effective_margin_mode,
+                "target_leverage": leverage,
+                "before": {
+                    "position": position,
+                    "position_view": _manual_position_view(position, estimates=before_estimates),
+                    "position_raw": position.get("raw"),
+                    "metrics": before_metrics,
+                    "balance": before_balance,
+                },
+                "result": result,
+                "warnings": warnings,
+            }
+
+        after_position = None
+        after_metrics = None
+        after_estimates = None
+        try:
+            after_positions = await gateway.fetch_positions()
+            after_position, pos_errors = self._manual_test_select_position(
+                after_positions, symbol, side
+            )
+            if pos_errors:
+                warnings.extend(pos_errors)
+            if after_position:
+                after_metrics = _manual_position_metrics(after_position)
+        except Exception as exc:  # pylint: disable=broad-except
+            warnings.append(f"{exchange}: refresh failed: {exc}")
+
+        after_balance = None
+        try:
+            after_balance = await gateway.fetch_balance()
+        except Exception as exc:  # pylint: disable=broad-except
+            warnings.append(f"{exchange}: balance refresh failed: {exc}")
+        if after_position:
+            after_estimates = _manual_margin_estimates(after_position, after_balance)
+
+        return {
+            "exchange": exchange,
+            "symbol": symbol,
+            "side": position.get("side") or side or None,
+            "margin_mode": effective_margin_mode,
+            "target_leverage": leverage,
+            "before": {
+                "position": position,
+                "position_view": _manual_position_view(position, estimates=before_estimates),
+                "position_raw": position.get("raw"),
+                "metrics": before_metrics,
+                "balance": before_balance,
+            },
+            "after": {
+                "position": after_position,
+                "position_view": _manual_position_view(after_position, estimates=after_estimates),
+                "position_raw": after_position.get("raw") if after_position else None,
+                "metrics": after_metrics,
+                "balance": after_balance,
+            },
+            "result": result,
+            "warnings": warnings,
+        }
+
+    async def manual_test_binance_leverage(self, payload: dict[str, Any]) -> dict[str, Any]:
+        exchange = normalize_exchange_name(str(payload.get("exchange") or "binance"))
+        symbol = str(payload.get("symbol") or "").strip()
+        leverage = _safe_float(payload.get("leverage"))
+        margin_mode = str(payload.get("margin_mode") or "").strip().lower()
+        if margin_mode in ("", "auto", "any", "none"):
+            margin_mode = ""
+
+        errors: list[str] = []
+        if not symbol:
+            errors.append("symbol is required")
+        if leverage is None or leverage <= 0:
+            errors.append("leverage must be > 0")
+        if exchange != "binance":
+            errors.append("exchange must be binance")
+        if margin_mode and margin_mode not in ("isolated", "cross"):
+            errors.append("margin_mode must be isolated/cross or empty")
+        if errors:
+            return {"errors": errors}
+
+        gateway, error = await self._manual_test_gateway(exchange)
+        if not gateway:
+            return {"errors": [error or "gateway_unavailable"]}
+        client = gateway.client
+        if client is None:
+            return {"errors": ["client_unavailable"]}
+        ccxt_symbol = await self._manual._resolve_market_symbol(client, symbol)
+        if not ccxt_symbol:
+            return {"errors": [f"{exchange}: unable to resolve symbol {symbol}"]}
+
+        if margin_mode:
+            try:
+                await client.set_margin_mode(margin_mode, ccxt_symbol)
+            except Exception as exc:  # pylint: disable=broad-except
+                return {
+                    "errors": [str(exc)],
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "margin_mode": margin_mode,
+                }
+
+        try:
+            target = int(round(float(leverage)))
+            result = await client.set_leverage(target, ccxt_symbol, {})
+        except Exception as exc:  # pylint: disable=broad-except
+            return {"errors": [str(exc)], "exchange": exchange, "symbol": symbol}
+
+        return {
+            "exchange": exchange,
+            "symbol": symbol,
+            "margin_mode": margin_mode or None,
+            "target_leverage": leverage,
+            "result": result,
+            "warnings": ["binance leverage set by symbol (binance-only test)"],
+        }
+
+    async def manual_test_coin_analysis(self, payload: dict[str, Any]) -> dict[str, Any]:
+        symbol = _normalize_input_symbol(str(payload.get("symbol") or ""))
+        window_minutes = int(_safe_float(payload.get("window_minutes")) or 4320)
+        funding_points = int(_safe_float(payload.get("funding_points")) or 120)
+        include_series = bool(payload.get("include_series"))
+
+        if not symbol:
+            return {"errors": ["symbol is required"]}
+
+        window_minutes = max(60, min(window_minutes, 4320))
+        funding_points = max(24, min(funding_points, 200))
+        try:
+            analysis = await self.analyze_symbol(
+                symbol,
+                window_minutes=window_minutes,
+                funding_points=funding_points,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            return {
+                "errors": [str(exc)],
+                "symbol": symbol,
+                "window_minutes": window_minutes,
+                "funding_points": funding_points,
+            }
+
+        if not include_series:
+            for row in analysis.get("exchanges") or []:
+                candles = row.pop("candles_1m", None)
+                if candles is not None:
+                    row["candles_1m_count"] = len(candles)
+
+        pairs = list(analysis.get("pair_analysis") or [])
+        best_pair = None
+        if pairs:
+            best_pair = max(
+                pairs,
+                key=lambda item: _safe_float(item.get("score")) or 0.0,
+            )
+
+        summary: dict[str, Any] = {
+            "symbol": analysis.get("symbol"),
+            "analysis_exchanges": analysis.get("analysis_exchanges"),
+            "exchange_count": len(analysis.get("exchanges") or []),
+            "pair_count": len(pairs),
+            "bot_decision": (analysis.get("bot_logic") or {}).get("decision"),
+            "bot_score": (analysis.get("bot_logic") or {}).get("score"),
+        }
+        if best_pair:
+            spread = best_pair.get("spread") or {}
+            funding = best_pair.get("funding_hourly") or {}
+            summary["best_pair"] = {
+                "left_exchange": best_pair.get("left_exchange"),
+                "right_exchange": best_pair.get("right_exchange"),
+                "score": best_pair.get("score"),
+                "recommendation": best_pair.get("recommendation"),
+                "spread_current_pct": spread.get("current_pct"),
+                "spread_p95_abs_pct": spread.get("p95_abs_pct"),
+                "spread_z_score": spread.get("z_score"),
+                "spread_coverage_pct": spread.get("coverage_pct"),
+                "funding_delta_hourly": funding.get("delta"),
+                "reasons": best_pair.get("reasons") or [],
+            }
+
+        return {
+            "symbol": analysis.get("symbol"),
+            "window_minutes": window_minutes,
+            "funding_points": funding_points,
+            "include_series": include_series,
+            "summary": summary,
+            "analysis": analysis,
+        }
+
+    async def manual_test_funding(self, payload: dict[str, Any]) -> dict[str, Any]:
+        exchange = normalize_exchange_name(str(payload.get("exchange") or ""))
+        raw_symbol = str(payload.get("symbol") or "")
+        symbol = _normalize_input_symbol(raw_symbol)
+        include_raw = bool(payload.get("include_raw"))
+        history_limit = _safe_float(payload.get("history_limit"))
+        if history_limit is None:
+            history_limit_value = 12
+        else:
+            history_limit_value = int(history_limit)
+        if history_limit_value < 1:
+            history_limit_value = 1
+        if history_limit_value > 200:
+            history_limit_value = 200
+
+        errors: list[str] = []
+        warnings: list[str] = []
+        if not exchange:
+            errors.append("exchange is required")
+        if not symbol:
+            errors.append("symbol is required")
+        if errors:
+            return {"errors": errors}
+
+        try:
+            adapter = get_adapter(exchange)
+        except KeyError:
+            return {"errors": [f"{exchange}: adapter unavailable"]}
+
+        try:
+            exchange_symbol = adapter.map_symbol(symbol)
+        except Exception as exc:  # pylint: disable=broad-except
+            exchange_symbol = None
+            warnings.append(f"{exchange}: symbol map failed: {exc}")
+
+        if not exchange_symbol:
+            return {"errors": [f"{exchange}: unsupported symbol {symbol}"]}
+
+        attempts: list[dict[str, Any]] = []
+        history_payload: list[dict[str, Any]] = []
+        funding_rate = None
+        next_funding_iso = None
+        funding_interval_hours = None
+        mark_price = None
+        rate_source = None
+        next_source = None
+        interval_source = None
+        mark_source = None
+
+        try:
+            snapshots = await adapter.fetch_market_snapshots_async([symbol])
+            if snapshots:
+                snap = snapshots[0]
+                snap_next = snap.next_funding_time.isoformat() if snap.next_funding_time else None
+                snap_next_stale = bool(snap_next) and is_stale_next_funding_iso(snap_next)
+                if snap_next_stale:
+                    warnings.append(f"{exchange}: snapshot next_funding_time is stale")
+                attempts.append(
+                    {
+                        "source": "snapshot",
+                        "status": "ok",
+                        "funding_rate": snap.funding_rate,
+                        "next_funding_time": snap_next,
+                        "funding_interval_hours": snap.funding_interval_hours,
+                        "mark_price": snap.mark_price,
+                        "stale_next_funding_time": snap_next_stale,
+                    }
+                )
+                if snap.funding_rate is not None and rate_source is None:
+                    funding_rate = snap.funding_rate
+                    rate_source = "snapshot"
+                if snap_next and (not snap_next_stale) and next_source is None:
+                    next_funding_iso = snap_next
+                    next_source = "snapshot"
+                if snap.funding_interval_hours is not None and interval_source is None:
+                    funding_interval_hours = snap.funding_interval_hours
+                    interval_source = "snapshot"
+                if snap.mark_price is not None and mark_source is None:
+                    mark_price = snap.mark_price
+                    mark_source = "snapshot"
+            else:
+                attempts.append({"source": "snapshot", "status": "empty"})
+        except Exception as exc:  # pylint: disable=broad-except
+            attempts.append({"source": "snapshot", "status": "error", "error": str(exc)})
+
+        try:
+            history = await asyncio.to_thread(
+                _load_funding_history_cached,
+                exchange,
+                exchange_symbol,
+                symbol,
+                history_limit_value,
+                adapter,
+            )
+            if history:
+                history = enrich_history_intervals(
+                    history,
+                    snapshot_interval=funding_interval_hours,
+                )
+                history_sorted = sorted(
+                    history,
+                    key=lambda item: _funding_history_ts_ms(
+                        item.get("ts_ms") or item.get("timestamp")
+                    )
+                    or 0,
+                    reverse=True,
+                )
+                latest = next((item for item in history_sorted if item.get("rate") is not None), None)
+                hist_rate = _safe_float(latest.get("rate")) if latest else None
+                hist_interval = infer_funding_interval_hours(
+                    history_sorted,
+                    snapshot_interval=funding_interval_hours,
+                )
+                hist_mark = _safe_float(latest.get("mark_price")) if latest else None
+                hist_next = project_next_funding_time_iso(
+                    history_sorted,
+                    interval_hours=hist_interval,
+                )
+
+                history_payload = []
+                for entry in history_sorted[:history_limit_value]:
+                    ts_ms = _funding_history_ts_ms(
+                        entry.get("ts_ms") or entry.get("timestamp")
+                    )
+                    ts_iso = None
+                    if ts_ms:
+                        ts_iso = datetime.fromtimestamp(
+                            ts_ms / 1000, tz=timezone.utc
+                        ).isoformat()
+                    history_payload.append(
+                        {
+                            "ts_ms": ts_ms,
+                            "ts_iso": ts_iso,
+                            "rate": _safe_float(entry.get("rate")),
+                            "interval_hours": _safe_float(entry.get("interval_hours")),
+                            "mark_price": _safe_float(entry.get("mark_price")),
+                        }
+                    )
+
+                attempts.append(
+                    {
+                        "source": "history",
+                        "status": "ok",
+                        "funding_rate": hist_rate,
+                        "next_funding_time": hist_next,
+                        "funding_interval_hours": hist_interval,
+                        "mark_price": hist_mark,
+                    }
+                )
+
+                if hist_rate is not None and rate_source is None:
+                    funding_rate = hist_rate
+                    rate_source = "history"
+                if hist_next and next_source is None:
+                    next_funding_iso = hist_next
+                    next_source = "history"
+                if hist_interval is not None and interval_source is None:
+                    funding_interval_hours = hist_interval
+                    interval_source = "history"
+                if hist_mark is not None and mark_source is None:
+                    mark_price = hist_mark
+                    mark_source = "history"
+            else:
+                attempts.append({"source": "history", "status": "empty"})
+        except Exception as exc:  # pylint: disable=broad-except
+            attempts.append({"source": "history", "status": "error", "error": str(exc)})
+
+        if normalize_exchange_name(exchange) == "bitget" and (
+            funding_rate is None or next_funding_iso is None
+        ):
+            try:
+                import ccxt  # type: ignore
+
+                client = ccxt.bitget({"options": {"defaultType": "swap"}})
+                base = symbol
+                for suffix in ("USDT", "USDC", "USD"):
+                    if base.endswith(suffix):
+                        base = base[: -len(suffix)]
+                        break
+                try:
+                    client.load_markets()
+                except Exception:  # pylint: disable=broad-except
+                    pass
+                candidates = [
+                    f"{base}/USDT:USDT",
+                    exchange_symbol,
+                    f"{base}USDT_UMCBL",
+                    f"{base}USD_DMCBL",
+                ]
+                funding = None
+                last_exc: Exception | None = None
+                for cand in candidates:
+                    if not cand:
+                        continue
+                    try:
+                        funding = client.fetch_funding_rate(cand)
+                        break
+                    except Exception as exc:  # pylint: disable=broad-except
+                        last_exc = exc
+                        continue
+                if funding:
+                    rate = _safe_float(funding.get("fundingRate"))
+                    next_ts = funding.get("fundingTimestamp")
+                    next_iso = None
+                    try:
+                        if next_ts:
+                            next_iso = datetime.fromtimestamp(
+                                float(next_ts) / 1000, tz=timezone.utc
+                            ).isoformat()
+                    except Exception:  # pylint: disable=broad-except
+                        next_iso = None
+                    mark = _safe_float(
+                        funding.get("markPrice")
+                        or funding.get("indexPrice")
+                        or funding.get("mark")
+                    )
+                    attempts.append(
+                        {
+                            "source": "ccxt",
+                            "status": "ok",
+                            "funding_rate": rate,
+                            "next_funding_time": next_iso,
+                            "funding_interval_hours": None,
+                            "mark_price": mark,
+                        }
+                    )
+                    if rate is not None and rate_source is None:
+                        funding_rate = rate
+                        rate_source = "ccxt"
+                    if next_iso and next_source is None:
+                        next_funding_iso = next_iso
+                        next_source = "ccxt"
+                    if mark is not None and mark_source is None:
+                        mark_price = mark
+                        mark_source = "ccxt"
+                elif last_exc:
+                    attempts.append({"source": "ccxt", "status": "error", "error": str(last_exc)})
+            except Exception as exc:  # pylint: disable=broad-except
+                attempts.append({"source": "ccxt", "status": "error", "error": str(exc)})
+
+        seconds_to_next, next_eta = _funding_eta(next_funding_iso)
+        response = {
+            "exchange": exchange,
+            "symbol": symbol,
+            "exchange_symbol": exchange_symbol,
+            "funding_rate": funding_rate,
+            "funding_interval_hours": funding_interval_hours,
+            "next_funding_time": next_funding_iso,
+            "seconds_to_next": seconds_to_next,
+            "next_funding_eta": next_eta,
+            "mark_price": mark_price,
+            "history_limit": history_limit_value,
+            "funding_history": history_payload,
+            "sources": {
+                "rate": rate_source,
+                "next_funding_time": next_source,
+                "funding_interval_hours": interval_source,
+                "mark_price": mark_source,
+            },
+            "attempts": attempts,
+            "warnings": warnings,
+        }
+
+        if funding_rate is None and next_funding_iso is None:
+            response["errors"] = [f"{exchange}: funding unavailable"]
+
+        if include_raw:
+            try:
+                response["raw"] = await asyncio.to_thread(
+                    self._funding_raw_payload,
+                    exchange,
+                    symbol,
+                    exchange_symbol,
+                    adapter,
+                    history_limit=history_limit_value,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                response["raw_error"] = str(exc)
+
+        try:
+            funding_test_logger.info(
+                json.dumps(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "exchange": exchange,
+                        "symbol": symbol,
+                        "exchange_symbol": exchange_symbol,
+                        "funding_rate": funding_rate,
+                        "funding_interval_hours": funding_interval_hours,
+                        "next_funding_time": next_funding_iso,
+                        "seconds_to_next": seconds_to_next,
+                        "sources": response.get("sources"),
+                        "attempts": attempts,
+                        "warnings": warnings,
+                    },
+                    ensure_ascii=True,
+                )
+            )
+        except Exception:  # pylint: disable=broad-except
+            pass
+
+        return response
 
     async def manual_test_limit(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._manual_test_order(payload, order_type="limit")
@@ -952,7 +2318,7 @@ class DataService:
         if not ccxt_symbol:
             return {"errors": [f"{exchange}: unable to resolve symbol {symbol}"]}
 
-        if hasattr(client, "set_leverage"):
+        if exchange != "kucoin" and hasattr(client, "set_leverage"):
             leverage_params: dict[str, object] = {}
             mode = margin_mode.lower() if margin_mode else ""
             if mode in ("isolated", "cross"):
@@ -1032,8 +2398,12 @@ class DataService:
             margin_mode = margin_mode or "ISOLATED"
             params["marginMode"] = margin_mode
             params["marginType"] = margin_mode
+            params["leverage"] = int(DEFAULT_MANUAL_LEVERAGE)
+            if not position_side:
+                position_side = "BOTH"
         if position_side:
-            params["posSide"] = position_side
+            if exchange != "kucoin":
+                params["posSide"] = position_side
             params["positionSide"] = position_side
 
         try:
@@ -1043,33 +2413,7 @@ class DataService:
                 order = await client.create_order(ccxt_symbol, "market", side, order_qty, None, params)
         except Exception as exc:  # pylint: disable=broad-except
             message = str(exc)
-            if exchange == "kucoin" and ("330005" in message or "margin mode" in message.lower()):
-                if hasattr(client, "set_margin_mode") and margin_mode:
-                    try:
-                        await client.set_margin_mode(margin_mode, ccxt_symbol)
-                        if order_type == "limit":
-                            order = await client.create_order(
-                                ccxt_symbol,
-                                "limit",
-                                side,
-                                order_qty,
-                                limit_price,
-                                params,
-                            )
-                        else:
-                            order = await client.create_order(
-                                ccxt_symbol,
-                                "market",
-                                side,
-                                order_qty,
-                                None,
-                                params,
-                            )
-                    except Exception as retry_exc:  # pylint: disable=broad-except
-                        return {"errors": [str(retry_exc)]}
-                else:
-                    return {"errors": ["kucoin set_margin_mode unavailable; switch margin mode in UI"]}
-            elif exchange == "bitget" and "40774" in message:
+            if exchange == "bitget" and "40774" in message:
                 retry_params = dict(params)
                 if params.get("posSide") == "net":
                     retry_params.pop("posSide", None)
@@ -1160,7 +2504,28 @@ class DataService:
             "logs": list(run.get("logs") or []),
             "result": run.get("result"),
             "error": run.get("error"),
+            "log_path": run.get("log_path"),
         }
+
+    async def manual_exec_log(self, exec_id: str) -> dict[str, Any]:
+        self._prune_manual_runs()
+        run = self._manual_runs.get(exec_id)
+        if not run:
+            return {"error": "execution_not_found"}
+        log_path = run.get("log_path")
+        if not log_path:
+            return {"error": "log_unavailable"}
+        try:
+            path = Path(log_path).resolve()
+            base = MANUAL_EXEC_LOG_DIR.resolve()
+            if not str(path).startswith(str(base)):
+                return {"error": "log_unavailable"}
+            if not path.exists():
+                return {"error": "log_missing"}
+            content = path.read_text(encoding="utf-8", errors="replace")
+            return {"log": content}
+        except Exception as exc:  # pylint: disable=broad-except
+            return {"error": f"log_read_failed: {exc}"}
 
     async def manual_exec_stop(self, exec_id: str) -> dict[str, Any]:
         self._prune_manual_runs()
@@ -1175,6 +2540,7 @@ class DataService:
             }
         run["stop_requested"] = True
         run["updated_at"] = datetime.now(timezone.utc).isoformat()
+        run["updated_at_ts"] = time.time()
         logs = run.get("logs")
         if isinstance(logs, list):
             logs.append(
@@ -1202,26 +2568,54 @@ class DataService:
         self._prune_manual_runs()
         exec_id = uuid4().hex[:12]
         now = datetime.now(timezone.utc).isoformat()
+        now_ts = time.time()
+        log_path = None
+        try:
+            MANUAL_EXEC_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = MANUAL_EXEC_LOG_DIR / f"{exec_id}.log"
+        except Exception:
+            log_path = None
         run: dict[str, Any] = {
             "execution_id": exec_id,
             "action": action,
             "status": "running",
             "created_at": now,
             "updated_at": now,
-            "created_at_ts": time.time(),
+            "created_at_ts": now_ts,
+            "updated_at_ts": now_ts,
             "logs": [],
             "result": None,
             "error": None,
             "stop_requested": False,
+            "log_path": str(log_path) if log_path else None,
         }
         self._manual_runs[exec_id] = run
+
+        def _append_log(entry: dict[str, Any]) -> None:
+            if not log_path:
+                return
+            try:
+                ts = entry.get("ts") or datetime.now(timezone.utc).isoformat()
+                event = entry.get("event") or ""
+                message = entry.get("message") or ""
+                data = entry.get("data") or {}
+                line = f"{ts} | {event} | {message}"
+                if data:
+                    line += f" | data={json.dumps(data, ensure_ascii=True)}"
+                line += "\n"
+                log_path.open("a", encoding="utf-8").write(line)
+            except Exception:
+                return
 
         def _log_cb(entry: dict[str, Any]) -> None:
             logs = run["logs"]
             logs.append(entry)
             if len(logs) > 200:
                 del logs[:-200]
-            run["updated_at"] = datetime.now(timezone.utc).isoformat()
+            now_log = datetime.now(timezone.utc).isoformat()
+            run["updated_at"] = now_log
+            run["updated_at_ts"] = time.time()
+            _append_log(entry)
 
         def _stop_cb() -> bool:
             return bool(run.get("stop_requested"))
@@ -1239,12 +2633,29 @@ class DataService:
                 run["result"] = result
                 if result.get("errors"):
                     run["status"] = "completed_with_errors"
+                    _append_log(
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "event": "errors",
+                            "message": "Result errors",
+                            "data": {"errors": result.get("errors")},
+                        }
+                    )
                 else:
                     run["status"] = "completed"
             except Exception as exc:  # pylint: disable=broad-except
                 run["status"] = "failed"
                 run["error"] = str(exc)
+                _append_log(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "event": "exception",
+                        "message": "Execution failed",
+                        "data": {"error": str(exc)},
+                    }
+                )
             run["updated_at"] = datetime.now(timezone.utc).isoformat()
+            run["updated_at_ts"] = time.time()
 
         asyncio.create_task(_runner())
         return {"execution_id": exec_id, "status": "running"}
@@ -1254,7 +2665,11 @@ class DataService:
         expired = [
             key
             for key, run in self._manual_runs.items()
-            if (now - float(run.get("created_at_ts") or 0)) > self._manual_run_ttl
+            if (
+                run.get("status") != "running"
+                and (now - float(run.get("updated_at_ts") or run.get("created_at_ts") or 0))
+                > self._manual_run_ttl
+            )
         ]
         for key in expired:
             self._manual_runs.pop(key, None)
@@ -1311,6 +2726,7 @@ class DataService:
             "events": list(self._events),
             "exchange_status": list(self._exchange_status.values()),
             "settings": settings_payload,
+            "auto_exit": self.auto_exit_payload(),
             "execution": self._execution_state(),
             "accounts": self._account_state(),
         }
@@ -1529,15 +2945,18 @@ class DataService:
             accounts_snapshot = self._accounts.snapshot()
             positions = accounts_snapshot.get("positions") or []
             account_last_updated = accounts_snapshot.get("last_updated")
+            now = datetime.now(timezone.utc)
+            interval = max(30, int(self._positions_market_interval or self._account_interval))
             if (
                 not force
                 and account_last_updated
                 and account_last_updated == self._positions_market_last_account_update
+                and self._positions_market_last_refresh
             ):
-                return
+                age = (now - self._positions_market_last_refresh).total_seconds()
+                if age < interval:
+                    return
             symbols_by_exchange = self._collect_positions_market_symbols(positions)
-            now = datetime.now(timezone.utc)
-            interval = max(30, int(self._positions_market_interval or self._account_interval))
             key_bits = [
                 f"{exchange}:{symbol}"
                 for exchange, symbols in sorted(symbols_by_exchange.items())
@@ -1818,10 +3237,11 @@ class DataService:
                     next_funding_iso = datetime.fromtimestamp(ts_val, tz=timezone.utc).isoformat()
                 except Exception:  # pylint: disable=broad-except
                     next_funding_iso = None
+            exchange_name = str(entry.get("exchange") or "").lower()
             snapshot = None
             snapshot_ts = None
             for sym in lookup_symbols:
-                key = (str(entry.get("exchange")).lower(), sym)
+                key = (exchange_name, sym)
                 snapshot = market_lookup.get(key)
                 if snapshot:
                     snapshot_ts = market_ts_lookup.get(key)
@@ -1829,23 +3249,52 @@ class DataService:
             entry_price = entry.get("entry_price")
             mark_price = entry.get("mark_price")
             unrealized = entry.get("unrealized_pnl")
+            snapshot_funding_stale = False
             if snapshot:
-                if funding_rate is None and snapshot.funding_rate is not None:
-                    funding_rate = snapshot.funding_rate
-                if next_funding_iso is None and snapshot.next_funding_time:
-                    next_funding_iso = snapshot.next_funding_time.isoformat()
-                if mark_price is None and snapshot.mark_price is not None:
-                    mark_price = snapshot.mark_price
-            if funding_rate is None or next_funding_iso is None:
+                interval_sec = int(self._positions_market_interval or 60)
+                if snapshot_ts:
+                    try:
+                        age_sec = (datetime.now(timezone.utc) - snapshot_ts).total_seconds()
+                    except Exception:  # pylint: disable=broad-except
+                        age_sec = None
+                    if age_sec is not None and age_sec > max(30, interval_sec):
+                        snapshot_funding_stale = True
+                if snapshot.next_funding_time:
+                    try:
+                        next_dt = snapshot.next_funding_time.astimezone(timezone.utc)
+                        if next_dt < (datetime.now(timezone.utc) - timedelta(minutes=5)):
+                            snapshot_funding_stale = True
+                    except Exception:  # pylint: disable=broad-except
+                        pass
+                if snapshot.funding_rate is not None:
+                    if not snapshot_funding_stale:
+                        funding_rate = snapshot.funding_rate
+                if snapshot.next_funding_time:
+                    if not snapshot_funding_stale:
+                        next_funding_iso = snapshot.next_funding_time.isoformat()
+                snap_mark = _safe_float(snapshot.mark_price)
+                if snap_mark is not None:
+                    mark_val = _safe_float(mark_price)
+                    if mark_val is None or mark_val == 0:
+                        mark_price = snap_mark
+                    elif exchange_name == "bingx":
+                        try:
+                            delta_pct = abs(snap_mark - mark_val) / abs(mark_val) * 100.0
+                        except Exception:
+                            delta_pct = None
+                        if delta_pct is None or delta_pct >= 0.1:
+                            mark_price = snap_mark
+            needs_live = funding_rate is None or next_funding_iso is None or snapshot_funding_stale
+            if needs_live:
                 rate_live, next_live, mark_live = self._funding_live(
                     entry.get("exchange"),
                     entry.get("symbol"),
                     symbol_norm,
                     raw_exchange_symbol=entry.get("symbol"),
                 )
-                if funding_rate is None:
+                if funding_rate is None or snapshot_funding_stale:
                     funding_rate = rate_live
-                if next_funding_iso is None:
+                if next_funding_iso is None or snapshot_funding_stale:
                     next_funding_iso = next_live
                 if mark_price is None and mark_live is not None:
                     mark_price = mark_live
@@ -2071,6 +3520,9 @@ class DataService:
         )
 
         # Try live snapshot first for freshest funding; fallback to cached history (<=2m), then ccxt.
+        snapshot_rate = None
+        snapshot_mark = None
+        snapshot_interval = None
         try:
             snapshots = adapter.fetch_market_snapshots([canonical_symbol])
         except Exception as exc:  # pylint: disable=broad-except
@@ -2079,11 +3531,16 @@ class DataService:
 
         if snapshots:
             snap = snapshots[0]
-            rate = getattr(snap, "funding_rate", None)
+            rate = _safe_float(getattr(snap, "funding_rate", None))
             next_time = getattr(snap, "next_funding_time", None)
             next_funding_iso = next_time.isoformat() if next_time else None
-            mark_val = getattr(snap, "mark_price", None)
-            if rate is not None or next_funding_iso is not None or mark_val is not None:
+            if next_funding_iso and is_stale_next_funding_iso(next_funding_iso):
+                next_funding_iso = None
+            mark_val = _safe_float(getattr(snap, "mark_price", None))
+            snapshot_rate = rate
+            snapshot_mark = mark_val
+            snapshot_interval = _safe_float(getattr(snap, "funding_interval_hours", None))
+            if next_funding_iso is not None:
                 funding_logger.info(
                     "funding ok source=snapshot exchange=%s symbol=%s rate=%s next=%s mark=%s",
                     exchange,
@@ -2112,22 +3569,18 @@ class DataService:
             limit=5,
         )
         if history:
+            history = enrich_history_intervals(history, snapshot_interval=snapshot_interval)
             latest = next((item for item in history if item.get("rate") is not None), None)
             if latest is None:
                 history = []
             else:
-                rate = latest.get("rate")
-                ts_ms = latest.get("ts_ms") or latest.get("timestamp")
-                interval_hours = latest.get("interval_hours") or 8.0
-                next_funding_iso = None
-                mark_val = latest.get("mark_price")
-                if ts_ms and isinstance(ts_ms, (int, float)) and ts_ms > 0:
-                    try:
-                        ts_ms = int(ts_ms)
-                        next_ms = ts_ms + int((interval_hours or 8.0) * 3600 * 1000)
-                        next_funding_iso = datetime.fromtimestamp(next_ms / 1000, tz=timezone.utc).isoformat()
-                    except Exception:  # pylint: disable=broad-except
-                        next_funding_iso = None
+                hist_rate = _safe_float(latest.get("rate"))
+                interval_hours = infer_funding_interval_hours(history, snapshot_interval=snapshot_interval)
+                next_funding_iso = project_next_funding_time_iso(history, interval_hours=interval_hours)
+                mark_val = _safe_float(latest.get("mark_price"))
+                rate = hist_rate if hist_rate is not None else snapshot_rate
+                if mark_val is None:
+                    mark_val = snapshot_mark
                 self._funding_cache[key] = (rate, next_funding_iso, mark_val, now_ts)
                 funding_logger.info(
                     "funding ok source=history exchange=%s symbol=%s rate=%s next=%s mark=%s",
@@ -2140,6 +3593,20 @@ class DataService:
                 return rate, next_funding_iso, mark_val
         else:
             logger.debug("Funding history empty for %s %s", exchange, exchange_symbol)
+
+        if normalize_exchange_name(exchange) != "bitget" and (
+            snapshot_rate is not None or snapshot_mark is not None
+        ):
+            funding_logger.info(
+                "funding ok source=snapshot_partial exchange=%s symbol=%s rate=%s next=%s mark=%s",
+                exchange,
+                canonical_symbol,
+                snapshot_rate,
+                None,
+                snapshot_mark,
+            )
+            self._funding_cache[key] = (snapshot_rate, None, snapshot_mark, now_ts)
+            return snapshot_rate, None, snapshot_mark
 
         # Additional fallback for Bitget: use ccxt funding rate directly if history/snapshot failed.
         if normalize_exchange_name(exchange) == "bitget":
@@ -2200,6 +3667,18 @@ class DataService:
             except Exception as exc:  # pylint: disable=broad-except
                 logger.debug("Bitget ccxt fallback failed for %s: %s", canonical_symbol, exc)
 
+        if snapshot_rate is not None or snapshot_mark is not None:
+            funding_logger.info(
+                "funding ok source=snapshot_partial exchange=%s symbol=%s rate=%s next=%s mark=%s",
+                exchange,
+                canonical_symbol,
+                snapshot_rate,
+                None,
+                snapshot_mark,
+            )
+            self._funding_cache[key] = (snapshot_rate, None, snapshot_mark, now_ts)
+            return snapshot_rate, None, snapshot_mark
+
         funding_logger.warning("funding failed exchange=%s symbol=%s reason=unavailable", exchange, canonical_symbol)
         return None, None, None
 
@@ -2208,6 +3687,8 @@ class DataService:
             return None
         long_legs = [leg for leg in legs if (leg.get("side") or "").lower() == "long"]
         short_legs = [leg for leg in legs if (leg.get("side") or "").lower() == "short"]
+        long_exchange = long_legs[0].get("exchange") if len(long_legs) == 1 else None
+        short_exchange = short_legs[0].get("exchange") if len(short_legs) == 1 else None
 
         def _weighted_avg(items: List[dict[str, Any]], key: str, weight_key: str = "amount") -> float | None:
             total_w = 0.0
@@ -2281,6 +3762,8 @@ class DataService:
             "short_entry_avg": short_entry,
             "long_mark_avg": long_mark,
             "short_mark_avg": short_mark,
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
         }
 
     def _market_snapshot_lookup(self) -> dict[tuple[str, str], MarketSnapshot]:
@@ -2486,102 +3969,778 @@ class DataService:
             protective.get("send_missing_stop_alerts", self._send_missing_stop_alerts)
         )
 
+    def _load_auto_exit_config(self) -> dict[str, Any]:
+        payload = self._auto_exit_store.load({"defaults": dict(AUTO_EXIT_DEFAULTS), "rules": {}})
+        return self._normalize_auto_exit_config(payload)
+
+    @staticmethod
+    def _normalize_auto_exit_config(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+        defaults = dict(AUTO_EXIT_DEFAULTS)
+        rules: dict[str, Any] = {}
+        if payload and isinstance(payload, Mapping):
+            incoming_defaults = payload.get("defaults")
+            if isinstance(incoming_defaults, Mapping):
+                if incoming_defaults.get("max_runtime_sec") is not None:
+                    try:
+                        defaults["max_runtime_sec"] = int(incoming_defaults.get("max_runtime_sec"))
+                    except Exception:
+                        pass
+                if incoming_defaults.get("cooldown_sec") is not None:
+                    try:
+                        defaults["cooldown_sec"] = max(0, int(incoming_defaults.get("cooldown_sec")))
+                    except Exception:
+                        pass
+                if "require_live" in incoming_defaults:
+                    defaults["require_live"] = bool(incoming_defaults.get("require_live"))
+                if incoming_defaults.get("auto_clear_no_position_sec") is not None:
+                    try:
+                        defaults["auto_clear_no_position_sec"] = max(0, int(incoming_defaults.get("auto_clear_no_position_sec")))
+                    except Exception:
+                        pass
+            incoming_rules = payload.get("rules")
+            if isinstance(incoming_rules, Mapping):
+                for key, rule in incoming_rules.items():
+                    if not isinstance(rule, Mapping):
+                        continue
+                    symbol = str(rule.get("symbol") or "").upper().strip()
+                    long_ex = normalize_exchange_name(str(rule.get("long_exchange") or ""))
+                    short_ex = normalize_exchange_name(str(rule.get("short_exchange") or ""))
+                    target = _safe_float(rule.get("target_spread_pct"))
+                    if not symbol or not long_ex or not short_ex or target is None:
+                        continue
+                    rule_key = f"{symbol}|{long_ex}|{short_ex}"
+                    rules[rule_key] = {
+                        "symbol": symbol,
+                        "long_exchange": long_ex,
+                            "short_exchange": short_ex,
+                            "target_spread_pct": float(target),
+                            "enabled": bool(rule.get("enabled", True)),
+                            "last_triggered_ts": float(rule.get("last_triggered_ts") or 0.0),
+                            "updated_at": rule.get("updated_at"),
+                            "missing_since_ts": float(rule.get("missing_since_ts") or 0.0),
+                        }
+        return {"defaults": defaults, "rules": rules}
+
+    @staticmethod
+    def _auto_exit_key(symbol: str, long_exchange: str, short_exchange: str) -> str:
+        return f"{normalize_symbol(symbol)}|{normalize_exchange_name(long_exchange)}|{normalize_exchange_name(short_exchange)}"
+
+    def auto_exit_payload(self) -> dict[str, Any]:
+        payload = json.loads(json.dumps(self._auto_exit))
+        payload["live_spreads"] = dict(self._auto_exit_live_spreads)
+        payload["events"] = list(self._auto_exit_events)
+        return payload
+
+    async def update_auto_exit_defaults(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        async with self._auto_exit_lock:
+            defaults = self._auto_exit.get("defaults", {})
+            runtime = payload.get("max_runtime_sec")
+            cooldown = payload.get("cooldown_sec")
+            require_live = payload.get("require_live")
+            auto_clear = payload.get("auto_clear_no_position_sec")
+            if runtime is not None:
+                defaults["max_runtime_sec"] = max(30, int(runtime))
+            if cooldown is not None:
+                defaults["cooldown_sec"] = max(0, int(cooldown))
+            if require_live is not None:
+                defaults["require_live"] = bool(require_live)
+            if auto_clear is not None:
+                defaults["auto_clear_no_position_sec"] = max(0, int(auto_clear))
+            self._auto_exit["defaults"] = defaults
+            self._auto_exit_store.save(self._auto_exit)
+        return {"auto_exit": self.auto_exit_payload()}
+
+    async def update_auto_exit_rule(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        symbol = str(payload.get("symbol") or "").upper().strip()
+        long_exchange = normalize_exchange_name(str(payload.get("long_exchange") or ""))
+        short_exchange = normalize_exchange_name(str(payload.get("short_exchange") or ""))
+        enabled = bool(payload.get("enabled", True))
+        target = _safe_float(payload.get("target_spread_pct"))
+        if not symbol or not long_exchange or not short_exchange:
+            raise ValueError("symbol, long_exchange, and short_exchange are required.")
+        key = self._auto_exit_key(symbol, long_exchange, short_exchange)
+        async with self._auto_exit_lock:
+            rules = self._auto_exit.get("rules", {})
+            if not enabled:
+                rules.pop(key, None)
+            else:
+                if target is None:
+                    raise ValueError("target_spread_pct is required when enabled.")
+                now_iso = datetime.now(timezone.utc).isoformat()
+                prev = rules.get(key, {})
+                rules[key] = {
+                    "symbol": symbol,
+                    "long_exchange": long_exchange,
+                    "short_exchange": short_exchange,
+                    "target_spread_pct": float(target),
+                    "enabled": True,
+                    "last_triggered_ts": float(prev.get("last_triggered_ts") or 0.0),
+                    "updated_at": now_iso,
+                    "missing_since_ts": 0.0,
+                }
+            self._auto_exit["rules"] = rules
+            self._auto_exit_store.save(self._auto_exit)
+        return {"auto_exit": self.auto_exit_payload()}
+
+    def _auto_exit_has_running(self) -> bool:
+        return self._auto_exit_running_exec() is not None
+
+    def _auto_exit_running_exec(self) -> dict[str, Any] | None:
+        for exec_id, run in self._manual_runs.items():
+            if run.get("status") == "running":
+                return {
+                    "execution_id": exec_id,
+                    "action": run.get("action"),
+                }
+        return None
+
+    async def _auto_exit_scheduler(self) -> None:
+        while True:
+            try:
+                await self._auto_exit_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("auto-exit loop failed: %s", exc)
+            await asyncio.sleep(self._auto_exit_poll_sec)
+
+    async def _auto_exit_cycle(self) -> None:
+        if self._auto_exit_inflight:
+            return
+        self._auto_exit_inflight = True
+        try:
+            async with self._auto_exit_lock:
+                config = json.loads(json.dumps(self._auto_exit))
+            positions = self._accounts.snapshot().get("positions") or []
+            if not positions:
+                return
+            _, grouped = self._positions_by_symbol(positions, return_grouped=True)
+            rules = config.get("rules") or {}
+            defaults = config.get("defaults") or {}
+            max_runtime_sec = int(defaults.get("max_runtime_sec", AUTO_EXIT_DEFAULTS["max_runtime_sec"]))
+            cooldown_sec = int(defaults.get("cooldown_sec", AUTO_EXIT_DEFAULTS["cooldown_sec"]))
+            require_live = bool(defaults.get("require_live", AUTO_EXIT_DEFAULTS["require_live"]))
+            auto_clear_sec = int(defaults.get("auto_clear_no_position_sec", AUTO_EXIT_DEFAULTS["auto_clear_no_position_sec"]))
+            now_ts = time.time()
+
+            live_spreads: dict[str, float] = {}
+            for symbol_key, legs in grouped.items():
+                longs = [leg for leg in legs if str(leg.get("side") or "").lower() == "long"]
+                shorts = [leg for leg in legs if str(leg.get("side") or "").lower() == "short"]
+                if len(longs) != 1 or len(shorts) != 1:
+                    continue
+                long_ex = normalize_exchange_name(str(longs[0].get("exchange") or ""))
+                short_ex = normalize_exchange_name(str(shorts[0].get("exchange") or ""))
+                if not long_ex or not short_ex:
+                    continue
+                spread = await self._auto_exit_live_spread(symbol_key, long_ex, short_ex)
+                if spread is None:
+                    continue
+                live_spreads[self._auto_exit_key(symbol_key, long_ex, short_ex)] = float(spread)
+            async with self._auto_exit_lock:
+                self._auto_exit_live_spreads = live_spreads
+
+            if not rules:
+                return
+            running = self._auto_exit_running_exec()
+            if running:
+                self._auto_exit_log_event(
+                    "global",
+                    "skip_running",
+                    {"reason": "execution_running", **running},
+                    now_ts,
+                )
+                return
+
+            rules_to_remove: set[str] = set()
+            rules_to_update: dict[str, dict[str, Any]] = {}
+
+            def mark_missing(rule_key: str, rule_state: Mapping[str, Any], reason: str, payload: dict[str, Any]) -> bool:
+                missing_since = float(rule_state.get("missing_since_ts") or 0.0)
+                if missing_since <= 0:
+                    missing_since = now_ts
+                    rules_to_update[rule_key] = {"missing_since_ts": missing_since}
+                elapsed = max(0.0, now_ts - missing_since)
+                if auto_clear_sec and elapsed >= auto_clear_sec:
+                    rules_to_remove.add(rule_key)
+                    self._auto_exit_event(
+                        "auto_clear",
+                        {
+                            "symbol": payload.get("symbol"),
+                            "long_exchange": payload.get("long_exchange"),
+                            "short_exchange": payload.get("short_exchange"),
+                            "reason": reason,
+                            "elapsed_sec": round(elapsed, 1),
+                        },
+                    )
+                    return True
+                if auto_clear_sec:
+                    payload["auto_clear_remaining_sec"] = round(max(0.0, auto_clear_sec - elapsed), 1)
+                self._auto_exit_log_event(rule_key, "skip", payload, now_ts)
+                return True
+
+            def clear_missing(rule_key: str, rule_state: Mapping[str, Any]) -> None:
+                if float(rule_state.get("missing_since_ts") or 0.0) > 0:
+                    rules_to_update[rule_key] = {"missing_since_ts": 0.0}
+
+            for key, rule in rules.items():
+                if not rule.get("enabled", True):
+                    continue
+                symbol = str(rule.get("symbol") or "").upper().strip()
+                symbol_key = normalize_symbol(symbol)
+                long_exchange = normalize_exchange_name(str(rule.get("long_exchange") or ""))
+                short_exchange = normalize_exchange_name(str(rule.get("short_exchange") or ""))
+                target = _safe_float(rule.get("target_spread_pct"))
+                if not symbol or not long_exchange or not short_exchange or target is None:
+                    continue
+                last_trigger = float(rule.get("last_triggered_ts") or 0.0)
+                if cooldown_sec and (now_ts - last_trigger) < cooldown_sec:
+                    remaining = max(0, cooldown_sec - (now_ts - last_trigger))
+                    self._auto_exit_log_event(
+                        key,
+                        "skip",
+                        {
+                            "symbol": symbol,
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                            "reason": "cooldown",
+                            "remaining_sec": round(remaining, 1),
+                        },
+                        now_ts,
+                    )
+                    continue
+                legs = grouped.get(symbol_key) or []
+                if not legs:
+                    mark_missing(
+                        key,
+                        rule,
+                        "no_position",
+                        {
+                            "symbol": symbol,
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                            "reason": "no_position",
+                        },
+                    )
+                    continue
+                long_count = sum(1 for leg in legs if str(leg.get("side") or "").lower() == "long")
+                short_count = sum(1 for leg in legs if str(leg.get("side") or "").lower() == "short")
+                if long_count != 1 or short_count != 1:
+                    mark_missing(
+                        key,
+                        rule,
+                        "multi_leg",
+                        {
+                            "symbol": symbol,
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                            "reason": "multi_leg",
+                            "long_legs": long_count,
+                            "short_legs": short_count,
+                        },
+                    )
+                    continue
+                long_leg = next(
+                    (leg for leg in legs if str(leg.get("side") or "").lower() == "long" and normalize_exchange_name(str(leg.get("exchange") or "")) == long_exchange),
+                    None,
+                )
+                short_leg = next(
+                    (leg for leg in legs if str(leg.get("side") or "").lower() == "short" and normalize_exchange_name(str(leg.get("exchange") or "")) == short_exchange),
+                    None,
+                )
+                if not long_leg or not short_leg:
+                    mark_missing(
+                        key,
+                        rule,
+                        "legs_missing",
+                        {
+                            "symbol": symbol,
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                            "reason": "legs_missing",
+                        },
+                    )
+                    continue
+                qty_long = abs(float(long_leg.get("quantity") or 0.0))
+                qty_short = abs(float(short_leg.get("quantity") or 0.0))
+                qty = min(qty_long, qty_short)
+                if qty <= 0:
+                    mark_missing(
+                        key,
+                        rule,
+                        "zero_qty",
+                        {
+                            "symbol": symbol,
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                            "reason": "zero_qty",
+                        },
+                    )
+                    continue
+                clear_missing(key, rule)
+                spread = live_spreads.get(self._auto_exit_key(symbol_key, long_exchange, short_exchange))
+                if spread is None and require_live:
+                    self._auto_exit_log_event(
+                        key,
+                        "skip",
+                        {
+                            "symbol": symbol,
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                            "reason": "live_missing",
+                        },
+                        now_ts,
+                    )
+                    continue
+                if spread is None:
+                    continue
+                if spread < float(target):
+                    self._auto_exit_log_event(
+                        key,
+                        "wait",
+                        {
+                            "symbol": symbol,
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                            "spread_pct": float(spread),
+                            "target_pct": float(target),
+                        },
+                        now_ts,
+                    )
+                    continue
+                if self._auto_exit_has_running():
+                    break
+                self._auto_exit_event(
+                    "trigger",
+                    {
+                        "symbol": symbol,
+                        "long_exchange": long_exchange,
+                        "short_exchange": short_exchange,
+                        "spread_pct": float(spread),
+                        "target_pct": float(target),
+                        "qty": qty,
+                    },
+                )
+                payload = {
+                    "symbol": symbol,
+                    "qty": qty,
+                    "notional": None,
+                    "mode": "smart-exit",
+                    "max_slippage_bps": 8,
+                    "spread_min_pct": float(target),
+                    "spread_max_pct": 10,
+                    "timeout_sec": 0,
+                    "max_runtime_sec": max_runtime_sec,
+                    "reprice_sec": 3,
+                    "chunk_qty": None,
+                    "chunk_notional": None,
+                    "force_chunk_qty": False,
+                    "use_orderbook_check": False,
+                    "fallback_to_market": False,
+                    "async_run": True,
+                    "dry_run": False,
+                    "long_exchange": long_exchange,
+                    "short_exchange": short_exchange,
+                    "margin_mode": "isolated",
+                }
+                result = await self.manual_exit(payload)
+                logger.info(
+                    "auto-exit triggered symbol=%s long=%s short=%s spread=%.4f target=%.4f result=%s",
+                    symbol,
+                    long_exchange,
+                    short_exchange,
+                    float(spread),
+                    float(target),
+                    result,
+                )
+                self._auto_exit_event(
+                    "start",
+                    {
+                        "symbol": symbol,
+                        "long_exchange": long_exchange,
+                        "short_exchange": short_exchange,
+                        "result": result,
+                    },
+                )
+                async with self._auto_exit_lock:
+                    stored_rules = self._auto_exit.get("rules", {})
+                    stored = stored_rules.get(key)
+                    if stored is not None:
+                        stored["last_triggered_ts"] = now_ts
+                        stored["updated_at"] = datetime.now(timezone.utc).isoformat()
+                        self._auto_exit_store.save(self._auto_exit)
+                break
+            if rules_to_remove or rules_to_update:
+                async with self._auto_exit_lock:
+                    stored_rules = self._auto_exit.get("rules", {})
+                    changed = False
+                    for key in rules_to_remove:
+                        if key in stored_rules:
+                            stored_rules.pop(key, None)
+                            changed = True
+                    for key, updates in rules_to_update.items():
+                        stored = stored_rules.get(key)
+                        if stored is None:
+                            continue
+                        for field, value in updates.items():
+                            stored[field] = value
+                            changed = True
+                    if changed:
+                        self._auto_exit_store.save(self._auto_exit)
+        finally:
+            self._auto_exit_inflight = False
+
+    async def _auto_exit_live_spread(
+        self,
+        symbol: str,
+        long_exchange: str,
+        short_exchange: str,
+    ) -> float | None:
+        book_long = await self._market_data.get_orderbook(long_exchange, symbol, depth=5, max_age_sec=15.0)
+        book_short = await self._market_data.get_orderbook(short_exchange, symbol, depth=5, max_age_sec=15.0)
+        if not book_long or not book_short:
+            return None
+        bids_long = book_long.get("bids") or []
+        asks_long = book_long.get("asks") or []
+        bids_short = book_short.get("bids") or []
+        asks_short = book_short.get("asks") or []
+        if not bids_long or not asks_long or not bids_short or not asks_short:
+            return None
+        try:
+            long_mid = (float(bids_long[0][0]) + float(asks_long[0][0])) / 2.0
+            short_mid = (float(bids_short[0][0]) + float(asks_short[0][0])) / 2.0
+        except Exception:
+            return None
+        if long_mid == 0:
+            return None
+        return (long_mid - short_mid) / long_mid * 100.0
+
+    def _auto_exit_event(self, event: str, payload: Mapping[str, Any]) -> None:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+        }
+        entry.update(dict(payload or {}))
+        self._auto_exit_events.append(entry)
+        if len(self._auto_exit_events) > self._auto_exit_event_limit:
+            self._auto_exit_events = self._auto_exit_events[-self._auto_exit_event_limit :]
+
+    def _auto_exit_log_event(
+        self,
+        key: str,
+        event: str,
+        payload: Mapping[str, Any],
+        now_ts: float,
+    ) -> None:
+        log_key = f"{key}:{event}"
+        last_ts = self._auto_exit_last_log_ts.get(log_key, 0.0)
+        if (now_ts - last_ts) < self._auto_exit_log_cooldown_sec:
+            return
+        self._auto_exit_last_log_ts[log_key] = now_ts
+        self._auto_exit_event(event, payload)
+
+    def _rebalance_position_qty(self, position: Mapping[str, Any]) -> float | None:
+        qty = _safe_float(position.get("coin_qty"))
+        if qty is None or qty == 0:
+            qty = _safe_float(position.get("contracts"))
+        if qty is None or qty == 0:
+            qty = _safe_float(position.get("amount"))
+        return qty
+
+    def _rebalance_position_side(
+        self,
+        position: Mapping[str, Any],
+        qty_hint: float | None,
+    ) -> str | None:
+        raw_side = str(position.get("side") or "").lower()
+        if raw_side in ("long", "short"):
+            return raw_side
+        if raw_side == "buy":
+            return "long"
+        if raw_side == "sell":
+            return "short"
+        if qty_hint is None:
+            return None
+        if qty_hint < 0:
+            return "short"
+        if qty_hint > 0:
+            return "long"
+        return None
+
+    def _rebalance_positions_snapshot(
+        self,
+        positions: list[dict[str, Any]],
+    ) -> dict[tuple[str, str, str], float]:
+        snapshot: dict[tuple[str, str, str], float] = {}
+        for position in positions or []:
+            exchange = normalize_exchange_name(str(position.get("exchange") or ""))
+            if not exchange:
+                continue
+            raw_symbol = (
+                position.get("symbol")
+                or position.get("symbol_normalized")
+                or position.get("exchange_symbol")
+            )
+            symbol_norm = _strip_settle(normalize_symbol(str(raw_symbol or "")))
+            if not symbol_norm:
+                continue
+            qty_raw = self._rebalance_position_qty(position)
+            side = self._rebalance_position_side(position, qty_raw)
+            if not side or qty_raw is None:
+                continue
+            qty = abs(qty_raw)
+            if qty <= 0:
+                continue
+            key = (symbol_norm, exchange, side)
+            snapshot[key] = snapshot.get(key, 0.0) + qty
+        return snapshot
+
+    async def _maybe_rebalance_positions(self, positions: list[dict[str, Any]]) -> None:
+        settings = self._settings_manager.current
+        protective = getattr(settings, "protective", {}) or {}
+        auto_rebalance = bool(protective.get("auto_rebalance_enabled", False))
+        current = self._rebalance_positions_snapshot(positions)
+        if not auto_rebalance:
+            self._rebalance_prev_positions = current
+            return
+        if not self._rebalance_prev_positions:
+            self._rebalance_prev_positions = current
+            return
+        delta_pct = _safe_float(protective.get("rebalance_delta_pct"))
+        delta_pct = 0.2 if delta_pct is None else max(0.0, min(delta_pct, 1.0))
+        cooldown = int(protective.get("rebalance_cooldown_sec", 120) or 0)
+        limit_timeout = int(protective.get("rebalance_limit_timeout_sec", 10) or 10)
+        limit_offset_bps = _safe_float(protective.get("rebalance_limit_offset_bps")) or 0.0
+        max_slippage_bps = _safe_float(protective.get("rebalance_max_slippage_bps")) or 0.0
+        now_ts = time.time()
+        reductions: dict[tuple[str, str], float] = {}
+        for key, prev_qty in self._rebalance_prev_positions.items():
+            if prev_qty <= 0:
+                continue
+            current_qty = current.get(key, 0.0)
+            drop = prev_qty - current_qty
+            if drop <= 0:
+                continue
+            if drop < prev_qty * delta_pct:
+                continue
+            symbol, _exchange, side = key
+            reduce_side = "long" if side == "short" else "short"
+            reductions[(symbol, reduce_side)] = reductions.get((symbol, reduce_side), 0.0) + drop
+        actions: list[dict[str, Any]] = []
+        for (symbol, reduce_side), drop_qty in reductions.items():
+            cooldown_key = (symbol, reduce_side)
+            last_ts = self._rebalance_last.get(cooldown_key)
+            if last_ts is not None and cooldown > 0 and now_ts - last_ts < cooldown:
+                continue
+            symbol_actions: list[dict[str, Any]] = []
+            legs: list[dict[str, Any]] = []
+            for position in positions or []:
+                exchange = normalize_exchange_name(str(position.get("exchange") or ""))
+                if not exchange or exchange in self._rebalance_blocked_exchanges:
+                    continue
+                raw_symbol = (
+                    position.get("symbol")
+                    or position.get("symbol_normalized")
+                    or position.get("exchange_symbol")
+                )
+                normalized_symbol = normalize_symbol(str(raw_symbol or ""))
+                symbol_norm = _strip_settle(normalized_symbol)
+                if symbol_norm != symbol:
+                    continue
+                symbol_trade = _dedupe_settle(normalized_symbol)
+                qty_raw = self._rebalance_position_qty(position)
+                side = self._rebalance_position_side(position, qty_raw)
+                if not side or side != reduce_side or qty_raw is None:
+                    continue
+                qty = abs(qty_raw)
+                if qty <= 0:
+                    continue
+                legs.append(
+                    {
+                        "exchange": exchange,
+                        "symbol": symbol_trade,
+                        "qty": qty,
+                        "margin_mode": position.get("margin_mode"),
+                    }
+                )
+            total_qty = sum(leg["qty"] for leg in legs)
+            if total_qty <= 0:
+                continue
+            target_qty = min(drop_qty, total_qty)
+            remaining = target_qty
+            order_side = "sell" if reduce_side == "long" else "buy"
+            for leg in sorted(legs, key=lambda item: item["qty"], reverse=True):
+                if remaining <= 0:
+                    break
+                leg_qty = min(remaining, leg["qty"])
+                try:
+                    result = await self._manual.agent_rebalance(
+                        exchange=leg["exchange"],
+                        symbol=leg.get("symbol") or symbol,
+                        side=order_side,
+                        qty_base=leg_qty,
+                        margin_mode=leg.get("margin_mode"),
+                        limit_timeout_sec=limit_timeout,
+                        limit_offset_bps=limit_offset_bps,
+                        max_slippage_bps=max_slippage_bps,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    result = {
+                        "exchange": leg["exchange"],
+                        "status": "error",
+                        "error": str(exc),
+                        "requested_qty": leg_qty,
+                    }
+                actions.append(
+                    {
+                        "symbol": symbol,
+                        "symbol_trade": leg.get("symbol") or symbol,
+                        "side": reduce_side,
+                        "exchange": leg["exchange"],
+                        "requested_qty": leg_qty,
+                        "result": result,
+                    }
+                )
+                symbol_actions.append(actions[-1])
+                filled_qty = _safe_float(result.get("filled_qty")) or 0.0
+                if filled_qty <= 0 and result.get("status") == "filled":
+                    filled_qty = leg_qty
+                remaining = max(0.0, remaining - filled_qty)
+            if symbol_actions:
+                self._rebalance_last[cooldown_key] = now_ts
+        if actions:
+            self._record_event(
+                "protective:rebalance",
+                {
+                    "message": "Auto rebalance executed",
+                    "count": len(actions),
+                    "actions": actions,
+                },
+            )
+        self._rebalance_prev_positions = current
+
     async def _maybe_sync_protective_orders(self) -> None:
         """Best-effort protective order sync if enabled in settings."""
         settings = self._settings_manager.current
         protective = getattr(settings, "protective", {}) or {}
         auto_protect = bool(protective.get("auto_protect_enabled", True))
         auto_take = bool(protective.get("auto_take_enabled", True))
-        if not auto_protect and not auto_take:
+        auto_rebalance = bool(protective.get("auto_rebalance_enabled", False))
+        if not auto_protect and not auto_take and not auto_rebalance:
             return
         snapshot = self._accounts.snapshot()
         positions = snapshot.get("positions") or []
-        anti_orphan = bool(protective.get("anti_orphan_enabled", False))
-        try:
-            actions = await self._protective_manager.sync_protective_orders(
-                positions,
-                anti_orphan_enabled=anti_orphan,
-            )
-            if actions:
-                if self._send_missing_stop_alerts:
-                    await self._handle_mexc_protective_alerts(actions)
-                summary = {
-                    "message": "Protective orders synced",
-                    "count": len(actions),
-                    "updated": sum(1 for a in actions if a.get("status") == "updated"),
-                    "unchanged": sum(1 for a in actions if a.get("status") == "unchanged"),
-                    "timeout": sum(1 for a in actions if a.get("status") == "timeout"),
-                    "error": sum(1 for a in actions if a.get("status") == "error"),
-                }
-                # Build a human-readable per-symbol summary.
-                per_symbol: dict[str, list[str]] = {}
-                for action in actions:
-                    sym = str(action.get("symbol") or "").upper()
-                    exch = str(action.get("exchange") or "")
-                    status = action.get("status")
-                    stop_val = action.get("target_stop")
-                    take_val = action.get("target_take")
-                    reason = action.get("reason") or action.get("error")
-                    parts = [f"{exch}: {status}"]
-                    if stop_val is not None:
-                        parts.append(f"sl={stop_val}")
-                    if take_val is not None:
-                        parts.append(f"tp={take_val}")
-                    if reason:
-                        parts.append(f"reason={reason}")
-                    per_symbol.setdefault(sym, []).append(", ".join(parts))
-                summary["details"] = {k: v for k, v in per_symbol.items()}
-                self._record_event("protective:sync", summary)
-                # Emit compact overall status instead of per-leg spam.
-                ok_states = {"updated", "unchanged", "blocked_ok"}
-                failures = [a for a in actions if a.get("status") not in ok_states]
-                if failures:
-                    logger.warning(
-                        "protective sync issues: %s",
-                        "; ".join(
-                            f"{f.get('exchange')} {f.get('symbol')} status={f.get('status')} err={f.get('error') or f.get('reason')}"
-                            for f in failures
-                        ),
-                    )
-                else:
-                    logger.info("protective sync ok: all stops/takes placed")
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("Protective sync failed: %s", exc)
+        if auto_protect or auto_take:
+            try:
+                actions = await self._protective_manager.sync_protective_orders(
+                    positions,
+                )
+                if actions:
+                    if self._send_missing_stop_alerts:
+                        await self._handle_mexc_protective_alerts(actions)
+                    summary = {
+                        "message": "Protective orders synced",
+                        "count": len(actions),
+                        "updated": sum(1 for a in actions if a.get("status") == "updated"),
+                        "unchanged": sum(1 for a in actions if a.get("status") == "unchanged"),
+                        "timeout": sum(1 for a in actions if a.get("status") == "timeout"),
+                        "error": sum(1 for a in actions if a.get("status") == "error"),
+                    }
+                    # Build a human-readable per-symbol summary.
+                    per_symbol: dict[str, list[str]] = {}
+                    for action in actions:
+                        sym = str(action.get("symbol") or "").upper()
+                        exch = str(action.get("exchange") or "")
+                        status = action.get("status")
+                        stop_val = action.get("target_stop")
+                        take_val = action.get("target_take")
+                        reason = action.get("reason") or action.get("error")
+                        parts = [f"{exch}: {status}"]
+                        if stop_val is not None:
+                            parts.append(f"sl={stop_val}")
+                        if take_val is not None:
+                            parts.append(f"tp={take_val}")
+                        if reason:
+                            parts.append(f"reason={reason}")
+                        per_symbol.setdefault(sym, []).append(", ".join(parts))
+                    summary["details"] = {k: v for k, v in per_symbol.items()}
+                    self._record_event("protective:sync", summary)
+                    # Emit compact overall status instead of per-leg spam.
+                    ok_states = {"updated", "unchanged", "blocked_ok"}
+                    failures = [a for a in actions if a.get("status") not in ok_states]
+                    if failures:
+                        logger.warning(
+                            "protective sync issues: %s",
+                            "; ".join(
+                                f"{f.get('exchange')} {f.get('symbol')} status={f.get('status')} err={f.get('error') or f.get('reason')}"
+                                for f in failures
+                            ),
+                        )
+                    else:
+                        logger.info("protective sync ok: all stops/takes placed")
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Protective sync failed: %s", exc)
+        if auto_rebalance:
+            try:
+                await self._maybe_rebalance_positions(positions)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Protective rebalance failed: %s", exc)
 
     async def analyze_symbol(
         self,
         symbol: str,
         *,
-        window_minutes: int = 720,
-        funding_points: int = 24,
+        window_minutes: int = 4320,
+        funding_points: int = 120,
     ) -> dict[str, Any]:
-        """Collect per-symbol analytics on demand without touching the global snapshot."""
+        """Collect on-demand historical analytics for a symbol."""
         canonical = normalize_symbol(symbol)
         if not canonical:
             raise ValueError("Symbol must be provided for analysis.")
 
-        window = max(30, min(int(window_minutes), 4320))  # clamp to 3 days of 1m bars.
-        funding_limit = max(6, int(funding_points))
+        window = max(60, min(int(window_minutes), 4320))
+        funding_limit = max(24, min(int(funding_points), 200))
 
         exchange_flags = getattr(self._settings_manager.current, "analysis_exchanges", None) or {}
-        enabled_exchanges = [
+        enabled_exchanges = {
             normalize_exchange_name(name)
             for name, enabled in exchange_flags.items()
             if enabled
+        }
+        selected_exchanges = [
+            ex for ex in COIN_ANALYSIS_CORE_EXCHANGES if not enabled_exchanges or ex in enabled_exchanges
         ]
+        if not selected_exchanges:
+            raise ValueError("Enable at least one core analysis exchange (binance/okx).")
+        global_warnings: list[str] = []
+        if len(selected_exchanges) < 2:
+            global_warnings.append("pair_analysis_limited: less than 2 core exchanges enabled")
 
         tasks = [
             self._analyze_symbol_on_exchange(ex, canonical, window, funding_limit)
-            for ex in enabled_exchanges
+            for ex in selected_exchanges
         ]
         results = await asyncio.gather(*tasks)
+        exchange_rows = [item for item in results if item]
+
+        pair_analysis: list[dict[str, Any]] = []
+        for i in range(len(exchange_rows)):
+            for j in range(i + 1, len(exchange_rows)):
+                pair_analysis.append(
+                    self._analyze_pair(exchange_rows[i], exchange_rows[j], window)
+                )
+        bot_logic = self._decide_coin_candidate(pair_analysis)
 
         return {
             "symbol": canonical,
             "requested_at": datetime.now(timezone.utc).isoformat(),
             "window_minutes": window,
             "funding_points": funding_limit,
-            "exchanges": [item for item in results if item],
+            "analysis_exchanges": selected_exchanges,
+            "warnings": global_warnings,
+            "exchanges": exchange_rows,
+            "pair_analysis": pair_analysis,
+            "bot_logic": bot_logic,
         }
 
     async def _analyze_symbol_on_exchange(
@@ -2617,6 +4776,7 @@ class DataService:
         warnings: list[str] = []
 
         # Latest snapshot (bid/ask/mark/funding).
+        snapshot_dict: dict[str, Any] = {}
         try:
             snapshots = await adapter.fetch_market_snapshots_async([canonical_symbol])
             if snapshots:
@@ -2630,6 +4790,8 @@ class DataService:
                 result["snapshot"] = snapshot_dict
         except Exception as exc:  # pylint: disable=broad-except
             errors.append(f"snapshot:{exc}")
+        if "snapshot" not in result:
+            result["snapshot"] = {}
 
         # Funding history (last N points).
         funding_history = await asyncio.to_thread(
@@ -2643,11 +4805,25 @@ class DataService:
         if funding_history:
             funding_history = sorted(
                 funding_history,
-                key=lambda item: item.get("ts_ms") or item.get("timestamp") or 0,
+                key=lambda item: _funding_history_ts_ms(
+                    item.get("ts_ms") or item.get("timestamp")
+                )
+                or 0,
                 reverse=True,
             )
             funding_history = funding_history[:funding_points]
         result["funding_history"] = funding_history
+        funding_interval_hours = _resolve_funding_interval_hours(
+            funding_history,
+            _safe_float(snapshot_dict.get("funding_interval_hours")),
+        )
+        result["funding_interval_hours_resolved"] = funding_interval_hours
+        latest_funding_rate = None
+        if funding_history:
+            latest_funding_rate = _safe_float(funding_history[0].get("rate"))
+        if latest_funding_rate is None:
+            latest_funding_rate = _safe_float(snapshot_dict.get("funding_rate"))
+        result["latest_funding_rate"] = latest_funding_rate
 
         # Recent 1m candles for spread/time-sync analysis.
         try:
@@ -2658,12 +4834,41 @@ class DataService:
                 canonical_symbol,
                 window_minutes,
             )
+            candles = sorted(
+                candles or [],
+                key=lambda row: _funding_history_ts_ms(row.get("ts_ms")) or 0,
+                reverse=True,
+            )
             if candles:
                 result["candles_1m"] = candles
             else:
                 warnings.append("candles_unavailable")
         except Exception as exc:  # pylint: disable=broad-except
             errors.append(f"candles:{exc}")
+
+        # Open interest history (only exchanges with robust historical API in this phase).
+        oi_payload = await asyncio.to_thread(
+            self._fetch_open_interest_for_exchange,
+            exchange,
+            canonical_symbol,
+            window_minutes,
+        )
+        result["open_interest"] = oi_payload
+        if oi_payload.get("status") not in ("ok", "partial"):
+            warnings.append(f"oi:{oi_payload.get('status') or 'unavailable'}")
+
+        candles_count = len(result.get("candles_1m") or [])
+        expected = max(1, window_minutes)
+        coverage_pct = candles_count / expected * 100.0
+        result["data_quality"] = {
+            "candles_expected": expected,
+            "candles_received": candles_count,
+            "candles_coverage_pct": round(coverage_pct, 2),
+            "funding_points_received": len(funding_history),
+            "oi_points_received": len(oi_payload.get("history") or []),
+        }
+        if coverage_pct < 70:
+            warnings.append("candles_coverage_low")
 
         status = "ok"
         if errors and warnings:
@@ -2678,6 +4883,271 @@ class DataService:
         if warnings:
             result["warnings"] = warnings
         return result
+
+    def _analyze_pair(
+        self,
+        left: Mapping[str, Any],
+        right: Mapping[str, Any],
+        window_minutes: int,
+    ) -> dict[str, Any]:
+        left_ex = str(left.get("exchange") or "")
+        right_ex = str(right.get("exchange") or "")
+        series = _spread_series_from_candles(
+            list(left.get("candles_1m") or []),
+            list(right.get("candles_1m") or []),
+        )
+        now_ts_ms = int(time.time() * 1000)
+        spread_values = [float(row.get("spread_pct") or 0.0) for row in series]
+        current_spread = spread_values[0] if spread_values else None
+        p25 = _percentile(spread_values, 25)
+        p50 = _percentile(spread_values, 50)
+        p75 = _percentile(spread_values, 75)
+        p95 = _percentile([abs(v) for v in spread_values], 95)
+        mean = sum(spread_values) / len(spread_values) if spread_values else None
+        std = None
+        if spread_values and len(spread_values) > 1 and mean is not None:
+            var = sum((v - mean) ** 2 for v in spread_values) / len(spread_values)
+            std = math.sqrt(max(0.0, var))
+        z_score = None
+        if current_spread is not None and mean is not None and std and std > 1e-12:
+            z_score = (current_spread - mean) / std
+        weighted_mean = _weighted_mean_recent(
+            series,
+            value_key="spread_pct",
+            now_ts_ms=now_ts_ms,
+            half_life_hours=24.0,
+        )
+        coverage_pct = (len(series) / max(1, window_minutes)) * 100.0
+
+        int_left = _safe_float(left.get("funding_interval_hours_resolved"))
+        int_right = _safe_float(right.get("funding_interval_hours_resolved"))
+        interval_match = (
+            int_left is not None
+            and int_right is not None
+            and abs(int_left - int_right) <= 0.05
+        )
+
+        left_rate = _safe_float(left.get("latest_funding_rate"))
+        right_rate = _safe_float(right.get("latest_funding_rate"))
+        left_hourly = (left_rate / int_left) if left_rate is not None and int_left else None
+        right_hourly = (right_rate / int_right) if right_rate is not None and int_right else None
+        funding_delta_hourly = (
+            left_hourly - right_hourly
+            if left_hourly is not None and right_hourly is not None
+            else None
+        )
+
+        oi_left = (left.get("open_interest") or {}).get("history") or []
+        oi_right = (right.get("open_interest") or {}).get("history") or []
+        oi_left_6h = _oi_change_pct(list(oi_left), 6)
+        oi_right_6h = _oi_change_pct(list(oi_right), 6)
+        oi_divergence_6h = None
+        if oi_left_6h is not None and oi_right_6h is not None:
+            oi_divergence_6h = abs(oi_left_6h - oi_right_6h)
+
+        score = 50.0
+        reasons: list[str] = []
+        if not interval_match:
+            score -= 30.0
+            reasons.append("funding_interval_mismatch")
+        if coverage_pct < 70.0:
+            score -= 20.0
+            reasons.append("spread_history_low_coverage")
+        if funding_delta_hourly is not None:
+            score += min(25.0, abs(funding_delta_hourly) * 100000.0)
+        else:
+            score -= 10.0
+            reasons.append("funding_delta_unavailable")
+        if z_score is not None and abs(z_score) >= 2.5:
+            score -= 15.0
+            reasons.append("spread_extreme_zscore")
+        if p95 is not None and current_spread is not None and abs(current_spread) > 1e-9:
+            tail_ratio = p95 / abs(current_spread)
+            if tail_ratio >= 3.0:
+                score -= 10.0
+                reasons.append("historical_tail_risk")
+        if oi_divergence_6h is not None and oi_divergence_6h >= 25.0:
+            score -= 10.0
+            reasons.append("oi_divergence_high")
+
+        score = max(0.0, min(100.0, score))
+        recommendation = "reject"
+        if interval_match and coverage_pct >= 70.0 and score >= 70.0:
+            recommendation = "enter_candidate"
+        elif interval_match and coverage_pct >= 50.0 and score >= 50.0:
+            recommendation = "watch"
+
+        return {
+            "left_exchange": left_ex,
+            "right_exchange": right_ex,
+            "window_minutes": window_minutes,
+            "funding_interval_hours": {
+                "left": int_left,
+                "right": int_right,
+                "match": interval_match,
+            },
+            "funding_hourly": {
+                "left": left_hourly,
+                "right": right_hourly,
+                "delta": funding_delta_hourly,
+            },
+            "spread": {
+                "points": len(series),
+                "coverage_pct": round(coverage_pct, 2),
+                "current_pct": current_spread,
+                "weighted_mean_pct": weighted_mean,
+                "p25_pct": p25,
+                "p50_pct": p50,
+                "p75_pct": p75,
+                "p95_abs_pct": p95,
+                "z_score": z_score,
+            },
+            "open_interest": {
+                "left_change_6h_pct": oi_left_6h,
+                "right_change_6h_pct": oi_right_6h,
+                "divergence_6h_pct": oi_divergence_6h,
+            },
+            "score": round(score, 2),
+            "recommendation": recommendation,
+            "reasons": reasons,
+        }
+
+    def _decide_coin_candidate(self, pairs: list[Mapping[str, Any]]) -> dict[str, Any]:
+        if not pairs:
+            return {
+                "decision": "reject",
+                "reason": "no_pairs_available",
+                "recommended_pair": None,
+                "score": 0,
+            }
+        ordered = sorted(
+            pairs,
+            key=lambda row: float(row.get("score") or 0.0),
+            reverse=True,
+        )
+        best = ordered[0]
+        best_score = float(best.get("score") or 0.0)
+        reco = str(best.get("recommendation") or "reject")
+        decision = "reject"
+        if reco == "enter_candidate":
+            decision = "enter_candidate"
+        elif reco == "watch":
+            decision = "watch"
+        return {
+            "decision": decision,
+            "score": round(best_score, 2),
+            "recommended_pair": {
+                "left_exchange": best.get("left_exchange"),
+                "right_exchange": best.get("right_exchange"),
+            },
+            "reason": "best_pair_score",
+            "pair_reasons": list(best.get("reasons") or []),
+            "note": "decision is advisory; execute only after manual dry-run checks",
+        }
+
+    def _fetch_open_interest_for_exchange(
+        self,
+        exchange: str,
+        canonical_symbol: str,
+        window_minutes: int,
+    ) -> dict[str, Any]:
+        name = normalize_exchange_name(exchange)
+        if name not in ("binance", "okx"):
+            return {
+                "status": "unsupported",
+                "history": [],
+                "current": None,
+                "error": "oi_history_not_supported_in_phase",
+            }
+        client = _ccxt_client(name)
+        if client is None:
+            return {
+                "status": "error",
+                "history": [],
+                "current": None,
+                "error": "ccxt_client_unavailable",
+            }
+        try:
+            client.load_markets()
+        except Exception:
+            pass
+        candidates = [
+            _ccxt_perp_symbol(canonical_symbol),
+            canonical_symbol,
+        ]
+        history_raw = None
+        symbol_used = None
+        since_ms = int(time.time() * 1000) - int(max(60, window_minutes) * 60 * 1000)
+        limit = max(24, min(300, int(window_minutes / 60) + 16))
+        seen: set[str] = set()
+        for cand in candidates:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            try:
+                history_raw = client.fetch_open_interest_history(cand, "1h", since_ms, limit)
+                if history_raw:
+                    symbol_used = cand
+                    break
+            except Exception:
+                continue
+        history: list[dict[str, Any]] = []
+        for row in history_raw or []:
+            ts_ms = _funding_history_ts_ms(row.get("timestamp") or row.get("ts"))
+            if not ts_ms:
+                continue
+            oi_contracts = _safe_float(
+                row.get("openInterestAmount")
+                or row.get("openInterest")
+                or row.get("baseVolume")
+            )
+            oi_notional = _safe_float(
+                row.get("openInterestValue")
+                or row.get("quoteVolume")
+                or row.get("openInterestUsd")
+            )
+            history.append(
+                {
+                    "ts_ms": ts_ms,
+                    "open_interest_contracts": oi_contracts,
+                    "open_interest_notional": oi_notional,
+                }
+            )
+        history.sort(key=lambda item: item.get("ts_ms") or 0, reverse=True)
+
+        current = None
+        if symbol_used:
+            try:
+                now_row = client.fetch_open_interest(symbol_used)
+                current = {
+                    "ts_ms": _funding_history_ts_ms(now_row.get("timestamp")),
+                    "open_interest_contracts": _safe_float(
+                        now_row.get("openInterestAmount")
+                        or now_row.get("openInterest")
+                        or now_row.get("baseVolume")
+                    ),
+                    "open_interest_notional": _safe_float(
+                        now_row.get("openInterestValue")
+                        or now_row.get("quoteVolume")
+                        or now_row.get("openInterestUsd")
+                    ),
+                }
+            except Exception:
+                current = None
+        if not history and not current:
+            return {
+                "status": "empty",
+                "history": [],
+                "current": None,
+            }
+        status = "ok" if history else "partial"
+        return {
+            "status": status,
+            "history": history,
+            "current": current,
+            "symbol": symbol_used,
+            "source": "ccxt_open_interest_history_1h",
+        }
 
     def _fetch_candles_for_exchange(
         self,

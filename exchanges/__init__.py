@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Dict, Type
 
 from .base import ExchangeAdapter
+from .binance import BinanceAdapter
 from .bingx import BingXAdapter
 from .bitget import BitgetAdapter
 from .bybit import BybitAdapter
@@ -16,6 +17,7 @@ from .okx import OKXAdapter
 
 ADAPTER_FACTORIES: Dict[str, Type[ExchangeAdapter]] = {
     "bybit": BybitAdapter,
+    "binance": BinanceAdapter,
     "okx": OKXAdapter,
     "htx": HTXAdapter,
     "bitget": BitgetAdapter,

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 from execution.manual import (
+    ManualTradeManager,
     _choose_chunk_qty,
     _min_qty_required,
     _precision_to_step,
     _round_to_step,
+    _symbol_matches,
     estimate_fill,
     max_qty_for_slippage,
     orderbook_stats,
@@ -85,6 +88,101 @@ class ManualTradeHelpersTestCase(unittest.TestCase):
         )
         self.assertIsNone(chunk)
         self.assertTrue(warnings)
+
+    def test_symbol_matches_settle_and_swap_variants(self) -> None:
+        self.assertTrue(_symbol_matches("FLOWUSDT", "FLOWUSDTUSDT"))
+        self.assertTrue(_symbol_matches("FLOWUSDT", "FLOW-USDT-SWAP"))
+        self.assertFalse(_symbol_matches("FLOWUSDT", "FLOWUSDC"))
+
+    def test_sum_position_qty_normalizes_side_aliases(self) -> None:
+        manager = ManualTradeManager()
+        positions = [
+            {"exchange": "gate", "symbol": "FLOW/USDT:USDT", "side": "buy", "coin_qty": 17090.0},
+            {"exchange": "okx", "symbol": "FLOW-USDT-SWAP", "side": "sell", "coin_qty": 17500.0},
+            {"exchange": "okx", "symbol": "FLOW-USDT-SWAP", "side": "net", "coin_qty": -10.0},
+        ]
+        self.assertAlmostEqual(
+            manager._sum_position_qty(
+                positions,
+                exchange="gate",
+                side="long",
+                symbol="FLOWUSDT",
+            ),
+            17090.0,
+        )
+        self.assertAlmostEqual(
+            manager._sum_position_qty(
+                positions,
+                exchange="okx",
+                side="short",
+                symbol="FLOWUSDT",
+            ),
+            17510.0,
+        )
+
+
+class _FakeBinanceClient:
+    def __init__(self, *, algo_ids: list[str], fail_algo_ids: set[str] | None = None) -> None:
+        self._algo_orders = [{"algoId": algo_id, "symbol": "ZKPUSDT"} for algo_id in algo_ids]
+        self._fail_algo_ids = set(fail_algo_ids or set())
+        self.cancel_all_calls: list[str] = []
+        self.cancel_order_calls: list[str] = []
+
+    async def cancel_all_orders(self, symbol: str) -> None:
+        self.cancel_all_calls.append(symbol)
+
+    async def fetch_open_orders(self, symbol: str):  # noqa: ARG002
+        return []
+
+    async def cancel_order(self, order_id: str, symbol: str) -> None:  # noqa: ARG002
+        self.cancel_order_calls.append(str(order_id))
+
+    async def request(self, path: str, api: str, method: str, params: dict):  # noqa: ARG002
+        if path == "openAlgoOrders" and method.upper() == "GET":
+            symbol = str(params.get("symbol") or "")
+            return [item for item in self._algo_orders if str(item.get("symbol") or "") == symbol]
+        if path == "algoOrder" and method.upper() == "DELETE":
+            algo_id = str(params.get("algoId") or "")
+            if algo_id in self._fail_algo_ids:
+                raise RuntimeError("delete failed")
+            self._algo_orders = [item for item in self._algo_orders if str(item.get("algoId") or "") != algo_id]
+            return {"algoId": algo_id}
+        raise RuntimeError(f"unsupported request path={path} method={method}")
+
+
+class ManualTradeBinanceCancelTestCase(unittest.TestCase):
+    def test_cancel_open_orders_also_cancels_binance_algo_orders(self) -> None:
+        manager = ManualTradeManager()
+        client = _FakeBinanceClient(algo_ids=["a1", "a2"])
+
+        ok = asyncio.run(
+            manager._cancel_open_orders_for_symbol(
+                client,
+                exchange="binance",
+                symbol="ZKP",
+                ccxt_symbol="ZKPUSDT",
+            )
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(client.cancel_all_calls, ["ZKPUSDT"])
+        remaining = asyncio.run(client.request("openAlgoOrders", "fapiPrivate", "GET", {"symbol": "ZKPUSDT"}))
+        self.assertEqual(remaining, [])
+
+    def test_cancel_open_orders_returns_false_when_algo_cancel_fails(self) -> None:
+        manager = ManualTradeManager()
+        client = _FakeBinanceClient(algo_ids=["a1"], fail_algo_ids={"a1"})
+
+        ok = asyncio.run(
+            manager._cancel_open_orders_for_symbol(
+                client,
+                exchange="binance",
+                symbol="ZKP",
+                ccxt_symbol="ZKPUSDT",
+            )
+        )
+
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":

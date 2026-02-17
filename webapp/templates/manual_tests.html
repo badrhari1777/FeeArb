@@ -3,11 +3,12 @@
 <head>
   <meta charset="utf-8" />
   <title>Manual Exchange Tests</title>
-  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', path='/favicon.svg') }}?v={{ static_version }}">
-  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}?v={{ static_version }}" />
+  {% set rp = request.scope.get('root_path', '') %}
+  <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
   {% set settings = settings or {} %}
   {% set analysis_exchanges = settings.get('analysis_exchanges', {}) %}
-  <script defer src="{{ url_for('static', path='/manual_tests.js') }}?v={{ static_version }}"></script>
+  <script defer src="{{ rp }}/static/manual_tests.js?v={{ static_version }}"></script>
 </head>
 <body class="page">
   <header class="masthead">
@@ -28,6 +29,7 @@
         </div>
       </dl>
       <a class="button" href="/manual">Back to manual</a>
+      <a class="button" href="/mobile">Open mobile UI</a>
     </div>
   </header>
 
@@ -103,7 +105,7 @@
 
     <section class="panel">
       <h2>Margin & leverage tests</h2>
-      <p class="settings-note">Fetch a live position and adjust isolated margin per exchange.</p>
+      <p class="settings-note">Fetch a live position, adjust isolated margin, and set leverage per exchange.</p>
       <div class="grid-list">
         {% for name, enabled in analysis_exchanges.items() %}
           {% if enabled %}
@@ -123,18 +125,37 @@
                   </select>
                 </label>
                 <label>
+                  Margin mode
+                  <select data-margin-mode>
+                    <option value="">Auto</option>
+                    <option value="isolated" selected>Isolated</option>
+                    <option value="cross">Cross</option>
+                  </select>
+                </label>
+                <label>
                   Amount (USDT)
                   <input type="number" data-margin-amount step="0.01" min="0" value="5" />
+                </label>
+                <label>
+                  Leverage
+                  <input type="number" data-margin-leverage step="0.1" min="0" value="3" />
                 </label>
               </div>
               <div class="settings-actions">
                 <button type="button" class="button" data-margin-fetch>Fetch position</button>
                 <button type="button" class="button" data-margin-add>Add margin</button>
                 <button type="button" class="button" data-margin-reduce>Reduce margin</button>
+                <button type="button" class="button" data-margin-leverage-set>Set leverage</button>
+                {% if name == "binance" %}
+                <button type="button" class="button" data-margin-leverage-set-binance>Set leverage (binance)</button>
+                {% endif %}
                 <span class="settings-status" data-margin-status aria-live="polite"></span>
               </div>
               <div class="panel-muted">
                 <pre class="code-block" data-margin-result></pre>
+              </div>
+              <div class="panel-muted">
+                <pre class="code-block" data-margin-view></pre>
               </div>
               <div class="panel-muted">
                 <pre class="code-block" data-margin-log></pre>
@@ -142,6 +163,100 @@
             </div>
           {% endif %}
         {% endfor %}
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Funding tests</h2>
+      <p class="settings-note">Check current funding, next funding ETA, interval, and history with raw API payloads.</p>
+      <div class="grid-list">
+        {% for name, enabled in analysis_exchanges.items() %}
+          {% if enabled %}
+            <div class="grid-card" data-funding-exchange="{{ name }}">
+              <h3>{{ name|upper }}</h3>
+              <div class="analysis-form">
+                <label>
+                  Symbol
+                  <input type="text" data-funding-symbol placeholder="BTCUSDT" autocomplete="off" />
+                </label>
+                <div class="settings-note" data-funding-examples></div>
+                <label>
+                  History points
+                  <input type="number" data-funding-history-limit min="1" max="200" step="1" value="12" />
+                </label>
+                <label class="settings-checkbox">
+                  <input type="checkbox" data-funding-raw checked />
+                  Include raw API response
+                </label>
+              </div>
+              <div class="panel-muted">
+                <h4>Snapshot (current / next / interval)</h4>
+                <div class="settings-actions">
+                  <button type="button" class="button" data-funding-snapshot-fetch>Fetch snapshot</button>
+                  <span class="settings-status" data-funding-snapshot-status aria-live="polite"></span>
+                </div>
+                <div class="settings-note">Parsed result</div>
+                <pre class="code-block" data-funding-snapshot-result></pre>
+                <div class="settings-note">Raw API (requests + responses)</div>
+                <pre class="code-block" data-funding-snapshot-raw></pre>
+                <div class="settings-note">Script log</div>
+                <pre class="code-block" data-funding-snapshot-log></pre>
+              </div>
+              <div class="panel-muted">
+                <h4>Funding history</h4>
+                <div class="settings-actions">
+                  <button type="button" class="button" data-funding-history-fetch>Fetch history</button>
+                  <span class="settings-status" data-funding-history-status aria-live="polite"></span>
+                </div>
+                <div class="settings-note">Parsed result</div>
+                <pre class="code-block" data-funding-history-result></pre>
+                <div class="settings-note">Raw API (requests + responses)</div>
+                <pre class="code-block" data-funding-history-raw></pre>
+                <div class="settings-note">Script log</div>
+                <pre class="code-block" data-funding-history-log></pre>
+              </div>
+            </div>
+          {% endif %}
+        {% endfor %}
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Coin analysis test</h2>
+      <p class="settings-note">Run candidate analysis (Binance + OKX core) with on-demand 72h history pull.</p>
+      <form id="coin-analysis-test-form" class="analysis-form">
+        <label>
+          Symbol
+          <input type="text" id="coin-analysis-symbol" placeholder="BTC or BTCUSDT" autocomplete="off" />
+        </label>
+        <label>
+          Window (minutes)
+          <input type="number" id="coin-analysis-window" min="60" max="4320" step="60" value="4320" />
+        </label>
+        <label>
+          Funding points
+          <input type="number" id="coin-analysis-funding-points" min="24" max="200" step="1" value="120" />
+        </label>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="coin-analysis-include-series" />
+          Include full candles series
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="coin-analysis-fetch">Run analysis</button>
+          <span class="settings-status" id="coin-analysis-status" aria-live="polite"></span>
+        </div>
+      </form>
+      <div class="panel-muted">
+        <div class="settings-note">Summary</div>
+        <pre id="coin-analysis-summary" class="code-block"></pre>
+      </div>
+      <div class="panel-muted">
+        <div class="settings-note">Payload</div>
+        <pre id="coin-analysis-raw" class="code-block"></pre>
+      </div>
+      <div class="panel-muted">
+        <div class="settings-note">Script log</div>
+        <pre id="coin-analysis-log" class="code-block"></pre>
       </div>
     </section>
 
@@ -367,6 +482,75 @@
       </div>
       <div class="panel-muted">
         <pre id="ws-trade-okx-raw-log" class="code-block"></pre>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>WS Trade Raw (Binance)</h2>
+      <form id="ws-trade-binance-raw-form" class="analysis-form">
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-binance-raw-connect">Connect</button>
+          <button type="button" class="button" id="ws-trade-binance-raw-disconnect">Disconnect</button>
+          <button type="button" class="button" id="ws-trade-binance-raw-reconnect">Reconnect</button>
+          <span class="settings-status" id="ws-trade-binance-raw-status" aria-live="polite"></span>
+        </div>
+        <div class="settings-intervals">
+          <label>
+            Silence threshold (sec)
+            <input type="number" id="ws-trade-binance-raw-silence" min="1" step="1" value="45" />
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="ws-trade-binance-raw-auto-probe" checked />
+            Auto probe ping
+          </label>
+          <button type="button" class="button" id="ws-trade-binance-raw-probe">Probe ping</button>
+          <span class="settings-status" id="ws-trade-binance-raw-monitor" aria-live="polite"></span>
+        </div>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-binance-extend">Extend listenKey</button>
+          <button type="button" class="button" id="ws-trade-binance-close">Close listenKey</button>
+        </div>
+        <label>
+          Symbol
+          <input type="text" id="ws-trade-binance-symbol" placeholder="BTCUSDT" autocomplete="off" />
+        </label>
+        <label>
+          Side
+          <select id="ws-trade-binance-side">
+            <option value="buy">Buy</option>
+            <option value="sell">Sell</option>
+          </select>
+        </label>
+        <label>
+          Qty
+          <input type="number" id="ws-trade-binance-qty" step="0.0001" min="0" value="0.01" />
+        </label>
+        <label>
+          Price
+          <input type="number" id="ws-trade-binance-price" step="0.0001" min="0" value="10000" />
+        </label>
+        <label>
+          Order id (cancel)
+          <input type="text" id="ws-trade-binance-order-id" placeholder="orderId" autocomplete="off" />
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-binance-order">Place limit (REST)</button>
+          <button type="button" class="button" id="ws-trade-binance-market">Place market (REST)</button>
+          <button type="button" class="button" id="ws-trade-binance-cancel">Cancel order (REST)</button>
+        </div>
+        <label>
+          Raw JSON (send)
+          <textarea id="ws-trade-binance-raw-payload" rows="4" placeholder='{"op":"subscribe","args":["listenKey"]}'></textarea>
+        </label>
+        <div class="settings-intervals">
+          <button type="button" class="button" id="ws-trade-binance-raw-send">Send</button>
+        </div>
+      </form>
+      <div class="panel-muted">
+        <pre id="ws-trade-binance-raw-script-log" class="code-block"></pre>
+      </div>
+      <div class="panel-muted">
+        <pre id="ws-trade-binance-raw-log" class="code-block"></pre>
       </div>
     </section>
 

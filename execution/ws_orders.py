@@ -20,12 +20,22 @@ from exchanges import normalize_exchange_name
 logger = logging.getLogger(__name__)
 
 BYBIT_PRIVATE_WS_URL = "wss://stream.bybit.com/v5/private"
+BINANCE_PRIVATE_WS_URL = "wss://fstream.binance.com/ws"
 OKX_PRIVATE_WS_URL = "wss://ws.okx.com:8443/ws/v5/private"
 GATE_PRIVATE_WS_URL = "wss://fx-ws.gateio.ws/v4/ws/usdt"
 BITGET_PRIVATE_WS_URL = "wss://ws.bitget.com/v2/ws/private"
 BINGX_SWAP_WS_URL = "wss://open-api-swap.bingx.com/swap-market"
+BINANCE_LISTEN_KEY_URL = "https://fapi.binance.com/fapi/v1/listenKey"
+BINGX_LISTEN_KEY_RENEW_SECONDS = 120
+BINANCE_LISTEN_KEY_RENEW_SECONDS = 1500
 
 DEFAULT_WS_ORDER_HEALTH = {
+    "binance": {
+        "heartbeat_interval": 15.0,
+        "heartbeat_timeout": 45.0,
+        "reconnect_attempts": 3,
+        "reconnect_grace_sec": 12.0,
+    },
     "bybit": {
         "heartbeat_interval": 15.0,
         "heartbeat_timeout": 45.0,
@@ -404,6 +414,8 @@ class _BaseOrderStream:
             self._heartbeat_task.cancel()
             try:
                 await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
             self._heartbeat_task = None
@@ -489,12 +501,12 @@ class _BaseOrderStream:
         asyncio.create_task(_await_pong())
 
     async def force_reconnect(self) -> None:
-        if not self._ws:
-            return
-        try:
-            await self._ws.close()
-        except Exception:
-            return
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+        await self._reset_connection()
 
     def emit_control_event(self, action: str, data: Mapping[str, Any] | None = None) -> None:
         self._emit_event(action, data)
@@ -630,6 +642,177 @@ class BybitOrderStream(_BaseOrderStream):
         except Exception:
             return
         self._mark_live("ping-send")
+
+
+class BinanceOrderStream(_BaseOrderStream):
+    def __init__(
+        self,
+        gateway: ExchangeGateway,
+        contract_size: float | None = None,
+        *,
+        event_cb: Optional[callable] = None,
+    ) -> None:
+        super().__init__("binance", contract_size=contract_size, event_cb=event_cb)
+        self._gateway = gateway
+        self._listen_key: Optional[str] = None
+        self._keepalive_task: Optional[asyncio.Task] = None
+
+    async def _connect_and_listen(self) -> None:
+        await self._reset_connection()
+        self._emit_event("connect_start")
+        listen_key = await self._fetch_listen_key()
+        if not listen_key:
+            return
+        self._listen_key = listen_key
+        ws_url = f"{BINANCE_PRIVATE_WS_URL}/{listen_key}"
+        self._ws = await websockets.connect(
+            ws_url,
+            ping_interval=20,
+            ping_timeout=10,
+            max_size=1_000_000,
+        )
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        self._mark_live("connected")
+        self._ensure_heartbeat()
+        while not self._stop.is_set():
+            message = await self._ws.recv()
+            text = _decode_gzip_message(message)
+            if not text:
+                continue
+            self._mark_live()
+            try:
+                payload = json.loads(text)
+            except Exception:
+                payload = None
+            if not isinstance(payload, dict):
+                continue
+            event = payload.get("e")
+            if event == "listenKeyExpired":
+                self._emit_event("listen_key_expired")
+                self._listen_key = None
+                break
+            if event != "ORDER_TRADE_UPDATE":
+                continue
+            data = payload.get("o") or {}
+            order_id = _safe_order_id(data.get("i") or data.get("orderId"))
+            if not order_id:
+                continue
+            filled = _safe_float(data.get("z"))
+            status = data.get("X")
+            symbol = data.get("s")
+            side = data.get("S")
+            self._update_order(
+                order_id,
+                symbol=symbol,
+                side=side,
+                filled_qty=filled,
+                status=status,
+                mode="set",
+            )
+
+    async def stop(self) -> None:
+        await super().stop()
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except Exception:
+                pass
+            self._keepalive_task = None
+        if self._listen_key:
+            await self._close_listen_key()
+            self._listen_key = None
+
+    async def _reset_connection(self) -> None:
+        await super()._reset_connection()
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self._keepalive_task = None
+
+    async def _fetch_listen_key(self) -> str | None:
+        _bootstrap_env(force=True)
+        await self._gateway.refresh_credentials_async(force_env=True)
+        api_key = self._gateway.api_key
+        if not api_key:
+            self._emit_event("listen_key_missing_api_key")
+            logger.warning("binance listenKey missing api key")
+            return None
+        self._emit_event("listen_key_request")
+        headers = {"X-MBX-APIKEY": api_key}
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    BINANCE_LISTEN_KEY_URL,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    payload = await resp.json()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("binance listenKey request failed: %s", exc)
+            self._emit_event("listen_key_failed", {"error": str(exc)})
+            return None
+        listen_key = payload.get("listenKey") if isinstance(payload, dict) else None
+        if not listen_key:
+            logger.warning("binance listenKey response missing: %s", payload)
+            self._emit_event("listen_key_failed", {"error": "missing_listen_key"})
+            return None
+        self._emit_event("listen_key_ok")
+        return str(listen_key)
+
+    async def _extend_listen_key(self) -> None:
+        _bootstrap_env(force=True)
+        await self._gateway.refresh_credentials_async(force_env=True)
+        api_key = self._gateway.api_key
+        if not api_key:
+            return
+        headers = {"X-MBX-APIKEY": api_key}
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession() as session:
+                async with session.put(
+                    BINANCE_LISTEN_KEY_URL,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    await resp.text()
+        except Exception:
+            return
+
+    async def _close_listen_key(self) -> None:
+        _bootstrap_env(force=True)
+        await self._gateway.refresh_credentials_async(force_env=True)
+        api_key = self._gateway.api_key
+        if not api_key:
+            return
+        headers = {"X-MBX-APIKEY": api_key}
+        try:
+            import aiohttp
+
+            async with aiohttp.ClientSession() as session:
+                async with session.delete(
+                    BINANCE_LISTEN_KEY_URL,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    await resp.text()
+        except Exception:
+            return
+
+    async def _keepalive_loop(self) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(BINANCE_LISTEN_KEY_RENEW_SECONDS)
+            if self._stop.is_set():
+                break
+            await self._extend_listen_key()
 
 
 class OkxOrderStream(_BaseOrderStream):
@@ -1233,6 +1416,11 @@ class BingxOrderStream(_BaseOrderStream):
             event = payload.get("e")
             if event:
                 self._mark_live(f"event:{event}")
+            if event == "listenKeyExpired":
+                logger.warning("bingx order ws listenKey expired; reconnecting")
+                self._emit_event("listen_key_expired")
+                self._listen_key = None
+                break
             if event not in ("ORDER_TRADE_UPDATE", "TRADE_UPDATE"):
                 continue
             data = payload.get("o") or {}
@@ -1272,6 +1460,8 @@ class BingxOrderStream(_BaseOrderStream):
             self._keepalive_task.cancel()
             try:
                 await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 pass
             self._keepalive_task = None
@@ -1372,7 +1562,7 @@ class BingxOrderStream(_BaseOrderStream):
 
     async def _keepalive_loop(self) -> None:
         while not self._stop.is_set():
-            await asyncio.sleep(30 * 60)
+            await asyncio.sleep(BINGX_LISTEN_KEY_RENEW_SECONDS)
             if self._stop.is_set():
                 break
             await self._extend_listen_key()
@@ -1496,6 +1686,8 @@ class LiveOrderTracker:
     def _build_stream(self, exchange: str, gateway: ExchangeGateway) -> _BaseOrderStream | None:
         if exchange == "bybit":
             return BybitOrderStream(gateway, event_cb=self._event_cb)
+        if exchange == "binance":
+            return BinanceOrderStream(gateway, event_cb=self._event_cb)
         if exchange == "okx":
             return OkxOrderStream(gateway, event_cb=self._event_cb)
         if exchange == "gate":

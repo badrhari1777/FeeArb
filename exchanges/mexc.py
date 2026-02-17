@@ -22,6 +22,7 @@ from utils.cache_db import (
     get_or_fetch_symbol_meta,
     get_or_fetch_funding_history,
 )
+from utils.funding import enrich_history_intervals, normalize_interval_hours, parse_timestamp_ms
 
 
 logger = logging.getLogger(__name__)
@@ -317,16 +318,16 @@ class MexcAdapter(ExchangeAdapter):
             data = payload.get("data") or []
             out: list[dict] = []
             for item in data[:limit]:
-                ts = _to_float(item.get("timestamp") or item.get("time"))
+                ts_ms = parse_timestamp_ms(item.get("timestamp") or item.get("time"))
                 out.append(
                     {
-                        "ts_ms": int(ts * 1000) if ts and ts < 10_000_000_000 else int(ts or 0),
+                        "ts_ms": ts_ms or 0,
                         "rate": _to_float(item.get("fundingRate") or item.get("fundingRate")),
-                        "interval_hours": _to_float(item.get("collectCycle")) or 8.0,
+                        "interval_hours": _collect_cycle_hours(item.get("collectCycle")),
                         "mark_price": _to_float(item.get("fairPrice")),
                     }
                 )
-            return out
+            return enrich_history_intervals(out)
 
         return get_or_fetch_funding_history(
             self.name,
@@ -351,7 +352,7 @@ class MexcAdapter(ExchangeAdapter):
             funding_rate=_to_float(funding.get("fundingRate"))
             or _to_float(ticker.get("fundingRate")),
             next_funding_time=_to_datetime(funding.get("nextSettleTime")),
-            funding_interval_hours=_to_float(funding.get("collectCycle")),
+            funding_interval_hours=_collect_cycle_hours(funding.get("collectCycle")),
             mark_price=_to_float(ticker.get("fairPrice")) or _to_float(ticker.get("lastPrice")),
             bid=_to_float(ticker.get("bid1") or ticker.get("bidPrice")),
             ask=_to_float(ticker.get("ask1") or ticker.get("askPrice")),
@@ -424,3 +425,14 @@ def _to_datetime(value: object):
     from datetime import datetime, timezone
 
     return datetime.fromtimestamp(seconds, tz=timezone.utc)
+
+
+def _collect_cycle_hours(value: object) -> float | None:
+    parsed = normalize_interval_hours(value)
+    if parsed is not None:
+        return parsed
+    raw = _to_float(value)
+    if raw is None:
+        return None
+    # Some responses expose collectCycle in seconds (e.g. 28800).
+    return normalize_interval_hours(raw / 3600.0)

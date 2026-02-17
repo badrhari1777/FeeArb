@@ -10,6 +10,7 @@ from orchestrator.models import MarketSnapshot
 
 from .base import ExchangeAdapter
 from utils.cache_db import SymbolMeta, get_or_fetch_symbol_meta, get_or_fetch_funding_history
+from utils.funding import enrich_history_intervals, normalize_interval_hours, parse_timestamp_ms
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,11 @@ class GateAdapter(ExchangeAdapter):
                         or ticker_item.get("funding_rate_indicative")
                     ),
                     next_funding_time=_to_datetime(contract_payload.get("funding_next_apply")),
+                    funding_interval_hours=normalize_interval_hours(
+                        contract_payload.get("funding_interval")
+                        or contract_payload.get("funding_interval_hour")
+                        or contract_payload.get("funding_interval_hours")
+                    ),
                     mark_price=_to_float(ticker_item.get("mark_price")),
                     bid=_to_float(ticker_item.get("highest_bid")),
                     ask=_to_float(ticker_item.get("lowest_ask")),
@@ -113,16 +119,16 @@ class GateAdapter(ExchangeAdapter):
                 return []
             out: list[dict] = []
             for item in payload:
-                ts = _to_float(item.get("t"))
+                ts_ms = parse_timestamp_ms(item.get("t"))
                 out.append(
                     {
-                        "ts_ms": int(ts * 1000) if ts else 0,
+                        "ts_ms": ts_ms or 0,
                         "rate": _to_float(item.get("r")),
-                        "interval_hours": 8.0,
+                        "interval_hours": None,
                         "mark_price": _to_float(item.get("p")),
                     }
                 )
-            return out
+            return enrich_history_intervals(out)
 
         return get_or_fetch_funding_history(
             self.name,

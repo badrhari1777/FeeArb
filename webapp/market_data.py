@@ -14,6 +14,7 @@ import websockets
 from execution.accounts import _safe_float
 from exchanges import normalize_exchange_name
 from .manual_symbols import (
+    _normalize_binance_symbol,
     _normalize_bingx_symbol,
     _normalize_bitget_symbol,
     _normalize_bybit_symbol,
@@ -26,6 +27,7 @@ from .manual_symbols import (
 logger = logging.getLogger(__name__)
 
 BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
+BINANCE_WS_URL = "wss://fstream.binance.com/ws"
 BINGX_WS_URL = "wss://open-api-swap.bingx.com/swap-market"
 MEXC_WS_URL = "wss://contract.mexc.com/edge"
 BITGET_WS_URL = "wss://ws.bitget.com/v2/ws/public"
@@ -165,7 +167,12 @@ class MarketDataBus:
             self._books.clear()
 
     async def get_orderbook(
-        self, exchange: str, symbol: str, *, depth: Optional[int] = None
+        self,
+        exchange: str,
+        symbol: str,
+        *,
+        depth: Optional[int] = None,
+        max_age_sec: Optional[float] = None,
     ) -> dict[str, Any] | None:
         key = await self._ensure_subscription(exchange, symbol)
         if not key:
@@ -175,7 +182,8 @@ class MarketDataBus:
         if not record:
             return None
         age = time.time() - record.updated_at
-        if self._max_age_sec and age > self._max_age_sec:
+        effective_max_age = self._max_age_sec if max_age_sec is None else max(0.0, float(max_age_sec))
+        if effective_max_age and age > effective_max_age:
             return None
         target_depth = max(1, int(depth or self._default_depth))
         book = _trim_book(record.book, target_depth)
@@ -205,6 +213,7 @@ class MarketDataBus:
     async def _run_exchange_loop(self, exchange: str, symbol: str, stop: asyncio.Event) -> None:
         handlers = {
             "bybit": self._bybit_loop,
+            "binance": self._binance_loop,
             "bingx": self._bingx_loop,
             "mexc": self._mexc_loop,
             "bitget": self._bitget_loop,
@@ -268,6 +277,38 @@ class MarketDataBus:
                         await self._update_book(exchange, symbol, state.to_book(50))
             except Exception as exc:
                 logger.debug("Bybit WS error: %s", exc)
+                await asyncio.sleep(1.0)
+
+    async def _binance_loop(self, symbol: str, exchange: str, stop: asyncio.Event) -> None:
+        stream_symbol = _normalize_binance_symbol(symbol).lower()
+        if not stream_symbol:
+            return
+        ws_url = f"{BINANCE_WS_URL}/{stream_symbol}@depth20@100ms"
+        while not stop.is_set():
+            try:
+                async with websockets.connect(
+                    ws_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_size=1_000_000,
+                ) as ws:
+                    while not stop.is_set():
+                        message = await ws.recv()
+                        text = _decode_message(message)
+                        if not text:
+                            continue
+                        payload = json.loads(text)
+                        bids = _parse_levels(payload.get("b") or [], side="bid", allow_zero=True)
+                        asks = _parse_levels(payload.get("a") or [], side="ask", allow_zero=True)
+                        if not bids or not asks:
+                            continue
+                        await self._update_book(
+                            exchange,
+                            symbol,
+                            OrderBookLite(bids=bids, asks=asks),
+                        )
+            except Exception as exc:
+                logger.debug("Binance WS error: %s", exc)
                 await asyncio.sleep(1.0)
 
     async def _bingx_loop(self, symbol: str, exchange: str, stop: asyncio.Event) -> None:

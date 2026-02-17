@@ -111,6 +111,7 @@
   }
 
   var marginSymbolHints = {
+    binance: 'BTCUSDT',
     bingx: 'BTC-USDT',
     gate: 'BTC_USDT',
     kucoin: 'BTCUSDTM',
@@ -118,6 +119,28 @@
     bybit: 'BTCUSDT',
     bitget: 'BTCUSDT',
     mexc: 'BTCUSDT'
+  };
+
+  var fundingSymbolHints = {
+    binance: 'BTCUSDT',
+    bingx: 'BTC-USDT',
+    gate: 'BTC_USDT',
+    kucoin: 'BTCUSDTM',
+    okx: 'BTC-USDT-SWAP',
+    bybit: 'BTCUSDT',
+    bitget: 'BTCUSDT',
+    mexc: 'BTCUSDT'
+  };
+
+  var fundingSymbolExamples = {
+    binance: 'BTCUSDT, ETHUSDT',
+    bingx: 'BTC-USDT, ETH-USDT',
+    gate: 'BTC_USDT, ETH_USDT',
+    kucoin: 'BTCUSDTM, ETHUSDTM',
+    okx: 'BTC-USDT-SWAP, ETH-USDT-SWAP',
+    bybit: 'BTCUSDT, ETHUSDT',
+    bitget: 'BTCUSDT, ETHUSDT',
+    mexc: 'BTCUSDT, ETHUSDT'
   };
 
   function setStatus(el, message, level) {
@@ -550,13 +573,18 @@
       var exchange = (card.getAttribute('data-margin-exchange') || '').trim();
       var symbolEl = card.querySelector('[data-margin-symbol]');
       var sideEl = card.querySelector('[data-margin-side]');
+      var modeEl = card.querySelector('[data-margin-mode]');
       var amountEl = card.querySelector('[data-margin-amount]');
+      var leverageEl = card.querySelector('[data-margin-leverage]');
       var statusEl = card.querySelector('[data-margin-status]');
       var resultEl = card.querySelector('[data-margin-result]');
+      var viewEl = card.querySelector('[data-margin-view]');
       var logEl = card.querySelector('[data-margin-log]');
       var fetchBtn = card.querySelector('[data-margin-fetch]');
       var addBtn = card.querySelector('[data-margin-add]');
       var reduceBtn = card.querySelector('[data-margin-reduce]');
+      var leverageBtn = card.querySelector('[data-margin-leverage-set]');
+      var leverageBinanceBtn = card.querySelector('[data-margin-leverage-set-binance]');
       var scriptLog = createScriptLogger(logEl);
 
       if (symbolEl && marginSymbolHints[exchange]) {
@@ -579,6 +607,18 @@
         return amountEl ? parseOptionalNumber(amountEl.value) : null;
       }
 
+      function readMarginMode() {
+        var mode = (modeEl ? modeEl.value : '').trim().toLowerCase();
+        if (!mode) {
+          return null;
+        }
+        return mode;
+      }
+
+      function readLeverage() {
+        return leverageEl ? parseOptionalNumber(leverageEl.value) : null;
+      }
+
       function setResult(data) {
         if (!resultEl) {
           return;
@@ -586,13 +626,50 @@
         resultEl.textContent = pretty(data || {});
       }
 
+      function setView(data) {
+        if (!viewEl) {
+          return;
+        }
+        if (!data) {
+          viewEl.textContent = '';
+          return;
+        }
+        var viewPayload = {};
+        if (data.error) {
+          viewPayload.error = data.error;
+        }
+        if (data.errors) {
+          viewPayload.errors = data.errors;
+        }
+        if (data.position_view) {
+          viewPayload.position_view = data.position_view;
+        }
+        if (data.before || data.after) {
+          viewPayload.before = data.before ? data.before.position_view || null : null;
+          viewPayload.after = data.after ? data.after.position_view || null : null;
+        }
+        if (data.margin_mode) {
+          viewPayload.margin_mode = data.margin_mode;
+        }
+        if (data.target_leverage !== undefined) {
+          viewPayload.target_leverage = data.target_leverage;
+        }
+        if (!Object.keys(viewPayload).length) {
+          viewEl.textContent = '';
+          return;
+        }
+        viewEl.textContent = pretty(viewPayload);
+      }
+
       function handleResponse(err, data) {
         if (err) {
           setStatus(statusEl, err.message, 'error');
           setResult({ error: err.message });
+          setView({ error: err.message });
           return;
         }
         setResult(data);
+        setView(data);
         if (data && data.errors && data.errors.length) {
           setStatus(statusEl, 'Completed with errors', 'error');
         } else {
@@ -650,6 +727,56 @@
         );
       }
 
+      function updateLeverage() {
+        var symbol = readSymbol();
+        if (!symbol) {
+          setStatus(statusEl, 'Symbol required', 'error');
+          return;
+        }
+        var leverage = readLeverage();
+        if (!leverage || leverage <= 0) {
+          setStatus(statusEl, 'Leverage must be > 0', 'error');
+          return;
+        }
+        var payload = {
+          exchange: exchange,
+          symbol: symbol,
+          leverage: leverage
+        };
+        var side = readSide();
+        if (side) {
+          payload.side = side;
+        }
+        var marginMode = readMarginMode();
+        if (marginMode) {
+          payload.margin_mode = marginMode;
+        }
+        sendRequest('Setting leverage', '/api/manual/test/leverage', payload);
+      }
+
+      function updateLeverageBinance() {
+        var symbol = readSymbol();
+        if (!symbol) {
+          setStatus(statusEl, 'Symbol required', 'error');
+          return;
+        }
+        var leverage = readLeverage();
+        if (!leverage || leverage <= 0) {
+          setStatus(statusEl, 'Leverage must be > 0', 'error');
+          return;
+        }
+        var payload = {
+          exchange: exchange,
+          symbol: symbol,
+          leverage: leverage
+        };
+        var marginMode = readMarginMode();
+        if (marginMode) {
+          payload.margin_mode = marginMode;
+        }
+        sendRequest('Setting leverage (binance)', '/api/manual/test/leverage/binance', payload);
+      }
+
       if (fetchBtn) {
         fetchBtn.addEventListener('click', function () {
           fetchPosition();
@@ -665,6 +792,362 @@
           updateMargin('reduce');
         });
       }
+      if (leverageBtn) {
+        leverageBtn.addEventListener('click', function () {
+          updateLeverage();
+        });
+      }
+      if (leverageBinanceBtn) {
+        leverageBinanceBtn.addEventListener('click', function () {
+          updateLeverageBinance();
+        });
+      }
+    });
+  }
+
+  function bindFundingTests() {
+    var cards = document.querySelectorAll('[data-funding-exchange]');
+    if (!cards || !cards.length) {
+      return;
+    }
+    Array.prototype.forEach.call(cards, function (card) {
+      var exchange = (card.getAttribute('data-funding-exchange') || '').trim();
+      var symbolEl = card.querySelector('[data-funding-symbol]');
+      var rawEl = card.querySelector('[data-funding-raw]');
+      var examplesEl = card.querySelector('[data-funding-examples]');
+      var historyLimitEl = card.querySelector('[data-funding-history-limit]');
+      var snapshotStatusEl = card.querySelector('[data-funding-snapshot-status]');
+      var snapshotResultEl = card.querySelector('[data-funding-snapshot-result]');
+      var snapshotRawEl = card.querySelector('[data-funding-snapshot-raw]');
+      var snapshotLogEl = card.querySelector('[data-funding-snapshot-log]');
+      var snapshotBtn = card.querySelector('[data-funding-snapshot-fetch]');
+      var historyStatusEl = card.querySelector('[data-funding-history-status]');
+      var historyResultEl = card.querySelector('[data-funding-history-result]');
+      var historyRawEl = card.querySelector('[data-funding-history-raw]');
+      var historyLogEl = card.querySelector('[data-funding-history-log]');
+      var historyBtn = card.querySelector('[data-funding-history-fetch]');
+      var snapshotLog = createScriptLogger(snapshotLogEl);
+      var historyLog = createScriptLogger(historyLogEl);
+
+      if (symbolEl && fundingSymbolHints[exchange]) {
+        symbolEl.placeholder = fundingSymbolHints[exchange];
+      }
+      if (examplesEl && fundingSymbolExamples[exchange]) {
+        examplesEl.textContent = 'Examples: ' + fundingSymbolExamples[exchange];
+      }
+
+      function readSymbol() {
+        return normalizeInputSymbol(symbolEl ? symbolEl.value : '');
+      }
+
+      function readHistoryLimit() {
+        if (!historyLimitEl) {
+          return 12;
+        }
+        var parsed = parseOptionalNumber(historyLimitEl.value);
+        if (!parsed || parsed <= 0) {
+          return 12;
+        }
+        var limit = Math.round(parsed);
+        if (limit < 1) {
+          limit = 1;
+        }
+        if (limit > 200) {
+          limit = 200;
+        }
+        return limit;
+      }
+
+      function buildPayload() {
+        return {
+          exchange: exchange,
+          symbol: readSymbol(),
+          include_raw: !!(rawEl && rawEl.checked),
+          history_limit: readHistoryLimit()
+        };
+      }
+
+      function setResult(el, data) {
+        if (!el) {
+          return;
+        }
+        el.textContent = pretty(data || {});
+      }
+
+      function setRaw(el, data, rawEnabled) {
+        if (!el) {
+          return;
+        }
+        if (!rawEnabled) {
+          el.textContent = 'Raw disabled (enable "Include raw API response").';
+          return;
+        }
+        el.textContent = pretty(data || {});
+      }
+
+      function setStatusForResponse(statusEl, data) {
+        if (!statusEl) {
+          return;
+        }
+        if (data && data.errors && data.errors.length) {
+          setStatus(statusEl, 'Completed with errors', 'error');
+        } else {
+          setStatus(statusEl, 'Completed', 'success');
+        }
+      }
+
+      function buildSnapshotSummary(data) {
+        var summary = {
+          exchange: data ? data.exchange : null,
+          symbol: data ? data.symbol : null,
+          exchange_symbol: data ? data.exchange_symbol : null,
+          funding_rate: data ? data.funding_rate : null,
+          funding_interval_hours: data ? data.funding_interval_hours : null,
+          next_funding_time: data ? data.next_funding_time : null,
+          seconds_to_next: data ? data.seconds_to_next : null,
+          next_funding_eta: data ? data.next_funding_eta : null,
+          mark_price: data ? data.mark_price : null,
+          sources: data ? data.sources : null,
+          attempts: data ? data.attempts : null,
+          warnings: data ? data.warnings : null
+        };
+        if (data && data.errors) {
+          summary.errors = data.errors;
+        }
+        return summary;
+      }
+
+      function buildHistorySummary(data) {
+        var history = data && data.funding_history ? data.funding_history : [];
+        var summary = {
+          exchange: data ? data.exchange : null,
+          symbol: data ? data.symbol : null,
+          exchange_symbol: data ? data.exchange_symbol : null,
+          history_limit: data ? data.history_limit : null,
+          history_count: history.length,
+          funding_history: history
+        };
+        if (data && data.warnings) {
+          summary.warnings = data.warnings;
+        }
+        if (data && data.errors) {
+          summary.errors = data.errors;
+        }
+        return summary;
+      }
+
+      function handleSnapshotResponse(err, data) {
+        if (err) {
+          setStatus(snapshotStatusEl, err.message, 'error');
+          setResult(snapshotResultEl, { error: err.message });
+          setRaw(snapshotRawEl, { error: err.message }, true);
+          return;
+        }
+        setResult(snapshotResultEl, buildSnapshotSummary(data));
+        setStatusForResponse(snapshotStatusEl, data);
+        var rawEnabled = !!(rawEl && rawEl.checked);
+        if (rawEnabled) {
+          var rawPayload = {
+            exchange: data && data.raw ? data.raw.exchange : (data ? data.exchange : null),
+            symbol: data && data.raw ? data.raw.symbol : (data ? data.symbol : null),
+            exchange_symbol: data && data.raw ? data.raw.exchange_symbol : (data ? data.exchange_symbol : null),
+            fetched_at: data && data.raw ? data.raw.fetched_at : null,
+            snapshot: data && data.raw ? data.raw.snapshot : null
+          };
+          if (data && data.raw_error) {
+            rawPayload.raw_error = data.raw_error;
+          }
+          if (data && data.raw && data.raw.errors) {
+            rawPayload.errors = data.raw.errors;
+          }
+          setRaw(snapshotRawEl, rawPayload, true);
+        } else {
+          setRaw(snapshotRawEl, null, false);
+        }
+      }
+
+      function handleHistoryResponse(err, data) {
+        if (err) {
+          setStatus(historyStatusEl, err.message, 'error');
+          setResult(historyResultEl, { error: err.message });
+          setRaw(historyRawEl, { error: err.message }, true);
+          return;
+        }
+        setResult(historyResultEl, buildHistorySummary(data));
+        setStatusForResponse(historyStatusEl, data);
+        var rawEnabled = !!(rawEl && rawEl.checked);
+        if (rawEnabled) {
+          var rawPayload = {
+            exchange: data && data.raw ? data.raw.exchange : (data ? data.exchange : null),
+            symbol: data && data.raw ? data.raw.symbol : (data ? data.symbol : null),
+            exchange_symbol: data && data.raw ? data.raw.exchange_symbol : (data ? data.exchange_symbol : null),
+            fetched_at: data && data.raw ? data.raw.fetched_at : null,
+            history: data && data.raw ? data.raw.history : null
+          };
+          if (data && data.raw_error) {
+            rawPayload.raw_error = data.raw_error;
+          }
+          if (data && data.raw && data.raw.errors) {
+            rawPayload.errors = data.raw.errors;
+          }
+          setRaw(historyRawEl, rawPayload, true);
+        } else {
+          setRaw(historyRawEl, null, false);
+        }
+      }
+
+      function fetchSnapshot() {
+        var symbol = readSymbol();
+        if (!symbol) {
+          setStatus(snapshotStatusEl, 'Symbol required', 'error');
+          return;
+        }
+        var payload = buildPayload();
+        setStatus(snapshotStatusEl, 'Fetching snapshot...', 'info');
+        snapshotLog('snapshot requested', payload);
+        request('POST', '/api/manual/test/funding', payload, handleSnapshotResponse);
+      }
+
+      function fetchHistory() {
+        var symbol = readSymbol();
+        if (!symbol) {
+          setStatus(historyStatusEl, 'Symbol required', 'error');
+          return;
+        }
+        var payload = buildPayload();
+        setStatus(historyStatusEl, 'Fetching history...', 'info');
+        historyLog('history requested', payload);
+        request('POST', '/api/manual/test/funding', payload, handleHistoryResponse);
+      }
+
+      if (snapshotBtn) {
+        snapshotBtn.addEventListener('click', function () {
+          fetchSnapshot();
+        });
+      }
+
+      if (historyBtn) {
+        historyBtn.addEventListener('click', function () {
+          fetchHistory();
+        });
+      }
+    });
+  }
+
+  function bindCoinAnalysisTests() {
+    var symbolEl = document.getElementById('coin-analysis-symbol');
+    var windowEl = document.getElementById('coin-analysis-window');
+    var fundingPointsEl = document.getElementById('coin-analysis-funding-points');
+    var includeSeriesEl = document.getElementById('coin-analysis-include-series');
+    var statusEl = document.getElementById('coin-analysis-status');
+    var summaryEl = document.getElementById('coin-analysis-summary');
+    var rawEl = document.getElementById('coin-analysis-raw');
+    var logEl = document.getElementById('coin-analysis-log');
+    var fetchBtn = document.getElementById('coin-analysis-fetch');
+    if (!fetchBtn) {
+      return;
+    }
+
+    var log = createScriptLogger(logEl);
+
+    function readSymbol() {
+      return normalizeInputSymbol(symbolEl ? symbolEl.value : '');
+    }
+
+    function readWindow() {
+      var value = parseOptionalNumber(windowEl ? windowEl.value : null);
+      var minutes = value ? Math.round(value) : 4320;
+      if (minutes < 60) {
+        minutes = 60;
+      }
+      if (minutes > 4320) {
+        minutes = 4320;
+      }
+      return minutes;
+    }
+
+    function readFundingPoints() {
+      var value = parseOptionalNumber(fundingPointsEl ? fundingPointsEl.value : null);
+      var points = value ? Math.round(value) : 120;
+      if (points < 24) {
+        points = 24;
+      }
+      if (points > 200) {
+        points = 200;
+      }
+      return points;
+    }
+
+    function buildSummary(data) {
+      var payload = data || {};
+      var analysis = payload.analysis || {};
+      var exchanges = analysis.exchanges || [];
+      var exchangeRows = exchanges.map(function (row) {
+        var quality = row && row.data_quality ? row.data_quality : {};
+        return {
+          exchange: row ? row.exchange : null,
+          status: row ? row.status : null,
+          funding_interval_hours: row ? row.funding_interval_hours_resolved : null,
+          latest_funding_rate: row ? row.latest_funding_rate : null,
+          candles_1m_count: row ? row.candles_1m_count : null,
+          candles_coverage_pct: quality ? quality.candles_coverage_pct : null,
+          oi_points_received: quality ? quality.oi_points_received : null,
+          warnings: row ? row.warnings : null,
+          errors: row ? row.errors : null
+        };
+      });
+      return {
+        symbol: payload.symbol || analysis.symbol || null,
+        window_minutes: payload.window_minutes,
+        funding_points: payload.funding_points,
+        include_series: payload.include_series,
+        summary: payload.summary || null,
+        analysis_warnings: analysis.warnings || null,
+        exchange_rows: exchangeRows
+      };
+    }
+
+    function runAnalysis() {
+      var symbol = readSymbol();
+      if (!symbol) {
+        setStatus(statusEl, 'Symbol required', 'error');
+        return;
+      }
+      var payload = {
+        symbol: symbol,
+        window_minutes: readWindow(),
+        funding_points: readFundingPoints(),
+        include_series: !!(includeSeriesEl && includeSeriesEl.checked)
+      };
+      setStatus(statusEl, 'Running analysis...', 'info');
+      log('coin analysis requested', payload);
+      request('POST', '/api/manual/test/coin-analysis', payload, function (err, data) {
+        if (err) {
+          setStatus(statusEl, err.message, 'error');
+          if (summaryEl) {
+            summaryEl.textContent = pretty({ error: err.message });
+          }
+          if (rawEl) {
+            rawEl.textContent = pretty({ error: err.message });
+          }
+          return;
+        }
+        if (summaryEl) {
+          summaryEl.textContent = pretty(buildSummary(data));
+        }
+        if (rawEl) {
+          rawEl.textContent = pretty(data || {});
+        }
+        if (data && data.errors && data.errors.length) {
+          setStatus(statusEl, 'Completed with errors', 'error');
+        } else {
+          setStatus(statusEl, 'Completed', 'success');
+        }
+      });
+    }
+
+    fetchBtn.addEventListener('click', function () {
+      runAnalysis();
     });
   }
 
@@ -1734,6 +2217,279 @@
     if (subPositionsBtn) {
       subPositionsBtn.addEventListener('click', function () {
         sendSubscribe('positions');
+      });
+    }
+  }
+
+  function bindWsTradeBinanceRaw() {
+    var statusEl = document.getElementById('ws-trade-binance-raw-status');
+    var logEl = document.getElementById('ws-trade-binance-raw-log');
+    var monitorEl = document.getElementById('ws-trade-binance-raw-monitor');
+    var scriptEl = document.getElementById('ws-trade-binance-raw-script-log');
+    var silenceEl = document.getElementById('ws-trade-binance-raw-silence');
+    var autoProbeEl = document.getElementById('ws-trade-binance-raw-auto-probe');
+    var probeBtn = document.getElementById('ws-trade-binance-raw-probe');
+    var payloadEl = document.getElementById('ws-trade-binance-raw-payload');
+    var symbolEl = document.getElementById('ws-trade-binance-symbol');
+    var sideEl = document.getElementById('ws-trade-binance-side');
+    var qtyEl = document.getElementById('ws-trade-binance-qty');
+    var priceEl = document.getElementById('ws-trade-binance-price');
+    var orderIdEl = document.getElementById('ws-trade-binance-order-id');
+    var ws = null;
+    var scriptLog = createScriptLogger(scriptEl);
+    var monitor = createWsMonitor({
+      statusEl: monitorEl,
+      scriptLog: scriptLog,
+      silenceEl: silenceEl,
+      autoProbeEl: autoProbeEl,
+      probeBtn: probeBtn,
+      defaultThreshold: 45,
+      sendPing: function () {
+        if (!ws || ws.readyState !== 1) {
+          return false;
+        }
+        send('ping');
+        return true;
+      }
+    });
+
+    function wsUrl() {
+      var proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      return proto + window.location.host + '/ws/trade-binance-raw';
+    }
+
+    function logLine(text) {
+      if (!logEl) {
+        return;
+      }
+      logEl.textContent += text + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function send(action, payload) {
+      if (!ws || ws.readyState !== 1) {
+        setStatus(statusEl, 'Not connected', 'error');
+        logLine('[client] not connected');
+        return;
+      }
+      var message = { action: action };
+      if (payload) {
+        if (typeof payload === 'string') {
+          message.raw = payload;
+        } else {
+          message.payload = payload;
+        }
+      }
+      ws.send(JSON.stringify(message));
+    }
+
+    function connect() {
+      if (ws && ws.readyState === 1) {
+        return;
+      }
+      ws = new WebSocket(wsUrl());
+      ws.onopen = function () {
+        setStatus(statusEl, 'Connected', 'success');
+        logLine('[client] ws_open');
+        monitor.onOpen();
+        monitor.logAction('connect requested; listenKey handled server-side');
+        send('connect');
+      };
+      ws.onmessage = function (evt) {
+        monitor.onLine(evt.data);
+        logLine(evt.data);
+      };
+      ws.onclose = function () {
+        setStatus(statusEl, 'Disconnected', 'info');
+        logLine('[client] ws_closed');
+        monitor.onClose();
+      };
+      ws.onerror = function () {
+        setStatus(statusEl, 'WebSocket error', 'error');
+        logLine('[client] ws_error');
+      };
+    }
+
+    function disconnect() {
+      if (!ws) {
+        return;
+      }
+      try {
+        send('close');
+      } catch (_err) {
+        // ignore
+      }
+      try {
+        ws.close();
+      } catch (_err2) {
+        // ignore
+      }
+      ws = null;
+    }
+
+    function reconnect() {
+      setStatus(statusEl, 'Reconnecting...', 'info');
+      monitor.logAction('reconnect requested');
+      disconnect();
+      window.setTimeout(function () {
+        connect();
+      }, 200);
+    }
+
+    function sendRaw() {
+      var raw = payloadEl ? String(payloadEl.value || '').trim() : '';
+      if (!raw) {
+        setStatus(statusEl, 'Raw payload required', 'error');
+        return;
+      }
+      monitor.logAction('raw payload sent');
+      send('send', raw);
+    }
+
+    function extendListenKey() {
+      setStatus(statusEl, 'Extending listenKey...', 'info');
+      monitor.logAction('listenKey extend requested');
+      send('extend_listen_key');
+    }
+
+    function closeListenKey() {
+      setStatus(statusEl, 'Closing listenKey...', 'info');
+      monitor.logAction('listenKey close requested');
+      send('close_listen_key');
+    }
+
+    function restOrder(orderType) {
+      var symbol = normalizeInputSymbol(symbolEl ? symbolEl.value : '');
+      var side = sideEl ? String(sideEl.value || '').trim().toLowerCase() : '';
+      var qty = qtyEl ? parseOptionalNumber(qtyEl.value) : null;
+      var price = priceEl ? parseOptionalNumber(priceEl.value) : null;
+      if (!symbol || !side || !qty) {
+        setStatus(statusEl, 'Symbol/side/qty required', 'error');
+        return;
+      }
+      if (orderType === 'limit' && (!price || price <= 0)) {
+        setStatus(statusEl, 'Price required for limit order', 'error');
+        return;
+      }
+      var payload = {
+        exchange: 'binance',
+        symbol: symbol,
+        side: side,
+        qty: qty
+      };
+      if (orderType === 'limit') {
+        payload.price = price;
+      }
+      setStatus(statusEl, 'Submitting ' + orderType + ' (REST)...', 'info');
+      monitor.logAction('rest order requested', { type: orderType, symbol: symbol, side: side, qty: qty });
+      request(
+        'POST',
+        orderType === 'limit' ? '/api/manual/test/limit' : '/api/manual/test/market',
+        payload,
+        function (err, data) {
+          if (err) {
+            setStatus(statusEl, err.message, 'error');
+            logLine('[rest] ' + err.message);
+            return;
+          }
+          logLine('[rest] ' + pretty(data));
+          if (data && data.order_id && orderIdEl && !orderIdEl.value) {
+            orderIdEl.value = data.order_id;
+          }
+          if (data && data.errors && data.errors.length) {
+            setStatus(statusEl, 'Completed with errors', 'error');
+          } else {
+            setStatus(statusEl, 'Completed', 'success');
+          }
+        }
+      );
+    }
+
+    function restCancel() {
+      var symbol = normalizeInputSymbol(symbolEl ? symbolEl.value : '');
+      var orderId = orderIdEl ? String(orderIdEl.value || '').trim() : '';
+      if (!symbol || !orderId) {
+        setStatus(statusEl, 'Symbol/order id required', 'error');
+        return;
+      }
+      var payload = {
+        exchange: 'binance',
+        symbol: symbol,
+        order_id: orderId
+      };
+      setStatus(statusEl, 'Canceling order (REST)...', 'info');
+      monitor.logAction('rest cancel requested', { symbol: symbol, order_id: orderId });
+      request('POST', '/api/manual/test/cancel', payload, function (err, data) {
+        if (err) {
+          setStatus(statusEl, err.message, 'error');
+          logLine('[rest] ' + err.message);
+          return;
+        }
+        logLine('[rest] ' + pretty(data));
+        if (data && data.errors && data.errors.length) {
+          setStatus(statusEl, 'Completed with errors', 'error');
+        } else {
+          setStatus(statusEl, 'Completed', 'success');
+        }
+      });
+    }
+
+    var connectBtn = document.getElementById('ws-trade-binance-raw-connect');
+    var disconnectBtn = document.getElementById('ws-trade-binance-raw-disconnect');
+    var reconnectBtn = document.getElementById('ws-trade-binance-raw-reconnect');
+    var sendBtn = document.getElementById('ws-trade-binance-raw-send');
+    var orderBtn = document.getElementById('ws-trade-binance-order');
+    var marketBtn = document.getElementById('ws-trade-binance-market');
+    var cancelBtn = document.getElementById('ws-trade-binance-cancel');
+    var extendBtn = document.getElementById('ws-trade-binance-extend');
+    var closeBtn = document.getElementById('ws-trade-binance-close');
+
+    if (connectBtn) {
+      connectBtn.addEventListener('click', function () {
+        setStatus(statusEl, 'Connecting...', 'info');
+        monitor.logAction('connect button pressed');
+        connect();
+      });
+    }
+    if (disconnectBtn) {
+      disconnectBtn.addEventListener('click', function () {
+        monitor.logAction('disconnect requested');
+        disconnect();
+      });
+    }
+    if (reconnectBtn) {
+      reconnectBtn.addEventListener('click', function () {
+        reconnect();
+      });
+    }
+    if (sendBtn) {
+      sendBtn.addEventListener('click', function () {
+        sendRaw();
+      });
+    }
+    if (extendBtn) {
+      extendBtn.addEventListener('click', function () {
+        extendListenKey();
+      });
+    }
+    if (closeBtn) {
+      closeBtn.addEventListener('click', function () {
+        closeListenKey();
+      });
+    }
+    if (orderBtn) {
+      orderBtn.addEventListener('click', function () {
+        restOrder('limit');
+      });
+    }
+    if (marketBtn) {
+      marketBtn.addEventListener('click', function () {
+        restOrder('market');
+      });
+    }
+    if (cancelBtn) {
+      cancelBtn.addEventListener('click', function () {
+        restCancel();
       });
     }
   }
@@ -2832,10 +3588,13 @@
   document.addEventListener('DOMContentLoaded', function () {
     bind();
     bindMarginTests();
+    bindFundingTests();
+    bindCoinAnalysisTests();
     bindWsTest();
     bindWsTradeRaw();
     bindWsTradePrivateRaw();
     bindWsTradeOkxRaw();
+    bindWsTradeBinanceRaw();
     bindWsTradeBitgetRaw();
     bindWsTradeGateRaw();
     bindWsTradeKucoinRaw();

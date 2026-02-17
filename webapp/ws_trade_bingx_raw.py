@@ -14,14 +14,14 @@ from urllib.parse import urlencode
 import aiohttp
 import websockets
 from fastapi import WebSocket
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from config import BASE_DIR
 from execution.accounts import EXCHANGE_SPECS, ExchangeGateway, _bootstrap_env
 
 BINGX_LISTEN_KEY_URL = "https://open-api.bingx.com/openApi/user/auth/userDataStream"
 BINGX_PRIVATE_WS_URL = "wss://open-api-swap.bingx.com/swap-market"
-BINGX_LISTEN_KEY_RENEW_SECONDS = 30 * 60
+BINGX_LISTEN_KEY_RENEW_SECONDS = 120
 
 logger = logging.getLogger(__name__)
 _RAW_LOGGER = logging.getLogger("ws_trade_bingx_raw")
@@ -61,14 +61,26 @@ class WsTradeBingxRawStream:
         self._remote_ws: Optional[websockets.WebSocketClientProtocol] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._keepalive_task: Optional[asyncio.Task] = None
+        self._reconnect_task: Optional[asyncio.Task] = None
+        self._connect_lock = asyncio.Lock()
         self._stop = asyncio.Event()
         self._listen_key: Optional[str] = None
         self._connected_url: Optional[str] = None
 
     async def run(self) -> None:
         try:
+            if self._websocket.application_state == WebSocketState.CONNECTING:
+                await self._websocket.accept()
             while True:
-                message = await self._websocket.receive_json()
+                if (
+                    self._websocket.application_state != WebSocketState.CONNECTED
+                    or self._websocket.client_state != WebSocketState.CONNECTED
+                ):
+                    break
+                try:
+                    message = await self._websocket.receive_json()
+                except (WebSocketDisconnect, RuntimeError):
+                    break
                 action = str(message.get("action") or "")
                 if action == "connect":
                     await self._connect()
@@ -100,7 +112,8 @@ class WsTradeBingxRawStream:
         if self._keepalive_task:
             self._keepalive_task.cancel()
             try:
-                await self._keepalive_task
+                if asyncio.current_task() is not self._keepalive_task:
+                    await self._keepalive_task
             except asyncio.CancelledError:
                 pass
             except Exception:
@@ -109,12 +122,15 @@ class WsTradeBingxRawStream:
         if self._reader_task:
             self._reader_task.cancel()
             try:
-                await self._reader_task
+                if asyncio.current_task() is not self._reader_task:
+                    await self._reader_task
             except asyncio.CancelledError:
                 pass
             except Exception:
                 pass
             self._reader_task = None
+        if self._reconnect_task and self._reconnect_task.done():
+            self._reconnect_task = None
         if self._remote_ws:
             try:
                 await self._remote_ws.close()
@@ -126,34 +142,45 @@ class WsTradeBingxRawStream:
             self._listen_key = None
 
     async def _connect(self) -> None:
-        await self._shutdown()
-        self._stop.clear()
-        listen_key = await self._fetch_listen_key()
-        if not listen_key:
-            await self._log_line("[err] bingx listenKey missing")
-            return
-        self._listen_key = listen_key
-        ws_url = f"{BINGX_PRIVATE_WS_URL}?listenKey={listen_key}"
-        try:
-            self._remote_ws = await websockets.connect(
-                ws_url,
-                ping_interval=20,
-                ping_timeout=10,
-                max_size=1_000_000,
+        async with self._connect_lock:
+            await self._shutdown()
+            self._stop.clear()
+            listen_key = await self._fetch_listen_key()
+            if not listen_key:
+                await self._log_line("[err] bingx listenKey missing")
+                return
+            self._listen_key = listen_key
+            ws_url = f"{BINGX_PRIVATE_WS_URL}?listenKey={listen_key}"
+            try:
+                self._remote_ws = await websockets.connect(
+                    ws_url,
+                    ping_interval=20,
+                    ping_timeout=10,
+                    max_size=1_000_000,
+                )
+                self._connected_url = ws_url
+            except Exception as exc:  # pylint: disable=broad-except
+                await self._log_line(f"[err] connect failed: {exc}")
+                return
+            self._reader_task = asyncio.create_task(self._reader_loop())
+            self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+            await self._log_line("[sys] connected to bingx swap user stream (listenKey)")
+            if self._connected_url:
+                await self._log_line(f"[sys] bingx ws url: {self._connected_url}")
+            await self._log_line(
+                "[sys] bingx user stream: no subscribe required "
+                "(ACCOUNT_UPDATE / ORDER_TRADE_UPDATE / ACCOUNT_CONFIG_UPDATE)"
             )
-            self._connected_url = ws_url
-        except Exception as exc:  # pylint: disable=broad-except
-            await self._log_line(f"[err] connect failed: {exc}")
+
+    def _request_reconnect(self, reason: str) -> None:
+        if self._stop.is_set():
             return
-        self._reader_task = asyncio.create_task(self._reader_loop())
-        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-        await self._log_line("[sys] connected to bingx swap user stream (listenKey)")
-        if self._connected_url:
-            await self._log_line(f"[sys] bingx ws url: {self._connected_url}")
-        await self._log_line(
-            "[sys] bingx user stream: no subscribe required "
-            "(ACCOUNT_UPDATE / ORDER_TRADE_UPDATE / ACCOUNT_CONFIG_UPDATE)"
-        )
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
+        async def _runner() -> None:
+            await self._log_line(f"[sys] bingx reconnect requested ({reason})")
+            await self._connect()
+        self._reconnect_task = asyncio.create_task(_runner())
 
     async def _fetch_listen_key(self) -> str | None:
         _bootstrap_env(force=True)
@@ -269,6 +296,8 @@ class WsTradeBingxRawStream:
             await self._log_line(f"[err] listenKey {method} failed: {exc}")
             return False
         await self._log_line(f"[err] listenKey {method} status {status}: {payload}")
+        if status == 404 and method.lower() == "put":
+            self._request_reconnect("listenKey 404")
         return False
 
     @staticmethod
@@ -318,6 +347,7 @@ class WsTradeBingxRawStream:
                 message = await self._remote_ws.recv()
             except Exception:
                 await self._log_line("[sys] remote ws closed")
+                self._request_reconnect("remote closed")
                 break
             text = _decode_message(message)
             if not text:
@@ -330,3 +360,7 @@ class WsTradeBingxRawStream:
             if self._is_ping_message(text, payload):
                 await self._send_pong()
                 continue
+            if isinstance(payload, dict) and payload.get("e") == "listenKeyExpired":
+                await self._log_line("[sys] bingx listenKey expired")
+                self._request_reconnect("listenKeyExpired")
+                break

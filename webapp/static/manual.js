@@ -166,7 +166,15 @@
             error = err;
           }
         } else {
-          error = new Error('Request failed (' + xhr.status + ')');
+          var responseText = (xhr.responseText || '').trim();
+          if (responseText.length > 200) {
+            responseText = responseText.slice(0, 200) + '...';
+          }
+          var detail = method + ' ' + url + ' (' + xhr.status + ')';
+          if (responseText) {
+            detail += ' ' + responseText;
+          }
+          error = new Error('Request failed ' + detail);
         }
         callback(error, data);
       }
@@ -377,12 +385,20 @@
         var stats = plan.stats && plan.stats[exch] ? plan.stats[exch] : {};
         var slip = plan.slippage && plan.slippage[exch] ? plan.slippage[exch] : {};
         var fund = plan.funding && plan.funding[exch] ? plan.funding[exch] : {};
+        var constraints = plan.market_constraints && plan.market_constraints[exch] ? plan.market_constraints[exch] : {};
         lines.push('');
         lines.push(exch.toUpperCase() + ' (' + leg.side + ')');
         lines.push('  best_bid=' + formatNumber(stats.best_bid, 4) +
           ' best_ask=' + formatNumber(stats.best_ask, 4));
         lines.push('  spread=' + formatNumber(stats.spread, 6) +
           ' mid=' + formatNumber(stats.mid, 4));
+        if (constraints.price_step) {
+          lines.push('  price_step=' + formatNumber(constraints.price_step, 8));
+          if (stats.mid) {
+            var tickBps = (constraints.price_step / stats.mid) * 10000.0;
+            lines.push('  tick_bps~=' + formatNumber(tickBps, 2));
+          }
+        }
         lines.push('  top3_liquidity_usd=' + formatNumber(stats.min_liquidity_top3, 2));
         lines.push('  expected_slippage_bps=' + formatNumber(slip.expected_slippage_bps, 2) +
           ' filled=' + formatNumber(slip.filled_qty, 6) +
@@ -494,7 +510,8 @@
   function resolveStrategyMode(action, rawMode) {
     if (action === 'roll') {
       var rollMode = document.getElementById('manual-roll-mode');
-      return rollMode ? rollMode.value : 'limit-first-expensive';
+      var resolved = rollMode ? rollMode.value : '';
+      return resolved || 'smart-roll';
     }
     if (rawMode === 'smart') {
       return action === 'exit' ? 'smart-exit' : 'smart-enter';
@@ -512,9 +529,11 @@
     var modeEl = document.getElementById('manual-mode');
     var mode = modeEl ? modeEl.value : '';
     var showMarket = showEnterExit && mode === 'fast';
+    var showExit = action === 'exit';
     toggleScope('manual-scope-enter-exit', showEnterExit);
     toggleScope('manual-scope-roll', showRoll);
     toggleScope('manual-scope-market', showMarket);
+    toggleScope('manual-scope-exit', showExit);
   }
 
   function toggleScope(className, show) {
@@ -665,7 +684,7 @@
       return Object.keys(cfg).length ? cfg : null;
     }
     var wsHealth = {};
-    var exchanges = ['bybit', 'okx', 'gate', 'bitget', 'kucoin', 'bingx'];
+    var exchanges = ['bybit', 'binance', 'okx', 'gate', 'bitget', 'kucoin', 'bingx'];
     for (var i = 0; i < exchanges.length; i += 1) {
       var exchange = exchanges[i];
       var cfg = readWsHealth(exchange);
@@ -749,6 +768,10 @@
         payload.long_exchange = document.getElementById('manual-long-exchange').value;
         payload.short_exchange = document.getElementById('manual-short-exchange').value;
         payload.expensive_leg = (document.getElementById('manual-expensive-leg').value || null);
+        if (action === 'exit') {
+          var allowFlipEl = document.getElementById('manual-exit-allow-flip');
+          payload.exit_allow_flip = allowFlipEl ? !!allowFlipEl.checked : false;
+        }
       }
       return payload;
     }
@@ -897,13 +920,15 @@
 
     function currentPayload() {
       var action = currentAction();
-      if (action === 'roll') {
-        return { disabled: true };
-      }
       var payload = payloadCommon(prefix + '-');
       payload.action = 'subscribe';
-      payload.long_exchange = document.getElementById(longId).value;
-      payload.short_exchange = document.getElementById(shortId).value;
+      if (action === 'roll') {
+        payload.long_exchange = document.getElementById(prefix + '-to-exchange').value;
+        payload.short_exchange = document.getElementById(prefix + '-from-exchange').value;
+      } else {
+        payload.long_exchange = document.getElementById(longId).value;
+        payload.short_exchange = document.getElementById(shortId).value;
+      }
       var liveToggle = document.getElementById(prefix + '-live-orderbook');
       if (liveToggle) {
         payload.include_orderbook = !!liveToggle.checked;
@@ -950,9 +975,6 @@
         subscribe();
       };
       ws.onmessage = function (evt) {
-        if (currentAction() === 'roll') {
-          return;
-        }
         var data = null;
         try {
           data = JSON.parse(evt.data);
@@ -1300,6 +1322,7 @@
   function wsOrderConfig(exchange) {
     var configs = {
       bybit: { endpoint: '/ws/trade-private-raw', loginRequired: true },
+      binance: { endpoint: '/ws/trade-binance-raw', loginRequired: false },
       okx: { endpoint: '/ws/trade-okx-raw', loginRequired: true },
       gate: { endpoint: '/ws/trade-gate-raw', loginRequired: true },
       bitget: { endpoint: '/ws/trade-bitget-raw', loginRequired: true },
@@ -1316,6 +1339,9 @@
   function buildOrderSubscriptions(exchange, rawSymbol) {
     if (exchange === 'bybit') {
       return [{ op: 'subscribe', args: ['order', 'execution'] }];
+    }
+    if (exchange === 'binance') {
+      return [];
     }
     if (exchange === 'okx') {
       return [{ op: 'subscribe', args: [{ channel: 'orders', instType: 'SWAP' }] }];

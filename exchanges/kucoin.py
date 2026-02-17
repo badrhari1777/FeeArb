@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List
 from urllib.parse import urlencode
@@ -64,6 +65,7 @@ class KucoinAdapter(ExchangeAdapter):
                     exchange_symbol=contract_symbol,
                     funding_rate=_to_float(contract_info.get("fundingFeeRate")),
                     next_funding_time=_to_datetime(contract_info.get("nextFundingRateDateTime")),
+                    funding_interval_hours=_funding_interval_hours(contract_info),
                     mark_price=_to_float(contract_info.get("markPrice")),
                     bid=_to_float(ticker_item.get("bestBidPrice")),
                     ask=_to_float(ticker_item.get("bestAskPrice")),
@@ -91,9 +93,22 @@ class KucoinAdapter(ExchangeAdapter):
     def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
         """Return recent funding history."""
         contract = self.map_symbol(symbol) or symbol
+        interval_hours = None
+        try:
+            contracts = self._load_contracts()
+            interval_hours = _funding_interval_hours(contracts.get(contract))
+        except Exception:  # pylint: disable=broad-except
+            interval_hours = None
 
         def _fetch() -> list[dict]:
-            params = urlencode({"symbol": contract, "pageSize": limit})
+            now_ms = int(time.time() * 1000)
+            effective_interval = interval_hours if interval_hours and interval_hours > 0 else 8.0
+            range_hours = max(6, int(limit)) * effective_interval
+            max_hours = 24 * 90
+            if range_hours > max_hours:
+                range_hours = max_hours
+            from_ms = now_ms - int(range_hours * 3600 * 1000)
+            params = urlencode({"symbol": contract, "from": from_ms, "to": now_ms})
             url = f"{self.base_url}/api/v1/contract/funding-rates?{params}"
             try:
                 payload = _get_json(url)
@@ -103,12 +118,16 @@ class KucoinAdapter(ExchangeAdapter):
             out: list[dict] = []
             if payload.get("code") == "200000":
                 for item in payload.get("data") or []:
-                    ts_ms = _to_float(item.get("timePoint") or item.get("ts")) or 0
+                    ts_ms = _to_float(
+                        item.get("timepoint")
+                        or item.get("timePoint")
+                        or item.get("ts")
+                    ) or 0
                     out.append(
                         {
                             "ts_ms": int(ts_ms),
                             "rate": _to_float(item.get("fundingRate") or item.get("funding_rate")),
-                            "interval_hours": 8.0,
+                            "interval_hours": effective_interval,
                             "mark_price": _to_float(item.get("markPrice")),
                         }
                     )
@@ -116,14 +135,19 @@ class KucoinAdapter(ExchangeAdapter):
 
         try:
             from utils.cache_db import get_or_fetch_funding_history
-
-            return get_or_fetch_funding_history(
+            history = get_or_fetch_funding_history(
                 self.name,
                 contract,
                 _fetch,
                 max_age_seconds=300,
                 limit=limit,
             )
+            if history:
+                effective_interval = interval_hours if interval_hours and interval_hours > 0 else 8.0
+                for item in history:
+                    if isinstance(item, dict):
+                        item["interval_hours"] = effective_interval
+            return history
         except Exception:  # pylint: disable=broad-except
             return _fetch()
 
@@ -134,6 +158,24 @@ def _get_json(url: str) -> dict:
         import json
 
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _funding_interval_hours(contract_info: dict) -> float | None:
+    if not isinstance(contract_info, dict):
+        return None
+    values: list[float] = []
+    for key in ("currentFundingRateGranularity", "fundingRateGranularity"):
+        raw_val = _to_float(contract_info.get(key))
+        if not raw_val or raw_val <= 0:
+            continue
+        seconds = raw_val / 1000.0 if raw_val > 100000 else raw_val
+        hours = seconds / 3600.0
+        if hours > 0:
+            values.append(hours)
+    if not values:
+        return None
+    # Kucoin can report both 8h and 1h; pick the smaller to match live funding cadence.
+    return min(values)
 
 
 def _to_float(value: object) -> float | None:

@@ -82,6 +82,7 @@ async def collect_sources_async(
     progress_cb: ProgressCallback | None = None,
     *,
     source_settings: Mapping[str, bool] | None = None,
+    exchange_settings: Mapping[str, bool] | None = None,
 ) -> SourceSnapshot:
     if aiohttp is None:
         raise RuntimeError(
@@ -95,6 +96,7 @@ async def collect_sources_async(
 
     messages: list[str] = []
     sources = _effective_sources(source_settings)
+    include_exchanges = _effective_exchanges(exchange_settings)
 
     timeout = aiohttp.ClientTimeout(total=30)
     headers = {
@@ -125,7 +127,10 @@ async def collect_sources_async(
                         screener_rows,
                         screener_from_cache,
                         screener_warning,
-                    ) = await _load_screener_snapshot_async(session)
+                    ) = await _load_screener_snapshot_async(
+                        session,
+                        include_exchanges=include_exchanges if include_exchanges else None,
+                    )
                     upsert_cached_source("arbitragescanner", {"rows": screener_rows})
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.warning("ArbitrageScanner fetch failed: %s", exc)
@@ -343,6 +348,7 @@ async def collect_snapshot_async(
     sources = await collect_sources_async(
         progress_cb,
         source_settings=source_settings,
+        exchange_settings=exchange_settings,
     )
     return await build_snapshot_from_sources(
         sources,
@@ -383,6 +389,8 @@ def collect_snapshot(
 
 async def _load_screener_snapshot_async(
     session: "ClientSession",
+    *,
+    include_exchanges: Iterable[str] | None = None,
 ) -> tuple[list[dict], bool, str | None]:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -404,7 +412,11 @@ async def _load_screener_snapshot_async(
         return [], False, "ArbitrageScanner returned no candidates."
 
     rows = _normalize_screener_rows(
-        arbitragescanner.build_top(data, exclude=("binance",), limit=20)
+        arbitragescanner.build_top(
+            data,
+            include=tuple(include_exchanges) if include_exchanges else None,
+            limit=20,
+        )
     )
     save_cache(
         "screener_latest.json",

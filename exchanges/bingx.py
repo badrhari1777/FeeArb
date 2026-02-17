@@ -9,7 +9,13 @@ from urllib.request import Request, urlopen
 from orchestrator.models import MarketSnapshot
 
 from .base import ExchangeAdapter
-from utils.cache_db import SymbolMeta, get_or_fetch_symbol_meta
+from utils.cache_db import SymbolMeta, get_or_fetch_funding_history, get_or_fetch_symbol_meta
+from utils.funding import (
+    enrich_history_intervals,
+    is_stale_next_funding_iso,
+    normalize_interval_hours,
+    parse_timestamp_ms,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,24 +45,37 @@ class BingXAdapter(ExchangeAdapter):
         if not targets:
             return []
 
-        ticker_payload = _get_json(
+        contract_payload = _get_json(
             f"{self.base_url}/openApi/swap/v2/quote/contracts"
+        ).get("data", [])
+        contract_map = {
+            item.get("symbol"): item for item in contract_payload if isinstance(item, dict)
+        }
+        ticker_payload = _get_json(
+            f"{self.base_url}/openApi/swap/v2/quote/ticker"
         ).get("data", [])
         ticker_map = {item.get("symbol"): item for item in ticker_payload if isinstance(item, dict)}
 
         for canonical, exch_symbol in targets.items():
+            contract_item = contract_map.get(exch_symbol, {})
             ticker_item = ticker_map.get(exch_symbol, {})
             funding_item = _get_json(
                 f"{self.base_url}/openApi/swap/v2/quote/fundingRate?"
                 + urlencode({"symbol": exch_symbol})
             ).get("data", [{}])[0]
-            if not ticker_item:
-                logger.debug("BingX: no ticker for %s", exch_symbol)
+            if not contract_item and not ticker_item:
+                logger.debug("BingX: no ticker/contract for %s", exch_symbol)
                 continue
-            self._cache_symbol_meta(exch_symbol, ticker_item)
-            mark_price = _to_float(ticker_item.get("lastPrice")) or _to_float(funding_item.get("markPrice"))
-            next_funding = _to_datetime(
-                funding_item.get("nextFundingTime") or funding_item.get("fundingTime")
+            if contract_item:
+                self._cache_symbol_meta(exch_symbol, contract_item)
+            mark_price = (
+                _to_float(ticker_item.get("lastPrice"))
+                or _to_float(funding_item.get("markPrice"))
+            )
+            interval_hours = _funding_interval_hours(funding_item, contract_item)
+            next_funding = _resolve_next_funding_time(
+                funding_item,
+                interval_hours=interval_hours,
             )
             snapshots.append(
                 MarketSnapshot(
@@ -65,9 +84,10 @@ class BingXAdapter(ExchangeAdapter):
                     exchange_symbol=exch_symbol,
                     funding_rate=_to_float(funding_item.get("fundingRate")),
                     next_funding_time=next_funding,
+                    funding_interval_hours=interval_hours,
                     mark_price=mark_price,
-                    bid=_to_float(ticker_item.get("bestBid")),
-                    ask=_to_float(ticker_item.get("bestAsk")),
+                    bid=_to_float(ticker_item.get("bidPrice") or ticker_item.get("bestBid")),
+                    ask=_to_float(ticker_item.get("askPrice") or ticker_item.get("bestAsk")),
                     raw={"ticker": ticker_item, "funding": funding_item},
                 )
             )
@@ -90,18 +110,20 @@ class BingXAdapter(ExchangeAdapter):
             data = payload.get("data") or []
             out: list[dict] = []
             for item in data[:limit]:
-                ts_ms = _to_float(item.get("timestamp") or item.get("nextFundingTime"))
+                ts_ms = parse_timestamp_ms(
+                    item.get("timestamp")
+                    or item.get("fundingTime")
+                    or item.get("nextFundingTime")
+                )
                 out.append(
                     {
-                        "ts_ms": int(ts_ms) if ts_ms else 0,
+                        "ts_ms": ts_ms or 0,
                         "rate": _to_float(item.get("fundingRate")),
-                        "interval_hours": 8.0,
+                        "interval_hours": _funding_interval_hours(item, None),
                         "mark_price": _to_float(item.get("markPrice")),
                     }
                 )
-            return out
-
-        from utils.cache_db import get_or_fetch_funding_history
+            return enrich_history_intervals(out)
 
         return get_or_fetch_funding_history(
             self.name,
@@ -152,12 +174,65 @@ def _to_float(value: object):
 
 
 def _to_datetime(value: object) -> datetime | None:
-    if value in (None, ""):
+    ts_ms = parse_timestamp_ms(value)
+    if ts_ms is None:
         return None
-    try:
-        ts = float(value)
-    except (TypeError, ValueError):
+    return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+
+
+def _funding_interval_hours(funding_item: dict | None, contract_item: dict | None) -> float | None:
+    candidates: list[object] = []
+    if isinstance(funding_item, dict):
+        candidates.extend(
+            [
+                funding_item.get("fundingIntervalHour"),
+                funding_item.get("fundingIntervalHours"),
+                funding_item.get("fundingInterval"),
+                funding_item.get("fundingRateInterval"),
+            ]
+        )
+    if isinstance(contract_item, dict):
+        candidates.extend(
+            [
+                contract_item.get("fundingIntervalHour"),
+                contract_item.get("fundingIntervalHours"),
+                contract_item.get("fundingInterval"),
+                contract_item.get("fundingRateInterval"),
+            ]
+        )
+    for candidate in candidates:
+        parsed = normalize_interval_hours(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _resolve_next_funding_time(
+    funding_item: dict,
+    *,
+    interval_hours: float | None,
+) -> datetime | None:
+    next_dt = _to_datetime(funding_item.get("nextFundingTime"))
+    if next_dt is not None:
+        if not is_stale_next_funding_iso(next_dt.isoformat()):
+            return next_dt
+        if interval_hours:
+            return _roll_forward(next_dt, interval_hours)
+
+    funding_dt = _to_datetime(funding_item.get("fundingTime"))
+    if funding_dt is None or not interval_hours:
         return None
-    if ts > 10_000_000:  # treat as ms
-        ts = ts / 1000.0
-    return datetime.fromtimestamp(ts, tz=timezone.utc)
+    return _roll_forward(funding_dt, interval_hours)
+
+
+def _roll_forward(start: datetime, interval_hours: float) -> datetime:
+    now = datetime.now(timezone.utc)
+    step_sec = int(interval_hours * 3600.0)
+    if step_sec <= 0:
+        return start
+    next_ts = start.timestamp()
+    now_ts = now.timestamp()
+    if next_ts <= now_ts:
+        hops = int((now_ts - next_ts) // step_sec) + 1
+        next_ts = next_ts + hops * step_sec
+    return datetime.fromtimestamp(next_ts, tz=timezone.utc)

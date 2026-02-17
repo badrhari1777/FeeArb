@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import atexit
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +21,22 @@ except ImportError:  # pragma: no cover - optional dependency
 
 logger = logging.getLogger(__name__)
 _LAST_ENV_MTIME: float | None = None
+KUCOIN_LEVERAGE_MARGIN_BUFFER_PCT = 0.0015
+KUCOIN_LEVERAGE_MARGIN_MIN_DELTA = 1.0
+SUMMARY_TZ = timezone(timedelta(hours=3))
+SUMMARY_SLOT_MINUTE = 40
+SUMMARY_SLOT_WINDOW_MINUTES = 20
+SUMMARY_QTY_DELTA_EPS = 1e-8
+EXCHANGE_ABBR: dict[str, str] = {
+    "binance": "BN",
+    "okx": "OK",
+    "bybit": "BY",
+    "gate": "GT",
+    "bitget": "BG",
+    "bingx": "BX",
+    "mexc": "MX",
+    "kucoin": "KC",
+}
 
 
 def _bootstrap_env(force: bool = False) -> None:
@@ -86,6 +103,16 @@ EXCHANGE_SPECS: Tuple[ExchangeSpec, ...] = (
         options={"defaultType": "swap", "defaultSettle": "usdt"},
         balance_params={"type": "swap"},
         position_params={"type": "swap"},
+    ),
+    ExchangeSpec(
+        slug="binance",
+        ccxt_id="binanceusdm",
+        key_var="BINANCE_API_KEY",
+        secret_var="BINANCE_API_SECRET",
+        settle_currency="USDT",
+        options={"defaultType": "future", "adjustForTimeDifference": True},
+        balance_params={"type": "future"},
+        position_params={"type": "future"},
     ),
     ExchangeSpec(
         slug="bingx",
@@ -167,9 +194,20 @@ def normalize_symbol(symbol: str | None) -> str:
     return "".join(cleaned)
 
 
+def _dedupe_settle(symbol: str | None) -> str:
+    normalized = normalize_symbol(symbol)
+    if not normalized:
+        return ""
+    for settle in ("USDT", "USDC", "USD"):
+        duplicated = settle + settle
+        if normalized.endswith(duplicated):
+            return normalized[: -len(duplicated)] + settle
+    return normalized
+
+
 def _ccxt_perp_symbol(symbol: str | None) -> str:
     """Best-effort CCXT perp notation (e.g. BTCUSDT -> BTC/USDT:USDT)."""
-    normalized = normalize_symbol(symbol)
+    normalized = _dedupe_settle(symbol)
     for suffix in ("USDT", "USDC", "USD"):
         if normalized.endswith(suffix):
             base = normalized[: -len(suffix)]
@@ -217,7 +255,7 @@ class ExchangeGateway:
             config["password"] = self.password
         try:
             client = exchange_cls(config)
-            if self.slug in {"mexc", "bingx"}:
+            if self.slug in {"mexc", "bingx", "binance"}:
                 # Align timestamps with server to avoid signature/recvWindow drift.
                 try:
                     await client.load_time_difference()
@@ -333,6 +371,44 @@ class ExchangeGateway:
         else:
             self._cycles_open += 1
 
+    def _is_time_sync_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        if "-1021" in message:
+            return True
+        if "timestamp for this request was" in message:
+            return True
+        if "timestamp outside recvwindow" in message:
+            return True
+        if "invalid nonce" in message:
+            return True
+        return False
+
+    async def _sync_time_difference(self) -> bool:
+        if not self.client or not hasattr(self.client, "load_time_difference"):
+            return False
+        try:
+            await self.client.load_time_difference()
+            return True
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("%s: time sync failed: %s", self.slug, exc)
+            return False
+
+    async def _call_with_time_sync_retry(
+        self,
+        operation: str,
+        callback: Callable[[], Any],
+    ) -> Any:
+        try:
+            return await callback()
+        except Exception as exc:  # pylint: disable=broad-except
+            if not self._is_time_sync_error(exc):
+                raise
+            synced = await self._sync_time_difference()
+            if not synced:
+                raise
+            logger.info("%s: retrying %s after exchange time sync", self.slug, operation)
+            return await callback()
+
     def map_symbol(self, symbol: str) -> str:
         """Map canonical symbol to exchange-specific if supported by ccxt."""
         if self.client and hasattr(self.client, "market_id"):  # type: ignore[truthy-bool]
@@ -346,7 +422,10 @@ class ExchangeGateway:
         if not self.client:
             raise RuntimeError(self._unavailable_reason or "exchange client unavailable")
         params = dict(self.spec.balance_params)
-        balance = await self.client.fetch_balance(params=params)
+        balance = await self._call_with_time_sync_retry(
+            "fetch_balance",
+            lambda: self.client.fetch_balance(params=params),
+        )
         mexc_meta: dict[str, float | None] | None = None
         if self.slug == "gate":
             self._patch_gate_balance(balance)
@@ -429,10 +508,16 @@ class ExchangeGateway:
         if not self.client:
             raise RuntimeError(self._unavailable_reason or "exchange client unavailable")
         params = dict(self.spec.position_params)
-        try:
-            positions = await self.client.fetch_positions(params=params)  # type: ignore[attr-defined]
-        except AttributeError:
-            positions = []
+        async def _fetch_positions() -> list[dict[str, Any]]:
+            try:
+                return await self.client.fetch_positions(params=params)  # type: ignore[attr-defined]
+            except AttributeError:
+                return []
+
+        positions = await self._call_with_time_sync_retry(
+            "fetch_positions",
+            _fetch_positions,
+        )
         result: list[dict[str, Any]] = []
         now = datetime.now(timezone.utc).isoformat()
         for payload in positions or []:
@@ -451,7 +536,25 @@ class ExchangeGateway:
             notional = _safe_float(payload.get("notional"))
             contract_size = _safe_float(payload.get("contractSize"), default=1.0)
             coin_qty = contracts * (contract_size or 1.0)
+            info = payload.get("info") or {}
             entry_px = _safe_float(payload.get("entryPrice"))
+            if entry_px is None:
+                entry_px = _safe_float(
+                    payload.get("avgPrice")
+                    or payload.get("avgEntryPrice")
+                    or payload.get("averagePrice")
+                )
+            if entry_px is None and isinstance(info, dict):
+                entry_px = _safe_float(
+                    info.get("entryPrice")
+                    or info.get("avgPrice")
+                    or info.get("avgEntryPrice")
+                    or info.get("averagePrice")
+                    or info.get("avgCost")
+                    or info.get("avg_cost")
+                    or info.get("openPrice")
+                    or info.get("open_price")
+                )
             if notional is None and entry_px is not None and contracts:
                 # For venues with contract sizes != 1 (e.g., MEXC), include contract_size to avoid under-reporting notional.
                 notional = contracts * (contract_size or 1.0) * entry_px
@@ -461,7 +564,14 @@ class ExchangeGateway:
                 info = payload.get("info") or {}
                 liq_price = _safe_float(info.get("liquidationPrice"))
             margin_mode, margin_mode_source = _extract_margin_mode(payload, self.slug)
-            info = payload.get("info") or {}
+            mark_px = _safe_float(payload.get("markPrice"))
+            if mark_px is None and isinstance(info, dict):
+                mark_px = _safe_float(
+                    info.get("markPrice")
+                    or info.get("mark_price")
+                    or info.get("mark")
+                    or info.get("currentMarkPrice")
+                )
             initial_margin = _safe_float(
                 payload.get("initialMargin")
                 or payload.get("positionInitialMargin")
@@ -469,7 +579,9 @@ class ExchangeGateway:
             )
             maintenance_margin = _safe_float(
                 payload.get("maintenanceMargin")
+                or payload.get("maintMargin")
                 or payload.get("positionMaintenanceMargin")
+                or payload.get("positionMaintMargin")
                 or payload.get("positionMM")
             )
             if initial_margin is None:
@@ -481,7 +593,9 @@ class ExchangeGateway:
             if maintenance_margin is None:
                 maintenance_margin = _safe_float(
                     info.get("maintenanceMargin")
+                    or info.get("maintMargin")
                     or info.get("positionMaintenanceMargin")
+                    or info.get("positionMaintMargin")
                     or info.get("positionMM")
                 )
             margin_used = None
@@ -501,8 +615,8 @@ class ExchangeGateway:
                     "coin_qty": coin_qty,
                     "notional": notional,
                     "side": side or None,
-                    "entry_price": _safe_float(payload.get("entryPrice")),
-                    "mark_price": _safe_float(payload.get("markPrice")),
+                    "entry_price": entry_px,
+                    "mark_price": mark_px,
                     "unrealized_pnl": _safe_float(payload.get("unrealizedPnl")),
                     "percentage": _safe_float(payload.get("percentage")),
                     "leverage": leverage,
@@ -593,17 +707,15 @@ class AccountMonitor:
         self._status: list[dict[str, Any]] = []
         self._last_updated: str | None = None
         self._task: asyncio.Task | None = None
-        self._next_summary_at: float = 0.0
+        self._last_summary_slot: str | None = None
         self._alert_cooldown = 600  # seconds
-        self._active_alerts: Set[tuple[str, str]] = set()
-        self._last_alert_sent: dict[tuple[str, str], float] = {}
         self._alert_lock = asyncio.Lock()
         self._telegram_warned = False
         self._margin_alerts_enabled = True
         self._warning_buffer_pct = 0.20
         self._panic_buffer_pct = 0.15
-        self._min_free_balance_abs = 500.0
-        self._min_free_balance_rel = 0.10
+        self._min_free_balance_abs = 0.0
+        self._min_free_balance_rel = 0.0
         self._target_buffer_pct = 0.25
         self._auto_margin_enabled = True
         self._auto_margin_reduce_enabled = True
@@ -661,8 +773,7 @@ class AccountMonitor:
 
     def update_summary_interval(self, seconds: int) -> None:
         self._summary_interval = max(30, int(seconds))
-        # Force next send to honour new cadence
-        self._next_summary_at = 0.0
+        self._last_summary_slot = None
 
     def update_alert_settings(
         self,
@@ -830,55 +941,270 @@ class AccountMonitor:
         positions: list[dict[str, Any]],
         refreshed_at: str | None,
     ) -> None:
-        """Send a periodic balance digest via Telegram."""
-        now = time.time()
-        if now < self._next_summary_at:
+        """Send an hourly position digest via Telegram around xx:40."""
+        slot_key = self._summary_slot_key()
+        if slot_key is None:
+            return
+        if slot_key == self._last_summary_slot:
             return
         warnings = await self._mexc_stop_warnings(positions) if self._missing_stop_alerts_enabled else []
-        text = self._build_balance_summary(balances, refreshed_at, warnings)
+        summary_positions = await self._positions_for_summary(positions)
+        text = self._build_positions_summary(summary_positions, refreshed_at, warnings)
         if await self._send_telegram_text(text):
-            self._next_summary_at = now + self._summary_interval
+            self._last_summary_slot = slot_key
 
-    def _build_balance_summary(
+    async def _positions_for_summary(self, positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        prepared = [dict(item) for item in (positions or [])]
+        missing: dict[tuple[str, str, str], list[int]] = {}
+        for idx, item in enumerate(prepared):
+            rate = _safe_float(item.get("funding_rate") or item.get("fundingRate"))
+            if rate is not None:
+                item["funding_rate"] = rate
+                continue
+            exchange = str(item.get("exchange") or "").lower()
+            raw_symbol = str(item.get("symbol") or "").strip()
+            symbol_norm = _dedupe_settle(item.get("symbol_normalized") or raw_symbol)
+            if not exchange or not symbol_norm:
+                continue
+            missing.setdefault((exchange, raw_symbol, symbol_norm), []).append(idx)
+        for (exchange, raw_symbol, symbol_norm), indexes in missing.items():
+            rate = await self._fetch_summary_funding_rate(exchange, raw_symbol, symbol_norm)
+            if rate is None:
+                continue
+            for idx in indexes:
+                prepared[idx]["funding_rate"] = rate
+        return prepared
+
+    async def _fetch_summary_funding_rate(
         self,
-        balances: list[dict[str, Any]],
+        exchange: str,
+        raw_symbol: str,
+        symbol_norm: str,
+    ) -> float | None:
+        gateway = self._gateways.get(exchange)
+        if gateway is None:
+            return None
+        try:
+            await gateway.ensure_client()
+        except Exception:  # pylint: disable=broad-except
+            return None
+        client = gateway.client
+        if client is None:
+            return None
+        candidates: list[str] = []
+        for candidate in (
+            raw_symbol,
+            gateway.map_symbol(raw_symbol) if raw_symbol else "",
+            gateway.map_symbol(symbol_norm) if symbol_norm else "",
+            _ccxt_perp_symbol(symbol_norm) if symbol_norm else "",
+            symbol_norm,
+        ):
+            cand = str(candidate or "").strip()
+            if not cand:
+                continue
+            if cand in candidates:
+                continue
+            candidates.append(cand)
+        for candidate in candidates:
+            try:
+                async def _fetch() -> dict[str, Any]:
+                    return await client.fetch_funding_rate(candidate)  # type: ignore[union-attr]
+
+                payload = await asyncio.wait_for(
+                    gateway._call_with_time_sync_retry("fetch_funding_rate", _fetch),
+                    timeout=12.0,
+                )
+                rate = _safe_float((payload or {}).get("fundingRate"))
+                if rate is not None:
+                    return rate
+            except Exception:  # pylint: disable=broad-except
+                continue
+        return None
+
+    def _summary_slot_key(self, now_utc: datetime | None = None) -> str | None:
+        now = (now_utc or datetime.now(timezone.utc)).astimezone(SUMMARY_TZ)
+        minute = int(now.minute)
+        if minute < SUMMARY_SLOT_MINUTE:
+            return None
+        if minute >= (SUMMARY_SLOT_MINUTE + SUMMARY_SLOT_WINDOW_MINUTES):
+            return None
+        return now.strftime("%Y-%m-%d %H")
+
+    def _build_positions_summary(
+        self,
+        positions: list[dict[str, Any]],
         refreshed_at: str | None,
         warnings: list[str] | None = None,
     ) -> str:
-        tz = timezone(timedelta(hours=3))
-        timestamp = "unknown"
         time_only = "unknown"
         if refreshed_at:
             try:
                 dt = datetime.fromisoformat(refreshed_at)
-                dt = dt.astimezone(tz)
-                timestamp = dt.strftime("%Y-%m-%d %H:%M:%S GMT+3")
+                dt = dt.astimezone(SUMMARY_TZ)
                 time_only = dt.strftime("%H:%M")
             except Exception:  # pylint: disable=broad-except
-                timestamp = refreshed_at
                 time_only = refreshed_at
-        header = f"Balance summary {time_only}"
-        by_exchange: dict[str, dict[str, Any]] = {}
-        for entry in balances:
-            slug = str(entry.get("exchange") or "").lower()
-            if slug and slug not in by_exchange:
-                by_exchange[slug] = entry
-
+        header = f"{time_only} Positions"
         lines = [header]
-        missing: list[str] = []
-        for spec in EXCHANGE_SPECS:
-            slug = spec.slug
-            entry = by_exchange.get(slug)
-            if not entry:
-                missing.append(slug)
-                continue
-            asset = entry.get("asset") or spec.settle_currency
-            total = int(round(_safe_float(entry.get("total"), default=0.0) or 0.0))
-            available = int(round(_safe_float(entry.get("available"), default=0.0) or 0.0))
-            lines.append(f"{slug}: {available} / {total} {asset}")
 
-        if missing:
-            lines.append("Missing data: " + ", ".join(missing))
+        grouped: dict[str, dict[str, Any]] = {}
+        for entry in positions:
+            symbol = _dedupe_settle(
+                entry.get("symbol_normalized") or entry.get("symbol")
+            )
+            if not symbol:
+                continue
+            side = str(entry.get("side") or "").lower()
+            exchange = str(entry.get("exchange") or "").lower()
+            qty_raw = _safe_float(entry.get("coin_qty"))
+            if qty_raw is None:
+                contracts = _safe_float(entry.get("contracts")) or 0.0
+                contract_size = _safe_float(entry.get("contract_size"), default=1.0) or 1.0
+                qty_raw = contracts * contract_size
+            qty_abs = abs(float(qty_raw or 0.0))
+            if side == "long":
+                qty_signed = qty_abs
+            elif side == "short":
+                qty_signed = -qty_abs
+            else:
+                qty_signed = float(qty_raw or 0.0)
+            notional = abs(float(_safe_float(entry.get("notional")) or 0.0))
+            if notional <= 0 and qty_abs > 0:
+                entry_px = _safe_float(entry.get("entry_price"))
+                if entry_px is not None and entry_px > 0:
+                    notional = qty_abs * entry_px
+            grouped.setdefault(symbol, {"symbol": symbol, "legs": []})
+            grouped[symbol]["legs"].append(
+                {
+                    "exchange": exchange,
+                    "side": side,
+                    "qty_abs": qty_abs,
+                    "qty_signed": qty_signed,
+                    "notional": notional,
+                    "entry_price": _safe_float(entry.get("entry_price")),
+                    "mark_price": _safe_float(entry.get("mark_price")),
+                    "funding_rate": _safe_float(entry.get("funding_rate") or entry.get("fundingRate")),
+                }
+            )
+
+        if not grouped:
+            lines.append("No live positions.")
+
+        def _weighted_avg(items: list[dict[str, Any]], key: str) -> float | None:
+            total_w = 0.0
+            total_v = 0.0
+            for item in items:
+                val = _safe_float(item.get(key))
+                if val is None:
+                    continue
+                weight = _safe_float(item.get("qty_abs"))
+                if weight is None or weight <= 0:
+                    weight = _safe_float(item.get("notional"))
+                if weight is None or weight <= 0:
+                    continue
+                total_w += weight
+                total_v += val * weight
+            if total_w <= 0:
+                return None
+            return total_v / total_w
+
+        def _spread_pct(long_price: float | None, short_price: float | None) -> float | None:
+            if long_price is None or short_price is None or long_price == 0:
+                return None
+            return (long_price - short_price) / long_price * 100.0
+
+        def _fmt_signed(value: float | None, decimals: int, suffix: str = "") -> str:
+            if value is None:
+                return "-"
+            return f"{value:+.{decimals}f}{suffix}"
+
+        def _fmt_notional(value: float) -> str:
+            if value >= 1_000_000:
+                return f"${value / 1_000_000:.1f}m"
+            if value >= 1_000:
+                return f"${value / 1_000:.1f}k"
+            return f"${value:.0f}"
+
+        def _fmt_qty(value: float) -> str:
+            rounded = round(value)
+            if abs(value - rounded) < 1e-6:
+                return str(int(rounded))
+            text = f"{value:.4f}"
+            return text.rstrip("0").rstrip(".")
+
+        def _exchange_codes(legs: list[dict[str, Any]]) -> str:
+            long_legs = sorted(
+                [leg for leg in legs if leg.get("side") == "long"],
+                key=lambda leg: str(leg.get("exchange") or ""),
+            )
+            short_legs = sorted(
+                [leg for leg in legs if leg.get("side") == "short"],
+                key=lambda leg: str(leg.get("exchange") or ""),
+            )
+            other_legs = sorted(
+                [leg for leg in legs if leg.get("side") not in {"long", "short"}],
+                key=lambda leg: str(leg.get("exchange") or ""),
+            )
+            ordered = long_legs + short_legs + other_legs
+            seen: set[str] = set()
+            out: list[str] = []
+            for leg in ordered:
+                exchange = str(leg.get("exchange") or "").lower()
+                if not exchange or exchange in seen:
+                    continue
+                seen.add(exchange)
+                out.append(EXCHANGE_ABBR.get(exchange, exchange[:2].upper()))
+            return ",".join(out) if out else "-"
+
+        for symbol in sorted(grouped.keys()):
+            legs = grouped[symbol]["legs"]
+            long_legs = [leg for leg in legs if leg.get("side") == "long"]
+            short_legs = [leg for leg in legs if leg.get("side") == "short"]
+            long_entry = _weighted_avg(long_legs, "entry_price")
+            short_entry = _weighted_avg(short_legs, "entry_price")
+            long_mark = _weighted_avg(long_legs, "mark_price")
+            short_mark = _weighted_avg(short_legs, "mark_price")
+            entry_spread = _spread_pct(long_entry, short_entry)
+            mark_spread = _spread_pct(long_mark, short_mark)
+            spread_delta = (
+                mark_spread - entry_spread
+                if mark_spread is not None and entry_spread is not None
+                else None
+            )
+            long_funding = _weighted_avg(long_legs, "funding_rate")
+            short_funding = _weighted_avg(short_legs, "funding_rate")
+            funding_delta = (
+                short_funding - long_funding
+                if short_funding is not None and long_funding is not None
+                else None
+            )
+            long_notional = sum(float(_safe_float(leg.get("notional")) or 0.0) for leg in long_legs)
+            short_notional = sum(float(_safe_float(leg.get("notional")) or 0.0) for leg in short_legs)
+            total_notional = sum(float(_safe_float(leg.get("notional")) or 0.0) for leg in legs)
+            nominal = 0.0
+            if long_notional > 0 and short_notional > 0:
+                nominal = min(long_notional, short_notional)
+            elif long_notional > 0 or short_notional > 0:
+                nominal = max(long_notional, short_notional)
+            else:
+                nominal = total_notional
+            qty_delta = sum(float(_safe_float(leg.get("qty_signed")) or 0.0) for leg in legs)
+            qty_suffix = ""
+            if abs(qty_delta) > SUMMARY_QTY_DELTA_EPS:
+                qty_suffix = f"  qDelta {_fmt_qty(qty_delta)}"
+            funding_delta_text = (
+                _fmt_signed(funding_delta * 100.0, 4, "%")
+                if funding_delta is not None
+                else "-"
+            )
+            lines.append(
+                (
+                    f"{_exchange_codes(legs)}  {symbol}  {_fmt_notional(nominal)}  "
+                    f"{_fmt_signed(spread_delta, 2)}  {funding_delta_text}"
+                    f"{qty_suffix}"
+                )
+            )
+
         for idx, warning in enumerate(warnings or []):
             prefix = "Warnings:" if idx == 0 else " -"
             lines.append(f"{prefix} {warning}")
@@ -953,13 +1279,25 @@ class AccountMonitor:
         positions: list[dict[str, Any]],
     ) -> None:
         """Evaluate balances and positions for Telegram alerts."""
-        if not balances or not self._margin_alerts_enabled:
+        if not balances:
             return
-        alerts: list[tuple[tuple[str, str], dict[str, Any]]] = []
         position_alerts: list[tuple[tuple[str, str, str], dict[str, Any]]] = []
-        resolved_keys: list[tuple[str, str]] = []
         resolved_positions: list[tuple[str, str, str]] = []
         now = time.time()
+        total_isolated = 0
+        warning_count = 0
+        panic_count = 0
+        add_ok = 0
+        add_fail = 0
+        reduce_ok = 0
+        reduce_fail = 0
+        min_buffer: float | None = None
+
+        balances_by_exchange: dict[str, dict[str, Any]] = {}
+        for entry in balances:
+            exchange = str(entry.get("exchange") or "").lower()
+            if exchange:
+                balances_by_exchange[exchange] = entry
 
         positions_by_exchange: dict[str, list[dict[str, Any]]] = {}
         for pos in positions or []:
@@ -968,96 +1306,62 @@ class AccountMonitor:
                 continue
             positions_by_exchange.setdefault(exchange, []).append(pos)
 
-        for entry in balances:
-            exchange = str(entry.get("exchange") or "").lower()
-            asset = str(entry.get("asset") or "").upper()
-            if not exchange or not asset:
-                continue
-            key = (exchange, asset)
-            exchange_positions = positions_by_exchange.get(exchange, [])
+        for exchange, exchange_positions in positions_by_exchange.items():
+            entry = balances_by_exchange.get(exchange)
+            asset = str(entry.get("asset") or "").upper() if entry else ""
             isolated_positions = [
                 pos for pos in exchange_positions if str(pos.get("margin_mode") or "").lower() == "isolated"
             ]
-            cross_positions = [
-                pos for pos in exchange_positions if str(pos.get("margin_mode") or "").lower() != "isolated"
-            ]
-            has_isolated = bool(isolated_positions)
-            has_cross = bool(cross_positions)
-
-            if has_isolated and not has_cross:
-                if key in self._active_alerts:
-                    resolved_keys.append(key)
-            else:
-                total = _safe_float(entry.get("total"), default=0.0) or 0.0
-                available = _safe_float(entry.get("available"))
-                used = _safe_float(entry.get("used"), default=0.0) or 0.0
-                margin_ratio = _safe_float(entry.get("margin_ratio"))
-                if used <= 0:
-                    if key in self._active_alerts:
-                        resolved_keys.append(key)
-                else:
-                    risk_triggered = False
-                    if available is not None:
-                        pct = (available / total) if total > 0 else None
-                        if (pct is not None and pct < 0.15) or available < 500:
-                            risk_triggered = True
-                    if margin_ratio is not None and margin_ratio > 0.8:
-                        risk_triggered = True
-
-                    if risk_triggered:
-                        alerts.append(
-                            (
-                                key,
-                                {
-                                    "exchange": exchange,
-                                    "asset": asset,
-                                    "entry": entry,
-                                    "total": total,
-                                    "available": available,
-                                    "used": used,
-                                    "margin_ratio": margin_ratio,
-                                },
-                            )
+            if not isolated_positions:
+                continue
+            for pos in isolated_positions:
+                total_isolated += 1
+                symbol = normalize_symbol(pos.get("symbol") or pos.get("symbol_normalized"))
+                if not symbol:
+                    continue
+                side = str(pos.get("side") or "").lower() or "unknown"
+                key = (exchange, symbol, side)
+                buffer_pct = self._position_liq_buffer_pct(pos)
+                if buffer_pct is None:
+                    continue
+                if min_buffer is None or buffer_pct < min_buffer:
+                    min_buffer = buffer_pct
+                severity = None
+                if buffer_pct <= self._panic_buffer_pct:
+                    severity = "panic"
+                    panic_count += 1
+                elif buffer_pct <= self._warning_buffer_pct:
+                    severity = "warning"
+                    warning_count += 1
+                if severity:
+                    margin_action = await self._maybe_adjust_isolated_margin(
+                        exchange=exchange,
+                        position=pos,
+                        balance_entry=entry or {},
+                        buffer_pct=buffer_pct,
+                        severity=severity,
+                    )
+                    if margin_action.get("status") == "ok":
+                        add_ok += 1
+                        logger.info(
+                            "%s %s %s margin top-up ok: +%s",
+                            exchange,
+                            symbol,
+                            side,
+                            margin_action.get("amount"),
                         )
-                    else:
-                        if available is not None and total > 0:
-                            if available > max(0.2 * total, 700):
-                                resolved_keys.append(key)
-                        elif available is not None and available > 700:
-                            resolved_keys.append(key)
-
-            if has_isolated:
-                for pos in isolated_positions:
-                    symbol = normalize_symbol(pos.get("symbol") or pos.get("symbol_normalized"))
-                    if not symbol:
                         continue
-                    side = str(pos.get("side") or "").lower() or "unknown"
-                    key = (exchange, symbol, side)
-                    buffer_pct = self._position_liq_buffer_pct(pos)
-                    if buffer_pct is None:
-                        continue
-                    severity = None
-                    if buffer_pct <= self._panic_buffer_pct:
-                        severity = "panic"
-                    elif buffer_pct <= self._warning_buffer_pct:
-                        severity = "warning"
-                    if severity:
-                        margin_action = await self._maybe_adjust_isolated_margin(
-                            exchange=exchange,
-                            position=pos,
-                            balance_entry=entry,
-                            buffer_pct=buffer_pct,
-                            severity=severity,
+                    status = margin_action.get("status")
+                    if status not in ("disabled", "cooldown", "skip"):
+                        add_fail += 1
+                        logger.warning(
+                            "%s %s %s margin top-up failed: %s",
+                            exchange,
+                            symbol,
+                            side,
+                            margin_action.get("error") or margin_action.get("reason") or status,
                         )
-                        if margin_action.get("status") == "ok":
-                            logger.info(
-                                "%s %s %s margin top-up ok: +%s",
-                                exchange,
-                                symbol,
-                                side,
-                                margin_action.get("amount"),
-                            )
-                            continue
+                    if self._margin_alerts_enabled:
                         qty = _safe_float(pos.get("coin_qty")) or _safe_float(pos.get("contracts"))
                         position_alerts.append(
                             (
@@ -1073,41 +1377,65 @@ class AccountMonitor:
                                     "mark_price": _safe_float(pos.get("mark_price")),
                                     "liq_price": _safe_float(pos.get("liquidation_price")),
                                     "quantity": qty,
-                                    "available": _safe_float(entry.get("available")),
+                                    "available": _safe_float((entry or {}).get("available")),
                                     "margin_action": margin_action,
                                 },
                             )
                         )
-                    else:
-                        if key in self._active_position_alerts:
-                            resolved_positions.append(key)
-                        reduce_action = await self._maybe_reduce_isolated_margin(
-                            exchange=exchange,
-                            position=pos,
-                            buffer_pct=buffer_pct,
+                else:
+                    if key in self._active_position_alerts:
+                        resolved_positions.append(key)
+                    reduce_action = await self._maybe_reduce_isolated_margin(
+                        exchange=exchange,
+                        position=pos,
+                        buffer_pct=buffer_pct,
+                    )
+                    if reduce_action and reduce_action.get("status") == "ok":
+                        reduce_ok += 1
+                        logger.info(
+                            "%s %s %s margin reduced: -%s",
+                            exchange,
+                            symbol,
+                            side,
+                            reduce_action.get("amount"),
                         )
-                        if reduce_action and reduce_action.get("status") == "ok":
-                            logger.info(
-                                "%s %s %s margin reduced: -%s",
+                    elif reduce_action:
+                        status = reduce_action.get("status")
+                        if status not in ("disabled", "cooldown", "skip"):
+                            reduce_fail += 1
+                            logger.warning(
+                                "%s %s %s margin reduce failed: %s",
                                 exchange,
                                 symbol,
                                 side,
-                                reduce_action.get("amount"),
+                                reduce_action.get("error") or reduce_action.get("reason") or status,
                             )
 
+        if total_isolated:
+            if warning_count == 0 and panic_count == 0:
+                if min_buffer is not None:
+                    logger.info(
+                        "Isolated margin check ok: positions=%s min_buffer=%.2f%%",
+                        total_isolated,
+                        min_buffer * 100.0,
+                    )
+                else:
+                    logger.info("Isolated margin check ok: positions=%s", total_isolated)
+            else:
+                logger.info(
+                    "Isolated margin risk: positions=%s warning=%s panic=%s add_ok=%s add_fail=%s reduce_ok=%s reduce_fail=%s",
+                    total_isolated,
+                    warning_count,
+                    panic_count,
+                    add_ok,
+                    add_fail,
+                    reduce_ok,
+                    reduce_fail,
+                )
+
         async with self._alert_lock:
-            for key in resolved_keys:
-                self._active_alerts.discard(key)
             for key in resolved_positions:
                 self._active_position_alerts.discard(key)
-
-            for key, payload in alerts:
-                last = self._last_alert_sent.get(key, 0.0)
-                if (now - last) < self._alert_cooldown and key in self._active_alerts:
-                    continue
-                if await self._send_telegram_alert(payload):
-                    self._active_alerts.add(key)
-                    self._last_alert_sent[key] = now
 
             for key, payload in position_alerts:
                 last = self._last_position_alert_sent.get(key, 0.0)
@@ -1117,33 +1445,10 @@ class AccountMonitor:
                     self._active_position_alerts.add(key)
                     self._last_position_alert_sent[key] = now
 
-    async def _send_telegram_alert(self, payload: dict[str, Any]) -> bool:
-        text = self._format_alert_message(payload)
-        return await self._send_telegram_text(text)
-
     async def send_telegram_message(self, text: str) -> bool:
         """Expose Telegram sending for external callers (throttling handled by caller)."""
         return await self._send_telegram_text(text)
 
-    def _format_alert_message(self, payload: dict[str, Any]) -> str:
-        exchange = payload.get("exchange", "").upper()
-        asset = payload.get("asset", "")
-        entry = payload.get("entry", {})
-        available = payload.get("available")
-        used = payload.get("used")
-        total = payload.get("total")
-        margin_ratio = payload.get("margin_ratio")
-        ts = entry.get("timestamp") or datetime.now(timezone.utc).isoformat()
-        parts = [
-            f"[ALERT] Low margin buffer on {exchange} {asset}",
-            f"Total: {total}",
-            f"Available: {available}",
-            f"Used: {used}",
-        ]
-        if margin_ratio is not None:
-            parts.append(f"Margin ratio: {margin_ratio}")
-        parts.append(f"Timestamp: {ts}")
-        return "\n".join(str(p) for p in parts)
 
     async def _send_telegram_position_alert(self, payload: dict[str, Any]) -> bool:
         text = self._format_position_alert_message(payload)
@@ -1160,7 +1465,7 @@ class AccountMonitor:
         qty = payload.get("quantity")
         asset = payload.get("asset", "")
         available = payload.get("available")
-        free_ok = available is not None and available >= self._min_free_balance_abs
+        free_ok = available is not None and available > 0
         margin_action = payload.get("margin_action") or {}
         parts = [
             f"[ALERT] Isolated margin risk on {exchange} {symbol} ({side})",
@@ -1180,7 +1485,7 @@ class AccountMonitor:
         if available is None:
             parts.append("Free balance: unknown")
         else:
-            status = "can add margin" if free_ok else "low for top-up"
+            status = "can add margin" if free_ok else "no free balance"
             parts.append(f"Free balance: {available} {asset} ({status})")
         if margin_action:
             action = margin_action.get("action")
@@ -1211,11 +1516,59 @@ class AccountMonitor:
         margin_used = _safe_float(position.get("margin_used"))
         if margin_used is not None and margin_used > 0:
             return margin_used
+        initial_margin = _safe_float(
+            position.get("initial_margin")
+            or position.get("position_initial_margin")
+            or position.get("position_im")
+        )
+        if initial_margin is not None and initial_margin > 0:
+            return initial_margin
+        raw = position.get("raw") if isinstance(position, dict) else None
+        if isinstance(raw, dict):
+            for key in (
+                "initialMargin",
+                "positionInitialMargin",
+                "positionIM",
+                "isolatedWallet",
+                "positionBalance",
+                "margin",
+            ):
+                value = _safe_float(raw.get(key))
+                if value is not None and value > 0:
+                    return value
+            info = raw.get("info")
+            if isinstance(info, dict):
+                for key in (
+                    "initialMargin",
+                    "positionInitialMargin",
+                    "positionIM",
+                    "isolatedWallet",
+                    "positionBalance",
+                    "margin",
+                ):
+                    value = _safe_float(info.get(key))
+                    if value is not None and value > 0:
+                        return value
         notional = _safe_float(position.get("notional"))
         leverage = _safe_float(position.get("leverage"))
         if notional is None or leverage is None or leverage <= 0:
             return None
         return abs(notional) / leverage
+
+    def _position_margin_base(self, position: Mapping[str, Any]) -> float | None:
+        raw = position.get("raw") if isinstance(position, dict) else None
+        if isinstance(raw, dict):
+            for key in ("collateral", "positionBalance", "posMargin"):
+                value = _safe_float(raw.get(key))
+                if value is not None and value > 0:
+                    return value
+            info = raw.get("info")
+            if isinstance(info, dict):
+                for key in ("positionBalance", "posMargin", "positionIM", "margin"):
+                    value = _safe_float(info.get(key))
+                    if value is not None and value > 0:
+                        return value
+        return self._position_margin_used(dict(position)) if isinstance(position, dict) else None
 
     def _position_side_hint(self, position: Mapping[str, Any]) -> str | None:
         side = str(position.get("side") or "").lower()
@@ -1252,10 +1605,36 @@ class AccountMonitor:
     def _margin_params_for_position(self, exchange: str, position: Mapping[str, Any]) -> dict[str, Any]:
         params: dict[str, Any] = {}
         side = self._position_side_hint(position)
-        if exchange == "okx" and side:
-            params["posSide"] = side
+        if exchange == "okx":
+            raw = position.get("raw") or {}
+            info = raw.get("info") if isinstance(raw, dict) else None
+            pos_side = None
+            if isinstance(info, dict):
+                pos_side = info.get("posSide")
+            if not pos_side:
+                pos_side = raw.get("posSide") if isinstance(raw, dict) else None
+            if not pos_side and side:
+                pos_side = side
+            if pos_side:
+                params["posSide"] = pos_side
         if exchange == "bitget" and side:
             params["holdSide"] = side
+        if exchange == "bingx":
+            raw = position.get("raw") or {}
+            info = raw.get("info") if isinstance(raw, dict) else None
+            pos_id = None
+            pos_side = None
+            if isinstance(info, dict):
+                pos_id = info.get("positionId") or info.get("position_id")
+                pos_side = info.get("positionSide") or info.get("position_side")
+            if not pos_id:
+                pos_id = raw.get("positionId") or raw.get("position_id") or raw.get("id") or position.get("id")
+            if not pos_side and side:
+                pos_side = "LONG" if side == "long" else "SHORT"
+            if pos_id:
+                params["positionId"] = pos_id
+            if pos_side:
+                params["positionSide"] = str(pos_side).upper()
         if exchange == "mexc":
             raw = position.get("raw") or {}
             pos_id = raw.get("positionId") or raw.get("position_id") or raw.get("id") or position.get("id")
@@ -1276,13 +1655,21 @@ class AccountMonitor:
         if market:
             if market.get("inverse"):
                 category = "inverse"
+        raw_amount = abs(float(amount))
+        margin_value = client.amount_to_precision(symbol, raw_amount)
+        if amount < 0:
+            margin_value = "-" + str(margin_value)
         params: dict[str, Any] = {
             "category": category,
             "symbol": market.get("id") if market else symbol,
-            "margin": client.amount_to_precision(symbol, amount),
+            "margin": margin_value,
         }
         raw = position.get("raw") or {}
         position_idx = raw.get("positionIdx") or raw.get("position_idx")
+        if position_idx is None:
+            info = raw.get("info") if isinstance(raw, dict) else None
+            if isinstance(info, dict):
+                position_idx = info.get("positionIdx") or info.get("position_idx")
         if position_idx is None:
             side = self._position_side_hint(position)
             if side == "long":
@@ -1293,6 +1680,42 @@ class AccountMonitor:
                 position_idx = 0
         params["positionIdx"] = int(position_idx)
         return await client.private_post_v5_position_add_margin(params)
+
+    async def _kucoin_withdraw_margin(
+        self,
+        client: Any,
+        symbol: str,
+        amount: float,
+    ) -> Any:
+        await client.load_markets()
+        market = client.market(symbol)
+        precision_amount = client.amount_to_precision(symbol, amount)
+        request: dict[str, Any] = {
+            "symbol": market.get("id") if market else symbol,
+            "withdrawAmount": precision_amount,
+        }
+        try:
+            return await client.request(
+                "margin/withdrawMargin",
+                api="futuresPrivate",
+                method="POST",
+                params=request,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            message = str(exc).lower()
+            if "not found" in message or "404" in message:
+                legacy = {
+                    "symbol": market.get("id") if market else symbol,
+                    "margin": precision_amount,
+                    "bizNo": client.uuid(),
+                }
+                return await client.request(
+                    "position/margin/withdraw-margin",
+                    api="futuresPrivate",
+                    method="POST",
+                    params=legacy,
+                )
+            raise
 
     async def _modify_margin(
         self,
@@ -1317,6 +1740,17 @@ class AccountMonitor:
         if not symbol:
             return {"status": "error", "error": "symbol_unavailable"}
         params = self._margin_params_for_position(exchange, position)
+
+        async def _reduce_margin(amount_value: float) -> Any:
+            if exchange == "bybit" and hasattr(client, "private_post_v5_position_add_margin"):
+                return await self._bybit_add_margin(client, symbol, -abs(amount_value), position)
+            if exchange == "kucoin":
+                return await self._kucoin_withdraw_margin(client, symbol, amount_value)
+            if not hasattr(client, "reduce_margin"):
+                raise RuntimeError("reduce_margin_unsupported")
+            reduce_amount = -amount_value if exchange == "bitget" else amount_value
+            return await client.reduce_margin(symbol, reduce_amount, params)
+
         try:
             if action == "add":
                 if exchange == "bybit" and hasattr(client, "private_post_v5_position_add_margin"):
@@ -1326,13 +1760,34 @@ class AccountMonitor:
                 else:
                     return {"status": "error", "error": "add_margin_unsupported"}
             else:
-                if exchange == "bybit":
-                    return {"status": "error", "error": "reduce_margin_unsupported"}
-                if not hasattr(client, "reduce_margin"):
-                    return {"status": "error", "error": "reduce_margin_unsupported"}
-                reduce_amount = -amount if exchange == "bitget" else amount
-                result = await client.reduce_margin(symbol, reduce_amount, params)
-            return {"status": "ok", "result": result}
+                try:
+                    result = await _reduce_margin(amount)
+                    return {"status": "ok", "result": result, "amount": amount}
+                except Exception as exc:  # pylint: disable=broad-except
+                    message = str(exc)
+                    if "reduce_margin_unsupported" in message:
+                        return {"status": "error", "error": "reduce_margin_unsupported"}
+                    requested = amount
+                    candidate = amount
+                    attempts: list[float] = []
+                    for shrink in (0.9, 0.95):
+                        candidate *= shrink
+                        if candidate <= 0:
+                            break
+                        attempts.append(candidate)
+                        try:
+                            result = await _reduce_margin(candidate)
+                            return {
+                                "status": "ok",
+                                "result": result,
+                                "amount": candidate,
+                                "requested_amount": requested,
+                                "retry_amounts": attempts,
+                            }
+                        except Exception as retry_exc:  # pylint: disable=broad-except
+                            message = str(retry_exc)
+                    return {"status": "error", "error": message}
+            return {"status": "ok", "result": result, "amount": amount}
         except Exception as exc:  # pylint: disable=broad-except
             return {"status": "error", "error": str(exc)}
 
@@ -1353,33 +1808,55 @@ class AccountMonitor:
             margin_mode = str(position.get("margin_mode") or "").lower() or None
             leverage = _safe_float(position.get("leverage"))
             if self._enforce_isolated_margin and margin_mode != "isolated":
-                key = (exchange, symbol, side, "mode")
-                if self._margin_enforce_ready(key):
-                    result = await self._set_margin_mode(exchange, position, "isolated")
-                    if result.get("status") == "ok":
-                        logger.info("%s %s %s margin mode set to isolated", exchange, symbol, side)
-                    else:
-                        logger.warning(
-                            "%s %s %s margin mode enforce failed: %s",
-                            exchange,
-                            symbol,
-                            side,
-                            result.get("error") or result,
-                        )
-            if self._enforce_leverage:
-                target = self._target_leverage
-                if target and (leverage is None or abs(leverage - target) > 0.05):
-                    key = (exchange, symbol, side, "leverage")
+                if exchange == "binance":
+                    # Binance does not allow margin type changes while a position exists.
+                    logger.info("%s %s %s margin mode enforce skipped (position open)", exchange, symbol, side)
+                else:
+                    key = (exchange, symbol, side, "mode")
                     if self._margin_enforce_ready(key):
-                        result = await self._set_leverage(exchange, position, margin_mode or "isolated", target)
+                        result = await self._set_margin_mode(exchange, position, "isolated")
                         if result.get("status") == "ok":
-                            logger.info(
-                                "%s %s %s leverage set to %s",
+                            logger.info("%s %s %s margin mode set to isolated", exchange, symbol, side)
+                            margin_mode = "isolated"
+                        else:
+                            logger.warning(
+                                "%s %s %s margin mode enforce failed: %s",
                                 exchange,
                                 symbol,
                                 side,
-                                target,
+                                result.get("error") or result,
                             )
+            if self._enforce_leverage:
+                target = self._target_leverage
+                if target and (leverage is None or abs(leverage - target) > 0.05):
+                    if exchange == "binance":
+                        logger.info("%s %s %s leverage enforce skipped (position open)", exchange, symbol, side)
+                        continue
+                    key = (exchange, symbol, side, "leverage")
+                    if self._margin_enforce_ready(key):
+                        effective_mode = margin_mode or "isolated"
+                        if exchange == "kucoin" and effective_mode != "cross":
+                            result = await self._kucoin_adjust_margin_for_leverage(position, target)
+                        else:
+                            result = await self._set_leverage(exchange, position, effective_mode, target)
+                        if result.get("status") == "ok":
+                            if result.get("action"):
+                                logger.info(
+                                    "%s %s %s leverage target %s via %s margin",
+                                    exchange,
+                                    symbol,
+                                    side,
+                                    target,
+                                    result.get("action"),
+                                )
+                            else:
+                                logger.info(
+                                    "%s %s %s leverage set to %s",
+                                    exchange,
+                                    symbol,
+                                    side,
+                                    target,
+                                )
                         else:
                             logger.warning(
                                 "%s %s %s leverage enforce failed: %s",
@@ -1441,6 +1918,8 @@ class AccountMonitor:
         margin_mode: str,
         leverage: float,
     ) -> dict[str, Any]:
+        if leverage is None or not math.isfinite(leverage) or leverage <= 0:
+            return {"status": "error", "error": "invalid_leverage"}
         gateway = self._gateways.get(exchange)
         if gateway is None:
             return {"status": "error", "error": "gateway_unavailable"}
@@ -1458,11 +1937,75 @@ class AccountMonitor:
         if not symbol:
             return {"status": "error", "error": "symbol_unavailable"}
         params = self._leverage_params_for_position(exchange, position, margin_mode)
+        if exchange == "binance":
+            params = dict(params)
+            params["leverage"] = int(round(leverage))
         try:
             await client.set_leverage(leverage, symbol, params or None)
             return {"status": "ok"}
         except Exception as exc:  # pylint: disable=broad-except
+            if exchange == "bingx":
+                message = str(exc).lower()
+                if "109400" in message or "invalid parameters" in message or "invalid parameter" in message:
+                    fallback_params = dict(params or {})
+                    fallback_params["side"] = "BOTH"
+                    try:
+                        await client.set_leverage(leverage, symbol, fallback_params)
+                        return {
+                            "status": "ok",
+                            "fallback": {
+                                "side": fallback_params.get("side"),
+                                "error": str(exc),
+                            },
+                        }
+                    except Exception as fallback_exc:  # pylint: disable=broad-except
+                        return {"status": "error", "error": str(fallback_exc)}
             return {"status": "error", "error": str(exc)}
+
+    async def _kucoin_adjust_margin_for_leverage(
+        self,
+        position: Mapping[str, Any],
+        target_leverage: float,
+    ) -> dict[str, Any]:
+        if target_leverage <= 0:
+            return {"status": "error", "error": "invalid_target_leverage"}
+        position_value = _safe_float(position.get("notional"))
+        if position_value is None:
+            raw = position.get("raw") if isinstance(position, dict) else None
+            if isinstance(raw, dict):
+                position_value = _safe_float(raw.get("positionValue"))
+                if position_value is None:
+                    info = raw.get("info")
+                    if isinstance(info, dict):
+                        position_value = _safe_float(info.get("positionValue"))
+        if position_value is None or position_value == 0:
+            return {"status": "error", "error": "position_value_unavailable"}
+        base_margin = self._position_margin_base(position)
+        if base_margin is None or base_margin <= 0:
+            return {"status": "error", "error": "base_margin_unavailable"}
+        target_margin = abs(position_value) / target_leverage * (1.0 + KUCOIN_LEVERAGE_MARGIN_BUFFER_PCT)
+        delta = base_margin - target_margin
+        if abs(delta) < KUCOIN_LEVERAGE_MARGIN_MIN_DELTA:
+            return {"status": "ok", "action": None, "amount": 0.0, "target_margin": target_margin}
+        action = "reduce" if delta > 0 else "add"
+        amount = abs(delta)
+        result = await self._modify_margin(
+            exchange="kucoin",
+            position=position,
+            amount=amount,
+            action=action,
+        )
+        result.update(
+            {
+                "action": action,
+                "amount": amount,
+                "target_margin": target_margin,
+                "base_margin": base_margin,
+                "target_leverage": target_leverage,
+                "buffer_pct": KUCOIN_LEVERAGE_MARGIN_BUFFER_PCT,
+            }
+        )
+        return result
 
     def _leverage_params_for_position(
         self,
@@ -1478,9 +2021,31 @@ class AccountMonitor:
             else:
                 params["marginMode"] = mode
         if exchange == "bingx":
-            side = self._position_side_hint(position)
-            if side:
-                params["side"] = "LONG" if side == "long" else "SHORT"
+            raw = position.get("raw") or {}
+            info = raw.get("info") if isinstance(raw, dict) else None
+            pos_side = None
+            if isinstance(info, dict):
+                pos_side = (
+                    info.get("positionSide")
+                    or info.get("position_side")
+                    or info.get("posSide")
+                    or info.get("ps")
+                )
+            if not pos_side and isinstance(raw, dict):
+                pos_side = (
+                    raw.get("positionSide")
+                    or raw.get("position_side")
+                    or raw.get("posSide")
+                    or raw.get("ps")
+                )
+            if pos_side:
+                normalized = str(pos_side).upper()
+                if normalized in ("LONG", "SHORT", "BOTH"):
+                    params["side"] = normalized
+            if "side" not in params:
+                side = self._position_side_hint(position)
+                if side:
+                    params["side"] = "LONG" if side == "long" else "SHORT"
         if exchange == "bybit":
             raw = position.get("raw") or {}
             pos_idx = raw.get("positionIdx") or raw.get("position_idx")
@@ -1517,16 +2082,21 @@ class AccountMonitor:
         if margin_used is None or margin_used <= 0:
             return {"status": "skip", "reason": "margin_used_missing"}
         available = _safe_float(balance_entry.get("available"))
-        min_free = max(self._min_free_balance_abs, self._min_free_balance_rel * margin_used)
-        if available is None or available <= min_free:
+        if available is None or available <= 0:
             return {
                 "status": "no_funds",
                 "available": available,
-                "min_required": min_free,
             }
-        max_add = max(0.0, available - min_free)
+        target_buffer = max(0.0, float(self._target_buffer_pct))
+        if buffer_pct >= target_buffer and target_buffer > 0:
+            return {"status": "skip", "reason": "buffer_ok"}
+        required_add = None
+        if buffer_pct and buffer_pct > 0 and target_buffer > 0:
+            required_add = margin_used * (target_buffer / buffer_pct - 1.0)
         add_pct = self._margin_add_panic_pct if severity == "panic" else self._margin_add_pct
-        add_amt = min(max_add, margin_used * add_pct)
+        fallback_add = margin_used * add_pct
+        desired_add = required_add if required_add is not None else fallback_add
+        add_amt = min(available, max(0.0, desired_add))
         if add_amt <= 0:
             return {"status": "skip", "reason": "amount_too_small"}
         result = await self._modify_margin(
@@ -1537,7 +2107,16 @@ class AccountMonitor:
         )
         if result.get("status") == "ok":
             self._last_margin_adjust[key] = now
-        result.update({"action": "add", "amount": add_amt, "buffer_pct": buffer_pct})
+        result.update(
+            {
+                "action": "add",
+                "amount": add_amt,
+                "buffer_pct": buffer_pct,
+                "target_buffer_pct": target_buffer,
+                "desired_add": desired_add,
+                "available": available,
+            }
+        )
         return result
 
     async def _maybe_reduce_isolated_margin(
@@ -1614,6 +2193,15 @@ def _normalize_margin_mode(value: Any) -> str | None:
         cleaned = value.strip().lower()
         if not cleaned:
             return None
+        if cleaned.isdigit():
+            try:
+                as_int = int(cleaned)
+            except ValueError:
+                as_int = None
+            if as_int == 0:
+                return "cross"
+            if as_int == 1:
+                return "isolated"
         if cleaned in {"cross", "crossed", "cross_margin", "crossed_margin", "regular_margin", "regular"}:
             return "cross"
         if cleaned in {"isolated", "isol", "isolated_margin", "fixed"}:
@@ -1636,14 +2224,30 @@ def _extract_margin_mode(payload: dict[str, Any], slug: str) -> tuple[str | None
             return mode, f"payload.{key}"
     info = payload.get("info")
     if isinstance(info, dict):
-        for key in ("marginMode", "margin_mode", "marginType", "margin_type", "mgnMode", "tradeMode"):
+        for key in ("marginMode", "margin_mode", "marginType", "margin_type", "mgnMode"):
             mode = _normalize_margin_mode(info.get(key))
             if mode:
                 return mode, f"info.{key}"
+    if slug == "bybit" and isinstance(info, dict):
+        trade_mode = _safe_float(info.get("tradeMode"))
+        if trade_mode is not None:
+            position_balance = _safe_float(info.get("positionBalance")) or _safe_float(
+                payload.get("positionBalance")
+            )
+            position_im = _safe_float(info.get("positionIM")) or _safe_float(payload.get("positionIM"))
+            if trade_mode == 1:
+                return "isolated", "info.tradeMode"
+            if trade_mode == 0:
+                if position_balance is not None and position_im is not None and position_balance > 0:
+                    diff = abs(position_balance - position_im)
+                    if diff / position_balance <= 0.05:
+                        return "isolated", "positionBalance_hint"
+                return "cross", "info.tradeMode"
     trade_mode = payload.get("tradeMode")
-    mode = _normalize_margin_mode(trade_mode)
-    if mode:
-        return mode, "payload.tradeMode"
+    if slug != "bybit":
+        mode = _normalize_margin_mode(trade_mode)
+        if mode:
+            return mode, "payload.tradeMode"
     if slug == "gate":
         leverage = _safe_float(payload.get("leverage"))
         if leverage is not None:

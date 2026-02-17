@@ -29,6 +29,11 @@ def _normalize_bybit_symbol(symbol: str) -> str:
     return symbol
 
 
+def _normalize_binance_symbol(symbol: str) -> str:
+    symbol = _normalize_input_symbol(symbol)
+    return symbol
+
+
 def _normalize_bingx_symbol(symbol: str) -> str:
     symbol = _normalize_input_symbol(symbol)
     if symbol.endswith("USDT"):

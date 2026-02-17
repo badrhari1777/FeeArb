@@ -23,11 +23,19 @@ DEFAULT_SOURCES: Final[Dict[str, bool]] = {
 }
 
 DEFAULT_EXCHANGES: Final[Dict[str, bool]] = {
-    name: True for name in SUPPORTED_EXCHANGES
+    "binance": True,
+    "okx": True,
+    "bybit": False,
+    "gate": False,
+    "bitget": False,
+    "bingx": False,
+    "mexc": False,
+    "kucoin": False,
 }
 
 # Broader set for deep-dive analysis (can include venues not in SUPPORTED_EXCHANGES).
 DEFAULT_ANALYSIS_EXCHANGES: Final[Dict[str, bool]] = {
+    "binance": True,
     "bybit": True,
     "bingx": True,
     "bitget": True,
@@ -81,15 +89,20 @@ class AppSettings:
         default_factory=lambda: {
             "auto_protect_enabled": True,
             "auto_take_enabled": True,
-            "anti_orphan_enabled": False,
             "send_margin_alerts": True,
             "send_missing_stop_alerts": True,
             "auto_margin_enabled": True,
             "auto_margin_reduce_enabled": True,
+            "auto_rebalance_enabled": False,
             "stop_gap_from_liq_pct": 0.07,
             "stop_requote_threshold_pct": 0.005,
             "fallback_liq_factor_long": 0.33,
             "fallback_liq_factor_short": 1.66,
+            "rebalance_delta_pct": 0.20,
+            "rebalance_cooldown_sec": 120,
+            "rebalance_limit_timeout_sec": 10,
+            "rebalance_limit_offset_bps": 2.0,
+            "rebalance_max_slippage_bps": 8.0,
             "target_safe_buffer_pct": 0.25,
             "warning_buffer_pct": 0.20,
             "panic_buffer_pct": 0.15,
@@ -109,6 +122,12 @@ class AppSettings:
             "exit_live_depth": 5,
             "ws_orders_health": {
                 "bybit": {
+                    "heartbeat_interval": 15.0,
+                    "heartbeat_timeout": 45.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 12.0,
+                },
+                "binance": {
                     "heartbeat_interval": 15.0,
                     "heartbeat_timeout": 45.0,
                     "reconnect_attempts": 3,
@@ -166,7 +185,7 @@ class AppSettings:
         else:
             updated.exchanges = _normalise_bool_map(
                 _default_exchanges(), self.exchanges, allow_new_keys=True
-        )
+            )
         if "analysis_exchanges" in payload:
             updated.analysis_exchanges = _normalise_bool_map(
                 DEFAULT_ANALYSIS_EXCHANGES, payload["analysis_exchanges"]
@@ -223,15 +242,20 @@ class AppSettings:
         defaults = {
             "auto_protect_enabled": True,
             "auto_take_enabled": True,
-            "anti_orphan_enabled": False,
             "send_margin_alerts": True,
             "send_missing_stop_alerts": True,
             "auto_margin_enabled": True,
             "auto_margin_reduce_enabled": True,
+            "auto_rebalance_enabled": False,
             "stop_gap_from_liq_pct": 0.07,
             "stop_requote_threshold_pct": 0.005,
             "fallback_liq_factor_long": 0.33,
             "fallback_liq_factor_short": 1.66,
+            "rebalance_delta_pct": 0.20,
+            "rebalance_cooldown_sec": 120,
+            "rebalance_limit_timeout_sec": 10,
+            "rebalance_limit_offset_bps": 2.0,
+            "rebalance_max_slippage_bps": 8.0,
             "target_safe_buffer_pct": 0.25,
             "warning_buffer_pct": 0.20,
             "panic_buffer_pct": 0.15,
@@ -252,6 +276,12 @@ class AppSettings:
             "exit_live_orderbook": False,
             "exit_live_depth": 5,
             "ws_orders_health": {
+                "binance": {
+                    "heartbeat_interval": 15.0,
+                    "heartbeat_timeout": 45.0,
+                    "reconnect_attempts": 3,
+                    "reconnect_grace_sec": 12.0,
+                },
                 "bybit": {
                     "heartbeat_interval": 15.0,
                     "heartbeat_timeout": 45.0,

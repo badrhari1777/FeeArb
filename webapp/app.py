@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.encoders import jsonable_encoder
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -20,6 +20,7 @@ from .manual_trade_stream import ManualTradeStream
 from .ws_trade_raw import WsTradeRawStream
 from .ws_trade_private_raw import WsTradePrivateRawStream
 from .ws_trade_okx_raw import WsTradeOkxRawStream
+from .ws_trade_binance_raw import WsTradeBinanceRawStream
 from .ws_trade_bitget_raw import WsTradeBitgetRawStream
 from .ws_trade_bitget_trade_raw import WsTradeBitgetTradeRawStream
 from .ws_trade_bingx_raw import WsTradeBingxRawStream
@@ -28,7 +29,7 @@ from .ws_trade_kucoin_raw import WsTradeKucoinRawStream
 
 BASE_DIR = Path(__file__).resolve().parent
 
-STATIC_VERSION = "v2026-01-09-13"
+STATIC_VERSION = "v2026-02-15-01"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -75,6 +76,7 @@ class ManualBasePayload(BaseModel):
     hedge_limit_mode: Optional[str] = None
     hedge_favorable_bps: Optional[float] = Field(default=None, ge=0)
     hedge_adverse_bps: Optional[float] = Field(default=None, ge=0)
+    hedge_adverse_ticks: Optional[float] = Field(default=None, ge=0)
     hedge_reprice_min_sec: Optional[float] = Field(default=None, ge=0)
     limit_offset_bps: Optional[float] = Field(default=None, ge=0)
     limit_offset_ticks: Optional[int] = Field(default=None, ge=0)
@@ -104,6 +106,7 @@ class ManualExitPayload(ManualBasePayload):
     long_exchange: str
     short_exchange: str
     position_id: Optional[str] = None
+    exit_allow_flip: Optional[bool] = False
 
 
 class ManualRollPayload(ManualBasePayload):
@@ -150,6 +153,42 @@ class ManualTestMarginPayload(BaseModel):
     side: Optional[str] = None
 
 
+class ManualTestLeveragePayload(BaseModel):
+    exchange: str
+    symbol: str
+    leverage: float = Field(..., gt=0)
+    side: Optional[str] = None
+    margin_mode: Optional[str] = None
+
+
+class ManualTestFundingPayload(BaseModel):
+    exchange: str
+    symbol: str
+    include_raw: bool = False
+    history_limit: Optional[int] = Field(default=12, ge=1, le=200)
+
+
+class ManualTestCoinAnalysisPayload(BaseModel):
+    symbol: str
+    window_minutes: Optional[int] = Field(default=4320, ge=60, le=4320)
+    funding_points: Optional[int] = Field(default=120, ge=24, le=200)
+    include_series: bool = False
+
+
+class AutoExitDefaultsPayload(BaseModel):
+    max_runtime_sec: Optional[int] = None
+    cooldown_sec: Optional[int] = None
+    require_live: Optional[bool] = None
+
+
+class AutoExitRulePayload(BaseModel):
+    symbol: str
+    long_exchange: str
+    short_exchange: str
+    enabled: Optional[bool] = True
+    target_spread_pct: Optional[float] = None
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
     # Kick off background startup so FastAPI can serve immediately.
@@ -186,8 +225,8 @@ async def index(request: Request) -> HTMLResponse:
 async def coin_analysis_page(
     request: Request,
     symbol: str,
-    window_minutes: int = 720,
-    funding_points: int = 24,
+    window_minutes: int = 4320,
+    funding_points: int = 120,
 ) -> HTMLResponse:
     settings = settings_manager.as_dict()
     return templates.TemplateResponse(
@@ -215,11 +254,36 @@ async def manual_page(request: Request) -> HTMLResponse:
     )
 
 
+@app.get("/mobile", response_class=HTMLResponse)
+async def mobile_page(request: Request) -> HTMLResponse:
+    state = service.state_payload()
+    return templates.TemplateResponse(
+        "mobile.html",
+        {
+            "request": request,
+            "state": state,
+            "static_version": STATIC_VERSION,
+        },
+    )
+
+
 @app.get("/manual-tests", response_class=HTMLResponse)
 async def manual_tests_page(request: Request) -> HTMLResponse:
     settings = settings_manager.as_dict()
     return templates.TemplateResponse(
         "manual_tests.html",
+        {
+            "request": request,
+            "settings": settings,
+            "static_version": STATIC_VERSION,
+        },
+    )
+
+@app.get("/spread-monitor", response_class=HTMLResponse)
+async def spread_monitor_page(request: Request) -> HTMLResponse:
+    settings = settings_manager.as_dict()
+    return templates.TemplateResponse(
+        "spread_monitor.html",
         {
             "request": request,
             "settings": settings,
@@ -234,8 +298,8 @@ async def snapshot_api() -> JSONResponse:
 @app.get("/api/coin/{symbol}")
 async def coin_analysis_api(
     symbol: str,
-    window_minutes: int = 720,
-    funding_points: int = 24,
+    window_minutes: int = 4320,
+    funding_points: int = 120,
 ) -> JSONResponse:
     if not symbol:
         raise HTTPException(status_code=400, detail="Symbol is required")
@@ -257,6 +321,11 @@ async def refresh_snapshot() -> JSONResponse:
 @app.get("/api/settings")
 async def get_settings() -> JSONResponse:
     return JSONResponse({"settings": settings_manager.as_dict()})
+
+
+@app.get("/api/auto-exit")
+async def get_auto_exit() -> JSONResponse:
+    return JSONResponse(service.auto_exit_payload())
 
 @app.websocket("/ws/manual")
 async def manual_stream(websocket: WebSocket) -> None:
@@ -298,6 +367,15 @@ async def trade_private_raw_stream(websocket: WebSocket) -> None:
 async def trade_okx_raw_stream(websocket: WebSocket) -> None:
     await websocket.accept()
     stream = WsTradeOkxRawStream(websocket)
+    try:
+        await stream.run()
+    except WebSocketDisconnect:
+        pass
+
+@app.websocket("/ws/trade-binance-raw")
+async def trade_binance_raw_stream(websocket: WebSocket) -> None:
+    await websocket.accept()
+    stream = WsTradeBinanceRawStream(websocket)
     try:
         await stream.run()
     except WebSocketDisconnect:
@@ -366,6 +444,24 @@ async def update_settings(payload: SettingsPayload) -> JSONResponse:
             "state": service.state_payload(),
         }
     )
+
+
+@app.post("/api/auto-exit/defaults")
+async def update_auto_exit_defaults(payload: AutoExitDefaultsPayload) -> JSONResponse:
+    try:
+        result = await service.update_auto_exit_defaults(payload.dict(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(result)
+
+
+@app.post("/api/auto-exit/rule")
+async def update_auto_exit_rule(payload: AutoExitRulePayload) -> JSONResponse:
+    try:
+        result = await service.update_auto_exit_rule(payload.dict(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(result)
 
 @app.post("/api/manual/enter")
 async def manual_enter(payload: ManualEnterPayload) -> JSONResponse:
@@ -444,6 +540,29 @@ async def manual_test_margin_reduce(payload: ManualTestMarginPayload) -> JSONRes
     return JSONResponse(jsonable_encoder(result))
 
 
+@app.post("/api/manual/test/leverage")
+async def manual_test_leverage(payload: ManualTestLeveragePayload) -> JSONResponse:
+    result = await service.manual_test_leverage(payload.dict())
+    return JSONResponse(jsonable_encoder(result))
+
+@app.post("/api/manual/test/leverage/binance")
+async def manual_test_leverage_binance(payload: ManualTestLeveragePayload) -> JSONResponse:
+    result = await service.manual_test_binance_leverage(payload.dict())
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/manual/test/funding")
+async def manual_test_funding(payload: ManualTestFundingPayload) -> JSONResponse:
+    result = await service.manual_test_funding(payload.dict())
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/manual/test/coin-analysis")
+async def manual_test_coin_analysis(payload: ManualTestCoinAnalysisPayload) -> JSONResponse:
+    result = await service.manual_test_coin_analysis(payload.dict())
+    return JSONResponse(jsonable_encoder(result))
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
     logger.exception("Unhandled error %s %s: %s", request.method, request.url.path, exc)
@@ -463,6 +582,13 @@ async def manual_exec_status(exec_id: str) -> JSONResponse:
     if result.get("error"):
         raise HTTPException(status_code=404, detail=result["error"])
     return JSONResponse(jsonable_encoder(result))
+
+@app.get("/api/manual/exec/{exec_id}/log")
+async def manual_exec_log(exec_id: str):
+    result = await service.manual_exec_log(exec_id)
+    if result.get("error"):
+        raise HTTPException(status_code=404, detail=result["error"])
+    return PlainTextResponse(result.get("log") or "")
 
 @app.post("/api/manual/exec/{exec_id}/stop")
 async def manual_exec_stop(exec_id: str) -> JSONResponse:

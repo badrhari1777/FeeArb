@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>FeeArb Mobile</title>
+  {% set rp = request.scope.get('root_path', '') %}
+  <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
+  <script>
+    window.__INITIAL_STATE__ = {{ state | tojson | safe }};
+  </script>
+  <script defer src="{{ rp }}/static/mobile.js?v={{ static_version }}"></script>
+</head>
+<body class="page page--mobile">
+  <header class="masthead masthead--mobile">
+    <div>
+      <h1>FeeArb Mobile</h1>
+      <p class="subtitle">Analyze and execute from phone-first UI</p>
+    </div>
+    <div class="status-block status-block--mobile">
+      <dl>
+        <div>
+          <dt>Status</dt>
+          <dd><span id="mobile-status-pill" class="status-pill">-</span></dd>
+        </div>
+        <div>
+          <dt>Last Updated</dt>
+          <dd id="mobile-last-updated">-</dd>
+        </div>
+      </dl>
+      <div class="mobile-header-actions">
+        <a class="button button--ghost" href="/">Dashboard</a>
+        <a class="button button--ghost" href="/manual">Manual</a>
+        <button id="mobile-refresh" class="button button--ghost" type="button">Refresh</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="content content--mobile">
+    <section class="panel panel--compact">
+      <h2>Quick Commands</h2>
+      <form id="mobile-command-form" class="mobile-form">
+        <label>
+          Action
+          <select id="mobile-action">
+            <option value="enter">Enter</option>
+            <option value="exit">Exit</option>
+            <option value="roll">Roll</option>
+          </select>
+        </label>
+        <label>
+          Symbol
+          <input type="text" id="mobile-symbol" placeholder="e.g. OMUSDT" autocomplete="off" />
+        </label>
+        <label>
+          Qty
+          <input type="number" id="mobile-qty" min="0" step="0.0001" placeholder="base qty" />
+        </label>
+        <label class="mobile-scope-enter-exit">
+          Long exchange
+          <select id="mobile-long-exchange"></select>
+        </label>
+        <label class="mobile-scope-enter-exit">
+          Short exchange
+          <select id="mobile-short-exchange"></select>
+        </label>
+        <label class="mobile-scope-roll hidden">
+          From exchange
+          <select id="mobile-from-exchange"></select>
+        </label>
+        <label class="mobile-scope-roll hidden">
+          To exchange
+          <select id="mobile-to-exchange"></select>
+        </label>
+        <label class="mobile-scope-roll hidden">
+          Side
+          <select id="mobile-side">
+            <option value="long">Long</option>
+            <option value="short">Short</option>
+          </select>
+        </label>
+        <div class="mobile-actions">
+          <button id="mobile-analyze" type="button" class="button">Analyze</button>
+          <button id="mobile-execute" type="button" class="button">Execute</button>
+          <button id="mobile-stop" type="button" class="button button--danger" disabled>Stop</button>
+        </div>
+      </form>
+      <p class="hint">Execute enforces dry-run preflight and asks for confirmation before order submit.</p>
+      <div id="mobile-command-status" class="settings-status" aria-live="polite"></div>
+    </section>
+
+    <section class="panel panel--compact">
+      <h2>Execution</h2>
+      <div class="mobile-meta">
+        <span id="mobile-exec-id">Execution id: -</span>
+      </div>
+      <div class="code-block-header">
+        <div class="panel-label">Plan</div>
+      </div>
+      <pre id="mobile-plan" class="code-block code-block--log">No plan yet.</pre>
+      <div class="code-block-header">
+        <div class="panel-label">Execution Log</div>
+      </div>
+      <pre id="mobile-exec-log" class="code-block code-block--log">No execution logs yet.</pre>
+    </section>
+
+    <section class="panel panel--compact">
+      <h2>Positions & Auto Exit</h2>
+      <div id="mobile-position-cards" class="mobile-cards">
+        <div class="muted">No symbol summaries yet.</div>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <h2>Auto Exit Events</h2>
+      <ul id="mobile-auto-events" class="event-log"></ul>
+      <div id="mobile-auto-events-empty" class="muted">No auto-exit events yet.</div>
+    </section>
+  </main>
+</body>
+</html>

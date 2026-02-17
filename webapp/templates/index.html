@@ -3,8 +3,9 @@
 <head>
   <meta charset="utf-8" />
   <title>Funding Arbitrage Monitor</title>
-  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', path='/favicon.svg') }}?v={{ static_version }}">
-  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}?v={{ static_version }}" />
+  {% set rp = request.scope.get('root_path', '') %}
+  <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
   {% set raw_snapshot = state.get('snapshot') %}
   {% set snapshot = raw_snapshot or {} %}
   {% set has_snapshot = raw_snapshot is not none %}
@@ -32,7 +33,7 @@
   <script>
     window.__INITIAL_STATE__ = {{ state | tojson | safe }};
   </script>
-  <script defer src="{{ url_for('static', path='/app.js') }}?v={{ static_version }}"></script>
+  <script defer src="{{ rp }}/static/app.js?v={{ static_version }}"></script>
 </head>
 <body class="page">
   <header class="masthead">
@@ -112,6 +113,7 @@
       </dl>
       <button id="refresh-button" class="button" type="button">Manual refresh</button>
       <a class="button" href="/manual">Manual trading</a>
+      <a class="button" href="/mobile">Mobile UI</a>
       <p class="hint">UI refresh: {{ refresh_interval }} s | Parser: {{ parser_interval }} s | Exchange poll: {{ exchange_interval }} s | Account refresh: {{ account_interval }} s | Positions market: {{ positions_market_interval }} s</p>
     </div>
   </header>
@@ -126,11 +128,11 @@
         </label>
         <label>
           1m window (minutes)
-          <input type="number" id="quick-window-input" min="30" max="4320" step="30" value="720" />
+          <input type="number" id="quick-window-input" min="60" max="4320" step="60" value="4320" />
         </label>
         <label>
           Funding points
-          <input type="number" id="quick-funding-input" min="6" max="120" step="2" value="24" />
+          <input type="number" id="quick-funding-input" min="24" max="200" step="4" value="120" />
         </label>
         <button type="submit" class="button" id="quick-analyze-button">Анализировать</button>
         <span class="settings-status" id="quick-analyze-status" aria-live="polite"></span>
@@ -205,14 +207,6 @@
             Auto-place protective takes
           </label>
           <label class="settings-checkbox">
-            <input type="checkbox" id="anti-orphan" {% if settings.get('protective', {}).get('anti_orphan_enabled', False) %}checked{% endif %} />
-            Close paired leg on protective execution (anti-orphan)
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="alert-margin" {% if settings.get('protective', {}).get('send_margin_alerts', True) %}checked{% endif %} />
-            Telegram alerts: low margin
-          </label>
-          <label class="settings-checkbox">
             <input type="checkbox" id="alert-missing-stops" {% if settings.get('protective', {}).get('send_missing_stop_alerts', True) %}checked{% endif %} />
             Telegram alerts: missing stop/take
           </label>
@@ -234,6 +228,64 @@
               <input type="number" id="fallback-short" step="0.01" min="0" value="{{ settings.get('protective', {}).get('fallback_liq_factor_short', 1.66) }}" />
             </label>
           </div>
+          <div class="settings-intervals">
+            <label class="settings-checkbox">
+              <input type="checkbox" id="rebalance-auto" {% if settings.get('protective', {}).get('auto_rebalance_enabled', False) %}checked{% endif %} />
+              Auto rebalance legs (limit -> market, excludes MEXC)
+            </label>
+            <label>
+              Rebalance delta (decimal)
+              <input type="number" id="rebalance-delta" step="0.01" min="0" max="1" value="{{ settings.get('protective', {}).get('rebalance_delta_pct', 0.2) }}" />
+            </label>
+            <label>
+              Rebalance cooldown (seconds)
+              <input type="number" id="rebalance-cooldown" step="1" min="0" value="{{ settings.get('protective', {}).get('rebalance_cooldown_sec', 120) }}" />
+            </label>
+            <label>
+              Rebalance limit timeout (seconds)
+              <input type="number" id="rebalance-timeout" step="1" min="1" value="{{ settings.get('protective', {}).get('rebalance_limit_timeout_sec', 10) }}" />
+            </label>
+            <label>
+              Rebalance limit offset (bps)
+              <input type="number" id="rebalance-offset" step="0.1" min="0" value="{{ settings.get('protective', {}).get('rebalance_limit_offset_bps', 2) }}" />
+            </label>
+            <label>
+              Rebalance max slippage (bps)
+              <input type="number" id="rebalance-slippage" step="0.1" min="0" value="{{ settings.get('protective', {}).get('rebalance_max_slippage_bps', 8) }}" />
+            </label>
+          </div>
+        </fieldset>
+        <fieldset class="settings-fieldset">
+          <legend>Auto Exit</legend>
+          <div class="settings-intervals">
+            <label>
+              Exit runtime (seconds)
+              <input type="number" id="auto-exit-runtime" min="30" max="86400" step="1" value="600" />
+            </label>
+            <label>
+              Cooldown (seconds)
+              <input type="number" id="auto-exit-cooldown" min="0" max="86400" step="1" value="300" />
+            </label>
+          </div>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="auto-exit-require-live" checked />
+            Require live spread (WS)
+          </label>
+        </fieldset>
+        <fieldset class="settings-fieldset">
+          <legend>Margin control</legend>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="auto-margin-add" {% if settings.get('protective', {}).get('auto_margin_enabled', True) %}checked{% endif %} />
+            Auto add margin (isolated)
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="auto-margin-reduce" {% if settings.get('protective', {}).get('auto_margin_reduce_enabled', True) %}checked{% endif %} />
+            Auto reduce margin (isolated)
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="alert-margin" {% if settings.get('protective', {}).get('send_margin_alerts', True) %}checked{% endif %} />
+            Telegram alerts: margin top-up failed
+          </label>
         </fieldset>
         <div class="settings-actions">
           <button type="submit" class="button" id="settings-submit">Save settings</button>
@@ -542,6 +594,9 @@
             <th>Stop Price</th>
             <th>Take Price</th>
             <th>Next Funding</th>
+            <th>Live Spread %</th>
+            <th>Auto Exit</th>
+            <th>Exit Spread %</th>
           </tr>
         </thead>
                 <tbody id="symbol-positions-body">
@@ -607,15 +662,47 @@
                 {% endif %}
               </td>
               <td>{{ row.next_funding_eta or row.next_funding or "-" }}</td>
+              <td>-</td>
+              <td>-</td>
+              <td>-</td>
             </tr>
           {% endfor %}
           {% if symbol_position_rows | length == 0 %}
-            <tr><td colspan="16" class="muted">No live positions detected.</td></tr>
+            <tr><td colspan="19" class="muted">No live positions detected.</td></tr>
           {% endif %}
         </tbody>
       </table>
-      <div class="muted" id="symbol-positions-meta">Positions market diagnostics will appear after the first refresh.</div>
-      <div class="muted" id="symbol-positions-diffs"></div>
+    </section>
+
+    <section class="panel" id="auto-exit-log-panel">
+      <div class="panel-header">
+        <h2>Auto Exit Log</h2>
+        <div class="panel-actions">
+          <button type="button" class="button button--ghost" id="auto-exit-log-copy">Copy</button>
+        </div>
+      </div>
+      <div class="log-box" id="auto-exit-log-box">
+        <ul class="event-log" id="auto-exit-log"></ul>
+      </div>
+      <div class="muted" id="auto-exit-log-empty">No auto-exit events yet.</div>
+    </section>
+
+    <section class="panel" id="auto-exit-agent-panel">
+      <div class="panel-header">
+        <h2>Auto Exit Agent</h2>
+        <div class="panel-actions">
+          <button type="button" class="button button--ghost" id="auto-exit-agent-copy">Copy</button>
+          <button type="button" class="button button--ghost" id="auto-exit-agent-open-log">Open log</button>
+          <button type="button" class="button button--danger" id="auto-exit-agent-stop">Stop</button>
+        </div>
+      </div>
+      <div class="muted" id="auto-exit-agent-status">No auto-exit execution yet.</div>
+      <div class="muted" id="auto-exit-agent-meta"></div>
+      <div class="value-neg" id="auto-exit-agent-errors"></div>
+      <div class="log-box" id="auto-exit-agent-log-box">
+        <ul class="event-log" id="auto-exit-agent-log"></ul>
+      </div>
+      <div class="muted" id="auto-exit-agent-log-empty">No agent logs yet.</div>
     </section>
 
     <section class="panel" id="candidate-testing-panel">

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Spread Monitor</title>
+  {% set rp = request.scope.get('root_path', '') %}
+  <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
+  {% set settings = settings or {} %}
+  {% set analysis_exchanges = settings.get('analysis_exchanges', {}) %}
+  <script defer src="{{ rp }}/static/spread_monitor.js?v={{ static_version }}"></script>
+</head>
+<body class="page page--manual">
+  <header class="masthead">
+    <div>
+      <h1>Spread Monitor</h1>
+      <p class="subtitle">Track live orderbooks and spreads for up to three pairs.</p>
+    </div>
+    <div class="status-block">
+      <dl>
+        <div>
+          <dt>Mode</dt>
+          <dd>Live spread view</dd>
+        </div>
+        <div>
+          <dt>Hint</dt>
+          <dd>Enable a pair, pick exchanges, and watch the spread update in real time.</dd>
+        </div>
+      </dl>
+      <a class="button" href="/">Back to dashboard</a>
+      <a class="button" href="/manual">Open manual trading</a>
+      <a class="button" href="/mobile">Open mobile UI</a>
+    </div>
+  </header>
+
+  <main class="content">
+    <section class="panel">
+      <div class="panel-label">Pairs</div>
+      <div class="overview-grid" id="spread-grid">
+        {% for idx in [1,2,3] %}
+        <div class="panel panel--compact spread-pair" id="spread-{{ idx }}-card" data-index="{{ idx }}">
+          <div class="code-block-header">
+            <span class="panel-label">Pair {{ idx }}</span>
+            {% if idx > 1 %}
+            <button class="button spread-remove" type="button" data-index="{{ idx }}">Remove</button>
+            {% endif %}
+          </div>
+          <div class="analysis-form">
+            <label>
+              Symbol
+              <input type="text" id="spread-{{ idx }}-symbol" placeholder="BTC or BTCUSDT" autocomplete="off" />
+            </label>
+            <label>
+              Long exchange
+              <select id="spread-{{ idx }}-long">
+                {% for name, enabled in analysis_exchanges.items() %}
+                  {% if enabled %}<option value="{{ name }}">{{ name|upper }}</option>{% endif %}
+                {% endfor %}
+              </select>
+            </label>
+            <label>
+              Short exchange
+              <select id="spread-{{ idx }}-short">
+                {% for name, enabled in analysis_exchanges.items() %}
+                  {% if enabled %}<option value="{{ name }}">{{ name|upper }}</option>{% endif %}
+                {% endfor %}
+              </select>
+            </label>
+            <label>
+              Spread min (%)
+              <input type="number" id="spread-{{ idx }}-spread-min" step="0.01" />
+            </label>
+            <label>
+              Spread max (%)
+              <input type="number" id="spread-{{ idx }}-spread-max" step="0.01" />
+            </label>
+            <label>
+              Orderbook depth
+              <input type="number" id="spread-{{ idx }}-depth" min="1" step="1" value="5" />
+            </label>
+            <label class="settings-checkbox">
+              <input type="checkbox" id="spread-{{ idx }}-show-book" checked />
+              Show orderbook
+            </label>
+          </div>
+          <div class="live-metrics" id="spread-{{ idx }}-live">Live spread: -</div>
+          <div class="code-block-header">
+            <span class="panel-label">Live orderbook</span>
+          </div>
+          <pre class="code-block code-block--wrap" id="spread-{{ idx }}-book">Live orderbook: waiting for data</pre>
+        </div>
+        {% endfor %}
+      </div>
+      <div style="margin-top: 12px;">
+        <button class="button" id="spread-add" type="button">Add pair</button>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

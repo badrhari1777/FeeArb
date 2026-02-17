@@ -16,6 +16,7 @@ from utils.cache_db import (
     get_or_fetch_symbol_meta,
     get_or_fetch_funding_history,
 )
+from utils.funding import enrich_history_intervals, normalize_interval_hours, parse_timestamp_ms
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,9 @@ class BitgetAdapter(ExchangeAdapter):
                     exchange_symbol=contract,
                     funding_rate=_to_float(funding_item.get("fundingRate") or ticker_item.get("fundingRate")),
                     next_funding_time=_to_datetime(funding_item.get("nextUpdate")),
-                    funding_interval_hours=_to_float(funding_item.get("fundingRateInterval")) or 8.0,
+                    funding_interval_hours=normalize_interval_hours(
+                        funding_item.get("fundingRateInterval")
+                    ),
                     mark_price=_to_float(ticker_item.get("markPrice"))
                     or _to_float(ticker_item.get("indexPrice"))
                     or _to_float(ticker_item.get("last")),
@@ -109,7 +112,9 @@ class BitgetAdapter(ExchangeAdapter):
                             exchange_symbol=contract,
                             funding_rate=_to_float(funding.get("fundingRate")),
                             next_funding_time=_to_datetime(funding.get("fundingTimestamp")),
-                            funding_interval_hours=_to_float(funding.get("interval")) or 8.0,
+                            funding_interval_hours=normalize_interval_hours(
+                                _to_float(funding.get("interval"))
+                            ),
                             mark_price=_to_float(ticker.get("mark")),
                             bid=_to_float(ticker.get("bid")),
                             ask=_to_float(ticker.get("ask")),
@@ -172,17 +177,17 @@ class BitgetAdapter(ExchangeAdapter):
             if payload.get("code") == "00000":
                 items = payload.get("data") or []
                 for item in items:
-                    ts = _to_float(item.get("timePoint"))
+                    ts_ms = parse_timestamp_ms(item.get("timePoint"))
                     out.append(
                         {
-                            "ts_ms": int(ts) if ts else 0,
+                            "ts_ms": ts_ms or 0,
                             "rate": _to_float(item.get("fundRate")),
-                            "interval_hours": 8.0,
+                            "interval_hours": None,
                             "mark_price": None,
                         }
                     )
             if out:
-                return out
+                return enrich_history_intervals(out)
             # REST empty; fall back to ccxt funding rate for latest value.
             try:
                 client = ccxt.bitget({"options": {"defaultType": "swap"}})
@@ -214,7 +219,7 @@ class BitgetAdapter(ExchangeAdapter):
                         {
                             "ts_ms": int(ts) if ts else 0,
                             "rate": _to_float(fr.get("fundingRate")),
-                            "interval_hours": _to_float(fr.get("interval")) or 8.0,
+                            "interval_hours": normalize_interval_hours(_to_float(fr.get("interval"))),
                             "mark_price": _to_float(fr.get("markPrice") or fr.get("indexPrice")),
                             "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                         }

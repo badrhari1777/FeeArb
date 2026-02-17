@@ -14,7 +14,7 @@ from utils.cache_db import (
     get_or_fetch_symbol_meta,
     get_or_fetch_funding_history,
 )
-from utils.cache_db import SymbolMeta, get_or_fetch_symbol_meta
+from utils.funding import enrich_history_intervals, parse_timestamp_ms
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,7 @@ class OKXAdapter(ExchangeAdapter):
                     exchange_symbol=inst_id,
                     funding_rate=_to_float(funding_item.get("fundingRate")),
                     next_funding_time=_to_datetime(funding_item.get("nextFundingTime")),
+                    funding_interval_hours=_funding_interval_hours(funding_item),
                     mark_price=_to_float(ticker_item.get("markPx"))
                     or _to_float(ticker_item.get("last")),
                     bid=_to_float(ticker_item.get("bidPx")),
@@ -118,16 +119,16 @@ class OKXAdapter(ExchangeAdapter):
             items = payload.get("data") or []
             out: list[dict] = []
             for item in items:
-                ts = _to_float(item.get("fundingTime"))
+                ts_ms = parse_timestamp_ms(item.get("fundingTime"))
                 out.append(
                     {
-                        "ts_ms": int(ts) if ts else 0,
+                        "ts_ms": ts_ms or 0,
                         "rate": _to_float(item.get("fundingRate")),
-                        "interval_hours": 8.0,
+                        "interval_hours": _funding_interval_hours(item),
                         "mark_price": _to_float(item.get("realizedRate")),
                     }
                 )
-            return out
+            return enrich_history_intervals(out)
 
         return get_or_fetch_funding_history(
             self.name,
@@ -158,4 +159,16 @@ def _to_datetime(value: object) -> datetime | None:
         millis = int(value)
     except (TypeError, ValueError):
         return None
+    if millis <= 0:
+        return None
     return datetime.fromtimestamp(millis / 1000, tz=timezone.utc)
+
+
+def _funding_interval_hours(item: dict) -> float | None:
+    if not isinstance(item, dict):
+        return None
+    funding_ms = parse_timestamp_ms(item.get("fundingTime"))
+    next_ms = parse_timestamp_ms(item.get("nextFundingTime"))
+    if funding_ms is None or next_ms is None or next_ms <= funding_ms:
+        return None
+    return (next_ms - funding_ms) / 1000.0 / 3600.0

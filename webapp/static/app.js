@@ -14,19 +14,26 @@
   var protectiveDefaults = {
     auto_protect_enabled: true,
     auto_take_enabled: true,
-    anti_orphan_enabled: false,
     send_margin_alerts: true,
     send_missing_stop_alerts: true,
+    auto_margin_enabled: true,
+    auto_margin_reduce_enabled: true,
+    auto_rebalance_enabled: false,
     stop_gap_from_liq_pct: 0.07,
     stop_requote_threshold_pct: 0.005,
     fallback_liq_factor_long: 0.33,
-    fallback_liq_factor_short: 1.66
+    fallback_liq_factor_short: 1.66,
+    rebalance_delta_pct: 0.2,
+    rebalance_cooldown_sec: 120,
+    rebalance_limit_timeout_sec: 10,
+    rebalance_limit_offset_bps: 2,
+    rebalance_max_slippage_bps: 8
   };
 
   var defaultSettings = {
     sources: { arbitragescanner: true, coinglass: true },
-    exchanges: { bybit: true, mexc: true },
-    analysis_exchanges: { bybit: true, bingx: true, bitget: true, okx: true, gate: true, mexc: true, kucoin: true },
+    exchanges: { binance: true, okx: true },
+    analysis_exchanges: { binance: true, bybit: true, bingx: true, bitget: true, okx: true, gate: true, mexc: true, kucoin: true },
     parser_refresh_seconds: 1200,
     exchange_refresh_seconds: 300,
     table_refresh_seconds: 60,
@@ -55,6 +62,17 @@
     positions_market: null
   };
 
+  var defaultAutoExit = {
+    defaults: {
+      max_runtime_sec: 600,
+      cooldown_sec: 300,
+      require_live: true
+    },
+    rules: {},
+    live_spreads: {},
+    events: []
+  };
+
   var defaultState = {
     status: 'idle',
     refresh_interval: defaultSettings.table_refresh_seconds,
@@ -70,13 +88,25 @@
     exchange_status: [],
     settings: clone(defaultSettings),
     execution: clone(defaultExecution),
-    accounts: clone(defaultAccounts)
+    accounts: clone(defaultAccounts),
+    auto_exit: clone(defaultAutoExit)
   };
 
   var globalState = normalizeState(window.__INITIAL_STATE__);
   var pollingTimer = null;
   var currentPollInterval = 0;
   var pollingInFlight = false;
+  var autoExitExecState = {
+    execId: null,
+    status: null,
+    logs: [],
+    errors: [],
+    error: null,
+    logPath: null,
+    lastFetched: 0
+  };
+  var staleAutoExitExecIds = {};
+  var autoExitExecTimer = null;
 
   var elements = {
     generatedAt: document.getElementById('generated-at'),
@@ -102,13 +132,23 @@
     positionsMarketInput: document.getElementById('positions-market-interval'),
     protectAuto: document.getElementById('protect-auto'),
     takeAuto: document.getElementById('take-auto'),
-    antiOrphan: document.getElementById('anti-orphan'),
     alertMargin: document.getElementById('alert-margin'),
+    autoMarginAdd: document.getElementById('auto-margin-add'),
+    autoMarginReduce: document.getElementById('auto-margin-reduce'),
     alertMissingStops: document.getElementById('alert-missing-stops'),
     stopGapInput: document.getElementById('stop-gap'),
     requoteInput: document.getElementById('stop-requote'),
     fallbackLongInput: document.getElementById('fallback-long'),
     fallbackShortInput: document.getElementById('fallback-short'),
+    rebalanceAuto: document.getElementById('rebalance-auto'),
+    rebalanceDeltaInput: document.getElementById('rebalance-delta'),
+    rebalanceCooldownInput: document.getElementById('rebalance-cooldown'),
+    rebalanceTimeoutInput: document.getElementById('rebalance-timeout'),
+    rebalanceOffsetInput: document.getElementById('rebalance-offset'),
+    rebalanceSlippageInput: document.getElementById('rebalance-slippage'),
+    autoExitRuntimeInput: document.getElementById('auto-exit-runtime'),
+    autoExitCooldownInput: document.getElementById('auto-exit-cooldown'),
+    autoExitRequireLive: document.getElementById('auto-exit-require-live'),
     settingsStatus: document.getElementById('settings-status'),
     settingsSubmit: document.getElementById('settings-submit'),
     refreshButton: document.getElementById('refresh-button'),
@@ -126,6 +166,17 @@
     symbolPositionsTable: document.getElementById('symbol-positions-body'),
     symbolPositionsMeta: document.getElementById('symbol-positions-meta'),
     symbolPositionsDiffs: document.getElementById('symbol-positions-diffs'),
+    autoExitLog: document.getElementById('auto-exit-log'),
+    autoExitLogEmpty: document.getElementById('auto-exit-log-empty'),
+    autoExitLogCopy: document.getElementById('auto-exit-log-copy'),
+    autoExitAgentStatus: document.getElementById('auto-exit-agent-status'),
+    autoExitAgentMeta: document.getElementById('auto-exit-agent-meta'),
+    autoExitAgentErrors: document.getElementById('auto-exit-agent-errors'),
+    autoExitAgentLog: document.getElementById('auto-exit-agent-log'),
+    autoExitAgentLogEmpty: document.getElementById('auto-exit-agent-log-empty'),
+    autoExitAgentCopy: document.getElementById('auto-exit-agent-copy'),
+    autoExitAgentOpenLog: document.getElementById('auto-exit-agent-open-log'),
+    autoExitAgentStop: document.getElementById('auto-exit-agent-stop'),
     quickAnalyzeForm: document.getElementById('quick-analyze-form'),
     quickAnalyzeInput: document.getElementById('quick-analyze-input'),
     quickWindowInput: document.getElementById('quick-window-input'),
@@ -283,6 +334,40 @@
     return normalized;
   }
 
+  function normalizeAutoExit(config) {
+    var normalized = clone(defaultAutoExit) || { defaults: {}, rules: {} };
+    if (!config || typeof config !== 'object') {
+      return normalized;
+    }
+    if (config.defaults && typeof config.defaults === 'object') {
+      if (config.defaults.max_runtime_sec !== undefined && config.defaults.max_runtime_sec !== null) {
+        var runtimeVal = parseInt(config.defaults.max_runtime_sec, 10);
+        if (!isNaN(runtimeVal)) {
+          normalized.defaults.max_runtime_sec = runtimeVal;
+        }
+      }
+      if (config.defaults.cooldown_sec !== undefined && config.defaults.cooldown_sec !== null) {
+        var cooldownVal = parseInt(config.defaults.cooldown_sec, 10);
+        if (!isNaN(cooldownVal)) {
+          normalized.defaults.cooldown_sec = cooldownVal;
+        }
+      }
+      if (config.defaults.require_live !== undefined && config.defaults.require_live !== null) {
+        normalized.defaults.require_live = !!config.defaults.require_live;
+      }
+    }
+    if (config.rules && typeof config.rules === 'object') {
+      normalized.rules = clone(config.rules) || {};
+    }
+    if (config.live_spreads && typeof config.live_spreads === 'object') {
+      normalized.live_spreads = clone(config.live_spreads) || {};
+    }
+    if (Array.isArray(config.events)) {
+      normalized.events = clone(config.events) || [];
+    }
+    return normalized;
+  }
+
   function normalizeState(source) {
     var state = clone(defaultState) || defaultState;
     if (source && typeof source === 'object') {
@@ -318,6 +403,7 @@
     state.settings = normalizeSettings(source ? source.settings : null);
     state.execution = normalizeExecution(source ? source.execution : null);
     state.accounts = normalizeAccounts(source ? source.accounts : null);
+    state.auto_exit = normalizeAutoExit(source ? source.auto_exit : null);
     return state;
   }
 
@@ -776,6 +862,69 @@
     return hours + 'h ' + remMinutes + 'm';
   }
 
+  function autoExitKey(symbol, longExchange, shortExchange) {
+    if (!symbol || !longExchange || !shortExchange) {
+      return '';
+    }
+    return String(symbol).toUpperCase() + '|' + String(longExchange).toLowerCase() + '|' + String(shortExchange).toLowerCase();
+  }
+
+  function autoExitRuleFor(symbol, longExchange, shortExchange) {
+    var key = autoExitKey(symbol, longExchange, shortExchange);
+    if (!key) {
+      return null;
+    }
+    var rules = (globalState.auto_exit && globalState.auto_exit.rules) ? globalState.auto_exit.rules : {};
+    return rules && rules.hasOwnProperty(key) ? rules[key] : null;
+  }
+
+  function autoExitLiveSpreadFor(symbol, longExchange, shortExchange) {
+    var key = autoExitKey(symbol, longExchange, shortExchange);
+    if (!key) {
+      return null;
+    }
+    var spreads = (globalState.auto_exit && globalState.auto_exit.live_spreads) ? globalState.auto_exit.live_spreads : {};
+    if (spreads && spreads.hasOwnProperty(key)) {
+      return spreads[key];
+    }
+    return null;
+  }
+
+  function formatAutoExitEvent(entry) {
+    if (!entry || !entry.event) {
+      return 'event';
+    }
+    if (entry.event === 'trigger') {
+      return 'Trigger ' + (entry.symbol || '-') + ' ' + (entry.long_exchange || '-') + '/' + (entry.short_exchange || '-') +
+        ' spread=' + formatNumber(entry.spread_pct, 2) + '% target=' + formatNumber(entry.target_pct, 2) + '% qty=' + formatNumber(entry.qty, 4);
+    }
+    if (entry.event === 'wait') {
+      return 'Wait ' + (entry.symbol || '-') + ' ' + (entry.long_exchange || '-') + '/' + (entry.short_exchange || '-') +
+        ' spread=' + formatNumber(entry.spread_pct, 2) + '% target=' + formatNumber(entry.target_pct, 2) + '%';
+    }
+    if (entry.event === 'skip') {
+      var msg = 'Skip ' + (entry.symbol || '-') + ' ' + (entry.long_exchange || '-') + '/' + (entry.short_exchange || '-') +
+        ' reason=' + (entry.reason || '-');
+      if (entry.remaining_sec !== undefined && entry.remaining_sec !== null) {
+        msg += ' remaining=' + formatNumber(entry.remaining_sec, 1) + 's';
+      }
+      if (entry.long_legs !== undefined && entry.short_legs !== undefined) {
+        msg += ' legs=' + entry.long_legs + '/' + entry.short_legs;
+      }
+      return msg;
+    }
+    if (entry.event === 'skip_running') {
+      var runningId = entry.execution_id ? (' exec_id=' + entry.execution_id) : '';
+      var runningAction = entry.action ? (' action=' + entry.action) : '';
+      return 'Skip cycle: execution running' + runningId + runningAction;
+    }
+    if (entry.event === 'start') {
+      var execId = entry.result && entry.result.execution_id ? entry.result.execution_id : '-';
+      return 'Started ' + (entry.symbol || '-') + ' exec_id=' + execId;
+    }
+    return entry.event;
+  }
+
   function renderSymbolPositions(rows) {
     if (!elements.symbolPositionsTable) {
       return;
@@ -839,6 +988,37 @@
         ? formatNumber(row.take_price, 6)
         : '-';
       var nextFundingText = row.next_funding_eta || formatNextFunding(row.next_funding);
+      var autoExitToggle = '-';
+      var autoExitTarget = '-';
+      var liveSpreadText = '-';
+      if (isSummary) {
+        var longEx = row.long_exchange;
+        var shortEx = row.short_exchange;
+        if (longEx && shortEx) {
+          var rule = autoExitRuleFor(row.symbol, longEx, shortEx);
+          var enabled = rule && rule.enabled;
+          var targetVal = rule && rule.target_spread_pct !== undefined && rule.target_spread_pct !== null
+            ? formatNumber(rule.target_spread_pct, 2)
+            : '';
+          var liveSpread = autoExitLiveSpreadFor(row.symbol, longEx, shortEx);
+          liveSpreadText = liveSpread !== null && liveSpread !== undefined
+            ? formatNumber(liveSpread, 2) + '%'
+            : '-';
+          var key = autoExitKey(row.symbol, longEx, shortEx);
+          var checkbox = '<input type="checkbox" class="auto-exit-toggle" data-key="' + escapeHtml(key) + '" data-symbol="' +
+            escapeHtml(row.symbol || '') + '" data-long="' + escapeHtml(longEx) + '" data-short="' + escapeHtml(shortEx) + '"' +
+            (enabled ? ' checked' : '') + ' />';
+          var input = '<input type="number" class="auto-exit-target" step="0.01" placeholder="-7.9" value="' + escapeHtml(targetVal) +
+            '" data-key="' + escapeHtml(key) + '" data-symbol="' + escapeHtml(row.symbol || '') + '" data-long="' +
+            escapeHtml(longEx) + '" data-short="' + escapeHtml(shortEx) + '" />';
+          autoExitToggle = checkbox;
+          autoExitTarget = input;
+        } else {
+          autoExitToggle = '<span class="muted">multi-leg</span>';
+          autoExitTarget = '<span class="muted">n/a</span>';
+          liveSpreadText = '<span class="muted">n/a</span>';
+        }
+      }
       var summaryTone = isSummary ? toneClass(row) : '';
       var classes = isSummary ? ('summary-row ' + summaryTone) : '';
       var symbolAttr = row.symbol ? ' data-symbol="' + escapeHtml(row.symbol) + '"' : '';
@@ -861,11 +1041,14 @@
         '<td>' + stopPriceText + '</td>' +
         '<td>' + takePriceText + '</td>' +
         '<td>' + escapeHtml(nextFundingText) + '</td>' +
+        '<td>' + liveSpreadText + '</td>' +
+        '<td>' + autoExitToggle + '</td>' +
+        '<td>' + autoExitTarget + '</td>' +
       '</tr>';
       lastSymbol = row.symbol;
     }
     if (!html) {
-      html = '<tr><td colspan="16" class="muted">No live positions.</td></tr>';
+      html = '<tr><td colspan="19" class="muted">No live positions.</td></tr>';
     }
     elements.symbolPositionsTable.innerHTML = html;
     attachSymbolHover(elements.symbolPositionsTable);
@@ -947,7 +1130,243 @@
       } else {
         lines.push('No margin mode/leverage issues detected.');
       }
-      elements.symbolPositionsDiffs.innerHTML = lines.map(escapeHtml).join('<br>');
+    elements.symbolPositionsDiffs.innerHTML = lines.map(escapeHtml).join('<br>');
+  }
+
+  function renderAutoExitLog(autoExit) {
+    if (!elements.autoExitLog || !elements.autoExitLogEmpty) {
+      return;
+    }
+    var events = (autoExit && Array.isArray(autoExit.events)) ? autoExit.events : [];
+    if (!events.length) {
+      elements.autoExitLog.innerHTML = '';
+      elements.autoExitLogEmpty.style.display = '';
+      return;
+    }
+    elements.autoExitLogEmpty.style.display = 'none';
+    var html = '';
+    var i;
+    for (i = events.length - 1; i >= 0; i -= 1) {
+      var entry = events[i] || {};
+      var ts = formatDate(entry.ts);
+      var message = formatAutoExitEvent(entry);
+      var messageHtml = escapeHtml(message);
+      if (entry.event === 'skip_running' && entry.execution_id) {
+        var execId = entry.execution_id;
+        var logUrl = '/api/manual/exec/' + encodeURIComponent(execId) + '/log';
+        messageHtml += ' <a class="event-log__link" href="' + logUrl + '" target="_blank" rel="noreferrer">log</a>';
+      }
+      html += '<li class="event-log__item"><span class="event-log__time">' + escapeHtml(ts) +
+        '</span><span class="event-log__message">' + messageHtml + '</span></li>';
+    }
+    elements.autoExitLog.innerHTML = html;
+  }
+
+  function latestAutoExitExecId(autoExit) {
+    if (!autoExit || !Array.isArray(autoExit.events)) {
+      return null;
+    }
+    var events = autoExit.events;
+    var i;
+    for (i = events.length - 1; i >= 0; i -= 1) {
+      var entry = events[i] || {};
+      if (entry.event === 'start') {
+        var execId = entry.result && entry.result.execution_id ? entry.result.execution_id : null;
+        if (execId && !staleAutoExitExecIds[execId]) {
+          return execId;
+        }
+      }
+    }
+    return null;
+  }
+
+  function resetAutoExitExecState(clearExecId) {
+    if (clearExecId !== false) {
+      autoExitExecState.execId = null;
+    }
+    autoExitExecState.status = null;
+    autoExitExecState.logs = [];
+    autoExitExecState.errors = [];
+    autoExitExecState.error = null;
+    autoExitExecState.logPath = null;
+    autoExitExecState.lastFetched = 0;
+  }
+
+  function syncAutoExitExecId(autoExit) {
+    var execId = latestAutoExitExecId(autoExit);
+    if (!execId) {
+      if (autoExitExecState.execId !== null) {
+        resetAutoExitExecState(true);
+      }
+      return;
+    }
+    if (autoExitExecState.execId !== execId) {
+      resetAutoExitExecState(true);
+      autoExitExecState.execId = execId;
+      fetchAutoExitExec();
+    }
+  }
+
+  function renderAutoExitAgent() {
+    if (!elements.autoExitAgentStatus || !elements.autoExitAgentLog || !elements.autoExitAgentLogEmpty) {
+      return;
+    }
+    if (!autoExitExecState.execId) {
+      elements.autoExitAgentStatus.textContent = 'No auto-exit execution yet.';
+      elements.autoExitAgentLog.innerHTML = '';
+      elements.autoExitAgentLogEmpty.style.display = '';
+      if (elements.autoExitAgentMeta) {
+        elements.autoExitAgentMeta.textContent = '';
+      }
+      if (elements.autoExitAgentErrors) {
+        elements.autoExitAgentErrors.textContent = '';
+      }
+      return;
+    }
+    var statusText = 'Execution ' + autoExitExecState.execId;
+    if (autoExitExecState.status) {
+      statusText += ' | status=' + autoExitExecState.status;
+    }
+    elements.autoExitAgentStatus.textContent = statusText;
+    if (elements.autoExitAgentMeta) {
+      elements.autoExitAgentMeta.textContent = autoExitExecState.logPath
+        ? ('Log file: ' + autoExitExecState.logPath)
+        : '';
+    }
+    if (elements.autoExitAgentErrors) {
+      var errorLines = [];
+      if (autoExitExecState.error) {
+        errorLines.push('Exception: ' + autoExitExecState.error);
+      }
+      var iErr;
+      var errors = autoExitExecState.errors || [];
+      for (iErr = 0; iErr < errors.length; iErr += 1) {
+        errorLines.push('Error: ' + errors[iErr]);
+      }
+      elements.autoExitAgentErrors.textContent = errorLines.join(' | ');
+    }
+    var logs = autoExitExecState.logs || [];
+    if (!logs.length) {
+      elements.autoExitAgentLog.innerHTML = '';
+      elements.autoExitAgentLogEmpty.style.display = '';
+      return;
+    }
+    elements.autoExitAgentLogEmpty.style.display = 'none';
+    var html = '';
+    var i;
+    for (i = logs.length - 1; i >= 0; i -= 1) {
+      var entry = logs[i] || {};
+      var ts = formatDate(entry.ts);
+      var message = entry.message || entry.event || '-';
+      html += '<li class="event-log__item"><span class="event-log__time">' + escapeHtml(ts) +
+        '</span><span class="event-log__message">' + escapeHtml(message) + '</span></li>';
+    }
+    elements.autoExitAgentLog.innerHTML = html;
+  }
+
+  function fetchAutoExitExec() {
+    if (!autoExitExecState.execId) {
+      return;
+    }
+    var requestedExecId = autoExitExecState.execId;
+    var now = Date.now();
+    if (autoExitExecState.lastFetched && (now - autoExitExecState.lastFetched) < 1500) {
+      return;
+    }
+    autoExitExecState.lastFetched = now;
+    request('GET', '/api/manual/exec/' + encodeURIComponent(requestedExecId), null, function (err, data) {
+      if (autoExitExecState.execId !== requestedExecId) {
+        return;
+      }
+      if (err) {
+        if (err.status === 404) {
+          staleAutoExitExecIds[requestedExecId] = true;
+          resetAutoExitExecState(true);
+          renderAutoExitAgent();
+        }
+        return;
+      }
+      if (!data) {
+        return;
+      }
+      autoExitExecState.status = data.status || null;
+      autoExitExecState.logs = Array.isArray(data.logs) ? data.logs.slice(-200) : [];
+      autoExitExecState.error = data.error || null;
+      autoExitExecState.errors = (data.result && Array.isArray(data.result.errors)) ? data.result.errors.slice(0, 20) : [];
+      autoExitExecState.logPath = data.log_path || null;
+      renderAutoExitAgent();
+    });
+  }
+
+  function autoExitLogText(events) {
+    if (!events || !events.length) {
+      return '';
+    }
+    var lines = [];
+    var i;
+    for (i = 0; i < events.length; i += 1) {
+      var entry = events[i] || {};
+      var ts = formatDate(entry.ts);
+      var message = formatAutoExitEvent(entry);
+      lines.push(ts + ' | ' + message);
+    }
+    return lines.join('\n');
+  }
+
+  function autoExitAgentLogText(state) {
+    var logs = state && state.logs ? state.logs : [];
+    var lines = [];
+    if (state) {
+      if (state.logPath) {
+        lines.push('Log file: ' + state.logPath);
+      }
+      if (state.error) {
+        lines.push('Exception: ' + state.error);
+      }
+      if (state.errors && state.errors.length) {
+        var errIndex;
+        for (errIndex = 0; errIndex < state.errors.length; errIndex += 1) {
+          lines.push('Error: ' + state.errors[errIndex]);
+        }
+      }
+      if (lines.length) {
+        lines.push('');
+      }
+    }
+    if (!logs || !logs.length) {
+      return lines.join('\n');
+    }
+    var i;
+    for (i = 0; i < logs.length; i += 1) {
+      var entry = logs[i] || {};
+      var ts = formatDate(entry.ts);
+      var message = entry.message || entry.event || '-';
+      lines.push(ts + ' | ' + message);
+    }
+    return lines.join('\n');
+  }
+
+  function copyToClipboard(text) {
+    if (!text) {
+      return;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text);
+      return;
+    }
+    var textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    try {
+      document.execCommand('copy');
+    } catch (_err) {
+      // ignore
+    }
+    document.body.removeChild(textarea);
   }
 
   function attachSymbolHover(tbody) {
@@ -1049,10 +1468,14 @@
     renderEvents(globalState.events || []);
     renderExecution(globalState.execution);
     renderAccounts(globalState.accounts);
+    renderAutoExitLog(globalState.auto_exit || {});
+    syncAutoExitExecId(globalState.auto_exit || {});
+    renderAutoExitAgent();
     renderMessages(collectMessages(globalState));
     toggleEmptyState(!globalState.snapshot);
     updateHint(globalState);
     updateRefreshButton();
+    syncAutoExitDefaults(globalState.auto_exit);
   }
 
   function getRefreshInterval(state) {
@@ -1151,6 +1574,15 @@
           }
         } else {
           error = new Error('Request failed (' + xhr.status + ')');
+          error.status = xhr.status;
+          try {
+            data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+            if (data && data.detail) {
+              error.detail = String(data.detail);
+            }
+          } catch (_parseErr) {
+            data = null;
+          }
         }
         callback(error, data);
       }
@@ -1260,8 +1692,8 @@
       return;
     }
     var symbol = (elements.quickAnalyzeInput.value || '').trim().toUpperCase();
-    var windowMinutes = elements.quickWindowInput ? parseInt(elements.quickWindowInput.value || '720', 10) : 720;
-    var fundingPoints = elements.quickFundingInput ? parseInt(elements.quickFundingInput.value || '24', 10) : 24;
+    var windowMinutes = elements.quickWindowInput ? parseInt(elements.quickWindowInput.value || '4320', 10) : 4320;
+    var fundingPoints = elements.quickFundingInput ? parseInt(elements.quickFundingInput.value || '120', 10) : 120;
     if (!symbol) {
       setQuickAnalyzeStatus('Введите символ.', 'error');
       return;
@@ -1332,15 +1764,100 @@
     result.protective = {
       auto_protect_enabled: elements.protectAuto ? !!elements.protectAuto.checked : true,
       auto_take_enabled: elements.takeAuto ? !!elements.takeAuto.checked : true,
-      anti_orphan_enabled: elements.antiOrphan ? !!elements.antiOrphan.checked : false,
       send_margin_alerts: elements.alertMargin ? !!elements.alertMargin.checked : true,
       send_missing_stop_alerts: elements.alertMissingStops ? !!elements.alertMissingStops.checked : true,
+      auto_margin_enabled: elements.autoMarginAdd ? !!elements.autoMarginAdd.checked : true,
+      auto_margin_reduce_enabled: elements.autoMarginReduce ? !!elements.autoMarginReduce.checked : true,
       stop_gap_from_liq_pct: elements.stopGapInput ? parseFloat(elements.stopGapInput.value) || defaultSettings.stop_gap_from_liq_pct || 0.07 : 0.07,
       stop_requote_threshold_pct: elements.requoteInput ? parseFloat(elements.requoteInput.value) || 0.005 : 0.005,
       fallback_liq_factor_long: elements.fallbackLongInput ? parseFloat(elements.fallbackLongInput.value) || 0.33 : 0.33,
-      fallback_liq_factor_short: elements.fallbackShortInput ? parseFloat(elements.fallbackShortInput.value) || 1.66 : 1.66
+      fallback_liq_factor_short: elements.fallbackShortInput ? parseFloat(elements.fallbackShortInput.value) || 1.66 : 1.66,
+      auto_rebalance_enabled: elements.rebalanceAuto ? !!elements.rebalanceAuto.checked : false,
+      rebalance_delta_pct: elements.rebalanceDeltaInput ? parseFloat(elements.rebalanceDeltaInput.value) || 0.2 : 0.2,
+      rebalance_cooldown_sec: elements.rebalanceCooldownInput ? parseInt(elements.rebalanceCooldownInput.value, 10) || 120 : 120,
+      rebalance_limit_timeout_sec: elements.rebalanceTimeoutInput ? parseInt(elements.rebalanceTimeoutInput.value, 10) || 10 : 10,
+      rebalance_limit_offset_bps: elements.rebalanceOffsetInput ? parseFloat(elements.rebalanceOffsetInput.value) || 2 : 2,
+      rebalance_max_slippage_bps: elements.rebalanceSlippageInput ? parseFloat(elements.rebalanceSlippageInput.value) || 8 : 8
     };
     return result;
+  }
+
+  function collectAutoExitDefaults() {
+    if (!elements.autoExitRuntimeInput && !elements.autoExitCooldownInput && !elements.autoExitRequireLive) {
+      return null;
+    }
+    var defaults = {
+      max_runtime_sec: defaultAutoExit.defaults.max_runtime_sec,
+      cooldown_sec: defaultAutoExit.defaults.cooldown_sec,
+      require_live: defaultAutoExit.defaults.require_live
+    };
+    if (elements.autoExitRuntimeInput) {
+      var runtimeValue = parseInt(elements.autoExitRuntimeInput.value, 10);
+      if (!isNaN(runtimeValue)) {
+        defaults.max_runtime_sec = Math.max(30, runtimeValue);
+      }
+    }
+    if (elements.autoExitCooldownInput) {
+      var cooldownValue = parseInt(elements.autoExitCooldownInput.value, 10);
+      if (!isNaN(cooldownValue)) {
+        defaults.cooldown_sec = Math.max(0, cooldownValue);
+      }
+    }
+    if (elements.autoExitRequireLive) {
+      defaults.require_live = !!elements.autoExitRequireLive.checked;
+    }
+    return defaults;
+  }
+
+  function syncAutoExitDefaults(autoExit) {
+    if (!autoExit || !autoExit.defaults) {
+      return;
+    }
+    if (elements.autoExitRuntimeInput) {
+      elements.autoExitRuntimeInput.value = autoExit.defaults.max_runtime_sec;
+    }
+    if (elements.autoExitCooldownInput) {
+      elements.autoExitCooldownInput.value = autoExit.defaults.cooldown_sec;
+    }
+    if (elements.autoExitRequireLive) {
+      elements.autoExitRequireLive.checked = !!autoExit.defaults.require_live;
+    }
+  }
+
+  function submitAutoExitDefaults(defaults, callback) {
+    if (!defaults) {
+      if (typeof callback === 'function') {
+        callback(null, null);
+      }
+      return;
+    }
+    request('POST', '/api/auto-exit/defaults', defaults, function (err, data) {
+      if (!err && data && data.auto_exit) {
+        globalState.auto_exit = normalizeAutoExit(data.auto_exit);
+      }
+      if (typeof callback === 'function') {
+        callback(err, data);
+      }
+    });
+  }
+
+  function toggleRebalanceFields(enabled) {
+    var isEnabled = !!enabled;
+    if (elements.rebalanceDeltaInput) {
+      elements.rebalanceDeltaInput.disabled = !isEnabled;
+    }
+    if (elements.rebalanceCooldownInput) {
+      elements.rebalanceCooldownInput.disabled = !isEnabled;
+    }
+    if (elements.rebalanceTimeoutInput) {
+      elements.rebalanceTimeoutInput.disabled = !isEnabled;
+    }
+    if (elements.rebalanceOffsetInput) {
+      elements.rebalanceOffsetInput.disabled = !isEnabled;
+    }
+    if (elements.rebalanceSlippageInput) {
+      elements.rebalanceSlippageInput.disabled = !isEnabled;
+    }
   }
 
   function syncSettingsForm(settings) {
@@ -1389,11 +1906,14 @@
     if (elements.takeAuto) {
       elements.takeAuto.checked = protective.hasOwnProperty('auto_take_enabled') ? !!protective.auto_take_enabled : true;
     }
-    if (elements.antiOrphan) {
-      elements.antiOrphan.checked = protective.hasOwnProperty('anti_orphan_enabled') ? !!protective.anti_orphan_enabled : false;
-    }
     if (elements.alertMargin) {
       elements.alertMargin.checked = protective.hasOwnProperty('send_margin_alerts') ? !!protective.send_margin_alerts : true;
+    }
+    if (elements.autoMarginAdd) {
+      elements.autoMarginAdd.checked = protective.hasOwnProperty('auto_margin_enabled') ? !!protective.auto_margin_enabled : true;
+    }
+    if (elements.autoMarginReduce) {
+      elements.autoMarginReduce.checked = protective.hasOwnProperty('auto_margin_reduce_enabled') ? !!protective.auto_margin_reduce_enabled : true;
     }
     if (elements.alertMissingStops) {
       elements.alertMissingStops.checked = protective.hasOwnProperty('send_missing_stop_alerts') ? !!protective.send_missing_stop_alerts : true;
@@ -1410,6 +1930,73 @@
     if (elements.fallbackShortInput) {
       elements.fallbackShortInput.value = protective.fallback_liq_factor_short !== undefined ? protective.fallback_liq_factor_short : 1.66;
     }
+    if (elements.rebalanceAuto) {
+      elements.rebalanceAuto.checked = protective.hasOwnProperty('auto_rebalance_enabled') ? !!protective.auto_rebalance_enabled : false;
+    }
+    if (elements.rebalanceDeltaInput) {
+      elements.rebalanceDeltaInput.value = protective.rebalance_delta_pct !== undefined ? protective.rebalance_delta_pct : 0.2;
+    }
+    if (elements.rebalanceCooldownInput) {
+      elements.rebalanceCooldownInput.value = protective.rebalance_cooldown_sec !== undefined ? protective.rebalance_cooldown_sec : 120;
+    }
+    if (elements.rebalanceTimeoutInput) {
+      elements.rebalanceTimeoutInput.value = protective.rebalance_limit_timeout_sec !== undefined ? protective.rebalance_limit_timeout_sec : 10;
+    }
+    if (elements.rebalanceOffsetInput) {
+      elements.rebalanceOffsetInput.value = protective.rebalance_limit_offset_bps !== undefined ? protective.rebalance_limit_offset_bps : 2;
+    }
+    if (elements.rebalanceSlippageInput) {
+      elements.rebalanceSlippageInput.value = protective.rebalance_max_slippage_bps !== undefined ? protective.rebalance_max_slippage_bps : 8;
+    }
+    toggleRebalanceFields(elements.rebalanceAuto ? elements.rebalanceAuto.checked : false);
+  }
+
+  function handleAutoExitChange(event) {
+    if (!event || !event.target) {
+      return;
+    }
+    var target = event.target;
+    if (!(target.classList && (target.classList.contains('auto-exit-toggle') || target.classList.contains('auto-exit-target')))) {
+      return;
+    }
+    var row = target.closest('tr');
+    if (!row) {
+      return;
+    }
+    var toggle = row.querySelector('.auto-exit-toggle');
+    var input = row.querySelector('.auto-exit-target');
+    if (!toggle || !input) {
+      return;
+    }
+    var symbol = input.dataset.symbol || toggle.dataset.symbol;
+    var longExchange = input.dataset.long || toggle.dataset.long;
+    var shortExchange = input.dataset.short || toggle.dataset.short;
+    if (!symbol || !longExchange || !shortExchange) {
+      return;
+    }
+    var enabled = !!toggle.checked;
+    var targetVal = parseFloat(input.value);
+    if (enabled && (isNaN(targetVal) || !isFinite(targetVal))) {
+      renderMessages(['Auto-exit target spread is required.']);
+      return;
+    }
+    var payload = {
+      symbol: symbol,
+      long_exchange: longExchange,
+      short_exchange: shortExchange,
+      enabled: enabled,
+      target_spread_pct: enabled ? targetVal : null
+    };
+    request('POST', '/api/auto-exit/rule', payload, function (err, data) {
+      if (err) {
+        renderMessages(['Auto-exit update failed: ' + err.message]);
+        return;
+      }
+      if (data && data.auto_exit) {
+        globalState.auto_exit = normalizeAutoExit(data.auto_exit);
+        renderSymbolPositions(globalState.accounts.positions_by_symbol || []);
+      }
+    });
   }
 
   function setSettingsStatus(message, tone) {
@@ -1433,6 +2020,7 @@
       event.preventDefault();
     }
     var payload = collectSettingsFromForm();
+    var autoExitDefaults = collectAutoExitDefaults();
     setSettingsStatus('Saving settings…', 'info');
     request('POST', '/api/settings', payload, function (err, data) {
       if (err) {
@@ -1448,16 +2036,24 @@
       syncSettingsForm(globalState.settings);
       renderAll();
       ensurePolling();
-      setSettingsStatus('Settings saved', 'success');
-      window.setTimeout(function () {
-        setSettingsStatus('', '');
-      }, 2500);
+      submitAutoExitDefaults(autoExitDefaults, function (err2) {
+        if (err2) {
+          setSettingsStatus('Auto-exit settings error: ' + err2.message, 'error');
+          return;
+        }
+        syncAutoExitDefaults(globalState.auto_exit);
+        setSettingsStatus('Settings saved', 'success');
+        window.setTimeout(function () {
+          setSettingsStatus('', '');
+        }, 2500);
+      });
     });
   }
 
   function init() {
     globalState = normalizeState(globalState);
     syncSettingsForm(globalState.settings);
+    syncAutoExitDefaults(globalState.auto_exit);
     renderAll();
     ensurePolling();
 
@@ -1472,6 +2068,53 @@
       elements.settingsForm.addEventListener('change', function () {
         setSettingsStatus('', '');
       });
+    }
+    if (elements.rebalanceAuto) {
+      elements.rebalanceAuto.addEventListener('change', function () {
+        toggleRebalanceFields(!!elements.rebalanceAuto.checked);
+      });
+    }
+    if (elements.symbolPositionsTable) {
+      elements.symbolPositionsTable.addEventListener('change', handleAutoExitChange);
+    }
+    if (elements.autoExitLogCopy) {
+      elements.autoExitLogCopy.addEventListener('click', function () {
+        var text = autoExitLogText((globalState.auto_exit && globalState.auto_exit.events) ? globalState.auto_exit.events : []);
+        copyToClipboard(text);
+      });
+    }
+    if (elements.autoExitAgentCopy) {
+      elements.autoExitAgentCopy.addEventListener('click', function () {
+        var text = autoExitAgentLogText(autoExitExecState);
+        copyToClipboard(text);
+      });
+    }
+    if (elements.autoExitAgentStop) {
+      elements.autoExitAgentStop.addEventListener('click', function () {
+        if (!autoExitExecState.execId) {
+          return;
+        }
+        request('POST', '/api/manual/exec/' + encodeURIComponent(autoExitExecState.execId) + '/stop', null, function () {
+          fetchAutoExitExec();
+        });
+      });
+    }
+    if (elements.autoExitAgentOpenLog) {
+      elements.autoExitAgentOpenLog.addEventListener('click', function () {
+        if (!autoExitExecState.execId) {
+          return;
+        }
+        var url = '/api/manual/exec/' + encodeURIComponent(autoExitExecState.execId) + '/log';
+        window.open(url, '_blank');
+      });
+    }
+
+    if (!autoExitExecTimer) {
+      autoExitExecTimer = window.setInterval(function () {
+        if (autoExitExecState.execId) {
+          fetchAutoExitExec();
+        }
+      }, 3000);
     }
 
     pollSnapshot(true);

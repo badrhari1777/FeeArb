@@ -3,8 +3,9 @@
 <head>
   <meta charset="utf-8" />
   <title>Coin Analysis | Funding Arbitrage Monitor</title>
-  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', path='/favicon.svg') }}?v={{ static_version }}">
-  <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}?v={{ static_version }}" />
+  {% set rp = request.scope.get('root_path', '') %}
+  <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
   <script>
     window.__COIN_SYMBOL__ = "{{ symbol | upper }}";
     window.__DEFAULT_WINDOW_MINUTES__ = {{ window_minutes }};
@@ -12,7 +13,7 @@
     window.__STATIC_VERSION__ = "{{ static_version }}";
     window.__SETTINGS__ = {{ settings | tojson | safe }};
   </script>
-  <script defer src="{{ url_for('static', path='/coin.js') }}?v={{ static_version }}"></script>
+  <script defer src="{{ rp }}/static/coin.js?v={{ static_version }}"></script>
 </head>
 <body class="page">
   <header class="masthead">
@@ -40,7 +41,7 @@
           <dd id="header-run">-</dd>
         </div>
       </dl>
-      <p class="hint">Exchanges pulled from current settings; data is fetched lazily per request.</p>
+      <p class="hint">Historical data is fetched on demand. Core pair analysis currently targets Binance + OKX.</p>
     </div>
   </header>
 
@@ -54,11 +55,11 @@
         </label>
         <label>
           1m window (minutes)
-          <input type="number" id="window-input" min="30" max="4320" step="30" value="{{ window_minutes }}" />
+          <input type="number" id="window-input" min="60" max="4320" step="60" value="{{ window_minutes }}" />
         </label>
         <label>
           Funding points
-          <input type="number" id="funding-input" min="6" max="120" step="2" value="{{ funding_points }}" />
+          <input type="number" id="funding-input" min="24" max="200" step="4" value="{{ funding_points }}" />
         </label>
         <button type="submit" class="button" id="analysis-submit">Analyze</button>
         <span class="settings-status" id="analysis-status" aria-live="polite"></span>
@@ -79,15 +80,49 @@
               <th>Mark</th>
               <th>1m candles</th>
               <th>Funding pts</th>
+              <th>Funding interval</th>
+              <th>OI points</th>
               <th>Status</th>
               <th>Notes</th>
             </tr>
           </thead>
           <tbody id="exchange-analysis-body">
-            <tr><td colspan="10" class="muted">Run an analysis to populate data.</td></tr>
+            <tr><td colspan="12" class="muted">Run an analysis to populate data.</td></tr>
           </tbody>
         </table>
       </div>
+    </section>
+
+    <section class="panel">
+      <h2>Pair analysis (core: Binance/OKX)</h2>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Pair</th>
+              <th>Decision</th>
+              <th>Score</th>
+              <th>Spread now %</th>
+              <th>Spread weighted %</th>
+              <th>Spread p95 abs %</th>
+              <th>Spread z-score</th>
+              <th>Funding interval</th>
+              <th>Funding delta / hour</th>
+              <th>OI div 6h %</th>
+              <th>Coverage %</th>
+              <th>Reasons</th>
+            </tr>
+          </thead>
+          <tbody id="pair-analysis-body">
+            <tr><td colspan="12" class="muted">Pair analysis is empty.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Bot logic</h2>
+      <pre class="code-block code-block--wrap" id="bot-logic-block">No decision yet.</pre>
     </section>
 
     <section class="panel">
