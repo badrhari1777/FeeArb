@@ -30,6 +30,7 @@ ADAPTER_FACTORIES: Dict[str, Type[ExchangeAdapter]] = {
 EXCHANGE_ALIASES: Dict[str, str] = {
     "kukoin": "kucoin",
 }
+_ADAPTER_CACHE: Dict[str, ExchangeAdapter] = {}
 
 
 def normalize_exchange_name(name: str) -> str:
@@ -45,9 +46,32 @@ def get_adapter(name: str) -> ExchangeAdapter:
     return cls()
 
 
+def get_adapter_cached(name: str) -> ExchangeAdapter:
+    canonical = normalize_exchange_name(name)
+    cached = _ADAPTER_CACHE.get(canonical)
+    if cached is not None:
+        return cached
+    cls = ADAPTER_FACTORIES.get(canonical)
+    if not cls:
+        raise KeyError(f"No adapter registered for exchange '{name}'")
+    adapter = cls()
+    _ADAPTER_CACHE[canonical] = adapter
+    return adapter
+
+
+def clear_adapter_cache(name: str | None = None) -> None:
+    if name is None:
+        _ADAPTER_CACHE.clear()
+        return
+    canonical = normalize_exchange_name(name)
+    _ADAPTER_CACHE.pop(canonical, None)
+
+
 __all__ = [
     "ExchangeAdapter",
     "get_adapter",
+    "get_adapter_cached",
+    "clear_adapter_cache",
     "normalize_exchange_name",
     "ADAPTER_FACTORIES",
 ]

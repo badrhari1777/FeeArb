@@ -32,25 +32,42 @@ class GateAdapter(ExchangeAdapter):
 
     def fetch_market_snapshots(self, symbols: Iterable[str]) -> List[MarketSnapshot]:
         snapshots: list[MarketSnapshot] = []
+        targets = {sym.upper(): self.map_symbol(sym) for sym in symbols}
+        targets = {canon: exch for canon, exch in targets.items() if exch}
+        if not targets:
+            return []
 
-        for canonical in {sym.upper() for sym in symbols}:
-            contract = self.map_symbol(canonical)
-            if not contract:
-                logger.debug("Gate: unsupported symbol %s", canonical)
-                continue
+        ticker_payload = _get_json(f"{self.base_url}/futures/usdt/tickers")
+        tickers = ticker_payload if isinstance(ticker_payload, list) else []
+        ticker_map = {
+            item.get("contract"): item
+            for item in tickers
+            if isinstance(item, dict) and item.get("contract")
+        }
+        contracts_payload = _get_json(f"{self.base_url}/futures/usdt/contracts")
+        contracts = contracts_payload if isinstance(contracts_payload, list) else []
+        contract_map = {
+            item.get("name"): item
+            for item in contracts
+            if isinstance(item, dict) and item.get("name")
+        }
 
-            ticker_url = (
-                f"{self.base_url}/futures/usdt/tickers?" + urlencode({"contract": contract})
-            )
-            contract_url = f"{self.base_url}/futures/usdt/contracts/{contract}"
+        for canonical, contract in targets.items():
+            ticker_item = ticker_map.get(contract)
+            if not ticker_item:
+                ticker_url = (
+                    f"{self.base_url}/futures/usdt/tickers?" + urlencode({"contract": contract})
+                )
+                fallback_ticker = _get_json(ticker_url)
+                if not isinstance(fallback_ticker, list) or not fallback_ticker:
+                    logger.info("Gate: empty ticker for %s", contract)
+                    continue
+                ticker_item = fallback_ticker[0]
 
-            ticker_payload = _get_json(ticker_url)
-            if not isinstance(ticker_payload, list) or not ticker_payload:
-                logger.info("Gate: empty ticker for %s", contract)
-                continue
-            ticker_item = ticker_payload[0]
-
-            contract_payload = _get_json(contract_url)
+            contract_payload = contract_map.get(contract)
+            if contract_payload is None:
+                contract_url = f"{self.base_url}/futures/usdt/contracts/{contract}"
+                contract_payload = _get_json(contract_url)
             self._cache_symbol_meta(contract, contract_payload)
 
             snapshots.append(

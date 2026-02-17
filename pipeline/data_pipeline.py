@@ -21,7 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 from config import PARSE_CACHE_TTL_SECONDS, SUPPORTED_EXCHANGES
 from project_settings import DEFAULT_SOURCES
-from exchanges import get_adapter, normalize_exchange_name
+from exchanges import get_adapter_cached, normalize_exchange_name
 from orchestrator.models import FundingOpportunity, MarketSnapshot
 from orchestrator.opportunities import (
     compute_opportunities,
@@ -589,7 +589,7 @@ def _active_adapters(enabled: Iterable[str] | None = None):
             continue
         seen.add(canonical)
         try:
-            adapters.append(get_adapter(canonical))
+            adapters.append(get_adapter_cached(canonical))
         except KeyError:
             logger.warning("No adapter implemented for %s", canonical)
     return adapters

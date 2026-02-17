@@ -48,21 +48,31 @@ class BinanceAdapter(ExchangeAdapter):
         if not targets:
             return []
 
-        for canonical, exch_symbol in targets.items():
-            premium = _get_json(
-                f"{self.base_url}/fapi/v1/premiumIndex?" + urlencode({"symbol": exch_symbol})
-            )
-            if premium.get("code") not in (None, 0):
-                logger.debug("Binance premiumIndex error for %s: %s", exch_symbol, premium)
-                continue
-            book = _get_json(
-                f"{self.base_url}/fapi/v1/ticker/bookTicker?" + urlencode({"symbol": exch_symbol})
-            )
-            if book.get("code") not in (None, 0):
-                logger.debug("Binance bookTicker error for %s: %s", exch_symbol, book)
-                book = {}
+        premium_payload = _get_json(f"{self.base_url}/fapi/v1/premiumIndex")
+        premium_map = _to_symbol_map(premium_payload)
+        book_payload = _get_json(f"{self.base_url}/fapi/v1/ticker/bookTicker")
+        book_map = _to_symbol_map(book_payload)
 
-            self._cache_symbol_meta(exch_symbol)
+        exch_symbols = sorted(set(targets.values()))
+        self._cache_symbol_meta_batch(exch_symbols)
+
+        for canonical, exch_symbol in targets.items():
+            premium = premium_map.get(exch_symbol)
+            if not premium:
+                premium = _get_json(
+                    f"{self.base_url}/fapi/v1/premiumIndex?" + urlencode({"symbol": exch_symbol})
+                )
+                if premium.get("code") not in (None, 0):
+                    logger.debug("Binance premiumIndex error for %s: %s", exch_symbol, premium)
+                    continue
+            book = book_map.get(exch_symbol)
+            if not book:
+                book = _get_json(
+                    f"{self.base_url}/fapi/v1/ticker/bookTicker?" + urlencode({"symbol": exch_symbol})
+                )
+                if book.get("code") not in (None, 0):
+                    logger.debug("Binance bookTicker error for %s: %s", exch_symbol, book)
+                    book = {}
 
             snapshots.append(
                 MarketSnapshot(
@@ -119,6 +129,57 @@ class BinanceAdapter(ExchangeAdapter):
             _fetch,
             max_age_seconds=self._META_TTL_SECONDS,
         )
+
+    def _cache_symbol_meta_batch(self, exch_symbols: list[str]) -> None:
+        if not exch_symbols:
+            return
+        try:
+            payload = _get_json(f"{self.base_url}/fapi/v1/exchangeInfo")
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("Binance exchangeInfo batch fetch failed: %s", exc)
+            payload = {}
+        if payload.get("code") not in (None, 0):
+            for symbol in exch_symbols:
+                self._cache_symbol_meta(symbol)
+            return
+        items = payload.get("symbols") or []
+        info_map = {
+            str(item.get("symbol") or ""): item
+            for item in items
+            if isinstance(item, dict) and item.get("symbol")
+        }
+        for symbol in exch_symbols:
+            info = info_map.get(symbol)
+            if not info:
+                self._cache_symbol_meta(symbol)
+                continue
+
+            def _fetch(info: dict = info, symbol: str = symbol) -> SymbolMeta | None:
+                filters = {item.get("filterType"): item for item in info.get("filters") or []}
+                price_filter = filters.get("PRICE_FILTER") or {}
+                lot_filter = filters.get("LOT_SIZE") or filters.get("MARKET_LOT_SIZE") or {}
+                notional_filter = filters.get("MIN_NOTIONAL") or {}
+                return SymbolMeta(
+                    exchange=self.name,
+                    symbol=symbol,
+                    contract_size=_to_float(info.get("contractSize")) or 1.0,
+                    price_step=_to_float(price_filter.get("tickSize")),
+                    qty_step=_to_float(lot_filter.get("stepSize")),
+                    min_qty=_to_float(lot_filter.get("minQty")),
+                    max_qty=_to_float(lot_filter.get("maxQty")),
+                    min_notional=_to_float(
+                        notional_filter.get("notional") or notional_filter.get("minNotional")
+                    ),
+                    max_leverage=_to_float(info.get("maxLeverage")),
+                    tick_size=_to_float(price_filter.get("tickSize")),
+                )
+
+            get_or_fetch_symbol_meta(
+                self.name,
+                symbol,
+                _fetch,
+                max_age_seconds=self._META_TTL_SECONDS,
+            )
 
     def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
         """Return cached funding history with ~2m refresh."""
@@ -196,3 +257,17 @@ def _to_datetime(value: object) -> datetime | None:
     if millis <= 0:
         return None
     return datetime.fromtimestamp(millis / 1000, tz=timezone.utc)
+
+
+def _to_symbol_map(payload: object) -> dict[str, dict]:
+    if isinstance(payload, list):
+        return {
+            str(item.get("symbol") or ""): item
+            for item in payload
+            if isinstance(item, dict) and item.get("symbol")
+        }
+    if isinstance(payload, dict):
+        symbol = str(payload.get("symbol") or "")
+        if symbol:
+            return {symbol: payload}
+    return {}

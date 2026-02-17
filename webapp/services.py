@@ -44,7 +44,7 @@ from utils.funding import (
     parse_timestamp_ms,
     project_next_funding_time_iso,
 )
-from exchanges import get_adapter, normalize_exchange_name
+from exchanges import get_adapter_cached, normalize_exchange_name
 from config import BASE_DIR, STATE_DIR
 from .market_data import MarketDataBus
 from .manual_symbols import _normalize_input_symbol
@@ -63,6 +63,7 @@ AUTO_EXIT_DEFAULTS = {
 AUTO_EXIT_STATE_PATH = STATE_DIR / "auto_exit_rules.json"
 MANUAL_EXEC_LOG_DIR = BASE_DIR / "logs" / "manual_exec"
 COIN_ANALYSIS_CORE_EXCHANGES: tuple[str, ...] = ("binance", "okx")
+COIN_ANALYSIS_CACHE_TTL_SEC = 90
 
 RefreshResult = Literal["completed", "in_progress", "failed"]
 
@@ -656,19 +657,14 @@ def _load_funding_history_cached(
     adapter: Any,
 ) -> list[dict]:
     """Fetch funding history with caching, falling back to adapter hook."""
-    exchange_name = normalize_exchange_name(exchange)
-    if exchange_name == "kucoin" and hasattr(adapter, "funding_history"):
+    fetch_limit = max(limit, min(limit + 8, 220))
+    if hasattr(adapter, "funding_history"):
         try:
-            return adapter.funding_history(canonical_symbol, limit=max(limit * 2, limit))
+            return adapter.funding_history(canonical_symbol, limit=fetch_limit)
         except Exception:  # pylint: disable=broad-except
             return []
 
     def _fetch() -> list[dict]:
-        if hasattr(adapter, "funding_history"):
-            try:
-                return adapter.funding_history(canonical_symbol, limit=max(limit * 2, limit))
-            except Exception:  # pylint: disable=broad-except
-                return []
         return []
 
     try:
@@ -873,6 +869,7 @@ class DataService:
         self._auto_exit_event_limit = 60
         self._auto_exit_last_log_ts: dict[str, float] = {}
         self._auto_exit_log_cooldown_sec = AUTO_EXIT_LOG_COOLDOWN_SEC
+        self._coin_analysis_cache: dict[tuple[str, int, int, tuple[str, ...]], tuple[float, dict[str, Any]]] = {}
         self._mexc_alert_cooldown = 600  # seconds
         self._last_mexc_alert: dict[tuple[str, str], float] = {}
         self._send_missing_stop_alerts = True
@@ -1930,7 +1927,7 @@ class DataService:
             return {"errors": errors}
 
         try:
-            adapter = get_adapter(exchange)
+            adapter = get_adapter_cached(exchange)
         except KeyError:
             return {"errors": [f"{exchange}: adapter unavailable"]}
 
@@ -2947,6 +2944,7 @@ class DataService:
             account_last_updated = accounts_snapshot.get("last_updated")
             now = datetime.now(timezone.utc)
             interval = max(30, int(self._positions_market_interval or self._account_interval))
+            grace_sec = min(10, max(2, interval // 10))
             if (
                 not force
                 and account_last_updated
@@ -2954,7 +2952,7 @@ class DataService:
                 and self._positions_market_last_refresh
             ):
                 age = (now - self._positions_market_last_refresh).total_seconds()
-                if age < interval:
+                if age < (interval + grace_sec):
                     return
             symbols_by_exchange = self._collect_positions_market_symbols(positions)
             key_bits = [
@@ -2969,7 +2967,7 @@ class DataService:
                 and key == (self._positions_market_last_key or ())
             ):
                 age = (now - self._positions_market_last_refresh).total_seconds()
-                if age < interval:
+                if age < (interval + grace_sec):
                     return
 
             if not symbols_by_exchange:
@@ -2986,7 +2984,7 @@ class DataService:
             async def _fetch_exchange(exchange: str, symbols: list[str]) -> dict[str, Any]:
                 async with self._positions_market_sem:
                     try:
-                        adapter = get_adapter(exchange)
+                        adapter = get_adapter_cached(exchange)
                     except KeyError as exc:
                         return {
                             "exchange": exchange,
@@ -3462,7 +3460,7 @@ class DataService:
             funding_logger.warning("funding failed exchange=? symbol=%s reason=no_exchange", normalized_symbol)
             return None, None, None
         try:
-            adapter = get_adapter(normalize_exchange_name(exchange))
+            adapter = get_adapter_cached(normalize_exchange_name(exchange))
         except KeyError:
             funding_logger.warning(
                 "funding failed exchange=%s symbol=%s reason=adapter_missing",
@@ -4716,6 +4714,16 @@ class DataService:
         if len(selected_exchanges) < 2:
             global_warnings.append("pair_analysis_limited: less than 2 core exchanges enabled")
 
+        cache_key = (canonical, window, funding_limit, tuple(selected_exchanges))
+        now_ts = time.time()
+        cached = self._coin_analysis_cache.get(cache_key)
+        if cached:
+            cached_at, cached_payload = cached
+            if now_ts - cached_at <= COIN_ANALYSIS_CACHE_TTL_SEC:
+                out = dict(cached_payload)
+                out["cache_hit"] = True
+                return out
+
         tasks = [
             self._analyze_symbol_on_exchange(ex, canonical, window, funding_limit)
             for ex in selected_exchanges
@@ -4731,7 +4739,7 @@ class DataService:
                 )
         bot_logic = self._decide_coin_candidate(pair_analysis)
 
-        return {
+        response = {
             "symbol": canonical,
             "requested_at": datetime.now(timezone.utc).isoformat(),
             "window_minutes": window,
@@ -4741,7 +4749,16 @@ class DataService:
             "exchanges": exchange_rows,
             "pair_analysis": pair_analysis,
             "bot_logic": bot_logic,
+            "cache_hit": False,
         }
+        self._coin_analysis_cache[cache_key] = (now_ts, response)
+        if len(self._coin_analysis_cache) > 32:
+            oldest_key = min(
+                self._coin_analysis_cache.keys(),
+                key=lambda key_item: self._coin_analysis_cache[key_item][0],
+            )
+            self._coin_analysis_cache.pop(oldest_key, None)
+        return response
 
     async def _analyze_symbol_on_exchange(
         self,
@@ -4755,7 +4772,7 @@ class DataService:
             "symbol": canonical_symbol,
         }
         try:
-            adapter = get_adapter(exchange)
+            adapter = get_adapter_cached(exchange)
         except KeyError:
             result["status"] = "error"
             result["error"] = f"Adapter for {exchange} not registered."
