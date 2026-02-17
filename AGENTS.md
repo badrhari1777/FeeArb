@@ -82,6 +82,7 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- OKX next-funding fix: for instruments with hourly cadence (e.g., `OM-USDT-SWAP`), snapshot now uses the nearest upcoming settlement between `fundingTime` and `nextFundingTime` (instead of always `nextFundingTime`), eliminating +1 interval drift in UI (`exchanges/okx.py`, `tests/test_funding_history_adapters.py`).
 - Performance/API-load refactor: added reusable adapter-instance cache (`get_adapter_cached`) and switched hot paths (snapshot pipeline + webapp funding/positions/analysis calls) to cached adapters to reuse per-exchange metadata/session state (notably Kucoin contracts cache), reducing repeated adapter init and contract metadata fetches (`exchanges/__init__.py`, `pipeline/data_pipeline.py`, `webapp/services.py`).
 - Reduced funding/history overhead in service glue: `_load_funding_history_cached` now calls adapter-native `funding_history` directly with bounded lookback (`limit + 8`, capped), removing nested cache layers and cutting duplicate DB/cache work (`webapp/services.py`).
 - Snapshot batching for public market data: Binance and Gate adapters now fetch bulk ticker/funding/contract payloads once per refresh and only fallback to per-symbol calls when needed, significantly reducing HTTP request count for multi-symbol refreshes (`exchanges/binance.py`, `exchanges/gate.py`).

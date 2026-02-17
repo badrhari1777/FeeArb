@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from exchanges.binance import BinanceAdapter
 from exchanges.bybit import BybitAdapter
-from exchanges.okx import OKXAdapter
+from exchanges.okx import OKXAdapter, _resolve_next_funding_time
 from exchanges.gate import GateAdapter
 from exchanges.bitget import BitgetAdapter
 from exchanges.mexc import MexcAdapter
@@ -64,6 +65,18 @@ class FundingHistoryAdaptersTestCase(unittest.TestCase):
             rows = OKXAdapter().funding_history("BTCUSDT", limit=2)
         self.assertEqual(len(rows), 2)
         self.assertAlmostEqual(float(rows[0].get("interval_hours") or 0.0), 4.0, places=6)
+
+    def test_okx_next_funding_prefers_nearest_upcoming_slot(self) -> None:
+        now = datetime.now(timezone.utc)
+        funding_dt = now + timedelta(minutes=30)
+        next_dt = now + timedelta(minutes=90)
+        item = {
+            "fundingTime": str(int(funding_dt.timestamp() * 1000)),
+            "nextFundingTime": str(int(next_dt.timestamp() * 1000)),
+        }
+        chosen = _resolve_next_funding_time(item)
+        self.assertIsNotNone(chosen)
+        self.assertEqual(int(chosen.timestamp()), int(funding_dt.timestamp()))
 
     def test_gate_history_infers_interval_from_seconds_timestamps(self) -> None:
         payload = [

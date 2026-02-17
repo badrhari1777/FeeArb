@@ -57,7 +57,7 @@ class OKXAdapter(ExchangeAdapter):
                     symbol=canonical,
                     exchange_symbol=inst_id,
                     funding_rate=_to_float(funding_item.get("fundingRate")),
-                    next_funding_time=_to_datetime(funding_item.get("nextFundingTime")),
+                    next_funding_time=_resolve_next_funding_time(funding_item),
                     funding_interval_hours=_funding_interval_hours(funding_item),
                     mark_price=_to_float(ticker_item.get("markPx"))
                     or _to_float(ticker_item.get("last")),
@@ -172,3 +172,22 @@ def _funding_interval_hours(item: dict) -> float | None:
     if funding_ms is None or next_ms is None or next_ms <= funding_ms:
         return None
     return (next_ms - funding_ms) / 1000.0 / 3600.0
+
+
+def _resolve_next_funding_time(item: dict) -> datetime | None:
+    if not isinstance(item, dict):
+        return None
+    funding_dt = _to_datetime(item.get("fundingTime"))
+    next_dt = _to_datetime(item.get("nextFundingTime"))
+    if funding_dt is None:
+        return next_dt
+    if next_dt is None:
+        return funding_dt
+
+    now = datetime.now(timezone.utc)
+    # OKX can return both `fundingTime` (upcoming settlement) and
+    # `nextFundingTime` (one interval later). We need the nearest upcoming one.
+    candidates = [dt for dt in (funding_dt, next_dt) if dt >= now]
+    if candidates:
+        return min(candidates)
+    return max(funding_dt, next_dt)
