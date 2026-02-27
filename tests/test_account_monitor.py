@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
+import tempfile
 
 from execution.accounts import AccountMonitor
 
@@ -155,6 +157,156 @@ class AccountMonitorSummaryTestCase(unittest.TestCase):
         )
         self.assertIn("RIVERUSDT", text)
         self.assertNotIn("RIVERUSDTUSDT", text)
+
+    def test_summary_slot_claim_dedupes_with_sent_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.monitor._summary_slot_marker_dir = Path(tmpdir)
+            self.monitor._summary_slot_marker_dir.mkdir(parents=True, exist_ok=True)
+            slot_key = "2026-02-16 14"
+            acquired, claim_path, _reason = self.monitor._acquire_summary_slot_claim(slot_key)
+            self.assertTrue(acquired)
+            self.assertIsNotNone(claim_path)
+            self.monitor._finalize_summary_slot_claim(slot_key, claim_path, "ok")
+            acquired_again, _claim_again, reason_again = self.monitor._acquire_summary_slot_claim(slot_key)
+            self.assertFalse(acquired_again)
+            self.assertEqual(reason_again, "sent")
+
+    def test_summary_slot_claim_releases_on_http_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.monitor._summary_slot_marker_dir = Path(tmpdir)
+            self.monitor._summary_slot_marker_dir.mkdir(parents=True, exist_ok=True)
+            slot_key = "2026-02-16 14"
+            acquired, claim_path, _reason = self.monitor._acquire_summary_slot_claim(slot_key)
+            self.assertTrue(acquired)
+            self.assertIsNotNone(claim_path)
+            self.monitor._finalize_summary_slot_claim(slot_key, claim_path, "http_error")
+            acquired_again, _claim_again, reason_again = self.monitor._acquire_summary_slot_claim(slot_key)
+            self.assertTrue(acquired_again)
+            self.assertNotEqual(reason_again, "sent")
+
+    def test_summary_slot_claim_blocks_after_ambiguous_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.monitor._summary_slot_marker_dir = Path(tmpdir)
+            self.monitor._summary_slot_marker_dir.mkdir(parents=True, exist_ok=True)
+            slot_key = "2026-02-16 14"
+            acquired, claim_path, _reason = self.monitor._acquire_summary_slot_claim(slot_key)
+            self.assertTrue(acquired)
+            self.assertIsNotNone(claim_path)
+            self.monitor._finalize_summary_slot_claim(slot_key, claim_path, "error")
+            acquired_again, _claim_again, reason_again = self.monitor._acquire_summary_slot_claim(slot_key)
+            self.assertFalse(acquired_again)
+            self.assertEqual(reason_again, "claimed")
+
+
+class _FakeGateClient:
+    def __init__(self, *, fail_add: bool = False) -> None:
+        self.fail_add = fail_add
+        self.markets = {
+            "ORCA/USDT:USDT": {
+                "id": "ORCA_USDT",
+                "symbol": "ORCA/USDT:USDT",
+                "settle": "usdt",
+                "settleId": "USDT",
+                "swap": True,
+            }
+        }
+        self.currencies = {
+            "USDT": {"precision": 8},
+            "usdt": {"precision": 8},
+        }
+        self.add_margin_calls: list[tuple[str, float, dict]] = []
+        self.reduce_margin_calls: list[tuple[str, float, dict]] = []
+        self.dual_margin_calls: list[dict] = []
+
+    async def load_markets(self) -> dict:
+        return self.markets
+
+    def market(self, symbol: str) -> dict:
+        return self.markets[symbol]
+
+    def number_to_string(self, value: float) -> str:
+        return f"{float(value):.8f}".rstrip("0").rstrip(".")
+
+    async def add_margin(self, symbol: str, amount: float, params: dict) -> dict:
+        self.add_margin_calls.append((symbol, amount, dict(params)))
+        if self.fail_add:
+            raise RuntimeError('gate {"label":"INVALID_PROTOCOL","message":"invalid argument: #3"}')
+        return {"status": "ok", "method": "add_margin"}
+
+    async def reduce_margin(self, symbol: str, amount: float, params: dict) -> dict:
+        self.reduce_margin_calls.append((symbol, amount, dict(params)))
+        return {"status": "ok", "method": "reduce_margin"}
+
+    async def privateFuturesPostSettleDualCompPositionsContractMargin(self, request: dict) -> dict:
+        self.dual_margin_calls.append(dict(request))
+        return {"status": "ok", "method": "dual_comp_margin"}
+
+
+class _FakeGateway:
+    def __init__(self, client: _FakeGateClient) -> None:
+        self.client = client
+
+    async def refresh_credentials_async(self, force_env: bool = True) -> None:
+        _ = force_env
+
+    async def ensure_client(self) -> None:
+        return None
+
+    def map_symbol(self, symbol: str) -> str:
+        return symbol
+
+    async def close(self) -> None:
+        return None
+
+
+class AccountMonitorGateMarginTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_gate_dual_mode_add_uses_dual_endpoint(self) -> None:
+        monitor = AccountMonitor(refresh_interval=60, summary_interval=60)
+        client = _FakeGateClient()
+        monitor._gateways = {"gate": _FakeGateway(client)}
+        position = {
+            "symbol": "ORCA/USDT:USDT",
+            "exchange_symbol": "ORCA_USDT",
+            "side": "long",
+            "raw": {"info": {"mode": "dual_long"}},
+        }
+        result = await monitor._modify_margin(
+            exchange="gate",
+            position=position,
+            amount=114.06611570247928,
+            action="add",
+        )
+        self.assertEqual(result.get("status"), "ok")
+        self.assertEqual(len(client.add_margin_calls), 0)
+        self.assertEqual(len(client.dual_margin_calls), 1)
+        request = client.dual_margin_calls[0]
+        self.assertEqual(request.get("contract"), "ORCA_USDT")
+        self.assertEqual(request.get("dual_side"), "dual_long")
+        self.assertEqual(request.get("change"), "114.0661157")
+
+    async def test_gate_add_falls_back_to_dual_endpoint_on_invalid_protocol(self) -> None:
+        monitor = AccountMonitor(refresh_interval=60, summary_interval=60)
+        client = _FakeGateClient(fail_add=True)
+        monitor._gateways = {"gate": _FakeGateway(client)}
+        position = {
+            "symbol": "ORCA/USDT:USDT",
+            "exchange_symbol": "ORCA_USDT",
+            "side": "short",
+            "raw": {"info": {"mode": "single"}},
+        }
+        result = await monitor._modify_margin(
+            exchange="gate",
+            position=position,
+            amount=114.06611570247928,
+            action="add",
+        )
+        self.assertEqual(result.get("status"), "ok")
+        self.assertEqual(len(client.add_margin_calls), 1)
+        self.assertAlmostEqual(client.add_margin_calls[0][1], 114.0661157)
+        self.assertEqual(len(client.dual_margin_calls), 1)
+        request = client.dual_margin_calls[0]
+        self.assertEqual(request.get("dual_side"), "dual_short")
+        self.assertEqual(request.get("change"), "114.0661157")
 
 
 if __name__ == "__main__":

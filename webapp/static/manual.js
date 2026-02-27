@@ -905,6 +905,8 @@
     var bookEl = document.getElementById(prefix + '-live-book');
     var ws = null;
     var reconnectTimer = null;
+    var lastStreamKey = null;
+    var lastPayloadKey = null;
 
     applyLivePrefs(prefix);
 
@@ -940,7 +942,53 @@
       return payload;
     }
 
-    function subscribe() {
+    function streamKey(payload) {
+      return [
+        String(payload && payload.symbol || '').toUpperCase(),
+        String(payload && payload.long_exchange || '').toLowerCase(),
+        String(payload && payload.short_exchange || '').toLowerCase()
+      ].join('|');
+    }
+
+    function payloadKey(payload) {
+      return [
+        streamKey(payload),
+        payload && payload.include_orderbook ? '1' : '0',
+        String(payload && payload.orderbook_depth || ''),
+        payload && payload.spread_min_pct !== null && payload.spread_min_pct !== undefined ? String(payload.spread_min_pct) : '',
+        payload && payload.spread_max_pct !== null && payload.spread_max_pct !== undefined ? String(payload.spread_max_pct) : ''
+      ].join('|');
+    }
+
+    function shouldRefreshForField(targetId) {
+      if (!targetId) {
+        return true;
+      }
+      if (targetId === (prefix + '-symbol')) {
+        return true;
+      }
+      if (targetId === (prefix + '-action')) {
+        return true;
+      }
+      if (targetId === longId || targetId === shortId) {
+        return true;
+      }
+      if (targetId === (prefix + '-from-exchange') || targetId === (prefix + '-to-exchange')) {
+        return true;
+      }
+      if (targetId === (prefix + '-spread-min') || targetId === (prefix + '-spread-max')) {
+        return true;
+      }
+      if (targetId === (prefix + '-live-orderbook') || targetId === (prefix + '-live-depth')) {
+        return true;
+      }
+      return false;
+    }
+
+    function subscribe(options) {
+      options = options || {};
+      var force = !!options.force;
+      var reconnect = !!options.reconnect;
       if (!ws || ws.readyState !== 1) {
         return;
       }
@@ -950,6 +998,8 @@
         if (bookEl) {
           bookEl.textContent = '';
         }
+        lastStreamKey = null;
+        lastPayloadKey = null;
         return;
       }
       if (!payload.symbol || !payload.long_exchange || !payload.short_exchange) {
@@ -957,13 +1007,24 @@
         if (bookEl) {
           bookEl.textContent = '';
         }
+        lastStreamKey = null;
+        lastPayloadKey = null;
+        return;
+      }
+      var nextStreamKey = streamKey(payload);
+      var nextPayloadKey = payloadKey(payload);
+      if (!force && nextPayloadKey === lastPayloadKey) {
         return;
       }
       ws.send(JSON.stringify(payload));
-      setLive('Live spread: connecting...', '');
+      if (reconnect || nextStreamKey !== lastStreamKey) {
+        setLive('Live spread: connecting...', '');
+      }
       if (bookEl && !payload.include_orderbook) {
         bookEl.textContent = 'Live orderbook: off';
       }
+      lastStreamKey = nextStreamKey;
+      lastPayloadKey = nextPayloadKey;
     }
 
     function connect() {
@@ -972,7 +1033,7 @@
       }
       ws = new WebSocket(wsUrl());
       ws.onopen = function () {
-        subscribe();
+        subscribe({ force: true, reconnect: true });
       };
       ws.onmessage = function (evt) {
         var data = null;
@@ -1038,6 +1099,8 @@
         }
       };
       ws.onclose = function () {
+        lastStreamKey = null;
+        lastPayloadKey = null;
         if (reconnectTimer) {
           return;
         }
@@ -1054,6 +1117,7 @@
     if (form) {
       form.addEventListener('change', function (evt) {
         var target = evt && evt.target ? evt.target : null;
+        var targetId = target && target.id ? target.id : '';
         var isLiveField = target && target.id && (
           target.id === (prefix + '-live-orderbook') ||
           target.id === (prefix + '-live-depth')
@@ -1061,6 +1125,9 @@
         if (isLiveField) {
           saveLivePrefs(prefix);
           persistManualSettings();
+        }
+        if (!shouldRefreshForField(targetId)) {
+          return;
         }
         subscribe();
       });

@@ -17,9 +17,11 @@ logger = logging.getLogger(__name__)
 class KucoinAdapter(ExchangeAdapter):
     name = "kucoin"
     base_url = "https://api-futures.kucoin.com"
+    _CONTRACTS_TTL_SEC = 30.0
 
     def __init__(self) -> None:
         self._contracts: Dict[str, dict] | None = None
+        self._contracts_loaded_at: float | None = None
 
     def map_symbol(self, symbol: str) -> str | None:
         symbol = symbol.upper().strip()
@@ -75,19 +77,39 @@ class KucoinAdapter(ExchangeAdapter):
 
         return snapshots
 
-    def _load_contracts(self) -> Dict[str, dict]:
-        if self._contracts is not None:
+    def _load_contracts(self, *, force: bool = False) -> Dict[str, dict]:
+        if self._contracts is not None and not force:
+            if self._contracts_loaded_at is not None:
+                age_sec = time.time() - self._contracts_loaded_at
+                if age_sec <= self._CONTRACTS_TTL_SEC:
+                    return self._contracts
+            else:
+                # Backward-compat fallback if timestamp was not set.
+                return self._contracts
+
+        stale_cache = self._contracts
+        url = f"{self.base_url}/api/v1/contracts/active"
+        try:
+            payload = _get_json(url)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("KuCoin: contracts request failed: %s", exc)
+            if stale_cache is not None:
+                return stale_cache
+            self._contracts = {}
+            self._contracts_loaded_at = time.time()
             return self._contracts
 
-        url = f"{self.base_url}/api/v1/contracts/active"
-        payload = _get_json(url)
         if payload.get("code") != "200000":
             logger.warning("KuCoin: contracts error: %s", payload.get("msg"))
+            if stale_cache is not None:
+                return stale_cache
             self._contracts = {}
+            self._contracts_loaded_at = time.time()
             return self._contracts
 
         data = payload.get("data") or []
         self._contracts = {item.get("symbol"): item for item in data if isinstance(item, dict)}
+        self._contracts_loaded_at = time.time()
         return self._contracts
 
     def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:

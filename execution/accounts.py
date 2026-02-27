@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 import aiohttp
-from config import BASE_DIR
+from config import BASE_DIR, STATE_DIR
 
 try:
     import ccxt.async_support as ccxt_async  # type: ignore
@@ -27,6 +27,7 @@ SUMMARY_TZ = timezone(timedelta(hours=3))
 SUMMARY_SLOT_MINUTE = 40
 SUMMARY_SLOT_WINDOW_MINUTES = 20
 SUMMARY_QTY_DELTA_EPS = 1e-8
+SUMMARY_SLOT_RETENTION_SEC = 72 * 3600
 EXCHANGE_ABBR: dict[str, str] = {
     "binance": "BN",
     "okx": "OK",
@@ -708,6 +709,7 @@ class AccountMonitor:
         self._last_updated: str | None = None
         self._task: asyncio.Task | None = None
         self._last_summary_slot: str | None = None
+        self._summary_slot_marker_dir = STATE_DIR / "telegram_summary_slots"
         self._alert_cooldown = 600  # seconds
         self._alert_lock = asyncio.Lock()
         self._telegram_warned = False
@@ -730,6 +732,7 @@ class AccountMonitor:
         self._missing_stop_alerts_enabled = True
         self._active_position_alerts: Set[tuple[str, str, str]] = set()
         self._last_position_alert_sent: dict[tuple[str, str, str], float] = {}
+        self._summary_slot_marker_dir.mkdir(parents=True, exist_ok=True)
         atexit.register(self._sync_close_gateways)
 
     async def start(self) -> None:
@@ -947,11 +950,85 @@ class AccountMonitor:
             return
         if slot_key == self._last_summary_slot:
             return
+        acquired, claim_path, reason = self._acquire_summary_slot_claim(slot_key)
+        if not acquired:
+            if reason in {"sent", "claimed"}:
+                self._last_summary_slot = slot_key
+            return
         warnings = await self._mexc_stop_warnings(positions) if self._missing_stop_alerts_enabled else []
         summary_positions = await self._positions_for_summary(positions)
         text = self._build_positions_summary(summary_positions, refreshed_at, warnings)
-        if await self._send_telegram_text(text):
+        send_status = await self._send_telegram_text_status(text)
+        self._finalize_summary_slot_claim(slot_key, claim_path, send_status)
+        if send_status == "ok":
             self._last_summary_slot = slot_key
+
+    def _summary_slot_file_stem(self, slot_key: str) -> str:
+        return slot_key.replace(" ", "_").replace(":", "-")
+
+    def _summary_slot_claim_path(self, slot_key: str) -> Path:
+        return self._summary_slot_marker_dir / f"{self._summary_slot_file_stem(slot_key)}.claim"
+
+    def _summary_slot_sent_path(self, slot_key: str) -> Path:
+        return self._summary_slot_marker_dir / f"{self._summary_slot_file_stem(slot_key)}.sent"
+
+    def _prune_summary_slot_markers(self) -> None:
+        cutoff = time.time() - SUMMARY_SLOT_RETENTION_SEC
+        try:
+            markers = list(self._summary_slot_marker_dir.glob("*.claim"))
+            markers.extend(self._summary_slot_marker_dir.glob("*.sent"))
+        except OSError:
+            return
+        for marker in markers:
+            try:
+                if marker.stat().st_mtime < cutoff:
+                    marker.unlink(missing_ok=True)
+            except OSError:
+                continue
+
+    def _acquire_summary_slot_claim(self, slot_key: str) -> tuple[bool, Path | None, str]:
+        self._prune_summary_slot_markers()
+        sent_path = self._summary_slot_sent_path(slot_key)
+        if sent_path.exists():
+            return False, None, "sent"
+        claim_path = self._summary_slot_claim_path(slot_key)
+        try:
+            fd = os.open(str(claim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            return False, None, "claimed"
+        except OSError as exc:
+            logger.warning("summary slot claim failed (%s): %s", slot_key, exc)
+            return True, None, "claim_bypass"
+        try:
+            marker_payload = f"pid={os.getpid()} ts={datetime.now(timezone.utc).isoformat()}\n"
+            os.write(fd, marker_payload.encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True, claim_path, "claimed"
+
+    def _finalize_summary_slot_claim(self, slot_key: str, claim_path: Path | None, send_status: str) -> None:
+        if claim_path is None:
+            return
+        if send_status == "ok":
+            sent_path = self._summary_slot_sent_path(slot_key)
+            try:
+                claim_path.replace(sent_path)
+            except FileNotFoundError:
+                return
+            except OSError as exc:
+                logger.warning("summary slot marker finalize failed (%s): %s", slot_key, exc)
+            return
+        if send_status in {"http_error", "skipped"}:
+            try:
+                claim_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        # Ambiguous transport failure: keep claim for this slot to suppress duplicates.
+        logger.warning(
+            "summary send uncertain for slot %s; retries suppressed until next slot",
+            slot_key,
+        )
 
     async def _positions_for_summary(self, positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         prepared = [dict(item) for item in (positions or [])]
@@ -1717,6 +1794,194 @@ class AccountMonitor:
                 )
             raise
 
+    def _gate_side_to_dual_side(self, value: Any) -> str | None:
+        side = str(value or "").strip().lower()
+        if side in {"dual_long", "long", "buy", "bid"}:
+            return "dual_long"
+        if side in {"dual_short", "short", "sell", "ask"}:
+            return "dual_short"
+        return None
+
+    def _gate_dual_side_for_position(self, position: Mapping[str, Any]) -> str | None:
+        raw = position.get("raw") or {}
+        info = raw.get("info") if isinstance(raw, dict) else None
+        candidates = [
+            position.get("side"),
+            position.get("dual_side"),
+            raw.get("side") if isinstance(raw, dict) else None,
+            raw.get("dual_side") if isinstance(raw, dict) else None,
+            info.get("side") if isinstance(info, dict) else None,
+            info.get("dual_side") if isinstance(info, dict) else None,
+            raw.get("mode") if isinstance(raw, dict) else None,
+            info.get("mode") if isinstance(info, dict) else None,
+        ]
+        for candidate in candidates:
+            dual_side = self._gate_side_to_dual_side(candidate)
+            if dual_side:
+                return dual_side
+        return None
+
+    def _gate_is_dual_mode_position(self, position: Mapping[str, Any]) -> bool:
+        raw = position.get("raw") or {}
+        info = raw.get("info") if isinstance(raw, dict) else None
+        mode_candidates = [
+            position.get("mode"),
+            position.get("position_mode"),
+            raw.get("mode") if isinstance(raw, dict) else None,
+            raw.get("position_mode") if isinstance(raw, dict) else None,
+            info.get("mode") if isinstance(info, dict) else None,
+            info.get("position_mode") if isinstance(info, dict) else None,
+        ]
+        for mode_value in mode_candidates:
+            mode = str(mode_value or "").strip().lower()
+            if not mode:
+                continue
+            if mode.startswith("dual"):
+                return True
+            if mode == "single":
+                return False
+        bool_candidates = [
+            position.get("in_dual_mode"),
+            position.get("dual_mode"),
+            raw.get("in_dual_mode") if isinstance(raw, dict) else None,
+            raw.get("dual_mode") if isinstance(raw, dict) else None,
+            info.get("in_dual_mode") if isinstance(info, dict) else None,
+            info.get("dual_mode") if isinstance(info, dict) else None,
+        ]
+        for value in bool_candidates:
+            if isinstance(value, bool):
+                return value
+            if value is None:
+                continue
+            cleaned = str(value).strip().lower()
+            if cleaned in {"true", "1"}:
+                return True
+            if cleaned in {"false", "0"}:
+                return False
+        return False
+
+    async def _gate_prepare_margin_change(
+        self,
+        client: Any,
+        symbol: str,
+        signed_amount: float,
+    ) -> tuple[float, Mapping[str, Any] | None]:
+        digits = 8
+        market: Mapping[str, Any] | None = None
+        try:
+            await client.load_markets()
+            market = client.market(symbol)
+            settle = None
+            if isinstance(market, dict):
+                settle = market.get("settle") or market.get("settleId")
+            currencies = getattr(client, "currencies", None) or {}
+            if settle:
+                settle_key = str(settle)
+                currency = (
+                    currencies.get(settle_key)
+                    or currencies.get(settle_key.upper())
+                    or currencies.get(settle_key.lower())
+                )
+                precision = currency.get("precision") if isinstance(currency, dict) else None
+                if isinstance(precision, (int, float)) and precision >= 0:
+                    digits = max(0, min(12, int(precision)))
+        except Exception:  # pylint: disable=broad-except
+            market = None
+        normalized = round(float(signed_amount), digits)
+        if normalized == 0 and signed_amount != 0:
+            normalized = float(signed_amount)
+        return normalized, market
+
+    def _gate_is_margin_protocol_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        if "invalid_protocol" in message and ("invalid argument" in message or "#3" in message):
+            return True
+        if "missing_required_param" in message and "dual_side" in message:
+            return True
+        return False
+
+    async def _gate_update_margin_dual(
+        self,
+        client: Any,
+        symbol: str,
+        position: Mapping[str, Any],
+        signed_change: float,
+        params: Mapping[str, Any],
+        market_hint: Mapping[str, Any] | None = None,
+    ) -> Any:
+        if not hasattr(client, "privateFuturesPostSettleDualCompPositionsContractMargin"):
+            raise RuntimeError("gate_dual_margin_unsupported")
+        market = market_hint
+        if market is None:
+            await client.load_markets()
+            market = client.market(symbol)
+        contract = None
+        settle = "usdt"
+        if isinstance(market, dict):
+            contract = market.get("id")
+            settle_value = market.get("settle") or market.get("settleId")
+            if settle_value:
+                settle = str(settle_value).lower()
+        if not contract:
+            contract = position.get("exchange_symbol") or position.get("symbol")
+        if not contract:
+            raise RuntimeError("gate_contract_unavailable")
+        dual_side = self._gate_dual_side_for_position(position)
+        if not dual_side:
+            raise RuntimeError("gate_dual_side_unavailable")
+        change_value = (
+            client.number_to_string(signed_change)
+            if hasattr(client, "number_to_string")
+            else str(signed_change)
+        )
+        request: dict[str, Any] = {
+            "settle": settle,
+            "contract": contract,
+            "change": change_value,
+            "dual_side": dual_side,
+        }
+        if isinstance(params, Mapping):
+            request.update(params)
+        return await client.privateFuturesPostSettleDualCompPositionsContractMargin(request)
+
+    async def _gate_modify_margin(
+        self,
+        client: Any,
+        symbol: str,
+        position: Mapping[str, Any],
+        signed_amount: float,
+        params: Mapping[str, Any],
+    ) -> Any:
+        normalized_change, market = await self._gate_prepare_margin_change(client, symbol, signed_amount)
+        if self._gate_is_dual_mode_position(position):
+            return await self._gate_update_margin_dual(
+                client=client,
+                symbol=symbol,
+                position=position,
+                signed_change=normalized_change,
+                params=params,
+                market_hint=market,
+            )
+        try:
+            if normalized_change >= 0:
+                if not hasattr(client, "add_margin"):
+                    raise RuntimeError("add_margin_unsupported")
+                return await client.add_margin(symbol, normalized_change, dict(params))
+            if not hasattr(client, "reduce_margin"):
+                raise RuntimeError("reduce_margin_unsupported")
+            return await client.reduce_margin(symbol, abs(normalized_change), dict(params))
+        except Exception as exc:  # pylint: disable=broad-except
+            if self._gate_is_margin_protocol_error(exc) and self._gate_dual_side_for_position(position):
+                return await self._gate_update_margin_dual(
+                    client=client,
+                    symbol=symbol,
+                    position=position,
+                    signed_change=normalized_change,
+                    params=params,
+                    market_hint=market,
+                )
+            raise
+
     async def _modify_margin(
         self,
         *,
@@ -1744,6 +2009,14 @@ class AccountMonitor:
         async def _reduce_margin(amount_value: float) -> Any:
             if exchange == "bybit" and hasattr(client, "private_post_v5_position_add_margin"):
                 return await self._bybit_add_margin(client, symbol, -abs(amount_value), position)
+            if exchange == "gate":
+                return await self._gate_modify_margin(
+                    client=client,
+                    symbol=symbol,
+                    position=position,
+                    signed_amount=-abs(amount_value),
+                    params=params,
+                )
             if exchange == "kucoin":
                 return await self._kucoin_withdraw_margin(client, symbol, amount_value)
             if not hasattr(client, "reduce_margin"):
@@ -1755,6 +2028,14 @@ class AccountMonitor:
             if action == "add":
                 if exchange == "bybit" and hasattr(client, "private_post_v5_position_add_margin"):
                     result = await self._bybit_add_margin(client, symbol, amount, position)
+                elif exchange == "gate":
+                    result = await self._gate_modify_margin(
+                        client=client,
+                        symbol=symbol,
+                        position=position,
+                        signed_amount=amount,
+                        params=params,
+                    )
                 elif hasattr(client, "add_margin"):
                     result = await client.add_margin(symbol, amount, params)
                 else:
@@ -2154,14 +2435,14 @@ class AccountMonitor:
         result.update({"action": "reduce", "amount": reduce_amt, "buffer_pct": buffer_pct})
         return result
 
-    async def _send_telegram_text(self, text: str) -> bool:
+    async def _send_telegram_text_status(self, text: str) -> str:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         if not token or not chat_id:
             if not self._telegram_warned:
                 logger.info("Telegram send skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set")
                 self._telegram_warned = True
-            return False
+            return "skipped"
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         data = {"chat_id": chat_id, "text": text}
         try:
@@ -2170,11 +2451,14 @@ class AccountMonitor:
                     if resp.status >= 400:
                         body = await resp.text()
                         logger.warning("Telegram alert failed (%s): %s", resp.status, body)
-                        return False
-            return True
+                        return "http_error"
+            return "ok"
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("Telegram alert error: %s", exc)
-            return False
+            return "error"
+
+    async def _send_telegram_text(self, text: str) -> bool:
+        return (await self._send_telegram_text_status(text)) == "ok"
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:

@@ -8,11 +8,19 @@ if (!(Test-Path $scriptPath)) {
 }
 
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$triggers = @(
+    New-ScheduledTaskTrigger -AtStartup
+    New-ScheduledTaskTrigger -AtLogOn
+)
+$settings = New-ScheduledTaskSettingsSet `
+    -StartWhenAvailable `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -RestartCount 10 `
+    -RestartInterval (New-TimeSpan -Minutes 1)
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
 
-$task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings -Principal $principal
+$task = New-ScheduledTask -Action $action -Trigger $triggers -Settings $settings -Principal $principal
 
 try {
     Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
@@ -21,4 +29,3 @@ try {
 }
 
 Write-Output "Installed scheduled task: $taskName"
-

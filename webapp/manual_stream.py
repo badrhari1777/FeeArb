@@ -149,6 +149,7 @@ class ManualSpreadStream:
         self._stop = asyncio.Event()
         self._config: dict[str, Any] = {}
         self._subscriptions: dict[str, str] = {}
+        self._stream_key: tuple[str, str, str] | None = None
 
     async def run(self) -> None:
         try:
@@ -165,15 +166,25 @@ class ManualSpreadStream:
             await self._shutdown()
 
     async def _start_stream(self, message: dict[str, Any]) -> None:
-        await self._shutdown()
-        self._config = message
-        self._stop.clear()
         symbol = str(message.get("symbol") or "").upper()
         long_exchange = normalize_exchange_name(str(message.get("long_exchange") or "")).lower()
         short_exchange = normalize_exchange_name(str(message.get("short_exchange") or "")).lower()
         if not symbol or not long_exchange or not short_exchange:
             await self._websocket.send_json({"type": "error", "error": "missing subscription fields"})
             return
+        next_config = dict(message)
+        next_config["symbol"] = symbol
+        next_config["long_exchange"] = long_exchange
+        next_config["short_exchange"] = short_exchange
+        next_key = (symbol, long_exchange, short_exchange)
+        if self._tasks and self._stream_key == next_key:
+            # Keep existing WS loops alive; only update dispatch settings.
+            self._config = next_config
+            return
+        await self._shutdown()
+        self._config = next_config
+        self._stream_key = next_key
+        self._stop.clear()
         exchanges = {long_exchange, short_exchange}
         self._subscriptions = self._build_subscriptions(symbol, exchanges)
         if "bybit" in exchanges:
@@ -207,16 +218,11 @@ class ManualSpreadStream:
                 pass
         self._tasks.clear()
         self._subscriptions = {}
+        self._stream_key = None
 
     async def _dispatch_loop(self) -> None:
         latest: dict[str, OrderBookLite] = {}
         last_seen: dict[str, float] = {}
-        long_exchange = normalize_exchange_name(str(self._config.get("long_exchange") or "")).lower()
-        short_exchange = normalize_exchange_name(str(self._config.get("short_exchange") or "")).lower()
-        spread_min_pct = _safe_float(self._config.get("spread_min_pct"))
-        spread_max_pct = _safe_float(self._config.get("spread_max_pct"))
-        include_orderbook = bool(self._config.get("include_orderbook"))
-        orderbook_depth = int(_safe_float(self._config.get("orderbook_depth")) or 5)
         last_status = 0.0
         while not self._stop.is_set():
             update = None
@@ -229,6 +235,15 @@ class ManualSpreadStream:
                 if exchange:
                     latest[exchange] = update["book"]
                     last_seen[exchange] = time.time()
+            config = self._config or {}
+            symbol = str(config.get("symbol") or "")
+            long_exchange = normalize_exchange_name(str(config.get("long_exchange") or "")).lower()
+            short_exchange = normalize_exchange_name(str(config.get("short_exchange") or "")).lower()
+            spread_min_pct = _safe_float(config.get("spread_min_pct"))
+            spread_max_pct = _safe_float(config.get("spread_max_pct"))
+            include_orderbook = bool(config.get("include_orderbook"))
+            orderbook_depth = int(_safe_float(config.get("orderbook_depth")) or 5)
+            orderbook_depth = max(1, orderbook_depth)
             long_book = latest.get(long_exchange)
             short_book = latest.get(short_exchange)
             now = time.time()
@@ -244,7 +259,7 @@ class ManualSpreadStream:
                             within = False
                 payload = {
                     "type": "spread",
-                    "symbol": str(self._config.get("symbol") or ""),
+                    "symbol": symbol,
                     "long_exchange": long_exchange,
                     "short_exchange": short_exchange,
                     "spread_pct": spread_value,
@@ -269,7 +284,7 @@ class ManualSpreadStream:
                     {
                         "type": "status",
                         "status": "waiting",
-                        "symbol": str(self._config.get("symbol") or ""),
+                        "symbol": symbol,
                         "missing": missing,
                         "last_seen": {key: last_seen.get(key) for key in missing},
                         "subscriptions": dict(self._subscriptions),

@@ -51,7 +51,12 @@ Validate:
 
 ```powershell
 Get-ScheduledTask -TaskName "FeeArb Public UI (Tailscale Funnel)" | Select-Object TaskName,State
+Get-ScheduledTaskInfo -TaskName "FeeArb Public UI (Tailscale Funnel)" | Select-Object LastRunTime,LastTaskResult
 ```
+
+Task behavior installed by the script:
+- Triggers: `At startup` and `At logon`.
+- Recovery: restarts up to 10 times with 1-minute interval if the start script fails.
 
 ## 4) Test reboot behavior
 
@@ -71,4 +76,3 @@ Get-ScheduledTask -TaskName "FeeArb Public UI (Tailscale Funnel)" | Select-Objec
 ```powershell
 & "C:\Projects\FeeArb\scripts\windows\uninstall_autostart_task.ps1"
 ```
-

@@ -174,6 +174,40 @@ def _position_delta_for_leg(start: float, current: float, leg: Mapping[str, Any]
     return max(0.0, current - start)
 
 
+def _cap_qty_to_target(
+    *,
+    requested_qty: float,
+    target_qty: float,
+    leg_delta: float,
+    amount_step: float | None = None,
+) -> float:
+    requested = max(0.0, _safe_float(requested_qty) or 0.0)
+    target = max(0.0, _safe_float(target_qty) or 0.0)
+    delta = max(0.0, _safe_float(leg_delta) or 0.0)
+    remaining_to_target = max(0.0, target - delta)
+    capped = min(requested, remaining_to_target)
+    if amount_step:
+        capped = _round_to_step(capped, amount_step, mode="down")
+    return max(0.0, capped)
+
+
+def _cap_qty_to_absolute_target(
+    *,
+    requested_qty: float,
+    target_qty: float,
+    current_qty: float,
+    amount_step: float | None = None,
+) -> float:
+    requested = max(0.0, _safe_float(requested_qty) or 0.0)
+    target = max(0.0, _safe_float(target_qty) or 0.0)
+    current = max(0.0, _safe_float(current_qty) or 0.0)
+    remaining_to_target = max(0.0, target - current)
+    capped = min(requested, remaining_to_target)
+    if amount_step:
+        capped = _round_to_step(capped, amount_step, mode="down")
+    return max(0.0, capped)
+
+
 def _choose_chunk_qty(
     *,
     remaining: float,
@@ -421,6 +455,8 @@ def _bingx_invalid_leverage_params(exc: Exception) -> bool:
         "109400" in message
         or "invalid parameters" in message
         or "invalid parameter" in message
+        or "requires a side argument" in message
+        or "one of (long, short, both)" in message
     )
 
 
@@ -1067,6 +1103,10 @@ class ManualTradeManager:
                     last_info = info
                     filled = _safe_float(info.get("filled_qty")) or 0.0
                     status = str(info.get("status") or "").lower()
+                    # Some WS streams can emit terminal state with zero fill before
+                    # REST catches up; treat it as inconclusive and continue probing.
+                    if status in ("filled", "closed", "finished") and filled <= 0:
+                        status = "open"
                     if expected_qty and filled >= expected_qty * 0.999:
                         result = {
                             "exchange": exchange,
@@ -1136,30 +1176,33 @@ class ManualTradeManager:
             if last_info:
                 filled = _safe_float(last_info.get("filled_qty")) or 0.0
                 status = str(last_info.get("status") or "open").lower()
-                if status in ("filled", "closed", "finished"):
+                if status in ("filled", "closed", "finished") and filled <= 0:
+                    status = "open"
+                elif status in ("filled", "closed", "finished"):
                     status = "filled"
                 elif filled > 0:
                     status = "partial"
-                result = {
-                    "exchange": exchange,
-                    "status": status,
-                    "order_id": order_id,
-                    "filled_qty": filled,
-                    "avg_price": last_info.get("avg_price"),
-                    "source": "ws",
-                    "ts": _now_iso(),
-                }
-                self._emit_order_status(
-                    log_cb,
-                    exchange=exchange,
-                    label=leg.get("label"),
-                    order_id=order_id,
-                    status=result.get("status"),
-                    filled_qty=result.get("filled_qty"),
-                    avg_price=result.get("avg_price"),
-                    source=result.get("source"),
-                )
-                return result
+                if status != "open" or filled > 0:
+                    result = {
+                        "exchange": exchange,
+                        "status": status,
+                        "order_id": order_id,
+                        "filled_qty": filled,
+                        "avg_price": last_info.get("avg_price"),
+                        "source": "ws",
+                        "ts": _now_iso(),
+                    }
+                    self._emit_order_status(
+                        log_cb,
+                        exchange=exchange,
+                        label=leg.get("label"),
+                        order_id=order_id,
+                        status=result.get("status"),
+                        filled_qty=result.get("filled_qty"),
+                        avg_price=result.get("avg_price"),
+                        source=result.get("source"),
+                    )
+                    return result
         else:
             self._emit_story(
                 log_cb,
@@ -1635,9 +1678,18 @@ class ManualTradeManager:
                     "warnings": list(adjusted_plan.get("warnings") or []),
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                 }
+            legs = list(adjusted_plan.get("legs") or [])
+            exchanges = []
+            for leg in legs:
+                exchange = normalize_exchange_name(str(leg.get("exchange") or ""))
+                if exchange and exchange not in exchanges:
+                    exchanges.append(exchange)
+            tracked_exchanges = set(exchanges)
             if log_cb:
                 def _ws_event_cb(payload: Mapping[str, Any]) -> None:
-                    exchange = str(payload.get("exchange") or "")
+                    exchange = normalize_exchange_name(str(payload.get("exchange") or ""))
+                    if tracked_exchanges and exchange not in tracked_exchanges:
+                        return
                     action = str(payload.get("action") or "event")
                     if action in ("listen_key_expired", "listen_key_failed"):
                         self._mark_ws_order_blocked(exchange, action)
@@ -1670,12 +1722,6 @@ class ManualTradeManager:
                     adjusted_plan.setdefault("warnings", []).append(
                         "mode overridden to smart-roll because chunking requested"
                     )
-            legs = list(adjusted_plan.get("legs") or [])
-            exchanges = []
-            for leg in legs:
-                exchange = normalize_exchange_name(str(leg.get("exchange") or ""))
-                if exchange and exchange not in exchanges:
-                    exchanges.append(exchange)
             await self._log_positions_snapshot(
                 exchanges=exchanges,
                 symbol=str(adjusted_plan.get("symbol") or ""),
@@ -1737,54 +1783,69 @@ class ManualTradeManager:
                     )
             if current is not None and abs(current - DEFAULT_MANUAL_LEVERAGE) <= 0.05:
                 continue
-            try:
-                await client.set_leverage(DEFAULT_MANUAL_LEVERAGE, ccxt_symbol, {"side": side})
-                self._emit_log(
-                    log_cb,
-                    "precheck",
-                    "bingx leverage set",
-                    {
+            variants: list[tuple[str, Mapping[str, Any] | None]] = [
+                (side, {"side": side}),
+                ("BOTH", {"side": "BOTH"}),
+                ("default", {}),
+            ]
+            last_exc: Exception | None = None
+            invalid_param_only = True
+            set_ok = False
+            for variant_name, params in variants:
+                try:
+                    await client.set_leverage(DEFAULT_MANUAL_LEVERAGE, ccxt_symbol, params or None)
+                    payload = {
                         "exchange": exchange,
                         "symbol": symbol,
-                        "side": side,
+                        "side": variant_name,
                         "leverage": DEFAULT_MANUAL_LEVERAGE,
                         "previous": current,
-                    },
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                if _bingx_invalid_leverage_params(exc):
-                    try:
-                        await client.set_leverage(DEFAULT_MANUAL_LEVERAGE, ccxt_symbol, {"side": "BOTH"})
-                        self._emit_log(
-                            log_cb,
-                            "precheck",
-                            "bingx leverage set",
-                            {
-                                "exchange": exchange,
-                                "symbol": symbol,
-                                "side": "BOTH",
-                                "leverage": DEFAULT_MANUAL_LEVERAGE,
-                                "previous": current,
-                                "fallback_from": side,
-                                "fallback_error": str(exc),
-                            },
-                        )
-                        continue
-                    except Exception as fallback_exc:  # pylint: disable=broad-except
-                        exc = fallback_exc
-                errors.append(f"{exchange}: set leverage failed ({side})")
+                    }
+                    if variant_name != side:
+                        payload["fallback_from"] = side
+                    self._emit_log(
+                        log_cb,
+                        "precheck",
+                        "bingx leverage set",
+                        payload,
+                    )
+                    set_ok = True
+                    break
+                except Exception as exc:  # pylint: disable=broad-except
+                    last_exc = exc
+                    if not _bingx_invalid_leverage_params(exc):
+                        invalid_param_only = False
+                        break
+            if set_ok:
+                continue
+            if invalid_param_only and last_exc is not None:
                 self._emit_log(
                     log_cb,
-                    "error",
-                    "bingx leverage set failed",
+                    "warn",
+                    "bingx leverage precheck skipped (invalid params)",
                     {
                         "exchange": exchange,
                         "symbol": symbol,
                         "side": side,
                         "leverage": DEFAULT_MANUAL_LEVERAGE,
-                        "error": str(exc),
+                        "error": str(last_exc),
                     },
                 )
+                continue
+            error_text = str(last_exc) if last_exc is not None else "unknown_error"
+            errors.append(f"{exchange}: set leverage failed ({side})")
+            self._emit_log(
+                log_cb,
+                "error",
+                "bingx leverage set failed",
+                {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "side": side,
+                    "leverage": DEFAULT_MANUAL_LEVERAGE,
+                    "error": error_text,
+                },
+            )
         return errors
 
     async def _ensure_kucoin_margin_mode_for_legs(
@@ -3743,11 +3804,19 @@ class ManualTradeManager:
                 return
             pending_qty = _safe_float(hedge_result.get("pending_qty"))
             if pending_qty:
-                _vlog(
-                    "wait",
-                    "hedge remainder below minimum; skipping",
-                    {"pending_qty": pending_qty, "min_qty": min_hedge_qty, "reason": reason},
-                )
+                if min_hedge_qty and pending_qty < min_hedge_qty:
+                    _vlog(
+                        "wait",
+                        "hedge remainder below minimum; skipping",
+                        {"pending_qty": pending_qty, "min_qty": min_hedge_qty, "reason": reason},
+                    )
+                else:
+                    pending_hedge_qty += pending_qty
+                    _vlog(
+                        "wait",
+                        "hedge remainder pending; re-queued",
+                        {"pending_qty": pending_qty, "min_qty": min_hedge_qty, "reason": reason},
+                    )
 
         while remaining > 0 and (time.time() - started_at) < max_runtime_sec:
             if self._stop_requested():
@@ -4022,6 +4091,9 @@ class ManualTradeManager:
                     active_filled = 0.0
                     active_since = None
                     await _sync_primary_fills("post_reprice_cancel", delay=0.2, include_active=False)
+                    await _pause_after_cancel("post_reprice_cancel")
+                    await asyncio.sleep(max(0.2, reprice_sec))
+                    continue
 
             if active_order_id is None:
                 self._emit_log(
@@ -4999,6 +5071,10 @@ class ManualTradeManager:
             side=hedge_side,
             symbol=symbol,
         )
+        # Smart-enter qty is an incremental target relative to start snapshot.
+        # Absolute safety caps must use start+qty, not qty alone.
+        primary_target_abs = max(0.0, primary_pos_start + qty)
+        hedge_target_abs = max(0.0, hedge_pos_start + qty)
 
         remaining = qty
         pending_hedge_qty = 0.0
@@ -5449,6 +5525,8 @@ class ManualTradeManager:
                 )
                 primary_delta = primary_filled_total
                 hedge_delta = hedge_filled_total
+                primary_current = primary_pos_start + primary_delta
+                hedge_current = hedge_pos_start + hedge_delta
             else:
                 primary_current = self._sum_position_qty(
                     positions,
@@ -5464,6 +5542,20 @@ class ManualTradeManager:
                 )
                 primary_delta = _position_delta_for_leg(primary_pos_start, primary_current, primary_leg)
                 hedge_delta = _position_delta_for_leg(hedge_pos_start, hedge_current, hedge_leg)
+            primary_over = max(0.0, primary_delta - qty)
+            hedge_over = max(0.0, hedge_delta - qty)
+            if primary_over > 0 or hedge_over > 0:
+                _vlog(
+                    "guard",
+                    "leg delta above target qty; capping final reconcile",
+                    {
+                        "primary_delta": primary_delta,
+                        "hedge_delta": hedge_delta,
+                        "target_qty": qty,
+                        "primary_over": primary_over,
+                        "hedge_over": hedge_over,
+                    },
+                )
             imbalance = primary_delta - hedge_delta
             if abs(imbalance) <= 0:
                 return
@@ -5472,13 +5564,43 @@ class ManualTradeManager:
                 step = hedge_amount_step
                 leg = hedge_leg
                 qty_needed = imbalance
+                leg_delta = hedge_delta
             else:
                 threshold = primary_fallback_min
                 step = primary_amount_step
                 leg = primary_leg
                 qty_needed = abs(imbalance)
-            qty_needed = _round_to_step(qty_needed, step, mode="down") if step else qty_needed
+                leg_delta = primary_delta
+            qty_needed = _cap_qty_to_target(
+                requested_qty=qty_needed,
+                target_qty=qty,
+                leg_delta=leg_delta,
+                amount_step=step,
+            )
+            leg_exchange = normalize_exchange_name(str(leg.get("exchange") or ""))
+            hedge_exchange = normalize_exchange_name(str(hedge_leg.get("exchange") or ""))
+            leg_current = hedge_current if leg_exchange == hedge_exchange else primary_current
+            leg_target_abs = hedge_target_abs if leg_exchange == hedge_exchange else primary_target_abs
+            qty_needed = _cap_qty_to_absolute_target(
+                requested_qty=qty_needed,
+                target_qty=leg_target_abs,
+                current_qty=leg_current,
+                amount_step=step,
+            )
             if qty_needed <= 0:
+                _vlog(
+                    "guard",
+                    "final reconcile skipped by target cap",
+                    {
+                        "reason": reason,
+                        "imbalance": imbalance,
+                        "target_qty": qty,
+                        "target_abs": leg_target_abs,
+                        "leg_exchange": leg.get("exchange"),
+                        "leg_delta": leg_delta,
+                        "leg_current": leg_current,
+                    },
+                )
                 return
             if threshold and qty_needed < threshold:
                 _vlog(
@@ -5513,17 +5635,107 @@ class ManualTradeManager:
             if hedge_qty <= 0:
                 return
             pending_hedge_qty = 0.0
+            cap_source = "observed"
+            cap_leg_delta = hedge_filled_total
+            cap_current_qty = hedge_pos_start + cap_leg_delta
+            pos_errors: list[str] = []
+            cap_positions, cap_errors = await self._fetch_positions_for_symbol(
+                exchanges=[hedge_leg["exchange"]],
+                symbol=symbol,
+                allow_ws=True,
+                contract_sizes=contract_sizes,
+            )
+            if cap_errors:
+                cap_positions, retry_errors = await self._fetch_positions_for_symbol(
+                    exchanges=[hedge_leg["exchange"]],
+                    symbol=symbol,
+                    allow_ws=False,
+                    contract_sizes=contract_sizes,
+                )
+                pos_errors = cap_errors + retry_errors
+            else:
+                cap_source = "positions_ws"
+            if not pos_errors:
+                hedge_current = self._sum_position_qty(
+                    cap_positions,
+                    exchange=hedge_leg["exchange"],
+                    side=hedge_side,
+                    symbol=symbol,
+                )
+                cap_leg_delta = _position_delta_for_leg(hedge_pos_start, hedge_current, hedge_leg)
+                cap_current_qty = hedge_current
+                if cap_source != "positions_ws":
+                    cap_source = "positions_rest"
+            else:
+                _vlog(
+                    "warn",
+                    "hedge target cap using observed fills (positions unavailable)",
+                    {"reason": reason, "errors": pos_errors},
+                )
+            raw_hedge_qty = hedge_qty
+            hedge_qty = _cap_qty_to_target(
+                requested_qty=hedge_qty,
+                target_qty=qty,
+                leg_delta=cap_leg_delta,
+                amount_step=None,
+            )
+            if hedge_qty < raw_hedge_qty:
+                _vlog(
+                    "guard",
+                    "hedge qty capped by target",
+                    {
+                        "requested_qty": raw_hedge_qty,
+                        "capped_qty": hedge_qty,
+                        "target_qty": qty,
+                        "leg_delta": cap_leg_delta,
+                        "cap_source": cap_source,
+                        "reason": reason,
+                    },
+                )
+            pre_abs_cap_qty = hedge_qty
+            hedge_qty = _cap_qty_to_absolute_target(
+                requested_qty=hedge_qty,
+                target_qty=hedge_target_abs,
+                current_qty=cap_current_qty,
+                amount_step=None,
+            )
+            if hedge_qty < pre_abs_cap_qty:
+                _vlog(
+                    "guard",
+                    "hedge qty capped by absolute target",
+                    {
+                        "requested_qty": pre_abs_cap_qty,
+                        "capped_qty": hedge_qty,
+                        "target_qty": qty,
+                        "target_abs": hedge_target_abs,
+                        "current_qty": cap_current_qty,
+                        "cap_source": cap_source,
+                        "reason": reason,
+                    },
+                )
+            if min_hedge_qty:
+                hedge_qty = math.floor(hedge_qty / min_hedge_qty) * min_hedge_qty
+            hedge_qty = _round_to_step(hedge_qty, hedge_amount_step, mode="down")
+            if hedge_qty <= 0:
+                _vlog(
+                    "guard",
+                    "hedge target reached; skipping pending hedge",
+                    {
+                        "target_qty": qty,
+                        "target_abs": hedge_target_abs,
+                        "leg_delta": cap_leg_delta,
+                        "current_qty": cap_current_qty,
+                        "cap_source": cap_source,
+                        "reason": reason,
+                    },
+                )
+                return
             if min_hedge_qty and hedge_qty < min_hedge_qty:
                 _vlog(
                     "wait",
                     "hedge below minimum; skipping",
                     {"pending_qty": hedge_qty, "min_qty": min_hedge_qty, "reason": reason},
                 )
-                return
-            if min_hedge_qty:
-                hedge_qty = math.floor(hedge_qty / min_hedge_qty) * min_hedge_qty
-            hedge_qty = _round_to_step(hedge_qty, hedge_amount_step, mode="down")
-            if hedge_qty <= 0:
                 return
             self._emit_log(log_cb, "submit", f"hedge {hedge_leg['exchange']} qty={hedge_qty:g}")
             hedge_result = await self._hedge_position(
@@ -5553,11 +5765,19 @@ class ManualTradeManager:
                 return
             pending_qty = _safe_float(hedge_result.get("pending_qty"))
             if pending_qty:
-                _vlog(
-                    "wait",
-                    "hedge remainder below minimum; skipping",
-                    {"pending_qty": pending_qty, "min_qty": min_hedge_qty, "reason": reason},
-                )
+                if min_hedge_qty and pending_qty < min_hedge_qty:
+                    _vlog(
+                        "wait",
+                        "hedge remainder below minimum; skipping",
+                        {"pending_qty": pending_qty, "min_qty": min_hedge_qty, "reason": reason},
+                    )
+                else:
+                    pending_hedge_qty += pending_qty
+                    _vlog(
+                        "wait",
+                        "hedge remainder pending; re-queued",
+                        {"pending_qty": pending_qty, "min_qty": min_hedge_qty, "reason": reason},
+                    )
 
         while remaining > 0 and (
             max_runtime_sec is None or (time.time() - started_at) < max_runtime_sec
@@ -8146,23 +8366,82 @@ class ManualTradeManager:
                     market_result = await self._place_market(
                         leg, symbol, remaining, {}, reason="hedge_adverse_bps", log_cb=log_cb
                     )
+                    market_filled = max(0.0, _safe_float(market_result.get("filled_qty")) or 0.0)
+                    market_status = None
+                    market_order_id = market_result.get("order_id")
+                    if market_order_id:
+                        market_fill_timeout_sec = max(
+                            2.0,
+                            hedge_reprice_min_sec,
+                            _safe_float(payload.get("market_fill_timeout_sec")) or 0.0,
+                        )
+                        market_status = await self._await_order_fill(
+                            leg,
+                            symbol,
+                            market_order_id,
+                            remaining,
+                            market_fill_timeout_sec,
+                            log_cb=None,
+                        )
+                        if market_status and market_status.get("status") != "error":
+                            market_filled = max(
+                                market_filled,
+                                max(0.0, _safe_float(market_status.get("filled_qty")) or 0.0),
+                            )
+                    total_filled = min(qty, filled_total + market_filled)
+                    remaining_after_market = max(0.0, qty - total_filled)
+                    final_status = "filled" if remaining_after_market <= 0 else "partial"
+                    resolved_avg = (
+                        market_result.get("avg_price")
+                        if market_filled > 0 and market_result.get("avg_price") is not None
+                        else (
+                            market_status.get("avg_price")
+                            if isinstance(market_status, Mapping) and market_status.get("avg_price") is not None
+                            else status.get("avg_price")
+                        )
+                    )
                     self._emit_order_status(
                         log_cb,
                         exchange=leg["exchange"],
                         label=leg.get("label"),
-                        order_id=order_id,
-                        status="partial",
-                        filled_qty=filled_total,
-                        avg_price=status.get("avg_price"),
-                        source=status.get("source"),
+                        order_id=(
+                            (market_status.get("order_id") if isinstance(market_status, Mapping) else None)
+                            or market_result.get("order_id")
+                            or order_id
+                        ),
+                        status=final_status,
+                        filled_qty=total_filled,
+                        avg_price=resolved_avg,
+                        source=(
+                            market_status.get("source")
+                            if isinstance(market_status, Mapping)
+                            else market_result.get("source")
+                        )
+                        or status.get("source"),
                     )
-                    return {
+                    result = {
                         "exchange": leg["exchange"],
-                        "status": "partial",
-                        "filled_qty": filled_total,
-                        "avg_price": status.get("avg_price"),
+                        "status": final_status,
+                        "order_id": (
+                            (market_status.get("order_id") if isinstance(market_status, Mapping) else None)
+                            or market_result.get("order_id")
+                            or order_id
+                        ),
+                        "filled_qty": total_filled,
+                        "avg_price": resolved_avg,
                         "fallback": market_result,
                     }
+                    if isinstance(market_status, Mapping):
+                        result["fallback_status"] = {
+                            "status": market_status.get("status"),
+                            "filled_qty": market_status.get("filled_qty"),
+                            "avg_price": market_status.get("avg_price"),
+                            "source": market_status.get("source"),
+                        }
+                    if remaining_after_market > 0:
+                        result["pending_qty"] = remaining_after_market
+                        result["pending_reason"] = "market_partial"
+                    return result
                 if (
                     favorable_bps is not None
                     and favorable_bps >= hedge_favorable_bps
