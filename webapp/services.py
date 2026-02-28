@@ -178,6 +178,78 @@ def _position_matches_symbol(position: Mapping[str, Any], match_keys: set[str]) 
     return False
 
 
+def _auto_exit_select_pair_from_legs(
+    legs: Iterable[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    long_legs: list[dict[str, Any]] = []
+    short_legs: list[dict[str, Any]] = []
+    for leg in legs or []:
+        side = str(leg.get("side") or "").lower()
+        if side not in ("long", "short"):
+            continue
+        exchange = normalize_exchange_name(str(leg.get("exchange") or ""))
+        qty = abs(_safe_float(leg.get("quantity")) or 0.0)
+        if not exchange or qty <= 0:
+            continue
+        item = {
+            "side": side,
+            "exchange": exchange,
+            "qty": float(qty),
+            "raw": dict(leg),
+        }
+        if side == "long":
+            long_legs.append(item)
+        else:
+            short_legs.append(item)
+    if not long_legs or not short_legs:
+        return None
+
+    mode = "single_pair"
+    selected_min_side = None
+    selected_min_exchange = None
+    selected_min_qty = None
+
+    if len(long_legs) == 1 and len(short_legs) == 1:
+        selected_long = long_legs[0]
+        selected_short = short_legs[0]
+    else:
+        mode = "multileg_min_leg"
+        all_legs = long_legs + short_legs
+        min_leg = min(
+            all_legs,
+            key=lambda item: (float(item.get("qty") or 0.0), str(item.get("exchange") or ""), str(item.get("side") or "")),
+        )
+        selected_min_side = str(min_leg.get("side") or "")
+        selected_min_exchange = str(min_leg.get("exchange") or "")
+        selected_min_qty = float(min_leg.get("qty") or 0.0)
+        if selected_min_side == "long":
+            selected_long = min_leg
+            selected_short = max(short_legs, key=lambda item: (float(item.get("qty") or 0.0), str(item.get("exchange") or "")))
+        else:
+            selected_short = min_leg
+            selected_long = max(long_legs, key=lambda item: (float(item.get("qty") or 0.0), str(item.get("exchange") or "")))
+
+    qty = min(float(selected_long.get("qty") or 0.0), float(selected_short.get("qty") or 0.0))
+    if qty <= 0:
+        return None
+
+    return {
+        "mode": mode,
+        "long_legs": len(long_legs),
+        "short_legs": len(short_legs),
+        "long_exchange": str(selected_long.get("exchange") or ""),
+        "short_exchange": str(selected_short.get("exchange") or ""),
+        "long_qty": float(selected_long.get("qty") or 0.0),
+        "short_qty": float(selected_short.get("qty") or 0.0),
+        "qty": float(qty),
+        "long_leg": dict(selected_long.get("raw") or {}),
+        "short_leg": dict(selected_short.get("raw") or {}),
+        "selected_min_side": selected_min_side,
+        "selected_min_exchange": selected_min_exchange,
+        "selected_min_qty": selected_min_qty,
+    }
+
+
 def _manual_position_metrics(position: Mapping[str, Any]) -> dict[str, float | None]:
     mark = _safe_float(position.get("mark_price"))
     liq = _safe_float(position.get("liquidation_price"))
@@ -4122,19 +4194,19 @@ class DataService:
             now_ts = time.time()
 
             live_spreads: dict[str, float] = {}
-            for symbol_key, legs in grouped.items():
-                longs = [leg for leg in legs if str(leg.get("side") or "").lower() == "long"]
-                shorts = [leg for leg in legs if str(leg.get("side") or "").lower() == "short"]
-                if len(longs) != 1 or len(shorts) != 1:
-                    continue
-                long_ex = normalize_exchange_name(str(longs[0].get("exchange") or ""))
-                short_ex = normalize_exchange_name(str(shorts[0].get("exchange") or ""))
-                if not long_ex or not short_ex:
-                    continue
-                spread = await self._auto_exit_live_spread(symbol_key, long_ex, short_ex)
+
+            async def resolve_live_spread(symbol_name: str, long_ex: str, short_ex: str) -> float | None:
+                spread_key = self._auto_exit_key(symbol_name, long_ex, short_ex)
+                cached = live_spreads.get(spread_key)
+                if cached is not None:
+                    return float(cached)
+                spread = await self._auto_exit_live_spread(symbol_name, long_ex, short_ex)
                 if spread is None:
-                    continue
-                live_spreads[self._auto_exit_key(symbol_key, long_ex, short_ex)] = float(spread)
+                    return None
+                spread_val = float(spread)
+                live_spreads[spread_key] = spread_val
+                return spread_val
+
             async with self._auto_exit_lock:
                 self._auto_exit_live_spreads = live_spreads
 
@@ -4221,32 +4293,43 @@ class DataService:
                         },
                     )
                     continue
-                long_count = sum(1 for leg in legs if str(leg.get("side") or "").lower() == "long")
-                short_count = sum(1 for leg in legs if str(leg.get("side") or "").lower() == "short")
-                if long_count != 1 or short_count != 1:
+                selected = _auto_exit_select_pair_from_legs(legs)
+                if not selected:
                     mark_missing(
                         key,
                         rule,
-                        "multi_leg",
+                        "legs_unavailable",
                         {
                             "symbol": symbol,
                             "long_exchange": long_exchange,
                             "short_exchange": short_exchange,
-                            "reason": "multi_leg",
-                            "long_legs": long_count,
-                            "short_legs": short_count,
+                            "reason": "legs_unavailable",
                         },
                     )
                     continue
-                long_leg = next(
-                    (leg for leg in legs if str(leg.get("side") or "").lower() == "long" and normalize_exchange_name(str(leg.get("exchange") or "")) == long_exchange),
-                    None,
-                )
-                short_leg = next(
-                    (leg for leg in legs if str(leg.get("side") or "").lower() == "short" and normalize_exchange_name(str(leg.get("exchange") or "")) == short_exchange),
-                    None,
-                )
-                if not long_leg or not short_leg:
+                selected_mode = str(selected.get("mode") or "single_pair")
+                selected_long_exchange = normalize_exchange_name(str(selected.get("long_exchange") or ""))
+                selected_short_exchange = normalize_exchange_name(str(selected.get("short_exchange") or ""))
+                if not selected_long_exchange or not selected_short_exchange:
+                    mark_missing(
+                        key,
+                        rule,
+                        "legs_unavailable",
+                        {
+                            "symbol": symbol,
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                            "reason": "legs_unavailable",
+                        },
+                    )
+                    continue
+                if (
+                    selected_mode == "single_pair"
+                    and (
+                        selected_long_exchange != long_exchange
+                        or selected_short_exchange != short_exchange
+                    )
+                ):
                     mark_missing(
                         key,
                         rule,
@@ -4256,12 +4339,12 @@ class DataService:
                             "long_exchange": long_exchange,
                             "short_exchange": short_exchange,
                             "reason": "legs_missing",
+                            "selected_long_exchange": selected_long_exchange,
+                            "selected_short_exchange": selected_short_exchange,
                         },
                     )
                     continue
-                qty_long = abs(float(long_leg.get("quantity") or 0.0))
-                qty_short = abs(float(short_leg.get("quantity") or 0.0))
-                qty = min(qty_long, qty_short)
+                qty = float(selected.get("qty") or 0.0)
                 if qty <= 0:
                     mark_missing(
                         key,
@@ -4269,22 +4352,29 @@ class DataService:
                         "zero_qty",
                         {
                             "symbol": symbol,
-                            "long_exchange": long_exchange,
-                            "short_exchange": short_exchange,
+                            "long_exchange": selected_long_exchange,
+                            "short_exchange": selected_short_exchange,
                             "reason": "zero_qty",
                         },
                     )
                     continue
                 clear_missing(key, rule)
-                spread = live_spreads.get(self._auto_exit_key(symbol_key, long_exchange, short_exchange))
+                spread = await resolve_live_spread(
+                    symbol_key,
+                    selected_long_exchange,
+                    selected_short_exchange,
+                )
                 if spread is None and require_live:
                     self._auto_exit_log_event(
                         key,
                         "skip",
                         {
                             "symbol": symbol,
-                            "long_exchange": long_exchange,
-                            "short_exchange": short_exchange,
+                            "long_exchange": selected_long_exchange,
+                            "short_exchange": selected_short_exchange,
+                            "rule_long_exchange": long_exchange,
+                            "rule_short_exchange": short_exchange,
+                            "selection_mode": selected_mode,
                             "reason": "live_missing",
                         },
                         now_ts,
@@ -4298,8 +4388,11 @@ class DataService:
                         "wait",
                         {
                             "symbol": symbol,
-                            "long_exchange": long_exchange,
-                            "short_exchange": short_exchange,
+                            "long_exchange": selected_long_exchange,
+                            "short_exchange": selected_short_exchange,
+                            "rule_long_exchange": long_exchange,
+                            "rule_short_exchange": short_exchange,
+                            "selection_mode": selected_mode,
                             "spread_pct": float(spread),
                             "target_pct": float(target),
                         },
@@ -4312,8 +4405,16 @@ class DataService:
                     "trigger",
                     {
                         "symbol": symbol,
-                        "long_exchange": long_exchange,
-                        "short_exchange": short_exchange,
+                        "long_exchange": selected_long_exchange,
+                        "short_exchange": selected_short_exchange,
+                        "rule_long_exchange": long_exchange,
+                        "rule_short_exchange": short_exchange,
+                        "selection_mode": selected_mode,
+                        "long_legs": int(selected.get("long_legs") or 0),
+                        "short_legs": int(selected.get("short_legs") or 0),
+                        "selected_min_side": selected.get("selected_min_side"),
+                        "selected_min_exchange": selected.get("selected_min_exchange"),
+                        "selected_min_qty": selected.get("selected_min_qty"),
                         "spread_pct": float(spread),
                         "target_pct": float(target),
                         "qty": qty,
@@ -4337,16 +4438,16 @@ class DataService:
                     "fallback_to_market": False,
                     "async_run": True,
                     "dry_run": False,
-                    "long_exchange": long_exchange,
-                    "short_exchange": short_exchange,
+                    "long_exchange": selected_long_exchange,
+                    "short_exchange": selected_short_exchange,
                     "margin_mode": "isolated",
                 }
                 result = await self.manual_exit(payload)
                 logger.info(
                     "auto-exit triggered symbol=%s long=%s short=%s spread=%.4f target=%.4f result=%s",
                     symbol,
-                    long_exchange,
-                    short_exchange,
+                    selected_long_exchange,
+                    selected_short_exchange,
                     float(spread),
                     float(target),
                     result,
@@ -4355,8 +4456,11 @@ class DataService:
                     "start",
                     {
                         "symbol": symbol,
-                        "long_exchange": long_exchange,
-                        "short_exchange": short_exchange,
+                        "long_exchange": selected_long_exchange,
+                        "short_exchange": selected_short_exchange,
+                        "rule_long_exchange": long_exchange,
+                        "rule_short_exchange": short_exchange,
+                        "selection_mode": selected_mode,
                         "result": result,
                     },
                 )
@@ -4368,6 +4472,8 @@ class DataService:
                         stored["updated_at"] = datetime.now(timezone.utc).isoformat()
                         self._auto_exit_store.save(self._auto_exit)
                 break
+            async with self._auto_exit_lock:
+                self._auto_exit_live_spreads = dict(live_spreads)
             if rules_to_remove or rules_to_update:
                 async with self._auto_exit_lock:
                     stored_rules = self._auto_exit.get("rules", {})
