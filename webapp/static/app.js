@@ -895,12 +895,26 @@
       return 'event';
     }
     if (entry.event === 'trigger') {
-      return 'Trigger ' + (entry.symbol || '-') + ' ' + (entry.long_exchange || '-') + '/' + (entry.short_exchange || '-') +
+      var triggerMsg = 'Trigger ' + (entry.symbol || '-') + ' ' + (entry.long_exchange || '-') + '/' + (entry.short_exchange || '-') +
         ' spread=' + formatNumber(entry.spread_pct, 2) + '% target=' + formatNumber(entry.target_pct, 2) + '% qty=' + formatNumber(entry.qty, 4);
+      if (entry.spread_scope) {
+        triggerMsg += ' scope=' + entry.spread_scope;
+      }
+      if (entry.pair_spread_pct !== undefined && entry.pair_spread_pct !== null) {
+        triggerMsg += ' pair=' + formatNumber(entry.pair_spread_pct, 2) + '%';
+      }
+      if (entry.overall_spread_pct !== undefined && entry.overall_spread_pct !== null) {
+        triggerMsg += ' overall=' + formatNumber(entry.overall_spread_pct, 2) + '%';
+      }
+      return triggerMsg;
     }
     if (entry.event === 'wait') {
-      return 'Wait ' + (entry.symbol || '-') + ' ' + (entry.long_exchange || '-') + '/' + (entry.short_exchange || '-') +
+      var waitMsg = 'Wait ' + (entry.symbol || '-') + ' ' + (entry.long_exchange || '-') + '/' + (entry.short_exchange || '-') +
         ' spread=' + formatNumber(entry.spread_pct, 2) + '% target=' + formatNumber(entry.target_pct, 2) + '%';
+      if (entry.spread_scope) {
+        waitMsg += ' scope=' + entry.spread_scope;
+      }
+      return waitMsg;
     }
     if (entry.event === 'skip') {
       var msg = 'Skip ' + (entry.symbol || '-') + ' ' + (entry.long_exchange || '-') + '/' + (entry.short_exchange || '-') +
@@ -994,24 +1008,27 @@
       if (isSummary) {
         var longEx = row.long_exchange;
         var shortEx = row.short_exchange;
-        if (longEx && shortEx) {
-          var rule = autoExitRuleFor(row.symbol, longEx, shortEx);
+        var isMultileg = !(longEx && shortEx);
+        var ruleLong = isMultileg ? 'multileg' : longEx;
+        var ruleShort = isMultileg ? 'multileg' : shortEx;
+        if (ruleLong && ruleShort) {
+          var rule = autoExitRuleFor(row.symbol, ruleLong, ruleShort);
           var enabled = rule && rule.enabled;
           var targetVal = rule && rule.target_spread_pct !== undefined && rule.target_spread_pct !== null
             ? formatNumber(rule.target_spread_pct, 2)
             : '';
-          var liveSpread = autoExitLiveSpreadFor(row.symbol, longEx, shortEx);
+          var liveSpread = autoExitLiveSpreadFor(row.symbol, ruleLong, ruleShort);
           liveSpreadText = liveSpread !== null && liveSpread !== undefined
             ? formatNumber(liveSpread, 2) + '%'
-            : '-';
-          var key = autoExitKey(row.symbol, longEx, shortEx);
+            : (isMultileg ? '<span class="muted">n/a</span>' : '-');
+          var key = autoExitKey(row.symbol, ruleLong, ruleShort);
           var checkbox = '<input type="checkbox" class="auto-exit-toggle" data-key="' + escapeHtml(key) + '" data-symbol="' +
-            escapeHtml(row.symbol || '') + '" data-long="' + escapeHtml(longEx) + '" data-short="' + escapeHtml(shortEx) + '"' +
+            escapeHtml(row.symbol || '') + '" data-long="' + escapeHtml(ruleLong) + '" data-short="' + escapeHtml(ruleShort) + '"' +
             (enabled ? ' checked' : '') + ' />';
           var input = '<input type="number" class="auto-exit-target" step="0.01" placeholder="-7.9" value="' + escapeHtml(targetVal) +
             '" data-key="' + escapeHtml(key) + '" data-symbol="' + escapeHtml(row.symbol || '') + '" data-long="' +
-            escapeHtml(longEx) + '" data-short="' + escapeHtml(shortEx) + '" />';
-          autoExitToggle = checkbox;
+            escapeHtml(ruleLong) + '" data-short="' + escapeHtml(ruleShort) + '" />';
+          autoExitToggle = checkbox + (isMultileg ? ' <span class="muted">multi-leg</span>' : '');
           autoExitTarget = input;
         } else {
           autoExitToggle = '<span class="muted">multi-leg</span>';

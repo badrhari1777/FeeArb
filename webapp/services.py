@@ -61,6 +61,8 @@ AUTO_EXIT_DEFAULTS = {
     "auto_clear_no_position_sec": 120,
 }
 AUTO_EXIT_STATE_PATH = STATE_DIR / "auto_exit_rules.json"
+AUTO_EXIT_MULTILEG_MARKER = "multileg"
+AUTO_EXIT_MULTILEG_PAIR_BUFFER_PCT = 0.02
 MANUAL_EXEC_LOG_DIR = BASE_DIR / "logs" / "manual_exec"
 COIN_ANALYSIS_CORE_EXCHANGES: tuple[str, ...] = ("binance", "okx")
 COIN_ANALYSIS_CACHE_TTL_SEC = 90
@@ -248,6 +250,51 @@ def _auto_exit_select_pair_from_legs(
         "selected_min_exchange": selected_min_exchange,
         "selected_min_qty": selected_min_qty,
     }
+
+
+def _is_auto_exit_multileg_rule(long_exchange: str | None, short_exchange: str | None) -> bool:
+    return (
+        normalize_exchange_name(str(long_exchange or "")) == AUTO_EXIT_MULTILEG_MARKER
+        and normalize_exchange_name(str(short_exchange or "")) == AUTO_EXIT_MULTILEG_MARKER
+    )
+
+
+def _auto_exit_overall_spread_from_legs(
+    legs: Iterable[Mapping[str, Any]],
+    live_mid_by_exchange: Mapping[str, float] | None = None,
+) -> float | None:
+    live_mid_by_exchange = live_mid_by_exchange or {}
+    long_qty = 0.0
+    long_notional = 0.0
+    short_qty = 0.0
+    short_notional = 0.0
+    for leg in legs or []:
+        side = str(leg.get("side") or "").lower()
+        if side not in ("long", "short"):
+            continue
+        exchange = normalize_exchange_name(str(leg.get("exchange") or ""))
+        qty = abs(_safe_float(leg.get("quantity")) or 0.0)
+        if qty <= 0:
+            continue
+        live_mid = _safe_float(live_mid_by_exchange.get(exchange))
+        mark = _safe_float(leg.get("mark_price"))
+        entry = _safe_float(leg.get("entry_price"))
+        price = live_mid if live_mid and live_mid > 0 else mark if mark and mark > 0 else entry
+        if not price or price <= 0:
+            continue
+        if side == "long":
+            long_qty += qty
+            long_notional += qty * price
+        else:
+            short_qty += qty
+            short_notional += qty * price
+    if long_qty <= 0 or short_qty <= 0:
+        return None
+    long_avg = long_notional / long_qty if long_qty > 0 else None
+    short_avg = short_notional / short_qty if short_qty > 0 else None
+    if not long_avg or long_avg == 0 or short_avg is None:
+        return None
+    return (long_avg - short_avg) / long_avg * 100.0
 
 
 def _manual_position_metrics(position: Mapping[str, Any]) -> dict[str, float | None]:
@@ -4194,6 +4241,33 @@ class DataService:
             now_ts = time.time()
 
             live_spreads: dict[str, float] = {}
+            live_mid_cache: dict[tuple[str, str], float | None] = {}
+
+            async def resolve_leg_mid(symbol_name: str, exchange: str) -> float | None:
+                key = (normalize_symbol(symbol_name), normalize_exchange_name(exchange))
+                if key in live_mid_cache:
+                    return live_mid_cache.get(key)
+                book = await self._market_data.get_orderbook(exchange, symbol_name, depth=5, max_age_sec=15.0)
+                if not book:
+                    live_mid_cache[key] = None
+                    return None
+                bids = book.get("bids") or []
+                asks = book.get("asks") or []
+                if not bids or not asks:
+                    live_mid_cache[key] = None
+                    return None
+                try:
+                    bid = float(bids[0][0])
+                    ask = float(asks[0][0])
+                except Exception:
+                    live_mid_cache[key] = None
+                    return None
+                if bid <= 0 or ask <= 0:
+                    live_mid_cache[key] = None
+                    return None
+                mid = (bid + ask) / 2.0
+                live_mid_cache[key] = mid
+                return mid
 
             async def resolve_live_spread(symbol_name: str, long_ex: str, short_ex: str) -> float | None:
                 spread_key = self._auto_exit_key(symbol_name, long_ex, short_ex)
@@ -4205,6 +4279,24 @@ class DataService:
                     return None
                 spread_val = float(spread)
                 live_spreads[spread_key] = spread_val
+                return spread_val
+
+            async def resolve_overall_spread(symbol_name: str, legs_list: list[dict[str, Any]]) -> float | None:
+                mids: dict[str, float] = {}
+                exchanges: set[str] = set()
+                for leg in legs_list:
+                    exchange = normalize_exchange_name(str(leg.get("exchange") or ""))
+                    if exchange:
+                        exchanges.add(exchange)
+                for exchange in exchanges:
+                    mid = await resolve_leg_mid(symbol_name, exchange)
+                    if mid and mid > 0:
+                        mids[exchange] = mid
+                spread_val = _auto_exit_overall_spread_from_legs(legs_list, mids)
+                if spread_val is None:
+                    spread_val = _auto_exit_overall_spread_from_legs(legs_list, {})
+                if spread_val is not None:
+                    live_spreads[self._auto_exit_key(symbol_name, AUTO_EXIT_MULTILEG_MARKER, AUTO_EXIT_MULTILEG_MARKER)] = float(spread_val)
                 return spread_val
 
             async with self._auto_exit_lock:
@@ -4260,6 +4352,7 @@ class DataService:
                 symbol_key = normalize_symbol(symbol)
                 long_exchange = normalize_exchange_name(str(rule.get("long_exchange") or ""))
                 short_exchange = normalize_exchange_name(str(rule.get("short_exchange") or ""))
+                rule_is_multileg = _is_auto_exit_multileg_rule(long_exchange, short_exchange)
                 target = _safe_float(rule.get("target_spread_pct"))
                 if not symbol or not long_exchange or not short_exchange or target is None:
                     continue
@@ -4324,7 +4417,26 @@ class DataService:
                     )
                     continue
                 if (
-                    selected_mode == "single_pair"
+                    not rule_is_multileg
+                    and selected_mode != "single_pair"
+                ):
+                    mark_missing(
+                        key,
+                        rule,
+                        "multi_leg_pair_rule",
+                        {
+                            "symbol": symbol,
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                            "reason": "multi_leg_pair_rule",
+                            "selected_mode": selected_mode,
+                            "long_legs": int(selected.get("long_legs") or 0),
+                            "short_legs": int(selected.get("short_legs") or 0),
+                        },
+                    )
+                    continue
+                if (
+                    not rule_is_multileg
                     and (
                         selected_long_exchange != long_exchange
                         or selected_short_exchange != short_exchange
@@ -4359,12 +4471,19 @@ class DataService:
                     )
                     continue
                 clear_missing(key, rule)
-                spread = await resolve_live_spread(
+                selected_pair_spread = await resolve_live_spread(
                     symbol_key,
                     selected_long_exchange,
                     selected_short_exchange,
                 )
-                if spread is None and require_live:
+                overall_spread = None
+                trigger_spread = selected_pair_spread
+                spread_scope = "pair"
+                if rule_is_multileg:
+                    spread_scope = "overall"
+                    overall_spread = await resolve_overall_spread(symbol_key, legs)
+                    trigger_spread = overall_spread
+                if trigger_spread is None and require_live:
                     self._auto_exit_log_event(
                         key,
                         "skip",
@@ -4375,14 +4494,15 @@ class DataService:
                             "rule_long_exchange": long_exchange,
                             "rule_short_exchange": short_exchange,
                             "selection_mode": selected_mode,
+                            "spread_scope": spread_scope,
                             "reason": "live_missing",
                         },
                         now_ts,
                     )
                     continue
-                if spread is None:
+                if trigger_spread is None:
                     continue
-                if spread < float(target):
+                if trigger_spread < float(target):
                     self._auto_exit_log_event(
                         key,
                         "wait",
@@ -4393,12 +4513,38 @@ class DataService:
                             "rule_long_exchange": long_exchange,
                             "rule_short_exchange": short_exchange,
                             "selection_mode": selected_mode,
-                            "spread_pct": float(spread),
+                            "spread_scope": spread_scope,
+                            "spread_pct": float(trigger_spread),
+                            "overall_spread_pct": float(overall_spread) if overall_spread is not None else None,
+                            "pair_spread_pct": float(selected_pair_spread) if selected_pair_spread is not None else None,
                             "target_pct": float(target),
                         },
                         now_ts,
                     )
                     continue
+                payload_spread_min = float(target)
+                if rule_is_multileg:
+                    pair_spread_for_exit = selected_pair_spread
+                    if pair_spread_for_exit is None:
+                        if require_live:
+                            self._auto_exit_log_event(
+                                key,
+                                "skip",
+                                {
+                                    "symbol": symbol,
+                                    "long_exchange": selected_long_exchange,
+                                    "short_exchange": selected_short_exchange,
+                                    "rule_long_exchange": long_exchange,
+                                    "rule_short_exchange": short_exchange,
+                                    "selection_mode": selected_mode,
+                                    "spread_scope": spread_scope,
+                                    "reason": "pair_live_missing",
+                                },
+                                now_ts,
+                            )
+                            continue
+                        pair_spread_for_exit = trigger_spread
+                    payload_spread_min = float(pair_spread_for_exit) - AUTO_EXIT_MULTILEG_PAIR_BUFFER_PCT
                 if self._auto_exit_has_running():
                     break
                 self._auto_exit_event(
@@ -4415,8 +4561,12 @@ class DataService:
                         "selected_min_side": selected.get("selected_min_side"),
                         "selected_min_exchange": selected.get("selected_min_exchange"),
                         "selected_min_qty": selected.get("selected_min_qty"),
-                        "spread_pct": float(spread),
+                        "spread_scope": spread_scope,
+                        "spread_pct": float(trigger_spread),
+                        "overall_spread_pct": float(overall_spread) if overall_spread is not None else None,
+                        "pair_spread_pct": float(selected_pair_spread) if selected_pair_spread is not None else None,
                         "target_pct": float(target),
+                        "pair_exit_target_pct": float(payload_spread_min),
                         "qty": qty,
                     },
                 )
@@ -4426,7 +4576,7 @@ class DataService:
                     "notional": None,
                     "mode": "smart-exit",
                     "max_slippage_bps": 8,
-                    "spread_min_pct": float(target),
+                    "spread_min_pct": float(payload_spread_min),
                     "spread_max_pct": 10,
                     "timeout_sec": 0,
                     "max_runtime_sec": max_runtime_sec,
@@ -4444,12 +4594,13 @@ class DataService:
                 }
                 result = await self.manual_exit(payload)
                 logger.info(
-                    "auto-exit triggered symbol=%s long=%s short=%s spread=%.4f target=%.4f result=%s",
+                    "auto-exit triggered symbol=%s long=%s short=%s spread=%.4f target=%.4f pair_target=%.4f result=%s",
                     symbol,
                     selected_long_exchange,
                     selected_short_exchange,
-                    float(spread),
+                    float(trigger_spread),
                     float(target),
+                    float(payload_spread_min),
                     result,
                 )
                 self._auto_exit_event(
