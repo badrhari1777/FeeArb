@@ -479,6 +479,30 @@ def _kucoin_margin_mode_noop(exc: Exception) -> bool:
     return "same" in message and "margin" in message
 
 
+def _is_min_order_size_error(error: Any) -> bool:
+    message = str(error or "").lower()
+    if not message:
+        return False
+    patterns = (
+        "min qty",
+        "minimum qty",
+        "minimum quantity",
+        "min notional",
+        "minimum notional",
+        "less than minimum",
+        "below minimum",
+        "order amount too small",
+        "quantity too small",
+        "invalid quantity",
+        "lot size",
+        "filter failure: lot_size",
+        "filter failure: min_notional",
+        "insufficient notional",
+        "amount precision",
+    )
+    return any(pattern in message for pattern in patterns)
+
+
 def _resolve_timeout(payload: Mapping[str, Any], default: int) -> int:
     raw = _safe_float(payload.get("timeout_sec"))
     if raw is None:
@@ -4404,6 +4428,21 @@ class ManualTradeManager:
                         )
                         actions.append(result)
                         self._emit_log(log_cb, "result", "final reconcile result", result)
+            if not stopped_by_user:
+                await self._finalize_exit_dust(
+                    symbol=symbol,
+                    legs=[primary_leg, hedge_leg],
+                    start_qty_by_exchange={
+                        primary_leg["exchange"]: primary_pos_start,
+                        hedge_leg["exchange"]: hedge_pos_start,
+                    },
+                    requested_exit_qty=qty,
+                    constraints=constraints,
+                    payload=payload,
+                    actions=actions,
+                    warnings=warnings,
+                    log_cb=log_cb,
+                )
 
         return {
             "dry_run": False,
@@ -4880,6 +4919,17 @@ class ManualTradeManager:
                         )
                         actions.append(result)
                         self._emit_log(log_cb, "result", "final reconcile result", result)
+                await self._finalize_exit_dust(
+                    symbol=symbol,
+                    legs=legs,
+                    start_qty_by_exchange=start_qty_by_exchange,
+                    requested_exit_qty=qty,
+                    constraints=constraints,
+                    payload=payload,
+                    actions=actions,
+                    warnings=warnings,
+                    log_cb=log_cb,
+                )
 
         if remaining > 0:
             warnings.append(f"Remaining qty {remaining:g} not exited (fast-exit runtime ended).")
@@ -8777,6 +8827,254 @@ class ManualTradeManager:
             reason = action.get("error") or "unknown error"
             errors.append(f"{exchange}: {reason}")
         return errors
+
+    async def _finalize_exit_dust(
+        self,
+        *,
+        symbol: str,
+        legs: Iterable[Mapping[str, Any]],
+        start_qty_by_exchange: Mapping[str, float],
+        requested_exit_qty: float,
+        constraints: Mapping[str, Any],
+        payload: Mapping[str, Any],
+        actions: list[dict[str, Any]],
+        warnings: list[str],
+        log_cb: Optional[callable] = None,
+    ) -> None:
+        legs_list = list(legs or [])
+        if not symbol or not legs_list or requested_exit_qty <= 0:
+            return
+        if any(not bool(leg.get("reduce_only")) for leg in legs_list):
+            self._emit_log(
+                log_cb,
+                "info",
+                "dust finalize skipped (non-reduce leg present)",
+                {"symbol": symbol},
+            )
+            return
+        exchanges = [normalize_exchange_name(str(leg.get("exchange") or "")) for leg in legs_list]
+        exchanges = [exchange for exchange in exchanges if exchange]
+        if not exchanges:
+            return
+        dust_notional_usd = _safe_float(payload.get("exit_dust_notional_usd"))
+        if dust_notional_usd is None or dust_notional_usd <= 0:
+            dust_notional_usd = 10.0
+        max_legs = int(_safe_float(payload.get("exit_dust_max_legs")) or 1)
+        if max_legs <= 0:
+            max_legs = 1
+
+        positions, pos_errors = await self._fetch_positions_for_symbol(
+            exchanges=exchanges,
+            symbol=symbol,
+            allow_ws=True,
+            contract_sizes=self._contract_sizes_from_constraints(constraints),
+        )
+        if pos_errors:
+            await asyncio.sleep(PRECHECK_RETRY_DELAY_SEC)
+            retry_positions, retry_errors = await self._fetch_positions_for_symbol(
+                exchanges=exchanges,
+                symbol=symbol,
+                allow_ws=False,
+                contract_sizes=self._contract_sizes_from_constraints(constraints),
+            )
+            if retry_errors:
+                warnings.extend(pos_errors + retry_errors)
+                self._emit_log(
+                    log_cb,
+                    "warn",
+                    "dust finalize skipped (positions unavailable)",
+                    {"symbol": symbol, "errors": pos_errors + retry_errors},
+                )
+                return
+            positions = retry_positions
+
+        def _mark_price_for_leg(exchange: str, side: str) -> float | None:
+            for pos in positions:
+                pos_exchange = normalize_exchange_name(str(pos.get("exchange") or ""))
+                if pos_exchange != exchange:
+                    continue
+                pos_symbol = str(pos.get("symbol") or pos.get("symbol_normalized") or "")
+                if not _symbol_matches(symbol, pos_symbol):
+                    continue
+                qty_hint = _safe_float(pos.get("coin_qty"))
+                if qty_hint is None:
+                    qty_hint = _safe_float(pos.get("contracts")) or _safe_float(pos.get("amount"))
+                pos_side = _normalize_position_side(pos.get("side"), qty_hint)
+                if pos_side != side:
+                    continue
+                mark = _safe_float(pos.get("mark_price"))
+                if mark is None:
+                    mark = _safe_float(pos.get("entry_price"))
+                if mark and mark > 0:
+                    return float(mark)
+            return None
+
+        candidates: list[dict[str, Any]] = []
+        for leg in legs_list:
+            exchange = normalize_exchange_name(str(leg.get("exchange") or ""))
+            if not exchange:
+                continue
+            side = _exit_position_side(leg)
+            if not side:
+                continue
+            start_qty = max(0.0, _safe_float(start_qty_by_exchange.get(exchange)) or 0.0)
+            target_end_qty = max(0.0, start_qty - requested_exit_qty)
+            current_qty = self._sum_position_qty(
+                positions,
+                exchange=exchange,
+                side=side,
+                symbol=symbol,
+            )
+            residual_qty = max(0.0, current_qty - target_end_qty)
+            if residual_qty <= 0:
+                continue
+            leg_constraints = constraints.get(exchange) or {}
+            min_qty_required = _safe_float(leg_constraints.get("min_qty_required")) or _safe_float(
+                leg_constraints.get("min_qty")
+            )
+            amount_step = _safe_float(leg_constraints.get("amount_step"))
+            close_qty = _round_to_step(residual_qty, amount_step, mode="down") if amount_step else residual_qty
+            if close_qty <= 0:
+                close_qty = residual_qty
+            mark_price = _mark_price_for_leg(exchange, side)
+            residual_notional = residual_qty * mark_price if mark_price and mark_price > 0 else None
+            dust_reasons: list[str] = []
+            if min_qty_required and residual_qty < min_qty_required:
+                dust_reasons.append("below_min_qty")
+            if residual_notional is not None and residual_notional < dust_notional_usd:
+                dust_reasons.append("below_dust_notional")
+            if not dust_reasons:
+                continue
+            candidates.append(
+                {
+                    "leg": dict(leg),
+                    "exchange": exchange,
+                    "side": side,
+                    "target_end_qty": target_end_qty,
+                    "current_qty": current_qty,
+                    "residual_qty": residual_qty,
+                    "close_qty": close_qty,
+                    "min_qty_required": min_qty_required,
+                    "residual_notional": residual_notional,
+                    "dust_reasons": dust_reasons,
+                }
+            )
+
+        if not candidates:
+            return
+        candidates.sort(
+            key=lambda item: (
+                float(item.get("residual_notional"))
+                if item.get("residual_notional") is not None
+                else float(item.get("residual_qty") or 0.0),
+                float(item.get("residual_qty") or 0.0),
+            )
+        )
+        self._emit_log(
+            log_cb,
+            "dust",
+            "dust finalize start",
+            {
+                "symbol": symbol,
+                "requested_exit_qty": requested_exit_qty,
+                "dust_notional_usd": dust_notional_usd,
+                "candidates": [
+                    {
+                        "exchange": item.get("exchange"),
+                        "side": item.get("side"),
+                        "current_qty": item.get("current_qty"),
+                        "target_end_qty": item.get("target_end_qty"),
+                        "residual_qty": item.get("residual_qty"),
+                        "residual_notional": item.get("residual_notional"),
+                        "reasons": item.get("dust_reasons"),
+                    }
+                    for item in candidates
+                ],
+            },
+        )
+
+        for item in candidates[:max_legs]:
+            leg = item.get("leg") or {}
+            exchange = str(item.get("exchange") or "")
+            close_qty = _safe_float(item.get("close_qty")) or 0.0
+            if close_qty <= 0:
+                continue
+            self._emit_log(
+                log_cb,
+                "submit",
+                f"dust finalize market {exchange} qty={close_qty:g}",
+                {
+                    "symbol": symbol,
+                    "side": item.get("side"),
+                    "residual_qty": item.get("residual_qty"),
+                    "residual_notional": item.get("residual_notional"),
+                    "reasons": item.get("dust_reasons"),
+                },
+            )
+            result = await self._place_market(
+                leg,
+                symbol,
+                close_qty,
+                payload,
+                reason="exit_dust_finalize",
+                log_cb=log_cb,
+            )
+            actions.append(result)
+            if result.get("status") == "error":
+                error_text = str(result.get("error") or "unknown_error")
+                if _is_min_order_size_error(error_text):
+                    warnings.append(f"{exchange}: non-closeable dust {close_qty:g} ({error_text})")
+                    self._emit_log(
+                        log_cb,
+                        "warn",
+                        "dust finalize non-closeable",
+                        {"exchange": exchange, "symbol": symbol, "qty": close_qty, "error": error_text},
+                    )
+                else:
+                    warnings.append(f"{exchange}: dust finalize failed ({error_text})")
+                    self._emit_log(
+                        log_cb,
+                        "warn",
+                        "dust finalize failed",
+                        {"exchange": exchange, "symbol": symbol, "qty": close_qty, "error": error_text},
+                    )
+                continue
+            order_id = result.get("order_id")
+            filled_qty = _safe_float(result.get("filled_qty")) or 0.0
+            if order_id and filled_qty + 1e-9 < close_qty:
+                fill_timeout_sec = max(2.0, _safe_float(payload.get("market_fill_timeout_sec")) or 3.0)
+                fill = await self._await_order_fill(
+                    leg,
+                    symbol,
+                    order_id,
+                    close_qty,
+                    fill_timeout_sec,
+                    log_cb=None,
+                )
+                if fill.get("status") != "error":
+                    filled_qty = max(filled_qty, _safe_float(fill.get("filled_qty")) or 0.0)
+            if filled_qty + 1e-9 < close_qty:
+                warnings.append(
+                    f"{exchange}: dust finalize partial fill {filled_qty:g}/{close_qty:g}"
+                )
+                self._emit_log(
+                    log_cb,
+                    "warn",
+                    "dust finalize partial",
+                    {
+                        "exchange": exchange,
+                        "symbol": symbol,
+                        "filled_qty": filled_qty,
+                        "requested_qty": close_qty,
+                    },
+                )
+            else:
+                self._emit_log(
+                    log_cb,
+                    "result",
+                    "dust finalize closed",
+                    {"exchange": exchange, "symbol": symbol, "filled_qty": filled_qty},
+                )
 
     def _emit_log(
         self,

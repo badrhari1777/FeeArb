@@ -9,6 +9,7 @@ from execution.manual import (
     _cap_qty_to_absolute_target,
     _cap_qty_to_target,
     _choose_chunk_qty,
+    _is_min_order_size_error,
     _min_qty_required,
     _precision_to_step,
     _round_to_step,
@@ -495,6 +496,178 @@ class ManualTradeBingxLeveragePrecheckTestCase(unittest.TestCase):
         errors = asyncio.run(manager._ensure_bingx_leverage_for_legs(legs, "ENSO"))
 
         self.assertEqual(errors, [])
+
+
+class _DustFinalizeManager(ManualTradeManager):
+    def __init__(self, *, positions, market_result=None) -> None:
+        super().__init__()
+        self._positions = list(positions)
+        self._market_result = market_result
+        self.market_calls: list[dict[str, float | str | None]] = []
+
+    async def _fetch_positions_for_symbol(
+        self,
+        *,
+        exchanges,
+        symbol,
+        allow_ws=True,
+        contract_sizes=None,
+    ):  # noqa: D401, ARG002
+        return list(self._positions), []
+
+    async def _place_market(
+        self,
+        leg,
+        symbol,
+        qty,
+        payload,
+        *,
+        reason=None,
+        require_ws=True,
+        log_cb=None,
+    ):  # noqa: D401, ARG002
+        self.market_calls.append(
+            {
+                "exchange": str(leg.get("exchange") or ""),
+                "symbol": symbol,
+                "qty": float(qty),
+                "reason": reason,
+            }
+        )
+        if self._market_result is not None:
+            return dict(self._market_result)
+        return {
+            "exchange": leg.get("exchange"),
+            "status": "submitted",
+            "order_id": f"dust-{leg.get('exchange')}",
+            "filled_qty": float(qty),
+            "avg_price": 1.0,
+        }
+
+
+class ManualTradeExitDustTestCase(unittest.TestCase):
+    def test_is_min_order_size_error_detection(self) -> None:
+        self.assertTrue(_is_min_order_size_error("Filter failure: LOT_SIZE"))
+        self.assertTrue(_is_min_order_size_error("minimum notional not met"))
+        self.assertFalse(_is_min_order_size_error("network timeout"))
+
+    def test_finalize_exit_dust_closes_smallest_leg(self) -> None:
+        manager = _DustFinalizeManager(
+            positions=[
+                {
+                    "exchange": "binance",
+                    "symbol": "AZTEC/USDT:USDT",
+                    "side": "long",
+                    "coin_qty": 6.0,
+                    "mark_price": 1.0,
+                },
+                {
+                    "exchange": "kucoin",
+                    "symbol": "AZTEC/USDT:USDT",
+                    "side": "short",
+                    "coin_qty": 7.0,
+                    "mark_price": 1.0,
+                },
+            ]
+        )
+        legs = [
+            {"exchange": "binance", "label": "long", "side": "sell", "reduce_only": True},
+            {"exchange": "kucoin", "label": "short", "side": "buy", "reduce_only": True},
+        ]
+        actions: list[dict[str, object]] = []
+        warnings: list[str] = []
+
+        asyncio.run(
+            manager._finalize_exit_dust(
+                symbol="AZTEC",
+                legs=legs,
+                start_qty_by_exchange={"binance": 100.0, "kucoin": 100.0},
+                requested_exit_qty=95.0,
+                constraints={},
+                payload={"exit_dust_notional_usd": 10.0, "exit_dust_max_legs": 1},
+                actions=actions,
+                warnings=warnings,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(len(manager.market_calls), 1)
+        self.assertEqual(manager.market_calls[0]["exchange"], "binance")
+        self.assertAlmostEqual(float(manager.market_calls[0]["qty"]), 1.0)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].get("exchange"), "binance")
+        self.assertEqual(warnings, [])
+
+    def test_finalize_exit_dust_non_closeable_warns(self) -> None:
+        manager = _DustFinalizeManager(
+            positions=[
+                {
+                    "exchange": "binance",
+                    "symbol": "AZTEC/USDT:USDT",
+                    "side": "long",
+                    "coin_qty": 6.0,
+                    "mark_price": 1.0,
+                }
+            ],
+            market_result={
+                "exchange": "binance",
+                "status": "error",
+                "error": "Filter failure: LOT_SIZE",
+            },
+        )
+        legs = [{"exchange": "binance", "label": "long", "side": "sell", "reduce_only": True}]
+        actions: list[dict[str, object]] = []
+        warnings: list[str] = []
+
+        asyncio.run(
+            manager._finalize_exit_dust(
+                symbol="AZTEC",
+                legs=legs,
+                start_qty_by_exchange={"binance": 100.0},
+                requested_exit_qty=95.0,
+                constraints={},
+                payload={"exit_dust_notional_usd": 10.0, "exit_dust_max_legs": 1},
+                actions=actions,
+                warnings=warnings,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].get("status"), "error")
+        self.assertTrue(any("non-closeable dust" in item for item in warnings))
+
+    def test_finalize_exit_dust_skips_non_reduce_legs(self) -> None:
+        manager = _DustFinalizeManager(
+            positions=[
+                {
+                    "exchange": "binance",
+                    "symbol": "AZTEC/USDT:USDT",
+                    "side": "long",
+                    "coin_qty": 6.0,
+                    "mark_price": 1.0,
+                }
+            ]
+        )
+        actions: list[dict[str, object]] = []
+        warnings: list[str] = []
+
+        asyncio.run(
+            manager._finalize_exit_dust(
+                symbol="AZTEC",
+                legs=[{"exchange": "binance", "label": "long", "side": "sell", "reduce_only": False}],
+                start_qty_by_exchange={"binance": 100.0},
+                requested_exit_qty=95.0,
+                constraints={},
+                payload={"exit_dust_notional_usd": 10.0},
+                actions=actions,
+                warnings=warnings,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(actions, [])
+        self.assertEqual(manager.market_calls, [])
 
 
 if __name__ == "__main__":
