@@ -1008,10 +1008,20 @@
       if (isSummary) {
         var longEx = row.long_exchange;
         var shortEx = row.short_exchange;
-        var isMultileg = !(longEx && shortEx);
+        var longCount = parseInt(row.long_legs_count, 10);
+        var shortCount = parseInt(row.short_legs_count, 10);
+        if (!isFinite(longCount)) {
+          longCount = 0;
+        }
+        if (!isFinite(shortCount)) {
+          shortCount = 0;
+        }
+        var hasBothSides = longCount > 0 && shortCount > 0;
+        var isPair = !!(longEx && shortEx);
+        var isMultileg = hasBothSides && !isPair;
         var ruleLong = isMultileg ? 'multileg' : longEx;
         var ruleShort = isMultileg ? 'multileg' : shortEx;
-        if (ruleLong && ruleShort) {
+        if (hasBothSides && ruleLong && ruleShort) {
           var rule = autoExitRuleFor(row.symbol, ruleLong, ruleShort);
           var enabled = rule && rule.enabled;
           var targetVal = rule && rule.target_spread_pct !== undefined && rule.target_spread_pct !== null
@@ -1031,7 +1041,7 @@
           autoExitToggle = checkbox + (isMultileg ? ' <span class="muted">multi-leg</span>' : '');
           autoExitTarget = input;
         } else {
-          autoExitToggle = '<span class="muted">multi-leg</span>';
+          autoExitToggle = '<span class="muted">one-side</span>';
           autoExitTarget = '<span class="muted">n/a</span>';
           liveSpreadText = '<span class="muted">n/a</span>';
         }

@@ -3879,6 +3879,8 @@ class DataService:
             "short_entry_avg": short_entry,
             "long_mark_avg": long_mark,
             "short_mark_avg": short_mark,
+            "long_legs_count": len(long_legs),
+            "short_legs_count": len(short_legs),
             "long_exchange": long_exchange,
             "short_exchange": short_exchange,
         }
