@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from project_settings import MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS, SettingsManager
+from utils import setup_logging
 
 from .services import DataService
 from .manual_stream import ManualSpreadStream
@@ -28,8 +29,9 @@ from .ws_trade_gate_raw import WsTradeGateRawStream
 from .ws_trade_kucoin_raw import WsTradeKucoinRawStream
 
 BASE_DIR = Path(__file__).resolve().parent
+setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-02-15-01"
+STATIC_VERSION = "v2026-04-22-01"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -186,7 +188,28 @@ class AutoExitRulePayload(BaseModel):
     long_exchange: str
     short_exchange: str
     enabled: Optional[bool] = True
+    spread_enabled: Optional[bool] = None
+    v1_enabled: Optional[bool] = None
     target_spread_pct: Optional[float] = None
+
+
+class CoinPaperEnterPayload(BaseModel):
+    symbol: str
+    qty: float = Field(..., gt=0)
+    pair_key: Optional[str] = None
+    direction: Optional[str] = None
+    action: Optional[str] = None
+    note: Optional[str] = None
+    source: Optional[str] = None
+    window_minutes: Optional[int] = Field(default=240, ge=60, le=4320)
+    funding_points: Optional[int] = Field(default=96, ge=24, le=200)
+
+
+class CoinPaperActionPayload(BaseModel):
+    position_key: str
+    action: str
+    qty: Optional[float] = Field(default=None, gt=0)
+    fraction: Optional[float] = Field(default=None, ge=0, le=1)
 
 
 @app.on_event("startup")
@@ -229,6 +252,11 @@ async def coin_analysis_page(
     funding_points: int = 120,
 ) -> HTMLResponse:
     settings = settings_manager.as_dict()
+    symbol_session = None
+    try:
+        symbol_session = await service.bootstrap_symbol_session(symbol)
+    except ValueError:
+        symbol_session = None
     return templates.TemplateResponse(
         "coin.html",
         {
@@ -238,6 +266,7 @@ async def coin_analysis_page(
             "funding_points": funding_points,
             "static_version": STATIC_VERSION,
             "settings": settings,
+            "symbol_session": symbol_session,
         },
     )
 
@@ -295,6 +324,44 @@ async def spread_monitor_page(request: Request) -> HTMLResponse:
 async def snapshot_api() -> JSONResponse:
     return JSONResponse(service.state_payload())
 
+@app.get("/api/coin/sessions")
+async def coin_sessions_api() -> JSONResponse:
+    sessions = await service.list_active_coin_symbol_sessions()
+    return JSONResponse({"sessions": sessions})
+
+
+@app.post("/api/coin/sessions/start")
+async def coin_sessions_start_api(
+    symbol: str,
+    ttl_sec: int | None = None,
+) -> JSONResponse:
+    try:
+        payload = await service.start_coin_symbol_session(symbol, ttl_sec=ttl_sec)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.post("/api/coin/sessions/extend")
+async def coin_sessions_extend_api(
+    symbol: str,
+    ttl_sec: int | None = None,
+) -> JSONResponse:
+    try:
+        payload = await service.extend_coin_symbol_session(symbol, ttl_sec=ttl_sec)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.post("/api/coin/sessions/stop")
+async def coin_sessions_stop_api(symbol: str) -> JSONResponse:
+    try:
+        payload = await service.stop_coin_symbol_session(symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
 @app.get("/api/coin/{symbol}")
 async def coin_analysis_api(
     symbol: str,
@@ -313,6 +380,409 @@ async def coin_analysis_api(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JSONResponse(payload)
 
+
+@app.get("/api/coin/focus/{symbol}")
+async def coin_focus_api(
+    symbol: str,
+    exchange: str | None = None,
+    limit: int = 200,
+) -> JSONResponse:
+    try:
+        payload = await service.get_coin_focus_snapshots(symbol, exchange=exchange, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(payload)
+
+
+@app.get("/api/coin/history/focus/{symbol}")
+async def coin_focus_history_api(
+    symbol: str,
+    exchange: str | None = None,
+    limit: int = 500,
+    since_ts_ms: int | None = None,
+    until_ts_ms: int | None = None,
+) -> JSONResponse:
+    try:
+        payload = await service.load_focus_history(
+            symbol,
+            exchange=exchange,
+            limit=limit,
+            since_ts_ms=since_ts_ms,
+            until_ts_ms=until_ts_ms,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.get("/api/coin/history/bootstrap/{symbol}")
+async def coin_bootstrap_history_api(
+    symbol: str,
+    exchange: str | None = None,
+    funding_limit: int = 500,
+    oi_limit: int = 500,
+    since_ts_ms: int | None = None,
+    until_ts_ms: int | None = None,
+) -> JSONResponse:
+    try:
+        payload = await service.load_bootstrap_history(
+            symbol,
+            exchange=exchange,
+            funding_limit=funding_limit,
+            oi_limit=oi_limit,
+            since_ts_ms=since_ts_ms,
+            until_ts_ms=until_ts_ms,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.get("/api/coin/context/{symbol}")
+async def coin_symbol_context_api(
+    symbol: str,
+    focus_limit: int = 500,
+    funding_limit: int = 500,
+    oi_limit: int = 500,
+    decision_limit: int = 500,
+    outcome_limit: int = 500,
+    real_obs_limit: int = 500,
+) -> JSONResponse:
+    try:
+        payload = await service.load_symbol_context(
+            symbol,
+            focus_limit=focus_limit,
+            funding_limit=funding_limit,
+            oi_limit=oi_limit,
+            decision_limit=decision_limit,
+            outcome_limit=outcome_limit,
+            real_obs_limit=real_obs_limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.get("/api/coin/positions-watcher/status")
+async def coin_positions_watcher_status_api(
+    symbol: str | None = None,
+) -> JSONResponse:
+    try:
+        payload = await service.get_coin_position_watcher_status(symbol=symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.post("/api/coin/positions-watcher/run")
+async def coin_positions_watcher_run_api(
+    force: bool = False,
+    symbols: str = "",
+    window_minutes: int = 240,
+    funding_points: int = 96,
+) -> JSONResponse:
+    symbol_list = [item.strip() for item in str(symbols or "").split(",") if item.strip()]
+    payload = await service.run_coin_position_watcher_once(
+        force=force,
+        symbols=(symbol_list or None),
+        window_minutes=window_minutes,
+        funding_points=funding_points,
+    )
+    status = await service.get_coin_position_watcher_status()
+    return JSONResponse(jsonable_encoder({"cycle": payload, "status": status}))
+
+
+@app.post("/api/coin/positions-watcher/enabled")
+async def coin_positions_watcher_enabled_api(
+    enabled: bool = True,
+) -> JSONResponse:
+    payload = await service.set_coin_position_watcher_enabled(enabled)
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.get("/api/coin/export/{symbol}")
+async def coin_export_json_api(
+    symbol: str,
+    include_live_analysis: bool = True,
+    window_minutes: int = 240,
+    funding_points: int = 96,
+) -> JSONResponse:
+    try:
+        payload = await service.export_coin_analysis_json(
+            symbol,
+            include_live_analysis=include_live_analysis,
+            window_minutes=window_minutes,
+            funding_points=funding_points,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.get("/api/coin/export/{symbol}/timeline.csv")
+async def coin_export_timeline_csv_api(
+    symbol: str,
+    include_live_analysis: bool = True,
+    window_minutes: int = 240,
+    funding_points: int = 96,
+) -> PlainTextResponse:
+    try:
+        csv_data = await service.export_coin_timeline_csv(
+            symbol,
+            include_live_analysis=include_live_analysis,
+            window_minutes=window_minutes,
+            funding_points=funding_points,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    safe_symbol = str(symbol or "symbol").upper()
+    headers = {
+        "Content-Disposition": f'attachment; filename="coin_timeline_{safe_symbol}.csv"',
+    }
+    return PlainTextResponse(csv_data, headers=headers)
+
+
+@app.get("/api/coin/export/{symbol}/timeline.parquet")
+async def coin_export_timeline_parquet_api(
+    symbol: str,
+    include_live_analysis: bool = True,
+    window_minutes: int = 240,
+    funding_points: int = 96,
+) -> Response:
+    try:
+        parquet_bytes = await service.export_coin_timeline_parquet(
+            symbol,
+            include_live_analysis=include_live_analysis,
+            window_minutes=window_minutes,
+            funding_points=funding_points,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    safe_symbol = str(symbol or "symbol").upper()
+    headers = {
+        "Content-Disposition": f'attachment; filename="coin_timeline_{safe_symbol}.parquet"',
+    }
+    return Response(
+        content=parquet_bytes,
+        media_type="application/x-parquet",
+        headers=headers,
+    )
+
+
+@app.get("/api/coin/review/weekly")
+async def coin_review_weekly_api(
+    days: int = 7,
+    top: int = 3,
+) -> JSONResponse:
+    payload = await service.get_coin_weekly_review(days=days, top=top)
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.get("/api/coin/review/weekly.csv")
+async def coin_review_weekly_csv_api(
+    days: int = 7,
+    top: int = 3,
+) -> PlainTextResponse:
+    csv_data = await service.export_coin_review_csv(days=days, top=top)
+    headers = {
+        "Content-Disposition": 'attachment; filename="coin_review_weekly.csv"',
+    }
+    return PlainTextResponse(csv_data, headers=headers)
+
+
+@app.get("/api/coin/review/{symbol}")
+async def coin_review_symbol_api(
+    symbol: str,
+    days: int = 7,
+    top: int = 3,
+    include_live_analysis: bool = False,
+) -> JSONResponse:
+    try:
+        payload = await service.export_coin_review_json(
+            symbol=symbol,
+            days=days,
+            top=top,
+            include_live_analysis=include_live_analysis,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.get("/api/coin/review/{symbol}/timeline.csv")
+async def coin_review_symbol_csv_api(
+    symbol: str,
+    days: int = 7,
+    top: int = 3,
+) -> PlainTextResponse:
+    try:
+        csv_data = await service.export_coin_review_csv(
+            symbol=symbol,
+            days=days,
+            top=top,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    safe_symbol = str(symbol or "symbol").upper()
+    headers = {
+        "Content-Disposition": f'attachment; filename="coin_review_{safe_symbol}.csv"',
+    }
+    return PlainTextResponse(csv_data, headers=headers)
+
+
+@app.get("/api/coin/replay/{symbol}")
+async def coin_replay_api(
+    symbol: str,
+    limit: int = 1000,
+    since_ts_ms: int | None = None,
+    until_ts_ms: int | None = None,
+    include_stored_decisions: bool = True,
+) -> JSONResponse:
+    try:
+        payload = await service.replay_coin_candidate_signals(
+            symbol,
+            limit=limit,
+            since_ts_ms=since_ts_ms,
+            until_ts_ms=until_ts_ms,
+            include_stored_decisions=include_stored_decisions,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.get("/api/coin/outcomes/auto-status")
+async def coin_outcomes_auto_status_api(
+    symbol: str | None = None,
+) -> JSONResponse:
+    try:
+        payload = await service.get_coin_outcomes_auto_status(symbol=symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.post("/api/coin/outcomes/auto-run")
+async def coin_outcomes_auto_run_api(
+    symbol: str | None = None,
+) -> JSONResponse:
+    try:
+        cycle = await service.evaluate_matured_coin_outcomes_once(symbol=symbol)
+        status = await service.get_coin_outcomes_auto_status(symbol=symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder({"cycle": cycle, "status": status}))
+
+
+@app.post("/api/coin/outcomes/auto-scheduler")
+async def coin_outcomes_auto_scheduler_api(
+    enabled: bool = True,
+) -> JSONResponse:
+    payload = await service.set_coin_outcomes_scheduler_enabled(enabled)
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.get("/api/coin/maintenance/retention-status")
+async def coin_retention_status_api() -> JSONResponse:
+    payload = await service.get_coin_analysis_maintenance_status()
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.post("/api/coin/maintenance/retention-run")
+async def coin_retention_run_api(
+    max_age_days: int | None = None,
+    closed_paper_days: int | None = None,
+) -> JSONResponse:
+    payload = await service.run_coin_analysis_retention_once(
+        max_age_days=max_age_days,
+        closed_paper_days=closed_paper_days,
+        reason="manual_api",
+    )
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.get("/api/coin/outcomes/{symbol}")
+async def coin_outcomes_api(
+    symbol: str,
+    limit: int = 500,
+    horizons: str = "",
+    phase_buckets: str = "",
+    actions: str = "",
+) -> JSONResponse:
+    horizon_list = [part.strip() for part in str(horizons or "").split(",") if part.strip()]
+    phase_bucket_list = [part.strip() for part in str(phase_buckets or "").split(",") if part.strip()]
+    action_list = [part.strip() for part in str(actions or "").split(",") if part.strip()]
+    try:
+        payload = await service.get_coin_outcomes(
+            symbol,
+            limit=limit,
+            horizons=horizon_list,
+            phase_buckets=phase_bucket_list,
+            actions=action_list,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.post("/api/coin/outcomes/{symbol}/evaluate")
+async def coin_outcomes_evaluate_api(
+    symbol: str,
+    horizons: str = "15m,1h,4h",
+    decision_limit: int = 500,
+    force: bool = False,
+) -> JSONResponse:
+    horizon_list = [part.strip() for part in str(horizons or "").split(",") if part.strip()]
+    try:
+        payload = await service.evaluate_coin_outcomes(
+            symbol,
+            horizons=horizon_list,
+            decision_limit=decision_limit,
+            force=force,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.get("/api/coin/paper/positions")
+async def coin_paper_positions_api(
+    symbol: str | None = None,
+    status: str | None = None,
+) -> JSONResponse:
+    payload = await service.get_coin_paper_positions(symbol=symbol, status=status)
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.get("/api/coin/paper/events/{position_key}")
+async def coin_paper_events_api(
+    position_key: str,
+    limit: int = 200,
+) -> JSONResponse:
+    try:
+        payload = await service.get_coin_paper_events(position_key, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.post("/api/coin/paper/enter")
+async def coin_paper_enter_api(payload: CoinPaperEnterPayload) -> JSONResponse:
+    try:
+        result = await service.coin_paper_enter(payload.dict(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/coin/paper/action")
+async def coin_paper_action_api(payload: CoinPaperActionPayload) -> JSONResponse:
+    try:
+        result = await service.coin_paper_apply_action(payload.dict(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
 @app.post("/api/refresh")
 async def refresh_snapshot() -> JSONResponse:
     result = await service.refresh_snapshot(force_accounts=True)
@@ -321,6 +791,16 @@ async def refresh_snapshot() -> JSONResponse:
 @app.get("/api/settings")
 async def get_settings() -> JSONResponse:
     return JSONResponse({"settings": settings_manager.as_dict()})
+
+
+@app.get("/api/mobile/positions")
+async def mobile_positions() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(service.mobile_positions_payload()))
+
+
+@app.get("/api/mobile/manual-defaults")
+async def mobile_manual_defaults() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(service.mobile_manual_defaults_payload()))
 
 
 @app.get("/api/auto-exit")

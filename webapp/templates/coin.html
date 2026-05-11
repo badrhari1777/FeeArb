@@ -41,7 +41,7 @@
           <dd id="header-run">-</dd>
         </div>
       </dl>
-      <p class="hint">Historical data is fetched on demand. Core pair analysis currently targets Binance + OKX.</p>
+      <p class="hint">Historical data is fetched on demand. Core pair analysis currently targets Binance + KuCoin.</p>
     </div>
   </header>
 
@@ -64,6 +64,12 @@
         <button type="submit" class="button" id="analysis-submit">Analyze</button>
         <span class="settings-status" id="analysis-status" aria-live="polite"></span>
       </form>
+      <div class="analysis-form" style="margin-top: 10px;">
+        <button type="button" class="button" id="export-json-btn">Export JSON</button>
+        <button type="button" class="button" id="export-csv-btn">Export CSV timeline</button>
+        <button type="button" class="button" id="export-parquet-btn">Export Parquet timeline</button>
+        <span class="settings-status" id="export-status" aria-live="polite"></span>
+      </div>
     </section>
 
     <section class="panel">
@@ -94,12 +100,14 @@
     </section>
 
     <section class="panel">
-      <h2>Pair analysis (core: Binance/OKX)</h2>
+      <h2>Pair analysis (core: Binance/KuCoin)</h2>
       <div class="table-wrapper">
         <table class="table">
           <thead>
             <tr>
               <th>Pair</th>
+              <th>Direction</th>
+              <th>Selected action</th>
               <th>Decision</th>
               <th>Score</th>
               <th>Spread now %</th>
@@ -114,7 +122,7 @@
             </tr>
           </thead>
           <tbody id="pair-analysis-body">
-            <tr><td colspan="12" class="muted">Pair analysis is empty.</td></tr>
+            <tr><td colspan="14" class="muted">Pair analysis is empty.</td></tr>
           </tbody>
         </table>
       </div>
@@ -123,6 +131,418 @@
     <section class="panel">
       <h2>Bot logic</h2>
       <pre class="code-block code-block--wrap" id="bot-logic-block">No decision yet.</pre>
+    </section>
+
+    <section class="panel">
+      <h2>Funding / spread view</h2>
+      <p class="muted" id="visual-summary">No visual summary yet.</p>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Window</th>
+              <th>Net funding bps</th>
+              <th>Avg / hour bps</th>
+              <th>Positive hours %</th>
+              <th>Spread now %</th>
+              <th>Spread mean %</th>
+              <th>Spread p95 abs %</th>
+              <th>Spread pts</th>
+              <th>Funding pts</th>
+              <th>Signal</th>
+            </tr>
+          </thead>
+          <tbody id="visual-window-body">
+            <tr><td colspan="10" class="muted">Run an analysis to populate data.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="chart-grid">
+        <div class="chart-card">
+          <div class="chart-title">Spread timeline</div>
+          <svg id="visual-spread-chart" class="chart-svg" viewBox="0 0 560 180" preserveAspectRatio="none" aria-label="Spread timeline"></svg>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">Funding carry timeline</div>
+          <svg id="visual-funding-chart" class="chart-svg" viewBox="0 0 560 180" preserveAspectRatio="none" aria-label="Funding carry timeline"></svg>
+        </div>
+      </div>
+      <div id="visual-notes" class="grid-list"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Decision journal</h2>
+      <pre class="code-block code-block--wrap" id="decision-journal-block">No decision journal entries yet.</pre>
+    </section>
+
+    <section class="panel">
+      <h2>Weekly review</h2>
+      <div class="analysis-form">
+        <label>
+          Days
+          <input type="number" id="review-days-input" min="1" max="30" step="1" value="7" />
+        </label>
+        <label>
+          Top candidates
+          <input type="number" id="review-top-input" min="1" max="10" step="1" value="3" />
+        </label>
+        <button type="button" class="button" id="review-load-btn">Load review</button>
+        <button type="button" class="button" id="review-export-json-btn">Export review JSON</button>
+        <button type="button" class="button" id="review-export-csv-btn">Export review CSV</button>
+        <span class="settings-status" id="review-status" aria-live="polite"></span>
+      </div>
+      <pre class="code-block code-block--wrap" id="review-summary-block">No weekly review yet.</pre>
+      <p class="muted" style="margin-top:10px;">Recent trade activity</p>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Time (UTC+3)</th>
+              <th>Symbol</th>
+              <th>Type</th>
+              <th>Pair</th>
+              <th>Direction</th>
+              <th>Source</th>
+              <th>State ref</th>
+            </tr>
+          </thead>
+          <tbody id="review-activity-body">
+            <tr><td colspan="7" class="muted">No recent activity yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:10px;">Tracked shortlist</p>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Time (UTC+3)</th>
+              <th>Symbol</th>
+              <th>Rank</th>
+              <th>Score</th>
+              <th>Spread %</th>
+              <th>Funding edge %</th>
+              <th>Pair</th>
+              <th>Reasons</th>
+            </tr>
+          </thead>
+          <tbody id="review-shortlist-body">
+            <tr><td colspan="8" class="muted">No shortlist history yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:10px;">Review tags</p>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Time (UTC+3)</th>
+              <th>Tag</th>
+              <th>Symbol</th>
+              <th>Severity</th>
+              <th>Score</th>
+              <th>Ref</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="review-tags-body">
+            <tr><td colspan="7" class="muted">No review tags yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:10px;">Entry review</p>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Time (UTC+3)</th>
+              <th>Tag</th>
+              <th>Symbol</th>
+              <th>Score</th>
+              <th>Ref</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="entry-review-body">
+            <tr><td colspan="6" class="muted">No entry review tags yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:10px;">Exit review</p>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Time (UTC+3)</th>
+              <th>Tag</th>
+              <th>Symbol</th>
+              <th>Score</th>
+              <th>Ref</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="exit-review-body">
+            <tr><td colspan="6" class="muted">No exit review tags yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:10px;">Entry action scorecard</p>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Action</th>
+              <th>Total</th>
+              <th>Correct %</th>
+              <th>Avg net %</th>
+              <th>Avg alt %</th>
+            </tr>
+          </thead>
+          <tbody id="entry-action-scorecard-body">
+            <tr><td colspan="5" class="muted">No entry action scorecard yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:10px;">Exit action scorecard</p>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Action</th>
+              <th>Total</th>
+              <th>Correct %</th>
+              <th>Avg net %</th>
+              <th>Avg alt %</th>
+            </tr>
+          </thead>
+          <tbody id="exit-action-scorecard-body">
+            <tr><td colspan="5" class="muted">No exit action scorecard yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:10px;">Phase scorecard</p>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Phase</th>
+              <th>Total</th>
+              <th>Correct %</th>
+              <th>Avg net %</th>
+              <th>Avg alt %</th>
+            </tr>
+          </thead>
+          <tbody id="phase-scorecard-body">
+            <tr><td colspan="5" class="muted">No phase scorecard yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Replay candidate signals</h2>
+      <div class="analysis-form">
+        <label>
+          Replay points
+          <input type="number" id="replay-limit-input" min="10" max="5000" step="10" value="500" />
+        </label>
+        <button type="button" class="button" id="replay-run-btn">Run replay</button>
+        <span class="settings-status" id="replay-status" aria-live="polite"></span>
+      </div>
+      <pre class="code-block code-block--wrap" id="replay-block">No replay yet.</pre>
+    </section>
+
+    <section class="panel">
+      <h2>Outcome evaluation</h2>
+      <div class="analysis-form">
+        <label>
+          Horizons (csv)
+          <input type="text" id="outcomes-horizons-input" value="15m,1h,4h" />
+        </label>
+        <label>
+          Decision limit
+          <input type="number" id="outcomes-limit-input" min="10" max="5000" step="10" value="500" />
+        </label>
+        <button type="button" class="button" id="outcomes-run-btn">Evaluate outcomes</button>
+        <span class="settings-status" id="outcomes-status" aria-live="polite"></span>
+      </div>
+      <div class="analysis-form" style="margin-top: 10px;">
+        <label>
+          Filter horizons (csv)
+          <input type="text" id="outcomes-filter-horizons-input" placeholder="15m,1h,4h" />
+        </label>
+        <label>
+          Filter phase
+          <select id="outcomes-filter-phase-select">
+            <option value="">all</option>
+            <option value="pre_boundary">pre_boundary</option>
+            <option value="mid_interval">mid_interval</option>
+            <option value="boundary">boundary</option>
+            <option value="emergency">emergency</option>
+            <option value="entry">entry</option>
+            <option value="exit">exit</option>
+            <option value="other">other</option>
+            <option value="unknown">unknown</option>
+          </select>
+        </label>
+        <label>
+          Filter actions (csv)
+          <input type="text" id="outcomes-filter-actions-input" placeholder="ENTRY_SMALL,ENTRY_STRONG" />
+        </label>
+      <button type="button" class="button" id="outcomes-load-btn">Load outcomes</button>
+      </div>
+      <p class="muted" style="margin-top:10px;">Auto evaluator status</p>
+      <button type="button" class="button" id="outcomes-auto-run-btn">Run auto cycle once</button>
+      <button type="button" class="button" id="outcomes-auto-pause-btn">Pause auto scheduler</button>
+      <button type="button" class="button" id="outcomes-auto-resume-btn">Resume auto scheduler</button>
+      <span class="settings-status" id="outcomes-auto-health" aria-live="polite"></span>
+      <pre class="code-block code-block--wrap" id="outcomes-auto-status-block">No auto evaluator status yet.</pre>
+      <p class="muted" style="margin-top:10px;">Latest outcome review rows</p>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Decision</th>
+              <th>Action</th>
+              <th>Phase</th>
+              <th>Horizon</th>
+              <th>Correctness</th>
+              <th>Timing</th>
+              <th>Net delta %</th>
+              <th>Evaluated (UTC+3)</th>
+            </tr>
+          </thead>
+          <tbody id="outcomes-review-body">
+            <tr><td colspan="8" class="muted">No outcome rows yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code-block code-block--wrap" id="outcomes-block">No outcomes yet.</pre>
+    </section>
+
+    <section class="panel">
+      <h2>Operator scorecard (pre-boundary)</h2>
+      <pre class="code-block code-block--wrap" id="operator-scorecard-block">No scorecard yet.</pre>
+    </section>
+
+    <section class="panel">
+      <h2>Position logic</h2>
+      <p class="muted">Paper positions</p>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Position key</th>
+              <th>Pair</th>
+              <th>Direction</th>
+              <th>Action</th>
+              <th>Phase</th>
+              <th>Min to next funding</th>
+              <th>Last decision (UTC+3)</th>
+              <th>Latest correctness</th>
+            </tr>
+          </thead>
+          <tbody id="position-logic-paper-body">
+            <tr><td colspan="8" class="muted">No paper position logic yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted" style="margin-top:10px;">Real / Manual positions</p>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Position key</th>
+              <th>Pair</th>
+              <th>Direction</th>
+              <th>Action</th>
+              <th>Phase</th>
+              <th>Min to next funding</th>
+              <th>Last decision (UTC+3)</th>
+              <th>Latest correctness</th>
+            </tr>
+          </thead>
+          <tbody id="position-logic-real-body">
+            <tr><td colspan="8" class="muted">No real/manual position logic yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <pre class="code-block code-block--wrap" id="position-logic-block">No position logic yet.</pre>
+    </section>
+
+    <section class="panel">
+      <h2>Retention maintenance</h2>
+      <div class="analysis-form">
+        <label>
+          Max age days
+          <input type="number" id="retention-max-age-input" min="1" max="3650" step="1" value="45" />
+        </label>
+        <label>
+          Closed paper days
+          <input type="number" id="retention-closed-paper-input" min="1" max="3650" step="1" value="120" />
+        </label>
+        <button type="button" class="button" id="retention-run-btn">Run retention now</button>
+        <span class="settings-status" id="retention-status" aria-live="polite"></span>
+      </div>
+      <pre class="code-block code-block--wrap" id="retention-block">No retention status yet.</pre>
+    </section>
+
+    <section class="panel">
+      <h2>Paper execution</h2>
+      <form id="paper-enter-form" class="analysis-form">
+        <label>
+          Qty
+          <input type="number" id="paper-qty-input" min="0.0001" step="0.0001" value="1" />
+        </label>
+        <label>
+          Pair key
+          <input type="text" id="paper-pair-input" placeholder="BTCUSDT|binance|kucoin" />
+        </label>
+        <label>
+          Direction
+          <select id="paper-direction-input">
+            <option value="long_a_short_b">long_a_short_b</option>
+            <option value="long_b_short_a">long_b_short_a</option>
+          </select>
+        </label>
+        <label>
+          Action
+          <select id="paper-action-input">
+            <option value="ENTRY_SMALL">ENTRY_SMALL</option>
+            <option value="ENTRY_STRONG">ENTRY_STRONG</option>
+          </select>
+        </label>
+        <button type="submit" class="button" id="paper-enter-submit">Paper enter</button>
+        <span class="settings-status" id="paper-enter-status" aria-live="polite"></span>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Paper positions</h2>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Position key</th>
+              <th>Status</th>
+              <th>Pair</th>
+              <th>Direction</th>
+              <th>Qty</th>
+              <th>Updated (UTC+3)</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="paper-positions-body">
+            <tr><td colspan="7" class="muted">No paper positions yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Paper events</h2>
+      <p class="muted" id="paper-events-title">Select/open a paper position to view events.</p>
+      <pre class="code-block code-block--wrap" id="paper-events-block">No events.</pre>
     </section>
 
     <section class="panel">

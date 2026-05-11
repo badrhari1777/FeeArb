@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class GateAdapter(ExchangeAdapter):
     name = "gate"
-    base_url = "https://api.gateio.ws/api/v4"
+    base_url = "https://fx-api.gateio.ws/api/v4"
     _META_TTL_SECONDS = 86_400  # 24h
 
     def map_symbol(self, symbol: str) -> str | None:
@@ -30,33 +30,62 @@ class GateAdapter(ExchangeAdapter):
             return f"{base}_USD"
         return None
 
+    def settle_for_symbol(self, symbol: str | None) -> str | None:
+        if not symbol:
+            return None
+        normalized = str(symbol).upper().strip()
+        if normalized.endswith("_USDT") or normalized.endswith("USDT"):
+            return "usdt"
+        if normalized.endswith("_USD") or normalized.endswith("USD"):
+            return "btc"
+        return None
+
     def fetch_market_snapshots(self, symbols: Iterable[str]) -> List[MarketSnapshot]:
         snapshots: list[MarketSnapshot] = []
-        targets = {sym.upper(): self.map_symbol(sym) for sym in symbols}
-        targets = {canon: exch for canon, exch in targets.items() if exch}
+        targets = {
+            sym.upper(): (self.map_symbol(sym), self.settle_for_symbol(sym))
+            for sym in symbols
+        }
+        targets = {
+            canon: (contract, settle)
+            for canon, (contract, settle) in targets.items()
+            if contract and settle
+        }
         if not targets:
             return []
 
-        ticker_payload = _get_json(f"{self.base_url}/futures/usdt/tickers")
-        tickers = ticker_payload if isinstance(ticker_payload, list) else []
-        ticker_map = {
-            item.get("contract"): item
-            for item in tickers
-            if isinstance(item, dict) and item.get("contract")
-        }
-        contracts_payload = _get_json(f"{self.base_url}/futures/usdt/contracts")
-        contracts = contracts_payload if isinstance(contracts_payload, list) else []
-        contract_map = {
-            item.get("name"): item
-            for item in contracts
-            if isinstance(item, dict) and item.get("name")
-        }
+        ticker_maps: dict[str, dict[str, dict]] = {}
+        contract_maps: dict[str, dict[str, dict]] = {}
+        for settle in sorted({settle for _contract, settle in targets.values()}):
+            try:
+                ticker_payload = _get_json(f"{self.base_url}/futures/{settle}/tickers")
+                tickers = ticker_payload if isinstance(ticker_payload, list) else []
+                ticker_maps[settle] = {
+                    item.get("contract"): item
+                    for item in tickers
+                    if isinstance(item, dict) and item.get("contract")
+                }
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Gate bulk tickers fetch failed for settle=%s: %s", settle, exc)
+                ticker_maps[settle] = {}
+            try:
+                contracts_payload = _get_json(f"{self.base_url}/futures/{settle}/contracts")
+                contracts = contracts_payload if isinstance(contracts_payload, list) else []
+                contract_maps[settle] = {
+                    item.get("name"): item
+                    for item in contracts
+                    if isinstance(item, dict) and item.get("name")
+                }
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug("Gate bulk contracts fetch failed for settle=%s: %s", settle, exc)
+                contract_maps[settle] = {}
 
-        for canonical, contract in targets.items():
-            ticker_item = ticker_map.get(contract)
+        for canonical, (contract, settle) in targets.items():
+            ticker_item = ticker_maps.get(settle, {}).get(contract)
             if not ticker_item:
                 ticker_url = (
-                    f"{self.base_url}/futures/usdt/tickers?" + urlencode({"contract": contract})
+                    f"{self.base_url}/futures/{settle}/tickers?"
+                    + urlencode({"contract": contract})
                 )
                 fallback_ticker = _get_json(ticker_url)
                 if not isinstance(fallback_ticker, list) or not fallback_ticker:
@@ -64,9 +93,9 @@ class GateAdapter(ExchangeAdapter):
                     continue
                 ticker_item = fallback_ticker[0]
 
-            contract_payload = contract_map.get(contract)
+            contract_payload = contract_maps.get(settle, {}).get(contract)
             if contract_payload is None:
-                contract_url = f"{self.base_url}/futures/usdt/contracts/{contract}"
+                contract_url = f"{self.base_url}/futures/{settle}/contracts/{contract}"
                 contract_payload = _get_json(contract_url)
             self._cache_symbol_meta(contract, contract_payload)
 
@@ -121,10 +150,11 @@ class GateAdapter(ExchangeAdapter):
     def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
         """Return cached funding history (expected 8h interval) with ~2m refresh."""
         contract = self.map_symbol(symbol) or symbol
+        settle = self.settle_for_symbol(contract) or "usdt"
 
         def _fetch() -> list[dict]:
             url = (
-                f"{self.base_url}/futures/usdt/funding_rate?"
+                f"{self.base_url}/futures/{settle}/funding_rate?"
                 + urlencode({"contract": contract, "limit": limit})
             )
             try:

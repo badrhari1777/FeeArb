@@ -49,6 +49,26 @@ MIN_REFRESH_SECONDS: Final[int] = 30
 MAX_REFRESH_SECONDS: Final[int] = 24 * 60 * 60  # one day
 
 
+def _default_manual_auto_exit_policy() -> Dict[str, Dict[str, float]]:
+    return {
+        "tier1": {
+            "chunk_notional_cap_usd": 350.0,
+            "market_cleanup_notional_cap_usd": 1500.0,
+            "edge_buffer_bps": 2.0,
+        },
+        "tier2": {
+            "chunk_notional_cap_usd": 250.0,
+            "market_cleanup_notional_cap_usd": 800.0,
+            "edge_buffer_bps": 4.0,
+        },
+        "lower_tier": {
+            "chunk_notional_cap_usd": 150.0,
+            "market_cleanup_notional_cap_usd": 0.0,
+            "edge_buffer_bps": 8.0,
+        },
+    }
+
+
 def _normalise_bool_map(
     baseline: Mapping[str, bool],
     incoming: Mapping[str, object] | None,
@@ -91,11 +111,18 @@ class AppSettings:
             "auto_take_enabled": True,
             "send_margin_alerts": True,
             "send_missing_stop_alerts": True,
+            "notification_primary_channel": "telegram",
+            "notification_fallback_channel": "none",
             "auto_margin_enabled": True,
             "auto_margin_reduce_enabled": True,
+            "enforce_isolated_margin": True,
+            "enforce_leverage": True,
+            "target_leverage": 3.0,
+            "kucoin_isolated_topup_only": True,
             "auto_rebalance_enabled": False,
-            "stop_gap_from_liq_pct": 0.07,
-            "stop_requote_threshold_pct": 0.005,
+            "stop_gap_from_liq_pct": 0.025,
+            "stop_requote_threshold_pct": 0.0025,
+            "stop_force_requote_max_age_sec": 60,
             "fallback_liq_factor_long": 0.33,
             "fallback_liq_factor_short": 1.66,
             "rebalance_delta_pct": 0.20,
@@ -103,7 +130,9 @@ class AppSettings:
             "rebalance_limit_timeout_sec": 10,
             "rebalance_limit_offset_bps": 2.0,
             "rebalance_max_slippage_bps": 8.0,
-            "target_safe_buffer_pct": 0.25,
+            "target_safe_buffer_pct": 0.30,
+            "margin_add_trigger_buffer_pct": 0.27,
+            "margin_reduce_trigger_buffer_pct": 0.33,
             "warning_buffer_pct": 0.20,
             "panic_buffer_pct": 0.15,
             "min_free_balance_abs": 500.0,
@@ -112,6 +141,7 @@ class AppSettings:
             "margin_add_panic_pct": 0.20,
             "margin_reduce_pct": 0.10,
             "margin_adjust_cooldown_sec": 300,
+            "position_check_interval_sec": 60,
         }
     )
     manual: Dict[str, object] = field(
@@ -120,6 +150,7 @@ class AppSettings:
             "enter_live_depth": 5,
             "exit_live_orderbook": False,
             "exit_live_depth": 5,
+            "auto_exit_policy": _default_manual_auto_exit_policy(),
             "ws_orders_health": {
                 "bybit": {
                     "heartbeat_interval": 15.0,
@@ -244,11 +275,18 @@ class AppSettings:
             "auto_take_enabled": True,
             "send_margin_alerts": True,
             "send_missing_stop_alerts": True,
+            "notification_primary_channel": "telegram",
+            "notification_fallback_channel": "none",
             "auto_margin_enabled": True,
             "auto_margin_reduce_enabled": True,
+            "enforce_isolated_margin": True,
+            "enforce_leverage": True,
+            "target_leverage": 3.0,
+            "kucoin_isolated_topup_only": True,
             "auto_rebalance_enabled": False,
-            "stop_gap_from_liq_pct": 0.07,
-            "stop_requote_threshold_pct": 0.005,
+            "stop_gap_from_liq_pct": 0.025,
+            "stop_requote_threshold_pct": 0.0025,
+            "stop_force_requote_max_age_sec": 60,
             "fallback_liq_factor_long": 0.33,
             "fallback_liq_factor_short": 1.66,
             "rebalance_delta_pct": 0.20,
@@ -256,7 +294,9 @@ class AppSettings:
             "rebalance_limit_timeout_sec": 10,
             "rebalance_limit_offset_bps": 2.0,
             "rebalance_max_slippage_bps": 8.0,
-            "target_safe_buffer_pct": 0.25,
+            "target_safe_buffer_pct": 0.30,
+            "margin_add_trigger_buffer_pct": 0.27,
+            "margin_reduce_trigger_buffer_pct": 0.33,
             "warning_buffer_pct": 0.20,
             "panic_buffer_pct": 0.15,
             "min_free_balance_abs": 500.0,
@@ -265,6 +305,7 @@ class AppSettings:
             "margin_add_panic_pct": 0.20,
             "margin_reduce_pct": 0.10,
             "margin_adjust_cooldown_sec": 300,
+            "position_check_interval_sec": 60,
         }
         merged = dict(defaults)
         if isinstance(self.protective, dict):
@@ -275,6 +316,7 @@ class AppSettings:
             "enter_live_depth": 5,
             "exit_live_orderbook": False,
             "exit_live_depth": 5,
+            "auto_exit_policy": _default_manual_auto_exit_policy(),
             "ws_orders_health": {
                 "binance": {
                     "heartbeat_interval": 15.0,
@@ -323,6 +365,15 @@ class AppSettings:
         manual = dict(manual_defaults)
         if isinstance(self.manual, dict):
             manual.update(self.manual)
+        auto_exit_policy = manual.get("auto_exit_policy")
+        merged_auto_exit_policy = _default_manual_auto_exit_policy()
+        if isinstance(auto_exit_policy, Mapping):
+            for tier_key, defaults in merged_auto_exit_policy.items():
+                incoming_section = auto_exit_policy.get(tier_key)
+                if isinstance(incoming_section, Mapping):
+                    merged_auto_exit_policy[tier_key] = dict(defaults)
+                    merged_auto_exit_policy[tier_key].update(incoming_section)
+        manual["auto_exit_policy"] = merged_auto_exit_policy
         self.manual = manual
         return self
 
@@ -358,12 +409,36 @@ class AppSettings:
             )
         try:
             protective = self.protective or {}
-            if protective.get("stop_gap_from_liq_pct", 0.07) < 0:
+            if protective.get("stop_gap_from_liq_pct", 0.025) < 0:
                 raise ValueError("stop_gap_from_liq_pct must be >= 0.")
-            if protective.get("stop_requote_threshold_pct", 0.005) < 0:
+            if protective.get("stop_requote_threshold_pct", 0.0025) < 0:
                 raise ValueError("stop_requote_threshold_pct must be >= 0.")
+            if float(protective.get("target_leverage", 3.0) or 0.0) <= 0:
+                raise ValueError("target_leverage must be > 0.")
+            primary_channel = str(protective.get("notification_primary_channel", "telegram") or "").strip().lower()
+            if primary_channel not in {"telegram", "pushbullet"}:
+                raise ValueError("notification_primary_channel must be telegram or pushbullet.")
+            fallback_channel = str(protective.get("notification_fallback_channel", "none") or "").strip().lower()
+            if fallback_channel not in {"none", "telegram", "pushbullet"}:
+                raise ValueError("notification_fallback_channel must be none, telegram, or pushbullet.")
         except Exception as exc:
             raise ValueError(f"Invalid protective settings: {exc}") from exc
+        try:
+            manual = self.manual or {}
+            auto_exit_policy = manual.get("auto_exit_policy") or {}
+            for tier_key, section in auto_exit_policy.items():
+                if not isinstance(section, Mapping):
+                    raise ValueError(f"manual.auto_exit_policy.{tier_key} must be an object.")
+                for field_name in (
+                    "chunk_notional_cap_usd",
+                    "market_cleanup_notional_cap_usd",
+                    "edge_buffer_bps",
+                ):
+                    value = float(section.get(field_name, 0.0) or 0.0)
+                    if value < 0:
+                        raise ValueError(f"manual.auto_exit_policy.{tier_key}.{field_name} must be >= 0.")
+        except Exception as exc:
+            raise ValueError(f"Invalid manual settings: {exc}") from exc
 
     def to_dict(self) -> Dict[str, object]:
         return {

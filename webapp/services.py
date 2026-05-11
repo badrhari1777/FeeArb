@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
 from datetime import datetime, timedelta, timezone
 import json
@@ -20,7 +22,15 @@ from pipeline import (
 )
 from orchestrator.models import MarketSnapshot
 from project_settings import SettingsManager
-from execution.manual import ManualTradeManager, _apply_price_offset
+from execution.manual import (
+    AUTO_EXIT_MARKET_FALLBACK_MAX_TIER,
+    ManualTradeManager,
+    _apply_price_offset,
+    estimate_fill,
+    max_qty_for_slippage,
+    suggest_expensive_leg,
+    venue_liquidity_tier,
+)
 from execution import (
     ExecutionSettingsManager,
     WalletService,
@@ -35,6 +45,7 @@ from execution.storage import JsonStateStore
 from execution.accounts import AccountMonitor, normalize_symbol
 from risk.config import default_risk_config, RiskConfig
 from risk.stop_manager import ProtectiveOrderManager
+from utils.notifications import NotificationRouter
 from utils import purge_expired
 from utils.cache_db import get_or_fetch_funding_history
 from utils.funding import (
@@ -44,8 +55,57 @@ from utils.funding import (
     parse_timestamp_ms,
     project_next_funding_time_iso,
 )
+from analysis_storage import (
+    CoinCandidateShortlistRow,
+    CoinDecisionRow,
+    CoinFeatureSnapshotRow,
+    CoinFocusSnapshotRow,
+    CoinFundingHistoryRow,
+    CoinOpenInterestHistoryRow,
+    CoinPaperPositionRow,
+    CoinRealPositionObservationRow,
+    CoinSymbolSessionRow,
+    CoinTradeActivityRow,
+    expire_symbol_sessions,
+    get_active_symbol_sessions,
+    get_candidate_shortlist,
+    get_coin_analysis_table_counts,
+    get_decisions,
+    get_feature_snapshot_by_id,
+    get_feature_snapshots,
+    get_funding_history,
+    get_focus_snapshots,
+    get_open_interest_history,
+    get_outcomes,
+    get_paper_events,
+    get_paper_positions,
+    get_real_position_observations,
+    get_trade_activity,
+    insert_candidate_shortlist_rows,
+    insert_decision,
+    insert_feature_snapshot,
+    insert_focus_snapshot,
+    insert_outcome,
+    insert_paper_event,
+    insert_real_position_observation,
+    insert_trade_activity,
+    prune_coin_analysis_data,
+    upsert_funding_history_rows,
+    upsert_open_interest_history_rows,
+    upsert_paper_position,
+    upsert_symbol_session,
+)
+from analysis_registry import build_pair_key
+from analysis_features import build_pair_feature_snapshots
+from analysis_decisions.constants import COIN_ANALYSIS_FEATURE_SET_VERSION
+from analysis_decisions import (
+    action_from_entry_score,
+    evaluate_candidate_pairs,
+    evaluate_position_signal,
+    normalize_reason_codes,
+)
 from exchanges import get_adapter_cached, normalize_exchange_name
-from config import BASE_DIR, STATE_DIR
+from config import BASE_DIR, STATE_DIR, EXCHANGE_COMMISSIONS
 from .market_data import MarketDataBus
 from .manual_symbols import _normalize_input_symbol
 from uuid import uuid4
@@ -63,9 +123,61 @@ AUTO_EXIT_DEFAULTS = {
 AUTO_EXIT_STATE_PATH = STATE_DIR / "auto_exit_rules.json"
 AUTO_EXIT_MULTILEG_MARKER = "multileg"
 AUTO_EXIT_MULTILEG_PAIR_BUFFER_PCT = 0.02
+AUTO_EXIT_EXECUTABLE_MAX_SLIPPAGE_BPS = 8.0
+AUTO_EXIT_POLICY_BY_TIER = {
+    1: {
+        "chunk_notional_cap_usd": 350.0,
+        "market_cleanup_notional_cap_usd": 1500.0,
+        "edge_buffer_bps": 2.0,
+    },
+    2: {
+        "chunk_notional_cap_usd": 250.0,
+        "market_cleanup_notional_cap_usd": 800.0,
+        "edge_buffer_bps": 4.0,
+    },
+}
+AUTO_EXIT_DEFAULT_POLICY = {
+    "chunk_notional_cap_usd": 150.0,
+    "market_cleanup_notional_cap_usd": 0.0,
+    "edge_buffer_bps": 8.0,
+}
+AUTO_EXIT_V1_CONFIRM_CYCLES = 2
+AUTO_EXIT_V1_TAKE_PROFIT_MIN_BPS = 40.0
+AUTO_EXIT_V1_TAKE_PROFIT_FUNDING_MULT = 4.0
+AUTO_EXIT_V1_SOFT_EXIT_THRESHOLD_BPS = -4.0
+AUTO_EXIT_V1_HOLD_THRESHOLD_BPS = 2.0
+AUTO_EXIT_V1_REVERSION_CREDIT_CAP_BPS = 12.0
+AUTO_EXIT_POLICY_SETTINGS_DEFAULTS = {
+    "tier1": dict(AUTO_EXIT_POLICY_BY_TIER[1]),
+    "tier2": dict(AUTO_EXIT_POLICY_BY_TIER[2]),
+    "lower_tier": dict(AUTO_EXIT_DEFAULT_POLICY),
+}
 MANUAL_EXEC_LOG_DIR = BASE_DIR / "logs" / "manual_exec"
-COIN_ANALYSIS_CORE_EXCHANGES: tuple[str, ...] = ("binance", "okx")
+COIN_ANALYSIS_CORE_EXCHANGES: tuple[str, ...] = ("binance", "kucoin")
 COIN_ANALYSIS_CACHE_TTL_SEC = 90
+COIN_ANALYSIS_SESSION_TTL_SEC = 30 * 60
+COIN_FOCUS_POLL_SEC = 5.0
+COIN_SHORTLIST_POLL_SEC = 180.0
+COIN_OUTCOME_POLL_SEC = 60.0
+COIN_OUTCOME_AUTO_HORIZONS: tuple[str, ...] = ("15m", "1h", "4h", "to_next_funding", "to_exit")
+COIN_OUTCOME_MATURITY_GRACE_MS = 60 * 1000
+COIN_OUTCOME_MAX_SYMBOLS_PER_CYCLE = 25
+COIN_RETENTION_POLL_SEC = 6 * 3600.0
+COIN_RETENTION_MAX_AGE_DAYS_DEFAULT = 45
+COIN_RETENTION_CLOSED_PAPER_DAYS_DEFAULT = 120
+COIN_POSITION_WATCHER_POLL_SEC = 45.0
+COIN_POSITION_WATCHER_SYMBOL_COOLDOWN_SEC = 45.0
+COIN_REVIEW_MISSED_ENTRY_SCORE_MIN = 60.0
+COIN_REVIEW_MISSED_ENTRY_LOOKAHEAD_MS = 6 * 3600 * 1000
+COIN_REVIEW_LATE_EXIT_NET_DELTA_MIN = -0.02
+COIN_REVIEW_STALE_POSITION_AGE_MS = 24 * 3600 * 1000
+COIN_REVIEW_BAD_ENTRY_NET_DELTA_MAX = -0.03
+COIN_REVIEW_GOOD_NO_TRADE_NET_DELTA_MAX = -0.02
+COIN_REVIEW_GOOD_EXIT_ALT_DELTA_MAX = -0.02
+COIN_REVIEW_BAD_HOLD_NET_DELTA_MAX = -0.03
+COIN_REVIEW_TOP_ITEMS_LIMIT = 5
+OUTCOME_DEFAULT_TAKER_FEE_RATE = 0.0005
+OUTCOME_ASSUMED_SLIPPAGE_BPS_PER_LEG = 4.0
 
 RefreshResult = Literal["completed", "in_progress", "failed"]
 
@@ -295,6 +407,509 @@ def _auto_exit_overall_spread_from_legs(
     if not long_avg or long_avg == 0 or short_avg is None:
         return None
     return (long_avg - short_avg) / long_avg * 100.0
+
+
+def _auto_exit_pair_fee_bps(long_exchange: str, short_exchange: str) -> float:
+    long_fee = float(EXCHANGE_COMMISSIONS.get(normalize_exchange_name(long_exchange), {}).get("taker", 0.0))
+    short_fee = float(EXCHANGE_COMMISSIONS.get(normalize_exchange_name(short_exchange), {}).get("taker", 0.0))
+    return (long_fee + short_fee) * 10_000.0
+
+
+def _auto_exit_policy_settings(manual_settings: Mapping[str, Any] | None = None) -> dict[str, dict[str, float]]:
+    merged: dict[str, dict[str, float]] = {
+        key: dict(value) for key, value in AUTO_EXIT_POLICY_SETTINGS_DEFAULTS.items()
+    }
+    incoming = (manual_settings or {}).get("auto_exit_policy")
+    if not isinstance(incoming, Mapping):
+        return merged
+    for tier_key, defaults in merged.items():
+        section = incoming.get(tier_key)
+        if not isinstance(section, Mapping):
+            continue
+        normalized_section = dict(defaults)
+        for field_name in (
+            "chunk_notional_cap_usd",
+            "market_cleanup_notional_cap_usd",
+            "edge_buffer_bps",
+        ):
+            value = _safe_float(section.get(field_name))
+            if value is not None and value >= 0:
+                normalized_section[field_name] = float(value)
+        merged[tier_key] = normalized_section
+    return merged
+
+
+def _auto_exit_policy_for_pair(
+    long_exchange: str,
+    short_exchange: str,
+    manual_settings: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    long_tier = venue_liquidity_tier(long_exchange)
+    short_tier = venue_liquidity_tier(short_exchange)
+    worst_tier = max(long_tier, short_tier)
+    settings_policy = _auto_exit_policy_settings(manual_settings)
+    policy_key = "tier1" if worst_tier <= 1 else "tier2" if worst_tier == 2 else "lower_tier"
+    base = dict(settings_policy.get("lower_tier", AUTO_EXIT_DEFAULT_POLICY))
+    base.update(settings_policy.get(policy_key, {}))
+    base["long_tier"] = long_tier
+    base["short_tier"] = short_tier
+    base["worst_tier"] = worst_tier
+    base["policy_key"] = policy_key
+    return base
+
+
+def _auto_exit_executable_metrics_from_books(
+    *,
+    long_exchange: str,
+    short_exchange: str,
+    long_book: Mapping[str, Any] | None,
+    short_book: Mapping[str, Any] | None,
+    qty: float,
+    max_slippage_bps: float = AUTO_EXIT_EXECUTABLE_MAX_SLIPPAGE_BPS,
+    fee_bps: float = 0.0,
+    edge_buffer_bps: float = 0.0,
+    chunk_notional_cap_usd: float | None = None,
+) -> dict[str, Any] | None:
+    qty_val = _safe_float(qty) or 0.0
+    if qty_val <= 0:
+        return None
+    bids_long = list((long_book or {}).get("bids") or [])
+    asks_short = list((short_book or {}).get("asks") or [])
+    if not bids_long or not asks_short:
+        return None
+    max_qty_long = max_qty_for_slippage(bids_long, side="sell", max_bps=max_slippage_bps)
+    max_qty_short = max_qty_for_slippage(asks_short, side="buy", max_bps=max_slippage_bps)
+    max_candidates = [val for val in (max_qty_long, max_qty_short) if val is not None and val > 0]
+    if not max_candidates:
+        return None
+    liquidity_cap_qty = min(float(val) for val in max_candidates)
+    if liquidity_cap_qty <= 0:
+        return None
+    chunk_qty = min(qty_val, liquidity_cap_qty)
+    best_bid_long = _safe_float(bids_long[0][0]) if bids_long else None
+    best_ask_short = _safe_float(asks_short[0][0]) if asks_short else None
+    reference_price = max(
+        [price for price in (best_bid_long, best_ask_short) if price and price > 0],
+        default=None,
+    )
+    if chunk_notional_cap_usd and chunk_notional_cap_usd > 0 and reference_price and reference_price > 0:
+        chunk_qty = min(chunk_qty, float(chunk_notional_cap_usd) / float(reference_price))
+    if chunk_qty <= 0:
+        return None
+    long_fill = estimate_fill(bids_long, chunk_qty)
+    short_fill = estimate_fill(asks_short, chunk_qty)
+    filled_long = _safe_float(long_fill.get("filled_qty")) or 0.0
+    filled_short = _safe_float(short_fill.get("filled_qty")) or 0.0
+    executable_qty = min(filled_long, filled_short, chunk_qty)
+    if executable_qty <= 0:
+        return None
+    avg_sell_long = _safe_float(long_fill.get("avg_price"))
+    avg_buy_short = _safe_float(short_fill.get("avg_price"))
+    if not avg_sell_long or not avg_buy_short or avg_sell_long <= 0:
+        return None
+    spread_pct = (avg_sell_long - avg_buy_short) / avg_sell_long * 100.0
+    chunk_notional = executable_qty * max(avg_sell_long, avg_buy_short)
+    fee_pct = float(fee_bps) / 100.0
+    edge_buffer_pct = float(edge_buffer_bps) / 100.0
+    net_spread_pct = float(spread_pct) - fee_pct
+    return {
+        "spread_pct": float(spread_pct),
+        "net_spread_pct": float(net_spread_pct),
+        "chunk_qty": float(executable_qty),
+        "chunk_notional_usd": float(chunk_notional),
+        "requested_qty": float(qty_val),
+        "liquidity_cap_qty": float(liquidity_cap_qty),
+        "safety_factor": None,
+        "fee_bps": float(fee_bps),
+        "fee_pct": float(fee_pct),
+        "edge_buffer_bps": float(edge_buffer_bps),
+        "edge_buffer_pct": float(edge_buffer_pct),
+        "avg_sell_long": float(avg_sell_long),
+        "avg_buy_short": float(avg_buy_short),
+        "long_remaining_qty": float(_safe_float(long_fill.get("remaining_qty")) or 0.0),
+        "short_remaining_qty": float(_safe_float(short_fill.get("remaining_qty")) or 0.0),
+        "max_qty_long": float(max_qty_long) if max_qty_long is not None else None,
+        "max_qty_short": float(max_qty_short) if max_qty_short is not None else None,
+        "chunk_notional_cap_usd": float(chunk_notional_cap_usd) if chunk_notional_cap_usd is not None else None,
+        "long_exchange": normalize_exchange_name(long_exchange),
+        "short_exchange": normalize_exchange_name(short_exchange),
+    }
+
+
+def _auto_exit_top_n_liquidity_usd(
+    levels: Iterable[Iterable[float]] | None,
+    *,
+    top_n: int = 3,
+) -> float:
+    total = 0.0
+    count = 0
+    for level in levels or []:
+        if count >= top_n or len(level) < 2:
+            break
+        price = _safe_float(level[0]) or 0.0
+        size = _safe_float(level[1]) or 0.0
+        if price <= 0 or size <= 0:
+            continue
+        total += price * size
+        count += 1
+    return float(total)
+
+
+def _auto_exit_execution_order(
+    *,
+    long_exchange: str,
+    short_exchange: str,
+    long_book: Mapping[str, Any] | None,
+    short_book: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    suggestion = suggest_expensive_leg(
+        normalize_exchange_name(long_exchange),
+        normalize_exchange_name(short_exchange),
+        fee_table=EXCHANGE_COMMISSIONS,
+        liquidity={
+            normalize_exchange_name(long_exchange): _auto_exit_top_n_liquidity_usd((long_book or {}).get("bids") or []),
+            normalize_exchange_name(short_exchange): _auto_exit_top_n_liquidity_usd((short_book or {}).get("asks") or []),
+        },
+    )
+    suggested_leg = str(suggestion.get("suggested_leg") or "")
+    primary_label = suggested_leg if suggested_leg in ("long", "short") else "long"
+    hedge_label = "short" if primary_label == "long" else "long"
+    primary_exchange = normalize_exchange_name(long_exchange if primary_label == "long" else short_exchange)
+    hedge_exchange = normalize_exchange_name(short_exchange if primary_label == "long" else long_exchange)
+    return {
+        "primary_label": primary_label,
+        "primary_exchange": primary_exchange,
+        "hedge_label": hedge_label,
+        "hedge_exchange": hedge_exchange,
+        "reason": suggestion.get("reason"),
+        "suggestion": suggestion,
+    }
+
+
+def _auto_exit_market_cleanup_status(
+    *,
+    long_exchange: str | None,
+    short_exchange: str | None,
+    cleanup_cap_usd: float | None,
+    estimated_notional_usd: float | None,
+    tier_limit: int = AUTO_EXIT_MARKET_FALLBACK_MAX_TIER,
+) -> dict[str, Any]:
+    def evaluate(exchange_name: str | None) -> dict[str, Any]:
+        exchange = normalize_exchange_name(str(exchange_name or ""))
+        if not exchange or exchange == AUTO_EXIT_MULTILEG_MARKER:
+            return {"exchange": exchange or None, "allowed": None, "reason": "unavailable"}
+        if venue_liquidity_tier(exchange) > max(1, int(tier_limit or 1)):
+            return {"exchange": exchange, "allowed": False, "reason": "tier_blocked"}
+        if cleanup_cap_usd is not None:
+            if cleanup_cap_usd <= 0:
+                return {"exchange": exchange, "allowed": False, "reason": "cap_zero"}
+            if estimated_notional_usd is not None and estimated_notional_usd > cleanup_cap_usd:
+                return {"exchange": exchange, "allowed": False, "reason": "notional_cap"}
+        return {"exchange": exchange, "allowed": True, "reason": "allowed"}
+
+    legs = [evaluate(long_exchange), evaluate(short_exchange)]
+    known = [row for row in legs if row.get("allowed") is not None]
+    overall_allowed = bool(known) and all(bool(row.get("allowed")) for row in known)
+    parts: list[str] = []
+    for row in known:
+        exchange = str(row.get("exchange") or "").upper()
+        reason = str(row.get("reason") or "")
+        status = "allow" if row.get("allowed") else f"block:{reason}"
+        parts.append(f"{exchange}:{status}")
+    summary = ", ".join(parts) if parts else "unavailable"
+    return {
+        "allowed": overall_allowed if known else None,
+        "summary": summary,
+        "legs": legs,
+    }
+
+
+def _auto_exit_edge_delta_bps(
+    net_spread_pct: float | None,
+    required_net_spread_pct: float | None,
+) -> float | None:
+    if net_spread_pct is None or required_net_spread_pct is None:
+        return None
+    return (float(net_spread_pct) - float(required_net_spread_pct)) * 100.0
+
+
+def _auto_exit_v1_clamp(value: float, lower: float, upper: float) -> float:
+    return max(float(lower), min(float(upper), float(value)))
+
+
+def _auto_exit_v1_interval_bucket(interval_minutes: float | None) -> str:
+    minutes = _safe_float(interval_minutes)
+    if minutes is None or minutes <= 0:
+        return "unknown"
+    if minutes <= 90.0:
+        return "1h"
+    if minutes <= 300.0:
+        return "4h"
+    return "8h"
+
+
+def _auto_exit_v1_window(
+    interval_minutes: float | None,
+    minutes_to_event: float | None,
+) -> dict[str, Any]:
+    interval_val = _safe_float(interval_minutes)
+    minutes_val = _safe_float(minutes_to_event)
+    if interval_val is None or interval_val <= 0 or minutes_val is None or minutes_val < 0:
+        return {
+            "bucket": _auto_exit_v1_interval_bucket(interval_val),
+            "stage": "unknown",
+            "pre_watch_window_min": None,
+            "decision_window_min": None,
+            "critical_window_min": None,
+            "funding_pressure_mult": None,
+            "reversion_credit_mult": None,
+            "take_profit_k": None,
+            "hard_exit_negative_funding_bps": None,
+        }
+    pre_watch_window = _auto_exit_v1_clamp(interval_val * 0.25, 15.0, 45.0)
+    decision_window = _auto_exit_v1_clamp(interval_val * 0.08, 10.0, 20.0)
+    critical_window = _auto_exit_v1_clamp(interval_val * 0.04, 5.0, 10.0)
+    bucket = _auto_exit_v1_interval_bucket(interval_val)
+    stage = "open"
+    if minutes_val <= critical_window:
+        stage = "critical"
+    elif minutes_val <= decision_window:
+        stage = "decision"
+    elif minutes_val <= pre_watch_window:
+        stage = "watch"
+
+    presets: dict[str, dict[str, tuple[float, float, float, float | None]]] = {
+        "1h": {
+            "open": (1.0, 0.30, 4.0, None),
+            "watch": (1.4, 0.12, 4.0, None),
+            "decision": (1.8, 0.05, 4.0, -2.0),
+            "critical": (2.2, 0.0, 4.0, 0.0),
+        },
+        "4h": {
+            "open": (0.9, 0.40, 4.0, None),
+            "watch": (1.2, 0.18, 4.0, None),
+            "decision": (1.6, 0.08, 4.0, -3.0),
+            "critical": (1.9, 0.02, 4.0, -2.0),
+        },
+        "8h": {
+            "open": (0.8, 0.45, 4.0, None),
+            "watch": (1.1, 0.22, 4.0, None),
+            "decision": (1.5, 0.10, 4.0, -4.0),
+            "critical": (1.8, 0.03, 4.0, -3.0),
+        },
+    }
+    bucket_key = bucket if bucket in presets else "8h"
+    funding_mult, reversion_mult, take_profit_k, hard_exit_negative = presets[bucket_key][stage]
+    return {
+        "bucket": bucket,
+        "stage": stage,
+        "pre_watch_window_min": float(pre_watch_window),
+        "decision_window_min": float(decision_window),
+        "critical_window_min": float(critical_window),
+        "funding_pressure_mult": float(funding_mult),
+        "reversion_credit_mult": float(reversion_mult),
+        "take_profit_k": float(take_profit_k),
+        "hard_exit_negative_funding_bps": (
+            float(hard_exit_negative) if hard_exit_negative is not None else None
+        ),
+    }
+
+
+def _auto_exit_v1_weighted_value(
+    legs: list[Mapping[str, Any]],
+    side: str,
+    field: str,
+) -> float | None:
+    total_weight = 0.0
+    total_value = 0.0
+    for leg in legs:
+        if str(leg.get("side") or "").lower() != side:
+            continue
+        value = _safe_float(leg.get(field))
+        weight = abs(_safe_float(leg.get("amount")) or _safe_float(leg.get("quantity")) or 0.0)
+        if value is None or weight <= 0:
+            continue
+        total_weight += weight
+        total_value += float(value) * float(weight)
+    if total_weight <= 0:
+        return None
+    return total_value / total_weight
+
+
+def _auto_exit_v1_position_context(legs: list[Mapping[str, Any]]) -> dict[str, Any]:
+    long_notional = sum(
+        abs(_safe_float(leg.get("amount")) or 0.0)
+        for leg in legs
+        if str(leg.get("side") or "").lower() == "long"
+    )
+    short_notional = sum(
+        abs(_safe_float(leg.get("amount")) or 0.0)
+        for leg in legs
+        if str(leg.get("side") or "").lower() == "short"
+    )
+    notional_candidates = [value for value in (long_notional, short_notional) if value > 0]
+    position_notional_usd = None
+    if notional_candidates:
+        position_notional_usd = sum(notional_candidates) / len(notional_candidates)
+
+    entry_long = _auto_exit_v1_weighted_value(legs, "long", "entry_price")
+    entry_short = _auto_exit_v1_weighted_value(legs, "short", "entry_price")
+    mark_long = _auto_exit_v1_weighted_value(legs, "long", "mark_price")
+    mark_short = _auto_exit_v1_weighted_value(legs, "short", "mark_price")
+
+    def spread_pct(long_price: float | None, short_price: float | None) -> float | None:
+        if long_price is None or short_price is None or long_price == 0:
+            return None
+        return (float(long_price) - float(short_price)) / float(long_price) * 100.0
+
+    funding_usd = 0.0
+    funding_known = False
+    interval_candidates: list[float] = []
+    next_candidates: list[float] = []
+    now_ts = datetime.now(timezone.utc).timestamp()
+    for leg in legs:
+        expected = _safe_float(leg.get("expected_funding"))
+        if expected is not None:
+            funding_usd += float(expected)
+            funding_known = True
+        interval_hours = _safe_float(leg.get("funding_interval_hours"))
+        if interval_hours is not None and interval_hours > 0:
+            interval_candidates.append(float(interval_hours) * 60.0)
+        next_iso = leg.get("next_funding")
+        if next_iso:
+            try:
+                next_dt = datetime.fromisoformat(str(next_iso))
+                minutes_to_next = max(0.0, (next_dt.timestamp() - now_ts) / 60.0)
+                next_candidates.append(minutes_to_next)
+            except Exception:
+                pass
+    return {
+        "position_notional_usd": float(position_notional_usd) if position_notional_usd is not None else None,
+        "entry_spread_pct": spread_pct(entry_long, entry_short),
+        "mark_spread_pct": spread_pct(mark_long, mark_short),
+        "funding_to_next_usd": float(funding_usd) if funding_known else None,
+        "effective_interval_minutes": min(interval_candidates) if interval_candidates else None,
+        "minutes_to_event": min(next_candidates) if next_candidates else None,
+    }
+
+
+def _auto_exit_v1_decision(
+    *,
+    close_now_bps: float | None,
+    funding_to_next_bps: float | None,
+    reversion_credit_bps: float | None,
+    window: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    close_bps = _safe_float(close_now_bps)
+    funding_bps = _safe_float(funding_to_next_bps)
+    reversion_bps = _safe_float(reversion_credit_bps) or 0.0
+    window = dict(window or {})
+    funding_mult = _safe_float(window.get("funding_pressure_mult"))
+    reversion_mult = _safe_float(window.get("reversion_credit_mult"))
+    take_profit_k = _safe_float(window.get("take_profit_k"))
+    hard_exit_negative = _safe_float(window.get("hard_exit_negative_funding_bps"))
+    stage = str(window.get("stage") or "unknown")
+
+    if close_bps is None:
+        return {
+            "decision": "skip",
+            "reason": "close_now_unavailable",
+            "wait_score_bps": None,
+            "take_profit_threshold_bps": None,
+            "risk_penalty_bps": None,
+        }
+    if funding_bps is None or funding_mult is None or reversion_mult is None or take_profit_k is None:
+        return {
+            "decision": "skip",
+            "reason": "funding_context_unavailable",
+            "wait_score_bps": None,
+            "take_profit_threshold_bps": None,
+            "risk_penalty_bps": None,
+        }
+
+    take_profit_threshold_bps = max(
+        float(AUTO_EXIT_V1_TAKE_PROFIT_MIN_BPS),
+        float(AUTO_EXIT_V1_TAKE_PROFIT_FUNDING_MULT) * max(float(funding_bps), 0.0),
+    )
+    if close_bps >= take_profit_threshold_bps:
+        return {
+            "decision": "exit",
+            "reason": "take_profit_multiple",
+            "wait_score_bps": None,
+            "take_profit_threshold_bps": float(take_profit_threshold_bps),
+            "risk_penalty_bps": 0.0,
+        }
+    if hard_exit_negative is not None:
+        if stage == "critical" and funding_bps < float(hard_exit_negative):
+            return {
+                "decision": "exit",
+                "reason": "negative_funding_critical",
+                "wait_score_bps": None,
+                "take_profit_threshold_bps": float(take_profit_threshold_bps),
+                "risk_penalty_bps": 0.0,
+            }
+        if stage == "decision" and funding_bps <= float(hard_exit_negative):
+            return {
+                "decision": "exit",
+                "reason": "negative_funding_decision_window",
+                "wait_score_bps": None,
+                "take_profit_threshold_bps": float(take_profit_threshold_bps),
+                "risk_penalty_bps": 0.0,
+            }
+
+    risk_penalty = 0.0
+    if close_bps < 0:
+        risk_penalty += min(6.0, abs(float(close_bps)) * 0.5)
+    if stage == "decision" and funding_bps < 0:
+        risk_penalty += 1.5
+    elif stage == "critical" and funding_bps < 0:
+        risk_penalty += 3.0
+
+    wait_score = float(funding_bps) * float(funding_mult)
+    wait_score += max(0.0, float(reversion_bps)) * float(reversion_mult)
+    wait_score -= risk_penalty
+    if wait_score <= float(AUTO_EXIT_V1_SOFT_EXIT_THRESHOLD_BPS):
+        return {
+            "decision": "confirm_exit",
+            "reason": "wait_score_negative",
+            "wait_score_bps": float(wait_score),
+            "take_profit_threshold_bps": float(take_profit_threshold_bps),
+            "risk_penalty_bps": float(risk_penalty),
+        }
+    if wait_score >= float(AUTO_EXIT_V1_HOLD_THRESHOLD_BPS):
+        return {
+            "decision": "hold",
+            "reason": "wait_score_positive",
+            "wait_score_bps": float(wait_score),
+            "take_profit_threshold_bps": float(take_profit_threshold_bps),
+            "risk_penalty_bps": float(risk_penalty),
+        }
+    return {
+        "decision": "hold",
+        "reason": "neutral_window",
+        "wait_score_bps": float(wait_score),
+        "take_profit_threshold_bps": float(take_profit_threshold_bps),
+        "risk_penalty_bps": float(risk_penalty),
+    }
+
+
+def _protective_issue_kind(message: Any) -> str | None:
+    text = str(message or "").strip()
+    if not text:
+        return None
+    lower = text.lower()
+    if "invalid api-key" in lower or "permissions for action" in lower or "authenticationerror" in lower:
+        return "auth_error"
+    if (
+        "exchangenotavailable" in lower
+        or "timeout while contacting dns servers" in lower
+        or "dns server returned answer with no data" in lower
+        or "getaddrinfo failed" in lower
+        or "bad gateway" in lower
+        or "network" in lower
+    ):
+        return "network_error"
+    return None
 
 
 def _manual_position_metrics(position: Mapping[str, Any]) -> dict[str, float | None]:
@@ -858,6 +1473,885 @@ def _spread_series_from_candles(
     return series
 
 
+def _funding_position_multiplier(
+    direction: str,
+    *,
+    leg: Literal["left", "right"],
+) -> float:
+    direction_text = str(direction or "").lower()
+    if direction_text == "long_b_short_a":
+        return 1.0 if leg == "left" else -1.0
+    return -1.0 if leg == "left" else 1.0
+
+
+def _funding_event_segments(
+    history: list[dict[str, Any]],
+    snapshot_interval: float | None,
+) -> list[dict[str, float]]:
+    rows = enrich_history_intervals(history or [], snapshot_interval=snapshot_interval)
+    segments: list[dict[str, float]] = []
+    for row in rows:
+        end_ts_ms = _funding_history_ts_ms(row.get("ts_ms") or row.get("timestamp"))
+        interval_hours = _safe_float(row.get("interval_hours"))
+        rate = _safe_float(
+            row.get("rate")
+            or row.get("fundingRate")
+            or row.get("funding_rate")
+        )
+        if not end_ts_ms or interval_hours is None or interval_hours <= 0 or rate is None:
+            continue
+        duration_ms = int(interval_hours * 3600.0 * 1000.0)
+        if duration_ms <= 0:
+            continue
+        segments.append(
+            {
+                "start_ts_ms": float(end_ts_ms - duration_ms),
+                "end_ts_ms": float(end_ts_ms),
+                "interval_hours": float(interval_hours),
+                "rate": float(rate),
+            }
+        )
+    segments.sort(key=lambda item: item.get("end_ts_ms") or 0.0)
+    return segments
+
+
+def _funding_carry_over_window_pct(
+    segments: list[dict[str, float]],
+    window_start_ms: int,
+    window_end_ms: int,
+    *,
+    multiplier: float,
+) -> tuple[float | None, float]:
+    if window_end_ms <= window_start_ms:
+        return None, 0.0
+    total_pct = 0.0
+    covered_ms = 0.0
+    for item in segments:
+        start_ts = int(_safe_float(item.get("start_ts_ms")) or 0)
+        end_ts = int(_safe_float(item.get("end_ts_ms")) or 0)
+        rate = _safe_float(item.get("rate"))
+        interval_hours = _safe_float(item.get("interval_hours"))
+        if start_ts <= 0 or end_ts <= start_ts or rate is None or interval_hours is None or interval_hours <= 0:
+            continue
+        overlap_ms = min(end_ts, window_end_ms) - max(start_ts, window_start_ms)
+        if overlap_ms <= 0:
+            continue
+        duration_ms = interval_hours * 3600.0 * 1000.0
+        if duration_ms <= 0:
+            continue
+        covered_ms += float(overlap_ms)
+        total_pct += float(multiplier) * float(rate) * (float(overlap_ms) / float(duration_ms))
+    if covered_ms <= 0:
+        return None, 0.0
+    return total_pct, min(100.0, covered_ms / max(1.0, float(window_end_ms - window_start_ms)) * 100.0)
+
+
+def _funding_net_hourly_series(
+    left_history: list[dict[str, Any]],
+    right_history: list[dict[str, Any]],
+    *,
+    left_interval_hours: float | None,
+    right_interval_hours: float | None,
+    direction: str,
+    max_points: int = 168,
+) -> list[dict[str, float]]:
+    hour_ms = 3600 * 1000
+    left_segments = _funding_event_segments(left_history, left_interval_hours)
+    right_segments = _funding_event_segments(right_history, right_interval_hours)
+    if not left_segments or not right_segments:
+        return []
+
+    latest_end_ms = min(
+        int(_safe_float(left_segments[-1].get("end_ts_ms")) or 0),
+        int(_safe_float(right_segments[-1].get("end_ts_ms")) or 0),
+    )
+    earliest_start_ms = max(
+        int(_safe_float(left_segments[0].get("start_ts_ms")) or 0),
+        int(_safe_float(right_segments[0].get("start_ts_ms")) or 0),
+    )
+    if latest_end_ms <= earliest_start_ms:
+        return []
+
+    bucket_end_ms = (latest_end_ms // hour_ms) * hour_ms
+    if bucket_end_ms <= earliest_start_ms:
+        bucket_end_ms += hour_ms
+
+    left_mult = _funding_position_multiplier(direction, leg="left")
+    right_mult = _funding_position_multiplier(direction, leg="right")
+    rows: list[dict[str, float]] = []
+    while bucket_end_ms - hour_ms >= earliest_start_ms:
+        bucket_start_ms = bucket_end_ms - hour_ms
+        left_pct, left_cov = _funding_carry_over_window_pct(
+            left_segments,
+            bucket_start_ms,
+            bucket_end_ms,
+            multiplier=left_mult,
+        )
+        right_pct, right_cov = _funding_carry_over_window_pct(
+            right_segments,
+            bucket_start_ms,
+            bucket_end_ms,
+            multiplier=right_mult,
+        )
+        if (
+            left_pct is not None
+            and right_pct is not None
+            and left_cov >= 99.0
+            and right_cov >= 99.0
+        ):
+            net_pct = float(left_pct) + float(right_pct)
+            rows.append(
+                {
+                    "ts_ms": float(bucket_end_ms),
+                    "left_bps": float(left_pct) * 10000.0,
+                    "right_bps": float(right_pct) * 10000.0,
+                    "net_bps": net_pct * 10000.0,
+                }
+            )
+        bucket_end_ms -= hour_ms
+
+    rows = list(reversed(rows))
+    if max_points > 0 and len(rows) > max_points:
+        rows = rows[-max_points:]
+    return rows
+
+
+def _downsample_chart_points(
+    rows: list[dict[str, Any]],
+    *,
+    value_key: str,
+    max_points: int = 96,
+) -> list[dict[str, float]]:
+    if max_points <= 0 or len(rows) <= max_points:
+        return [
+            {
+                "ts_ms": float(_safe_float(item.get("ts_ms")) or 0.0),
+                value_key: float(_safe_float(item.get(value_key)) or 0.0),
+            }
+            for item in rows
+            if _safe_float(item.get("ts_ms")) is not None and _safe_float(item.get(value_key)) is not None
+        ]
+    step = max(1, int(math.ceil(len(rows) / float(max_points))))
+    sampled = rows[::step]
+    if sampled[-1] != rows[-1]:
+        sampled.append(rows[-1])
+    return [
+        {
+            "ts_ms": float(_safe_float(item.get("ts_ms")) or 0.0),
+            value_key: float(_safe_float(item.get(value_key)) or 0.0),
+        }
+        for item in sampled
+        if _safe_float(item.get("ts_ms")) is not None and _safe_float(item.get(value_key)) is not None
+    ]
+
+
+def _build_visual_window_rows(
+    spread_series: list[dict[str, float]],
+    funding_series: list[dict[str, float]],
+) -> list[dict[str, Any]]:
+    if not spread_series and not funding_series:
+        return []
+    candidate_hours = [4, 12, 24, 72]
+    latest_ts_ms = 0
+    if spread_series:
+        latest_ts_ms = max(latest_ts_ms, int(_safe_float(spread_series[0].get("ts_ms")) or 0))
+    if funding_series:
+        latest_ts_ms = max(latest_ts_ms, int(_safe_float(funding_series[-1].get("ts_ms")) or 0))
+    if latest_ts_ms <= 0:
+        latest_ts_ms = int(time.time() * 1000)
+
+    rows: list[dict[str, Any]] = []
+    for hours in candidate_hours:
+        cutoff_ms = latest_ts_ms - hours * 3600 * 1000
+        spread_rows = [
+            item for item in spread_series
+            if int(_safe_float(item.get("ts_ms")) or 0) >= cutoff_ms
+        ]
+        funding_rows = [
+            item for item in funding_series
+            if int(_safe_float(item.get("ts_ms")) or 0) >= cutoff_ms
+        ]
+        if not spread_rows and not funding_rows:
+            continue
+
+        spread_values = [
+            float(_safe_float(item.get("spread_pct")) or 0.0)
+            for item in spread_rows
+            if _safe_float(item.get("spread_pct")) is not None
+        ]
+        net_values = [
+            float(_safe_float(item.get("net_bps")) or 0.0)
+            for item in funding_rows
+            if _safe_float(item.get("net_bps")) is not None
+        ]
+        positive_hours = len([value for value in net_values if value > 0])
+        negative_hours = len([value for value in net_values if value < 0])
+        net_total_bps = sum(net_values) if net_values else None
+        positive_share_pct = (
+            positive_hours / len(net_values) * 100.0
+            if net_values
+            else None
+        )
+        signal = "watch"
+        if net_total_bps is not None:
+            if net_total_bps > 0 and (positive_share_pct or 0.0) >= 65.0:
+                signal = "favorable"
+            elif net_total_bps < 0 and negative_hours >= max(1, int(len(net_values) * 0.5)):
+                signal = "avoid"
+
+        rows.append(
+            {
+                "label": f"{hours}h",
+                "hours": hours,
+                "funding_net_bps": net_total_bps,
+                "funding_avg_hourly_bps": (
+                    net_total_bps / len(net_values)
+                    if net_values and net_total_bps is not None
+                    else None
+                ),
+                "funding_positive_share_pct": positive_share_pct,
+                "spread_current_pct": (
+                    _safe_float(spread_rows[0].get("spread_pct"))
+                    if spread_rows
+                    else None
+                ),
+                "spread_mean_pct": (
+                    sum(spread_values) / len(spread_values)
+                    if spread_values
+                    else None
+                ),
+                "spread_p95_abs_pct": _percentile([abs(value) for value in spread_values], 95),
+                "spread_points": len(spread_values),
+                "funding_points": len(net_values),
+                "signal": signal,
+            }
+        )
+    return rows
+
+
+def _direction_label(
+    direction: str,
+    left_exchange: str,
+    right_exchange: str,
+) -> str:
+    if str(direction or "").lower() == "long_b_short_a":
+        return f"Long {right_exchange} / Short {left_exchange}"
+    return f"Long {left_exchange} / Short {right_exchange}"
+
+
+def _spread_pct_from_prices(left_px: float | None, right_px: float | None) -> float | None:
+    if left_px is None or right_px is None:
+        return None
+    mid = (left_px + right_px) / 2.0
+    if abs(mid) <= 1e-12:
+        return None
+    return (left_px - right_px) / mid * 100.0
+
+
+def _nearest_snapshot(
+    rows: list[dict[str, Any]],
+    target_ts_ms: int,
+    *,
+    max_distance_ms: int = 10 * 60 * 1000,
+) -> dict[str, Any] | None:
+    best = None
+    best_dist = None
+    for item in rows or []:
+        ts = int(_safe_float(item.get("ts_ms")) or 0)
+        if ts <= 0:
+            continue
+        dist = abs(ts - target_ts_ms)
+        if dist > max_distance_ms:
+            continue
+        if best is None or best_dist is None or dist < best_dist:
+            best = item
+            best_dist = dist
+    return best
+
+
+def _decision_spread_delta(
+    direction: str,
+    entry_open_spread_pct: float | None,
+    left_snapshot: dict[str, Any] | None,
+    right_snapshot: dict[str, Any] | None,
+) -> tuple[float | None, float | None]:
+    if not left_snapshot or not right_snapshot:
+        return None, None
+    bid_a = _safe_float(left_snapshot.get("bid"))
+    ask_a = _safe_float(left_snapshot.get("ask"))
+    bid_b = _safe_float(right_snapshot.get("bid"))
+    ask_b = _safe_float(right_snapshot.get("ask"))
+    direction_text = str(direction or "").lower()
+    future_close = None
+    if direction_text == "long_b_short_a":
+        future_close = _spread_pct_from_prices(bid_b, ask_a)
+    else:
+        future_close = _spread_pct_from_prices(bid_a, ask_b)
+    if future_close is None or entry_open_spread_pct is None:
+        return future_close, None
+    return future_close, future_close - entry_open_spread_pct
+
+
+def _size_appropriateness_for_action(
+    action: str,
+    spread_delta_pct: float | None,
+) -> str:
+    if spread_delta_pct is None:
+        return "insufficient_data"
+    a = str(action or "").strip().upper()
+    d = float(spread_delta_pct)
+    mag = abs(d)
+
+    if a == "ENTRY_STRONG":
+        if d <= 0:
+            return "wrong_direction"
+        if d >= 0.12:
+            return "appropriate"
+        return "too_aggressive"
+    if a in {"ENTRY_SMALL", "ADD_SMALL"}:
+        if d <= 0:
+            return "wrong_direction"
+        if d >= 0.18:
+            return "too_conservative"
+        return "appropriate"
+    if a == "FULL_EXIT":
+        if d >= 0:
+            return "wrong_direction"
+        if d <= -0.12:
+            return "appropriate"
+        return "too_aggressive"
+    if a == "PARTIAL_EXIT":
+        if d >= 0:
+            return "wrong_direction"
+        if d <= -0.18:
+            return "too_conservative"
+        return "appropriate"
+    if a in {"HOLD", "NO_TRADE", "ADD_BLOCKED"}:
+        if mag <= 0.06:
+            return "appropriate"
+        if d > 0:
+            return "too_conservative"
+        return "too_aggressive"
+    return "not_applicable"
+
+
+def _action_size_ratio(action: str) -> float:
+    a = str(action or "").strip().upper()
+    if a == "ENTRY_STRONG":
+        return 1.0
+    if a in {"ENTRY_SMALL", "PARTIAL_EXIT"}:
+        return 0.5
+    if a == "ADD_SMALL":
+        return 0.25
+    if a == "FULL_EXIT":
+        return 1.0
+    return 0.0
+
+
+def _execution_cost_components_pct(
+    *,
+    action: str,
+    left_exchange: str,
+    right_exchange: str,
+) -> tuple[float, float, float, float]:
+    size_ratio = _action_size_ratio(action)
+    if size_ratio <= 0:
+        return 0.0, 0.0, 0.0, size_ratio
+    left_fee = float(
+        (EXCHANGE_COMMISSIONS.get(str(left_exchange or "").lower(), {}) or {}).get(
+            "taker",
+            OUTCOME_DEFAULT_TAKER_FEE_RATE,
+        )
+    )
+    right_fee = float(
+        (EXCHANGE_COMMISSIONS.get(str(right_exchange or "").lower(), {}) or {}).get(
+            "taker",
+            OUTCOME_DEFAULT_TAKER_FEE_RATE,
+        )
+    )
+    fees_pct = -(left_fee + right_fee) * 100.0 * size_ratio
+    slippage_pct = -((OUTCOME_ASSUMED_SLIPPAGE_BPS_PER_LEG * 2.0) / 100.0) * size_ratio
+    return fees_pct, slippage_pct, (fees_pct + slippage_pct), size_ratio
+
+
+def _estimate_funding_component_pct(
+    *,
+    horizon: str,
+    decision_ts_ms: int,
+    horizon_target_ts_ms: int,
+    funding_to_next_pct: float | None,
+    net_funding_hourly: float | None,
+    hours_to_next_funding: float | None,
+) -> float | None:
+    if horizon_target_ts_ms <= decision_ts_ms:
+        return None
+    if horizon == "to_next_funding" and funding_to_next_pct is not None:
+        return float(funding_to_next_pct)
+
+    hourly = net_funding_hourly
+    if hourly is None and funding_to_next_pct is not None:
+        h = _safe_float(hours_to_next_funding)
+        if h is not None and h > 1e-9:
+            hourly = float(funding_to_next_pct) / h
+    if hourly is None:
+        return None
+
+    elapsed_h = (float(horizon_target_ts_ms) - float(decision_ts_ms)) / 3_600_000.0
+    if elapsed_h <= 0:
+        return None
+    return float(hourly) * elapsed_h
+
+
+def _is_horizon_matured(
+    *,
+    horizon: str,
+    horizon_target_ts_ms: int | None,
+    now_ts_ms: int,
+) -> bool:
+    target_ts = int(horizon_target_ts_ms or 0)
+    if horizon in {"15m", "1h", "4h"}:
+        return target_ts > 0 and target_ts <= (now_ts_ms - COIN_OUTCOME_MATURITY_GRACE_MS)
+    if horizon in {"to_next_funding", "to_exit"}:
+        return target_ts > 0 and target_ts <= (now_ts_ms - COIN_OUTCOME_MATURITY_GRACE_MS)
+    return False
+
+
+def _next_funding_target_ts_ms(
+    decision_ts_ms: int,
+    left_decision_snapshot: dict[str, Any] | None,
+    right_decision_snapshot: dict[str, Any] | None,
+    feature_common: Mapping[str, Any] | None,
+) -> int | None:
+    candidates: list[int] = []
+    for snap in (left_decision_snapshot, right_decision_snapshot):
+        if not snap:
+            continue
+        next_ts = int(_safe_float(snap.get("next_funding_ts_ms")) or 0)
+        if next_ts > decision_ts_ms:
+            candidates.append(next_ts)
+    if candidates:
+        return min(candidates)
+
+    common = dict(feature_common or {})
+    funding_meta = dict(common.get("funding") or {})
+    left_int = _safe_float(funding_meta.get("left_interval_hours"))
+    right_int = _safe_float(funding_meta.get("right_interval_hours"))
+    intervals = [x for x in (left_int, right_int) if x is not None and x > 0]
+    if not intervals:
+        return None
+    interval_h = min(intervals)
+    return decision_ts_ms + int(interval_h * 3600.0 * 1000.0)
+
+
+def _paper_exit_target_ts_ms(
+    decision_ts_ms: int,
+    state_ref: str,
+    paper_positions_by_key: Mapping[str, Mapping[str, Any]],
+    paper_events_by_key: Mapping[str, list[dict[str, Any]]],
+) -> int | None:
+    key = str(state_ref or "").strip()
+    if not key:
+        return None
+    row = dict((paper_positions_by_key or {}).get(key) or {})
+    candidates: list[int] = []
+    closed_at_ms = int(_safe_float(row.get("closed_at_ms")) or 0)
+    if closed_at_ms > decision_ts_ms:
+        candidates.append(closed_at_ms)
+
+    for event in list((paper_events_by_key or {}).get(key) or []):
+        ts_ms = int(_safe_float(event.get("ts_ms")) or 0)
+        if ts_ms <= decision_ts_ms:
+            continue
+        event_type = str(event.get("event_type") or "").strip().lower()
+        payload = dict(event.get("payload") or {})
+        status = str(payload.get("status") or "").strip().lower()
+        if event_type in {"full_exit", "closed", "exit"} or status == "closed":
+            candidates.append(ts_ms)
+    if not candidates:
+        return None
+    return min(candidates)
+
+
+def _real_exit_target_ts_ms(
+    decision_ts_ms: int,
+    state_ref: str,
+    real_observations_by_key: Mapping[str, list[dict[str, Any]]],
+) -> int | None:
+    key = str(state_ref or "").strip()
+    if not key:
+        return None
+    rows = list((real_observations_by_key or {}).get(key) or [])
+    if not rows:
+        return None
+    candidates: list[int] = []
+    for row in rows:
+        ts_ms = int(_safe_float(row.get("ts_ms")) or 0)
+        if ts_ms <= decision_ts_ms:
+            continue
+        if str(row.get("status") or "").strip().lower() == "closed":
+            candidates.append(ts_ms)
+    if not candidates:
+        return None
+    return min(candidates)
+
+
+def _outcome_phase_bucket(phase: object) -> str:
+    text = str(phase or "").strip().lower()
+    if not text:
+        return "unknown"
+    if "pre_boundary" in text:
+        return "pre_boundary"
+    if "mid_interval" in text:
+        return "mid_interval"
+    if "emergency" in text:
+        return "emergency"
+    if "boundary" in text:
+        return "boundary"
+    if "entry" in text:
+        return "entry"
+    if "exit" in text:
+        return "exit"
+    return "other"
+
+
+def _new_outcome_bucket() -> dict[str, Any]:
+    return {
+        "total": 0,
+        "correct": 0,
+        "incorrect": 0,
+        "mixed": 0,
+        "insufficient_data": 0,
+        "unknown": 0,
+        "known_total": 0,
+        "correct_rate_pct": None,
+    }
+
+
+def _finalize_outcome_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
+    known_total = int(bucket.get("correct", 0)) + int(bucket.get("incorrect", 0)) + int(bucket.get("mixed", 0))
+    bucket["known_total"] = known_total
+    if known_total > 0:
+        bucket["correct_rate_pct"] = (float(bucket.get("correct", 0)) / float(known_total)) * 100.0
+    else:
+        bucket["correct_rate_pct"] = None
+    return bucket
+
+
+def _build_outcomes_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_horizon: dict[str, dict[str, Any]] = {}
+    by_phase_bucket: dict[str, dict[str, Any]] = {}
+    by_phase_horizon: dict[str, dict[str, Any]] = {}
+    timing_quality: dict[str, int] = {}
+    size_appropriateness: dict[str, int] = {}
+    wait_help = {"true": 0, "false": 0, "unknown": 0}
+    early_exit_help = {"true": 0, "false": 0, "unknown": 0}
+
+    for row in rows:
+        outcome = dict(row.get("outcome") or {})
+        horizon = str(row.get("horizon") or outcome.get("horizon") or "unknown")
+        phase = str(outcome.get("decision_phase") or row.get("decision_phase") or "unknown")
+        phase_bucket = _outcome_phase_bucket(phase)
+        correctness = str(outcome.get("decision_correctness") or "unknown").strip().lower()
+        if correctness not in {"correct", "incorrect", "mixed", "insufficient_data"}:
+            correctness = "unknown"
+
+        horizon_bucket = by_horizon.setdefault(horizon, _new_outcome_bucket())
+        phase_bucket_row = by_phase_bucket.setdefault(phase_bucket, _new_outcome_bucket())
+        phase_horizon_key = f"{phase_bucket}|{horizon}"
+        phase_horizon_bucket = by_phase_horizon.setdefault(phase_horizon_key, _new_outcome_bucket())
+
+        for bucket in (horizon_bucket, phase_bucket_row, phase_horizon_bucket):
+            bucket["total"] = int(bucket.get("total", 0)) + 1
+            bucket[correctness] = int(bucket.get(correctness, 0)) + 1
+
+        quality = str(outcome.get("timing_quality") or "unknown").strip().lower()
+        timing_quality[quality] = timing_quality.get(quality, 0) + 1
+        size_fit = str(outcome.get("size_appropriateness") or "unknown").strip().lower()
+        size_appropriateness[size_fit] = size_appropriateness.get(size_fit, 0) + 1
+
+        wait_value = outcome.get("would_waiting_15m_help")
+        if wait_value is True:
+            wait_help["true"] += 1
+        elif wait_value is False:
+            wait_help["false"] += 1
+        else:
+            wait_help["unknown"] += 1
+
+        early_exit_value = outcome.get("would_exiting_15m_earlier_help")
+        if early_exit_value is True:
+            early_exit_help["true"] += 1
+        elif early_exit_value is False:
+            early_exit_help["false"] += 1
+        else:
+            early_exit_help["unknown"] += 1
+
+    for name in list(by_horizon.keys()):
+        by_horizon[name] = _finalize_outcome_bucket(by_horizon[name])
+    for name in list(by_phase_bucket.keys()):
+        by_phase_bucket[name] = _finalize_outcome_bucket(by_phase_bucket[name])
+    for name in list(by_phase_horizon.keys()):
+        by_phase_horizon[name] = _finalize_outcome_bucket(by_phase_horizon[name])
+
+    return {
+        "total": len(rows),
+        "by_horizon": by_horizon,
+        "by_phase_bucket": by_phase_bucket,
+        "by_phase_horizon": by_phase_horizon,
+        "timing_quality": timing_quality,
+        "size_appropriateness": size_appropriateness,
+        "would_waiting_15m_help": wait_help,
+        "would_exiting_15m_earlier_help": early_exit_help,
+        "operator_scorecard_pre_boundary": _build_pre_boundary_operator_scorecard(rows),
+    }
+
+
+def _new_operator_score_bucket() -> dict[str, Any]:
+    return {
+        "total": 0,
+        "correct": 0,
+        "incorrect": 0,
+        "mixed": 0,
+        "insufficient_data": 0,
+        "unknown": 0,
+        "known_total": 0,
+        "hit_rate_pct": None,
+        "wrong_rate_pct": None,
+        "mixed_rate_pct": None,
+        "wait_help_true": 0,
+        "wait_help_false": 0,
+        "wait_help_unknown": 0,
+        "wait_help_rate_pct": None,
+        "early_exit_help_true": 0,
+        "early_exit_help_false": 0,
+        "early_exit_help_unknown": 0,
+        "early_exit_help_rate_pct": None,
+    }
+
+
+def _safe_rate_pct(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return (float(numerator) / float(denominator)) * 100.0
+
+
+def _finalize_operator_score_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
+    known_total = int(bucket.get("correct", 0)) + int(bucket.get("incorrect", 0)) + int(bucket.get("mixed", 0))
+    bucket["known_total"] = known_total
+    bucket["hit_rate_pct"] = _safe_rate_pct(int(bucket.get("correct", 0)), known_total)
+    bucket["wrong_rate_pct"] = _safe_rate_pct(int(bucket.get("incorrect", 0)), known_total)
+    bucket["mixed_rate_pct"] = _safe_rate_pct(int(bucket.get("mixed", 0)), known_total)
+
+    wait_known = int(bucket.get("wait_help_true", 0)) + int(bucket.get("wait_help_false", 0))
+    bucket["wait_help_rate_pct"] = _safe_rate_pct(int(bucket.get("wait_help_true", 0)), wait_known)
+
+    early_exit_known = int(bucket.get("early_exit_help_true", 0)) + int(bucket.get("early_exit_help_false", 0))
+    bucket["early_exit_help_rate_pct"] = _safe_rate_pct(
+        int(bucket.get("early_exit_help_true", 0)),
+        early_exit_known,
+    )
+    return bucket
+
+
+def _build_operator_traffic_light(bucket: dict[str, Any]) -> dict[str, Any]:
+    known_total = int(bucket.get("known_total", 0))
+    hit_rate = _safe_float(bucket.get("hit_rate_pct"))
+    wrong_rate = _safe_float(bucket.get("wrong_rate_pct"))
+    wait_help_rate = _safe_float(bucket.get("wait_help_rate_pct"))
+    early_exit_help_rate = _safe_float(bucket.get("early_exit_help_rate_pct"))
+
+    score = 0
+    reasons: list[str] = []
+
+    if known_total <= 0:
+        return {
+            "status": "gray",
+            "score": 0,
+            "reasons": ["no_known_outcomes"],
+        }
+    if known_total >= 20:
+        score += 2
+        reasons.append("sample_depth_good")
+    elif known_total >= 8:
+        score += 1
+        reasons.append("sample_depth_ok")
+    else:
+        score -= 1
+        reasons.append("sample_depth_low")
+
+    if hit_rate is not None:
+        if hit_rate >= 70.0:
+            score += 2
+            reasons.append("hit_rate_strong")
+        elif hit_rate >= 55.0:
+            score += 1
+            reasons.append("hit_rate_ok")
+        elif hit_rate >= 45.0:
+            reasons.append("hit_rate_mixed")
+        else:
+            score -= 2
+            reasons.append("hit_rate_weak")
+
+    if wrong_rate is not None:
+        if wrong_rate <= 15.0:
+            score += 2
+            reasons.append("wrong_rate_low")
+        elif wrong_rate <= 25.0:
+            score += 1
+            reasons.append("wrong_rate_ok")
+        elif wrong_rate <= 35.0:
+            reasons.append("wrong_rate_mixed")
+        else:
+            score -= 2
+            reasons.append("wrong_rate_high")
+
+    if wait_help_rate is not None:
+        if wait_help_rate <= 25.0:
+            score += 1
+            reasons.append("timing_wait_signal_good")
+        elif wait_help_rate > 40.0:
+            score -= 1
+            reasons.append("timing_wait_signal_bad")
+
+    if early_exit_help_rate is not None:
+        if early_exit_help_rate <= 25.0:
+            score += 1
+            reasons.append("timing_early_exit_signal_good")
+        elif early_exit_help_rate > 40.0:
+            score -= 1
+            reasons.append("timing_early_exit_signal_bad")
+
+    status = "red"
+    if score >= 4:
+        status = "green"
+    elif score >= 1:
+        status = "yellow"
+    if known_total < 5 and status == "green":
+        status = "yellow"
+        reasons.append("limited_sample_cap")
+
+    return {
+        "status": status,
+        "score": score,
+        "reasons": reasons,
+    }
+
+
+def _apply_operator_score_row(bucket: dict[str, Any], row: dict[str, Any]) -> None:
+    outcome = dict(row.get("outcome") or {})
+    correctness = str(outcome.get("decision_correctness") or "unknown").strip().lower()
+    if correctness not in {"correct", "incorrect", "mixed", "insufficient_data"}:
+        correctness = "unknown"
+    bucket["total"] = int(bucket.get("total", 0)) + 1
+    bucket[correctness] = int(bucket.get(correctness, 0)) + 1
+
+    wait_value = outcome.get("would_waiting_15m_help")
+    if wait_value is True:
+        bucket["wait_help_true"] = int(bucket.get("wait_help_true", 0)) + 1
+    elif wait_value is False:
+        bucket["wait_help_false"] = int(bucket.get("wait_help_false", 0)) + 1
+    else:
+        bucket["wait_help_unknown"] = int(bucket.get("wait_help_unknown", 0)) + 1
+
+    early_exit_value = outcome.get("would_exiting_15m_earlier_help")
+    if early_exit_value is True:
+        bucket["early_exit_help_true"] = int(bucket.get("early_exit_help_true", 0)) + 1
+    elif early_exit_value is False:
+        bucket["early_exit_help_false"] = int(bucket.get("early_exit_help_false", 0)) + 1
+    else:
+        bucket["early_exit_help_unknown"] = int(bucket.get("early_exit_help_unknown", 0)) + 1
+
+
+def _build_pre_boundary_operator_scorecard(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    filtered: list[dict[str, Any]] = []
+    phases: set[str] = set()
+    for row in rows:
+        outcome = dict(row.get("outcome") or {})
+        raw_phase = str(outcome.get("decision_phase") or row.get("decision_phase") or "unknown")
+        if _outcome_phase_bucket(raw_phase) != "pre_boundary":
+            continue
+        filtered.append(row)
+        phases.add(raw_phase)
+
+    overall = _new_operator_score_bucket()
+    by_horizon: dict[str, dict[str, Any]] = {}
+    for row in filtered:
+        _apply_operator_score_row(overall, row)
+        horizon = str(row.get("horizon") or "unknown")
+        item = by_horizon.setdefault(horizon, _new_operator_score_bucket())
+        _apply_operator_score_row(item, row)
+
+    overall = _finalize_operator_score_bucket(overall)
+    overall["traffic_light"] = _build_operator_traffic_light(overall)
+    for horizon in list(by_horizon.keys()):
+        by_horizon[horizon] = _finalize_operator_score_bucket(by_horizon[horizon])
+        by_horizon[horizon]["traffic_light"] = _build_operator_traffic_light(by_horizon[horizon])
+
+    return {
+        "phase_bucket": "pre_boundary",
+        "phase_values_seen": sorted(phases),
+        "total_rows": len(filtered),
+        "overall": overall,
+        "by_horizon": by_horizon,
+        "traffic_light": dict(overall.get("traffic_light") or {}),
+    }
+
+
+def _new_review_score_bucket() -> dict[str, Any]:
+    return {
+        "total": 0,
+        "correct": 0,
+        "incorrect": 0,
+        "mixed": 0,
+        "insufficient_data": 0,
+        "unknown": 0,
+        "known_total": 0,
+        "correct_rate_pct": None,
+        "avg_net_pnl_delta_pct": None,
+        "avg_alt_delta_pct": None,
+        "_net_sum": 0.0,
+        "_net_count": 0,
+        "_alt_sum": 0.0,
+        "_alt_count": 0,
+    }
+
+
+def _apply_review_score_row(bucket: dict[str, Any], row: Mapping[str, Any]) -> None:
+    outcome = dict(row.get("outcome") or {})
+    correctness = str(outcome.get("decision_correctness") or "unknown").strip().lower()
+    if correctness not in {"correct", "incorrect", "mixed", "insufficient_data"}:
+        correctness = "unknown"
+    bucket["total"] = int(bucket.get("total", 0)) + 1
+    bucket[correctness] = int(bucket.get(correctness, 0)) + 1
+
+    net_delta_pct = _safe_float(outcome.get("net_pnl_delta_pct"))
+    if net_delta_pct is not None:
+        bucket["_net_sum"] = float(bucket.get("_net_sum", 0.0)) + float(net_delta_pct)
+        bucket["_net_count"] = int(bucket.get("_net_count", 0)) + 1
+    alt_delta = _safe_float(outcome.get("net_pnl_delta_vs_alternative"))
+    if alt_delta is not None:
+        bucket["_alt_sum"] = float(bucket.get("_alt_sum", 0.0)) + float(alt_delta)
+        bucket["_alt_count"] = int(bucket.get("_alt_count", 0)) + 1
+
+
+def _finalize_review_score_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
+    known_total = int(bucket.get("correct", 0)) + int(bucket.get("incorrect", 0)) + int(bucket.get("mixed", 0))
+    bucket["known_total"] = known_total
+    bucket["correct_rate_pct"] = _safe_rate_pct(int(bucket.get("correct", 0)), known_total)
+    net_count = int(bucket.get("_net_count", 0))
+    alt_count = int(bucket.get("_alt_count", 0))
+    bucket["avg_net_pnl_delta_pct"] = (
+        float(bucket.get("_net_sum", 0.0)) / float(net_count) if net_count > 0 else None
+    )
+    bucket["avg_alt_delta_pct"] = (
+        float(bucket.get("_alt_sum", 0.0)) / float(alt_count) if alt_count > 0 else None
+    )
+    bucket.pop("_net_sum", None)
+    bucket.pop("_net_count", None)
+    bucket.pop("_alt_sum", None)
+    bucket.pop("_alt_count", None)
+    return bucket
+
+
 def _weighted_mean_recent(
     series: list[dict[str, float]],
     *,
@@ -950,9 +2444,12 @@ class DataService:
         self._telemetry = TelemetryClient(self._execution_settings)
         self._telemetry_events: List[dict[str, Any]] = []
         self._telemetry.register_listener(self._handle_telemetry_event)
+        self._notifier = NotificationRouter()
         self._accounts = AccountMonitor(
             refresh_interval=self._account_interval,
             summary_interval=self._summary_interval,
+            on_margin_adjust=self._on_margin_adjust_events,
+            notifier=self._notifier,
         )
         self._positions_market_lock = asyncio.Lock()
         self._positions_market_cache: dict[tuple[str, str], MarketSnapshot] = {}
@@ -966,7 +2463,7 @@ class DataService:
         self._positions_market_task: Optional[asyncio.Task] = None
         self._positions_market_sem = asyncio.Semaphore(POSITIONS_MARKET_CONCURRENCY)
         self._risk_config: RiskConfig = self._risk_config_from_settings()
-        self._protective_manager = ProtectiveOrderManager(self._risk_config)
+        self._protective_manager = ProtectiveOrderManager(self._risk_config, notifier=self._notifier)
         self._last_protective: dict[tuple[str, str, str], dict[str, float | None]] = {}
         self._protective_interval = getattr(self._risk_config, "position_check_interval_sec", 180)
         self._protective_task: Optional[asyncio.Task] = None
@@ -984,15 +2481,2808 @@ class DataService:
         self._auto_exit_poll_sec = AUTO_EXIT_POLL_SEC
         self._auto_exit_inflight = False
         self._auto_exit_live_spreads: dict[str, float] = {}
+        self._auto_exit_diagnostics: list[dict[str, Any]] = []
+        self._auto_exit_v1_diagnostics: list[dict[str, Any]] = []
         self._auto_exit_events: list[dict[str, Any]] = []
         self._auto_exit_event_limit = 60
         self._auto_exit_last_log_ts: dict[str, float] = {}
         self._auto_exit_log_cooldown_sec = AUTO_EXIT_LOG_COOLDOWN_SEC
         self._coin_analysis_cache: dict[tuple[str, int, int, tuple[str, ...]], tuple[float, dict[str, Any]]] = {}
+        self._coin_focus_task: Optional[asyncio.Task] = None
+        self._coin_focus_poll_sec = COIN_FOCUS_POLL_SEC
+        self._coin_shortlist_poll_sec = COIN_SHORTLIST_POLL_SEC
+        self._coin_shortlist_last_run_ts = 0.0
+        self._coin_shortlist_last_cycle: dict[str, Any] = {}
+        self._coin_outcomes_task: Optional[asyncio.Task] = None
+        self._coin_outcomes_poll_sec = COIN_OUTCOME_POLL_SEC
+        self._coin_outcomes_scheduler_enabled = True
+        self._coin_outcomes_last_cycle: dict[str, Any] = {}
+        self._coin_outcomes_cycle_history: list[dict[str, Any]] = []
+        self._coin_outcomes_cycle_history_limit = 50
+        self._coin_retention_task: Optional[asyncio.Task] = None
+        self._coin_retention_poll_sec = COIN_RETENTION_POLL_SEC
+        self._coin_retention_max_age_days = COIN_RETENTION_MAX_AGE_DAYS_DEFAULT
+        self._coin_retention_closed_paper_days = COIN_RETENTION_CLOSED_PAPER_DAYS_DEFAULT
+        self._coin_retention_last_report: dict[str, Any] = {}
+        self._coin_position_watcher_task: Optional[asyncio.Task] = None
+        self._coin_position_watcher_poll_sec = COIN_POSITION_WATCHER_POLL_SEC
+        self._coin_position_watcher_enabled = True
+        self._coin_position_watcher_last_cycle: dict[str, Any] = {}
+        self._coin_position_watcher_last_by_symbol_ts: dict[str, float] = {}
         self._mexc_alert_cooldown = 600  # seconds
         self._last_mexc_alert: dict[tuple[str, str], float] = {}
         self._send_missing_stop_alerts = True
+        self._margin_logic_state: dict[str, str] = {}
+        self._margin_logic_log: list[dict[str, Any]] = []
+        self._margin_logic_log_limit = 80
+        self._snapshot_dict_cache_key: int | None = None
+        self._snapshot_dict_cache: dict[str, object] | None = None
+        self._account_state_cache_key: tuple[Any, ...] | None = None
+        self._account_state_cache: dict[str, object] | None = None
         self._apply_alert_settings()
+
+    async def bootstrap_symbol_session(
+        self,
+        symbol: str,
+        *,
+        ttl_sec: int | None = None,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        canonical = normalize_symbol(symbol)
+        if not canonical:
+            raise ValueError("Symbol must be provided for session bootstrap.")
+        ts_ms = int(now_ms or (time.time() * 1000))
+        ttl = max(60, int(ttl_sec or COIN_ANALYSIS_SESSION_TTL_SEC))
+        row = CoinSymbolSessionRow(
+            canonical_symbol=canonical,
+            started_at_ms=ts_ms,
+            expires_at_ms=ts_ms + ttl * 1000,
+            is_tracking=True,
+            updated_at_ms=ts_ms,
+        )
+        await asyncio.to_thread(upsert_symbol_session, row)
+        return {
+            "canonical_symbol": canonical,
+            "started_at_ms": row.started_at_ms,
+            "expires_at_ms": row.expires_at_ms,
+            "ttl_sec": ttl,
+            "tracking": True,
+        }
+
+    async def start_coin_symbol_session(
+        self,
+        symbol: str,
+        *,
+        ttl_sec: int | None = None,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        return await self.bootstrap_symbol_session(symbol, ttl_sec=ttl_sec, now_ms=now_ms)
+
+    async def extend_coin_symbol_session(
+        self,
+        symbol: str,
+        *,
+        ttl_sec: int | None = None,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        return await self.bootstrap_symbol_session(symbol, ttl_sec=ttl_sec, now_ms=now_ms)
+
+    async def stop_coin_symbol_session(
+        self,
+        symbol: str,
+        *,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        canonical = normalize_symbol(symbol)
+        if not canonical:
+            raise ValueError("Symbol must be provided for session stop.")
+        ts_ms = int(now_ms or (time.time() * 1000))
+        row = CoinSymbolSessionRow(
+            canonical_symbol=canonical,
+            started_at_ms=ts_ms,
+            expires_at_ms=ts_ms,
+            is_tracking=False,
+            updated_at_ms=ts_ms,
+        )
+        await asyncio.to_thread(upsert_symbol_session, row)
+        return {
+            "canonical_symbol": canonical,
+            "stopped_at_ms": ts_ms,
+            "tracking": False,
+        }
+
+    async def list_active_coin_symbol_sessions(
+        self,
+        *,
+        now_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        ts_ms = int(now_ms or (time.time() * 1000))
+        await asyncio.to_thread(expire_symbol_sessions, ts_ms)
+        active = await asyncio.to_thread(get_active_symbol_sessions, ts_ms)
+        out: list[dict[str, Any]] = []
+        for row in active:
+            out.append(
+                {
+                    "canonical_symbol": row.canonical_symbol,
+                    "started_at_ms": row.started_at_ms,
+                    "expires_at_ms": row.expires_at_ms,
+                    "updated_at_ms": row.updated_at_ms,
+                    "tracking": bool(row.is_tracking),
+                }
+            )
+        return out
+
+    async def _record_coin_trade_activity(
+        self,
+        *,
+        canonical_symbol: str,
+        activity_type: str,
+        ts_ms: int | None = None,
+        pair_key: str | None = None,
+        direction: str | None = None,
+        source: str | None = None,
+        state_ref: str | None = None,
+        payload: Mapping[str, Any] | None = None,
+    ) -> None:
+        safe_symbol = normalize_symbol(canonical_symbol)
+        if not safe_symbol:
+            return
+        safe_ts_ms = int(ts_ms or (time.time() * 1000))
+        event_id = (
+            f"coin-activity-{safe_symbol.lower()}-"
+            f"{str(activity_type or 'unknown').lower()}-{safe_ts_ms}-{uuid4().hex[:8]}"
+        )
+        await asyncio.to_thread(
+            insert_trade_activity,
+            CoinTradeActivityRow(
+                event_id=event_id,
+                ts_ms=safe_ts_ms,
+                canonical_symbol=safe_symbol,
+                pair_key=str(pair_key or "").strip() or None,
+                direction=str(direction or "").strip() or None,
+                activity_type=str(activity_type or "unknown").strip().lower() or "unknown",
+                source=str(source or "").strip() or None,
+                state_ref=str(state_ref or "").strip() or None,
+                payload=dict(payload or {}),
+            ),
+        )
+
+    def _coin_shortlist_candidates_from_snapshot(self, top_n: int = 3) -> list[dict[str, Any]]:
+        snapshot = self._snapshot
+        if snapshot is None:
+            return []
+        candidates: list[dict[str, Any]] = []
+        seen_symbols: set[str] = set()
+        opportunities = sorted(
+            list(snapshot.opportunities or []),
+            key=lambda item: abs(_safe_float(getattr(item, "effective_spread", None)) or _safe_float(getattr(item, "spread", None)) or 0.0),
+            reverse=True,
+        )
+        for item in opportunities:
+            symbol = normalize_symbol(str(getattr(item, "symbol", "") or ""))
+            long_exchange = normalize_exchange_name(str(getattr(item, "long_exchange", "") or ""))
+            short_exchange = normalize_exchange_name(str(getattr(item, "short_exchange", "") or ""))
+            if not symbol or symbol in seen_symbols:
+                continue
+            if {long_exchange, short_exchange} != set(COIN_ANALYSIS_CORE_EXCHANGES):
+                continue
+            seen_symbols.add(symbol)
+            candidates.append(
+                {
+                    "symbol": symbol,
+                    "long_exchange": long_exchange,
+                    "short_exchange": short_exchange,
+                    "spread": _safe_float(getattr(item, "spread", None)),
+                    "effective_spread": _safe_float(getattr(item, "effective_spread", None)),
+                    "price_diff_pct": _safe_float(getattr(item, "price_diff_pct", None)),
+                }
+            )
+            if len(candidates) >= max(1, int(top_n)):
+                break
+        return candidates
+
+    def _coin_shortlist_row_from_analysis(
+        self,
+        *,
+        rank: int,
+        source_name: str,
+        analysis: Mapping[str, Any],
+    ) -> CoinCandidateShortlistRow | None:
+        canonical = normalize_symbol(str(analysis.get("symbol") or ""))
+        if not canonical:
+            return None
+        pairs = list(analysis.get("pair_analysis") or [])
+        selected: Mapping[str, Any] | None = None
+        for row in pairs:
+            left = normalize_exchange_name(str(row.get("left_exchange") or ""))
+            right = normalize_exchange_name(str(row.get("right_exchange") or ""))
+            if {left, right} == set(COIN_ANALYSIS_CORE_EXCHANGES):
+                selected = row
+                break
+        if selected is None and pairs:
+            selected = pairs[0]
+        if selected is None:
+            return None
+        direction = str((analysis.get("bot_logic") or {}).get("recommended_pair", {}).get("direction") or "long_a_short_b")
+        scores = dict(selected.get("scores") or {})
+        spread_block = dict(selected.get("spread") or {})
+        premium_block = dict(selected.get("premium") or {})
+        oi_block = dict(selected.get("open_interest") or {})
+        reasons = [str(item) for item in list(selected.get("reasons") or [])[:8]]
+        return CoinCandidateShortlistRow(
+            ts_ms=int(time.time() * 1000),
+            canonical_symbol=canonical,
+            pair_key=str(selected.get("pair_key") or ""),
+            rank=max(1, int(rank)),
+            source_name=str(source_name or "markets_top3"),
+            direction_hint=direction,
+            candidate_score=_safe_float(selected.get("score")) or _safe_float(scores.get("entry_score")),
+            funding_edge_pct=(
+                _safe_float(((selected.get("funding") or {}).get("delta_pct")))
+                or _safe_float(((selected.get("funding_hourly") or {}).get("delta")))
+                or _safe_float(scores.get("funding_score"))
+            ),
+            entry_spread_pct=(
+                _safe_float(((selected.get("derived_spread") or {}).get("open_spread_pct")))
+                or _safe_float(spread_block.get("current_pct"))
+            ),
+            premium_diff_pct=_safe_float(premium_block.get("delta_pct")),
+            oi_change_1h_pct=_safe_float(oi_block.get("oi_change_1h_pct")),
+            oi_change_4h_pct=_safe_float(oi_block.get("oi_change_4h_pct")),
+            reason_codes=reasons,
+            payload={
+                "score": _safe_float(selected.get("score")),
+                "recommendation": selected.get("recommendation"),
+                "decision_phase": selected.get("decision_phase"),
+                "reasons": reasons,
+                "spread": spread_block,
+                "premium": premium_block,
+                "open_interest": oi_block,
+                "bot_logic": analysis.get("bot_logic") or {},
+            },
+        )
+
+    async def collect_coin_candidate_shortlist_once(self, *, top_n: int = 3) -> dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+        snapshot_candidates = self._coin_shortlist_candidates_from_snapshot(top_n=max(1, int(top_n)))
+        if not snapshot_candidates:
+            cycle = {
+                "ts_ms": now_ms,
+                "top_n": max(1, int(top_n)),
+                "shortlisted": 0,
+                "source_candidates": 0,
+                "symbols": [],
+            }
+            self._coin_shortlist_last_cycle = cycle
+            self._coin_shortlist_last_run_ts = time.time()
+            return cycle
+
+        stored_rows: list[CoinCandidateShortlistRow] = []
+        shortlisted_symbols: list[str] = []
+        errors: list[dict[str, str]] = []
+        for rank, candidate in enumerate(snapshot_candidates, start=1):
+            symbol = normalize_symbol(str(candidate.get("symbol") or ""))
+            if not symbol:
+                continue
+            try:
+                analysis = await self.analyze_symbol(
+                    symbol,
+                    window_minutes=240,
+                    funding_points=96,
+                    use_cache=True,
+                    persist_candidate_decision=False,
+                    run_position_logic=False,
+                )
+                row = self._coin_shortlist_row_from_analysis(
+                    rank=rank,
+                    source_name="markets_top3",
+                    analysis=analysis,
+                )
+                if row is None:
+                    continue
+                stored_rows.append(row)
+                shortlisted_symbols.append(symbol)
+                await self.bootstrap_symbol_session(symbol, ttl_sec=45 * 60, now_ms=now_ms)
+            except Exception as exc:  # pylint: disable=broad-except
+                errors.append({"symbol": symbol, "error": str(exc)})
+        inserted = 0
+        if stored_rows:
+            inserted = await asyncio.to_thread(insert_candidate_shortlist_rows, stored_rows)
+        cycle = {
+            "ts_ms": now_ms,
+            "top_n": max(1, int(top_n)),
+            "source_candidates": len(snapshot_candidates),
+            "shortlisted": inserted,
+            "symbols": shortlisted_symbols,
+            "errors": errors[:10],
+        }
+        self._coin_shortlist_last_cycle = cycle
+        self._coin_shortlist_last_run_ts = time.time()
+        return cycle
+
+    async def get_coin_focus_snapshots(
+        self,
+        symbol: str,
+        *,
+        exchange: str | None = None,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        canonical = normalize_symbol(symbol)
+        if not canonical:
+            raise ValueError("Symbol is required for focus snapshots.")
+        name = normalize_exchange_name(exchange) if exchange else None
+        rows = await asyncio.to_thread(
+            get_focus_snapshots,
+            canonical,
+            exchange=name,
+            limit=max(1, min(int(limit), 2000)),
+        )
+        return {
+            "symbol": canonical,
+            "exchange": name,
+            "points": len(rows),
+            "rows": rows,
+        }
+
+    async def load_focus_history(
+        self,
+        symbol: str,
+        *,
+        exchange: str | None = None,
+        limit: int = 500,
+        since_ts_ms: int | None = None,
+        until_ts_ms: int | None = None,
+    ) -> dict[str, Any]:
+        payload = await self.get_coin_focus_snapshots(
+            symbol,
+            exchange=exchange,
+            limit=max(1, min(int(limit), 5000)),
+        )
+        rows = list(payload.get("rows") or [])
+        if since_ts_ms is not None:
+            since_val = int(since_ts_ms)
+            rows = [
+                row for row in rows if int(_safe_float(row.get("ts_ms")) or 0) >= since_val
+            ]
+        if until_ts_ms is not None:
+            until_val = int(until_ts_ms)
+            rows = [
+                row for row in rows if int(_safe_float(row.get("ts_ms")) or 0) <= until_val
+            ]
+        return {
+            "symbol": payload.get("symbol"),
+            "exchange": payload.get("exchange"),
+            "points": len(rows),
+            "window": {
+                "since_ts_ms": int(since_ts_ms) if since_ts_ms is not None else None,
+                "until_ts_ms": int(until_ts_ms) if until_ts_ms is not None else None,
+            },
+            "rows": rows,
+        }
+
+    async def load_bootstrap_history(
+        self,
+        symbol: str,
+        *,
+        exchange: str | None = None,
+        funding_limit: int = 500,
+        oi_limit: int = 500,
+        since_ts_ms: int | None = None,
+        until_ts_ms: int | None = None,
+    ) -> dict[str, Any]:
+        canonical = normalize_symbol(symbol)
+        if not canonical:
+            raise ValueError("symbol is required")
+        name = normalize_exchange_name(exchange) if exchange else None
+        funding_rows = await asyncio.to_thread(
+            get_funding_history,
+            canonical,
+            exchange=name,
+            limit=max(1, min(int(funding_limit), 5000)),
+        )
+        oi_rows = await asyncio.to_thread(
+            get_open_interest_history,
+            canonical,
+            exchange=name,
+            limit=max(1, min(int(oi_limit), 5000)),
+        )
+        if since_ts_ms is not None:
+            since_val = int(since_ts_ms)
+            funding_rows = [
+                row for row in funding_rows if int(_safe_float(row.get("ts_ms")) or 0) >= since_val
+            ]
+            oi_rows = [
+                row for row in oi_rows if int(_safe_float(row.get("ts_ms")) or 0) >= since_val
+            ]
+        if until_ts_ms is not None:
+            until_val = int(until_ts_ms)
+            funding_rows = [
+                row for row in funding_rows if int(_safe_float(row.get("ts_ms")) or 0) <= until_val
+            ]
+            oi_rows = [
+                row for row in oi_rows if int(_safe_float(row.get("ts_ms")) or 0) <= until_val
+            ]
+        funding_sources = sorted(
+            {
+                str(row.get("source_type") or "").strip()
+                for row in funding_rows
+                if str(row.get("source_type") or "").strip()
+            }
+        )
+        oi_sources = sorted(
+            {
+                str(row.get("source_type") or "").strip()
+                for row in oi_rows
+                if str(row.get("source_type") or "").strip()
+            }
+        )
+        return {
+            "symbol": canonical,
+            "exchange": name,
+            "window": {
+                "since_ts_ms": int(since_ts_ms) if since_ts_ms is not None else None,
+                "until_ts_ms": int(until_ts_ms) if until_ts_ms is not None else None,
+            },
+            "funding_history": funding_rows,
+            "open_interest_history": oi_rows,
+            "counts": {
+                "funding_points": len(funding_rows),
+                "open_interest_points": len(oi_rows),
+            },
+            "provenance": {
+                "funding_sources": funding_sources,
+                "open_interest_sources": oi_sources,
+            },
+        }
+
+    async def load_symbol_context(
+        self,
+        symbol: str,
+        *,
+        focus_limit: int = 500,
+        funding_limit: int = 500,
+        oi_limit: int = 500,
+        decision_limit: int = 500,
+        outcome_limit: int = 500,
+        real_obs_limit: int = 500,
+    ) -> dict[str, Any]:
+        canonical = normalize_symbol(symbol)
+        if not canonical:
+            raise ValueError("symbol is required")
+        sessions = await self.list_active_coin_symbol_sessions()
+        active_session = next(
+            (
+                item
+                for item in sessions
+                if normalize_symbol(str(item.get("canonical_symbol") or "")) == canonical
+            ),
+            None,
+        )
+        focus = await self.load_focus_history(canonical, limit=max(1, min(int(focus_limit), 5000)))
+        bootstrap = await self.load_bootstrap_history(
+            canonical,
+            funding_limit=max(1, min(int(funding_limit), 5000)),
+            oi_limit=max(1, min(int(oi_limit), 5000)),
+        )
+        decisions = await asyncio.to_thread(
+            get_decisions,
+            canonical_symbol=canonical,
+            limit=max(1, min(int(decision_limit), 5000)),
+        )
+        outcomes = await asyncio.to_thread(
+            get_outcomes,
+            canonical_symbol=canonical,
+            limit=max(1, min(int(outcome_limit), 5000)),
+        )
+        paper = await self.get_coin_paper_positions(symbol=canonical, status="open")
+        real_rows = await asyncio.to_thread(
+            get_real_position_observations,
+            canonical_symbol=canonical,
+            limit=max(1, min(int(real_obs_limit), 5000)),
+        )
+        return {
+            "symbol": canonical,
+            "active_session": active_session,
+            "focus_history": focus,
+            "bootstrap_history": bootstrap,
+            "decision_journal": {
+                "count": len(decisions),
+                "rows": decisions,
+            },
+            "decision_outcomes": {
+                "count": len(outcomes),
+                "rows": outcomes,
+            },
+            "paper_positions_open": paper,
+            "real_position_observations": {
+                "count": len(real_rows),
+                "rows": real_rows,
+            },
+        }
+
+    async def get_coin_paper_positions(
+        self,
+        *,
+        symbol: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        canonical = normalize_symbol(symbol) if symbol else None
+        rows = await asyncio.to_thread(get_paper_positions, status=status)
+        if canonical:
+            rows = [
+                row
+                for row in rows
+                if normalize_symbol(str(row.get("canonical_symbol") or "")) == canonical
+            ]
+        return {
+            "symbol": canonical,
+            "status": status,
+            "count": len(rows),
+            "rows": rows,
+        }
+
+    async def get_coin_paper_events(
+        self,
+        position_key: str,
+        *,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        key = str(position_key or "").strip()
+        if not key:
+            raise ValueError("position_key is required")
+        rows = await asyncio.to_thread(
+            get_paper_events,
+            key,
+            limit=max(1, min(int(limit), 2000)),
+        )
+        return {
+            "position_key": key,
+            "count": len(rows),
+            "rows": rows,
+        }
+
+    async def get_coin_weekly_review(
+        self,
+        *,
+        days: int = 7,
+        top: int = 3,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        safe_days = max(1, min(int(days), 30))
+        safe_top = max(1, min(int(top), 10))
+        now_ms = int(time.time() * 1000)
+        since_ts_ms = now_ms - safe_days * 24 * 3600 * 1000
+        canonical = normalize_symbol(symbol) if symbol else None
+
+        trade_rows = await asyncio.to_thread(
+            get_trade_activity,
+            canonical_symbol=canonical,
+            since_ts_ms=since_ts_ms,
+            limit=5000,
+        )
+        shortlist_rows = await asyncio.to_thread(
+            get_candidate_shortlist,
+            canonical_symbol=canonical,
+            since_ts_ms=since_ts_ms,
+            limit=5000,
+        )
+        decisions = await asyncio.to_thread(
+            get_decisions,
+            canonical_symbol=canonical,
+            limit=5000,
+        )
+        decisions = [
+            row for row in decisions if int(_safe_float(row.get("ts_ms")) or 0) >= since_ts_ms
+        ]
+        outcomes = await asyncio.to_thread(
+            get_outcomes,
+            canonical_symbol=canonical,
+            limit=5000,
+        )
+        outcomes = [
+            row
+            for row in outcomes
+            if int(_safe_float(row.get("evaluated_at_ms")) or 0) >= since_ts_ms
+        ]
+        paper_rows = await asyncio.to_thread(get_paper_positions, status="open")
+        if canonical:
+            paper_rows = [
+                row
+                for row in paper_rows
+                if normalize_symbol(str(row.get("canonical_symbol") or "")) == canonical
+            ]
+        real_rows = await asyncio.to_thread(
+            get_real_position_observations,
+            canonical_symbol=canonical,
+            limit=5000,
+        )
+        real_rows = [row for row in real_rows if str(row.get("status") or "") == "open"]
+
+        recent_traded_symbols = sorted(
+            {
+                normalize_symbol(str(row.get("canonical_symbol") or ""))
+                for row in trade_rows
+                if str(row.get("canonical_symbol") or "").strip()
+            }
+        )
+        shortlist_symbols = sorted(
+            {
+                normalize_symbol(str(row.get("canonical_symbol") or ""))
+                for row in shortlist_rows
+                if str(row.get("canonical_symbol") or "").strip()
+            }
+        )
+        latest_shortlist_by_symbol: dict[str, dict[str, Any]] = {}
+        for row in shortlist_rows:
+            sym = normalize_symbol(str(row.get("canonical_symbol") or ""))
+            if not sym or sym in latest_shortlist_by_symbol:
+                continue
+            latest_shortlist_by_symbol[sym] = row
+        top_candidate_symbols = [
+            sym
+            for sym, _row in sorted(
+                latest_shortlist_by_symbol.items(),
+                key=lambda item: (
+                    -int(_safe_float(item[1].get("ts_ms")) or 0),
+                    int(_safe_float(item[1].get("rank")) or 999),
+                ),
+            )[:safe_top]
+        ]
+        activity_by_type: dict[str, int] = {}
+        for row in trade_rows:
+            key_name = str(row.get("activity_type") or "unknown")
+            activity_by_type[key_name] = int(activity_by_type.get(key_name, 0) + 1)
+
+        trade_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        for row in trade_rows:
+            sym = normalize_symbol(str(row.get("canonical_symbol") or ""))
+            if not sym:
+                continue
+            trade_by_symbol.setdefault(sym, []).append(row)
+
+        review_tags: list[dict[str, Any]] = []
+        seen_missed_entries: set[tuple[str, int, int]] = set()
+        for row in shortlist_rows:
+            sym = normalize_symbol(str(row.get("canonical_symbol") or ""))
+            rank = int(_safe_float(row.get("rank")) or 0)
+            candidate_score = _safe_float(row.get("candidate_score"))
+            shortlist_ts_ms = int(_safe_float(row.get("ts_ms")) or 0)
+            if not sym or shortlist_ts_ms <= 0:
+                continue
+            if rank <= 0 or rank > safe_top:
+                continue
+            if candidate_score is None or candidate_score < float(COIN_REVIEW_MISSED_ENTRY_SCORE_MIN):
+                continue
+            nearby_trade = False
+            for trade in trade_by_symbol.get(sym, []):
+                trade_ts_ms = int(_safe_float(trade.get("ts_ms")) or 0)
+                if abs(trade_ts_ms - shortlist_ts_ms) <= COIN_REVIEW_MISSED_ENTRY_LOOKAHEAD_MS:
+                    nearby_trade = True
+                    break
+            if nearby_trade:
+                continue
+            dedupe_key = (sym, shortlist_ts_ms, rank)
+            if dedupe_key in seen_missed_entries:
+                continue
+            seen_missed_entries.add(dedupe_key)
+            funding_edge_pct = _safe_float(row.get("funding_edge_pct")) or 0.0
+            entry_spread_pct = _safe_float(row.get("entry_spread_pct")) or 0.0
+            impact_score = round(
+                float(candidate_score)
+                + max(0.0, 8.0 - float(rank) * 2.0)
+                + min(12.0, abs(float(entry_spread_pct)) * 20.0)
+                + min(10.0, abs(float(funding_edge_pct)) * 100.0),
+                2,
+            )
+            review_tags.append(
+                {
+                    "tag": "missed_entry",
+                    "symbol": sym,
+                    "ts_ms": shortlist_ts_ms,
+                    "severity": "warn" if impact_score >= 75.0 else "info",
+                    "impact_score": impact_score,
+                    "rank": rank,
+                    "candidate_score": candidate_score,
+                    "pair_key": row.get("pair_key"),
+                    "reason": "strong_shortlist_without_trade",
+                    "payload": {
+                        "funding_edge_pct": funding_edge_pct,
+                        "entry_spread_pct": entry_spread_pct,
+                        "reason_codes": list(row.get("reason_codes") or []),
+                    },
+                }
+            )
+
+        for row in outcomes:
+            outcome = dict(row.get("outcome") or {})
+            action = str(row.get("action") or outcome.get("decision_action") or "").upper()
+            correctness = str(outcome.get("decision_correctness") or "").strip().lower()
+            net_delta_pct = _safe_float(outcome.get("net_pnl_delta_pct"))
+            timing_quality = str(outcome.get("timing_quality") or "")
+            net_alt = _safe_float(outcome.get("net_pnl_delta_vs_alternative"))
+
+            if action in {"ENTRY_SMALL", "ENTRY_STRONG", "ADD_SMALL"}:
+                is_bad_entry = False
+                if correctness == "incorrect":
+                    is_bad_entry = True
+                elif net_delta_pct is not None and net_delta_pct <= float(COIN_REVIEW_BAD_ENTRY_NET_DELTA_MAX):
+                    is_bad_entry = True
+                if is_bad_entry:
+                    impact_score = round(
+                        60.0
+                        + min(25.0, abs(float(net_delta_pct or 0.0)) * 100.0)
+                        + (10.0 if correctness == "incorrect" else 0.0)
+                        + (8.0 if timing_quality == "poor" else 0.0),
+                        2,
+                    )
+                    review_tags.append(
+                        {
+                            "tag": "bad_entry",
+                            "symbol": normalize_symbol(str(row.get("canonical_symbol") or "")),
+                            "ts_ms": int(_safe_float(row.get("evaluated_at_ms")) or 0),
+                            "severity": "high" if impact_score >= 85.0 else "warn",
+                            "impact_score": impact_score,
+                            "decision_id": row.get("decision_id"),
+                            "action": action,
+                            "horizon": row.get("horizon"),
+                            "phase": outcome.get("decision_phase"),
+                            "reason": "entry_underperformed",
+                            "payload": {
+                                "decision_correctness": correctness,
+                                "timing_quality": timing_quality,
+                                "net_pnl_delta_pct": net_delta_pct,
+                                "net_pnl_delta_vs_alternative": outcome.get("net_pnl_delta_vs_alternative"),
+                            },
+                        }
+                    )
+
+            if action in {"PARTIAL_EXIT", "FULL_EXIT"}:
+                is_good_exit = (
+                    correctness == "correct"
+                    and net_alt is not None
+                    and net_alt <= float(COIN_REVIEW_GOOD_EXIT_ALT_DELTA_MAX)
+                )
+                if is_good_exit:
+                    impact_score = round(
+                        55.0
+                        + min(22.0, abs(float(net_alt or 0.0)) * 100.0)
+                        + (8.0 if timing_quality == "good" else 0.0)
+                        + (4.0 if action == "FULL_EXIT" else 0.0),
+                        2,
+                    )
+                    review_tags.append(
+                        {
+                            "tag": "good_exit",
+                            "symbol": normalize_symbol(str(row.get("canonical_symbol") or "")),
+                            "ts_ms": int(_safe_float(row.get("evaluated_at_ms")) or 0),
+                            "severity": "info" if impact_score < 70.0 else "warn",
+                            "impact_score": impact_score,
+                            "decision_id": row.get("decision_id"),
+                            "action": action,
+                            "horizon": row.get("horizon"),
+                            "phase": outcome.get("decision_phase"),
+                            "reason": "timely_exit_confirmed",
+                            "payload": {
+                                "decision_correctness": correctness,
+                                "timing_quality": timing_quality,
+                                "net_pnl_delta_pct": net_delta_pct,
+                                "net_pnl_delta_vs_alternative": net_alt,
+                            },
+                        }
+                    )
+
+            if action in {"NO_TRADE", "ADD_BLOCKED"}:
+                is_good_no_trade = (
+                    correctness == "correct"
+                    and net_delta_pct is not None
+                    and net_delta_pct <= float(COIN_REVIEW_GOOD_NO_TRADE_NET_DELTA_MAX)
+                )
+                if is_good_no_trade:
+                    impact_score = round(
+                        50.0
+                        + min(20.0, abs(float(net_delta_pct or 0.0)) * 100.0)
+                        + (6.0 if timing_quality == "good" else 0.0),
+                        2,
+                    )
+                    review_tags.append(
+                        {
+                            "tag": "good_no_trade",
+                            "symbol": normalize_symbol(str(row.get("canonical_symbol") or "")),
+                            "ts_ms": int(_safe_float(row.get("evaluated_at_ms")) or 0),
+                            "severity": "info" if impact_score < 65.0 else "warn",
+                            "impact_score": impact_score,
+                            "decision_id": row.get("decision_id"),
+                            "action": action,
+                            "horizon": row.get("horizon"),
+                            "phase": outcome.get("decision_phase"),
+                            "reason": "avoided_bad_entry",
+                            "payload": {
+                                "decision_correctness": correctness,
+                                "timing_quality": timing_quality,
+                                "net_pnl_delta_pct": net_delta_pct,
+                            },
+                        }
+                    )
+
+            if action == "HOLD":
+                is_bad_hold = False
+                if correctness == "incorrect":
+                    is_bad_hold = True
+                elif net_delta_pct is not None and net_delta_pct <= float(COIN_REVIEW_BAD_HOLD_NET_DELTA_MAX):
+                    is_bad_hold = True
+                if is_bad_hold and not bool(outcome.get("would_exiting_15m_earlier_help")):
+                    impact_score = round(
+                        58.0
+                        + min(25.0, abs(float(net_delta_pct or 0.0)) * 100.0)
+                        + (8.0 if timing_quality == "poor" else 0.0),
+                        2,
+                    )
+                    review_tags.append(
+                        {
+                            "tag": "bad_hold",
+                            "symbol": normalize_symbol(str(row.get("canonical_symbol") or "")),
+                            "ts_ms": int(_safe_float(row.get("evaluated_at_ms")) or 0),
+                            "severity": "warn" if impact_score < 85.0 else "high",
+                            "impact_score": impact_score,
+                            "decision_id": row.get("decision_id"),
+                            "action": action,
+                            "horizon": row.get("horizon"),
+                            "phase": outcome.get("decision_phase"),
+                            "reason": "holding_underperformed",
+                            "payload": {
+                                "decision_correctness": correctness,
+                                "timing_quality": timing_quality,
+                                "net_pnl_delta_pct": net_delta_pct,
+                                "net_pnl_delta_vs_alternative": net_alt,
+                            },
+                        }
+                    )
+
+            if action not in {"HOLD", "ENTRY_SMALL", "ENTRY_STRONG", "ADD_SMALL"}:
+                continue
+            if not bool(outcome.get("would_exiting_15m_earlier_help")):
+                continue
+            if net_alt is None or net_alt > float(COIN_REVIEW_LATE_EXIT_NET_DELTA_MIN):
+                continue
+            impact_score = round(
+                70.0
+                + min(30.0, abs(float(net_alt)) * 100.0)
+                + (10.0 if str(outcome.get("timing_quality") or "") == "poor" else 0.0),
+                2,
+            )
+            review_tags.append(
+                {
+                    "tag": "late_exit",
+                    "symbol": normalize_symbol(str(row.get("canonical_symbol") or "")),
+                    "ts_ms": int(_safe_float(row.get("evaluated_at_ms")) or 0),
+                    "severity": "high" if impact_score >= 90.0 else "warn",
+                    "impact_score": impact_score,
+                    "decision_id": row.get("decision_id"),
+                    "action": action,
+                    "horizon": row.get("horizon"),
+                    "phase": outcome.get("decision_phase"),
+                    "reason": "earlier_exit_would_help",
+                    "payload": {
+                        "timing_quality": outcome.get("timing_quality"),
+                        "net_pnl_delta_vs_alternative": net_alt,
+                        "net_pnl_delta_pct": outcome.get("net_pnl_delta_pct"),
+                    },
+                }
+            )
+
+        trade_by_state: dict[str, list[dict[str, Any]]] = {}
+        for row in trade_rows:
+            state_ref = str(row.get("state_ref") or "").strip()
+            if not state_ref:
+                continue
+            trade_by_state.setdefault(state_ref, []).append(row)
+        for row in paper_rows:
+            position_key = str(row.get("position_key") or "").strip()
+            opened_at_ms = int(_safe_float(row.get("opened_at_ms")) or 0)
+            if not position_key or opened_at_ms <= 0:
+                continue
+            if (now_ms - opened_at_ms) < int(COIN_REVIEW_STALE_POSITION_AGE_MS):
+                continue
+            state_trades = list(trade_by_state.get(position_key) or [])
+            meaningful_followup = False
+            for trade in state_trades:
+                trade_type = str(trade.get("activity_type") or "")
+                trade_ts_ms = int(_safe_float(trade.get("ts_ms")) or 0)
+                if trade_type != "paper_enter" and trade_ts_ms > opened_at_ms:
+                    meaningful_followup = True
+                    break
+            if meaningful_followup:
+                continue
+            age_hours = round((now_ms - opened_at_ms) / 3_600_000.0, 2)
+            impact_score = round(
+                40.0 + min(35.0, max(0.0, float(age_hours) - 24.0) * 1.5),
+                2,
+            )
+            review_tags.append(
+                {
+                    "tag": "stale_position",
+                    "symbol": normalize_symbol(str(row.get("canonical_symbol") or "")),
+                    "ts_ms": now_ms,
+                    "severity": "warn" if impact_score >= 50.0 else "info",
+                    "impact_score": impact_score,
+                    "state_ref": position_key,
+                    "pair_key": row.get("pair_key"),
+                    "reason": "open_paper_position_no_followup_actions",
+                    "payload": {
+                        "opened_at_ms": opened_at_ms,
+                        "age_hours": age_hours,
+                        "qty": row.get("qty"),
+                    },
+                }
+            )
+
+        tag_counts: dict[str, int] = {}
+        severity_counts: dict[str, int] = {}
+        for row in review_tags:
+            key_name = str(row.get("tag") or "unknown")
+            tag_counts[key_name] = int(tag_counts.get(key_name, 0) + 1)
+            severity = str(row.get("severity") or "unknown")
+            severity_counts[severity] = int(severity_counts.get(severity, 0) + 1)
+        review_tags.sort(
+            key=lambda item: (
+                -float(_safe_float(item.get("impact_score")) or 0.0),
+                -int(_safe_float(item.get("ts_ms")) or 0),
+                str(item.get("tag") or ""),
+            )
+        )
+        entry_review_tags = [
+            item for item in review_tags if str(item.get("tag") or "") in {"missed_entry", "bad_entry", "good_no_trade"}
+        ]
+        exit_review_tags = [
+            item for item in review_tags if str(item.get("tag") or "") in {"late_exit", "stale_position", "good_exit", "bad_hold"}
+        ]
+
+        def _top_review_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "tag": item.get("tag"),
+                    "symbol": item.get("symbol"),
+                    "severity": item.get("severity"),
+                    "impact_score": item.get("impact_score"),
+                    "reason": item.get("reason"),
+                    "ts_ms": item.get("ts_ms"),
+                    "ref": item.get("state_ref") or item.get("decision_id") or item.get("pair_key"),
+                }
+                for item in rows[: int(COIN_REVIEW_TOP_ITEMS_LIMIT)]
+            ]
+
+        top_review_items = [
+            {
+                "tag": item.get("tag"),
+                "symbol": item.get("symbol"),
+                "severity": item.get("severity"),
+                "impact_score": item.get("impact_score"),
+                "reason": item.get("reason"),
+                "ts_ms": item.get("ts_ms"),
+                "ref": item.get("state_ref") or item.get("decision_id") or item.get("pair_key"),
+            }
+            for item in review_tags[: int(COIN_REVIEW_TOP_ITEMS_LIMIT)]
+        ]
+
+        entry_action_set = {"ENTRY_SMALL", "ENTRY_STRONG", "ADD_SMALL", "NO_TRADE", "ADD_BLOCKED"}
+        exit_action_set = {"HOLD", "PARTIAL_EXIT", "FULL_EXIT"}
+        entry_action_scorecards: dict[str, dict[str, Any]] = {}
+        exit_action_scorecards: dict[str, dict[str, Any]] = {}
+        phase_scorecards: dict[str, dict[str, Any]] = {}
+        for row in outcomes:
+            outcome = dict(row.get("outcome") or {})
+            action = str(row.get("action") or outcome.get("decision_action") or "").upper()
+            phase_bucket = _outcome_phase_bucket(outcome.get("decision_phase") or row.get("decision_phase"))
+            if action in entry_action_set:
+                bucket = entry_action_scorecards.setdefault(action, _new_review_score_bucket())
+                _apply_review_score_row(bucket, row)
+            if action in exit_action_set:
+                bucket = exit_action_scorecards.setdefault(action, _new_review_score_bucket())
+                _apply_review_score_row(bucket, row)
+            phase_bucket_row = phase_scorecards.setdefault(phase_bucket, _new_review_score_bucket())
+            _apply_review_score_row(phase_bucket_row, row)
+        for name in list(entry_action_scorecards.keys()):
+            entry_action_scorecards[name] = _finalize_review_score_bucket(entry_action_scorecards[name])
+        for name in list(exit_action_scorecards.keys()):
+            exit_action_scorecards[name] = _finalize_review_score_bucket(exit_action_scorecards[name])
+        for name in list(phase_scorecards.keys()):
+            phase_scorecards[name] = _finalize_review_score_bucket(phase_scorecards[name])
+
+        return {
+            "schema_version": "coin_review_v1",
+            "scope": {
+                "symbol": canonical,
+                "days": safe_days,
+                "top": safe_top,
+                "since_ts_ms": since_ts_ms,
+                "until_ts_ms": now_ms,
+            },
+            "recent_trade_activity": trade_rows,
+            "recent_traded_symbols": recent_traded_symbols,
+            "shortlist_history": shortlist_rows,
+            "shortlist_symbols": shortlist_symbols,
+            "top_candidate_symbols": top_candidate_symbols,
+            "position_symbols": {
+                "paper_open": sorted(
+                    {
+                        normalize_symbol(str(row.get("canonical_symbol") or ""))
+                        for row in paper_rows
+                        if str(row.get("canonical_symbol") or "").strip()
+                    }
+                ),
+                "real_manual_open": sorted(
+                    {
+                        normalize_symbol(str(row.get("canonical_symbol") or ""))
+                        for row in real_rows
+                        if str(row.get("canonical_symbol") or "").strip()
+                    }
+                ),
+            },
+            "paper_positions": paper_rows,
+            "real_position_observations": real_rows,
+            "decision_journal": decisions,
+            "decision_outcomes": outcomes,
+            "review_tags": review_tags,
+            "entry_review": {
+                "tags": entry_review_tags,
+                "summary": {
+                    "total": len(entry_review_tags),
+                    "tag_counts": {
+                        "missed_entry": len(
+                            [item for item in entry_review_tags if str(item.get("tag") or "") == "missed_entry"]
+                        ),
+                        "bad_entry": len(
+                            [item for item in entry_review_tags if str(item.get("tag") or "") == "bad_entry"]
+                        ),
+                        "good_no_trade": len(
+                            [item for item in entry_review_tags if str(item.get("tag") or "") == "good_no_trade"]
+                        ),
+                    },
+                    "top_items": _top_review_items(entry_review_tags),
+                    "action_scorecards": entry_action_scorecards,
+                },
+            },
+            "exit_review": {
+                "tags": exit_review_tags,
+                "summary": {
+                    "total": len(exit_review_tags),
+                    "tag_counts": {
+                        "late_exit": len(
+                            [item for item in exit_review_tags if str(item.get("tag") or "") == "late_exit"]
+                        ),
+                        "stale_position": len(
+                            [item for item in exit_review_tags if str(item.get("tag") or "") == "stale_position"]
+                        ),
+                        "good_exit": len(
+                            [item for item in exit_review_tags if str(item.get("tag") or "") == "good_exit"]
+                        ),
+                        "bad_hold": len(
+                            [item for item in exit_review_tags if str(item.get("tag") or "") == "bad_hold"]
+                        ),
+                    },
+                    "top_items": _top_review_items(exit_review_tags),
+                    "action_scorecards": exit_action_scorecards,
+                },
+            },
+            "summary": {
+                "trade_activity_total": len(trade_rows),
+                "trade_activity_by_type": activity_by_type,
+                "symbols_traded_count": len(recent_traded_symbols),
+                "symbols_shortlisted_count": len(shortlist_symbols),
+                "paper_open_positions": len(paper_rows),
+                "real_manual_open_positions": len(real_rows),
+                "decisions_total": len(decisions),
+                "outcomes_total": len(outcomes),
+                "review_tag_counts": tag_counts,
+                "review_tag_severity_counts": severity_counts,
+                "top_review_items": top_review_items,
+                "phase_scorecards": phase_scorecards,
+            },
+        }
+
+    async def export_coin_review_json(
+        self,
+        *,
+        symbol: str | None = None,
+        days: int = 7,
+        top: int = 3,
+        include_live_analysis: bool = False,
+    ) -> dict[str, Any]:
+        review_payload = await self.get_coin_weekly_review(days=days, top=top, symbol=symbol)
+        canonical = normalize_symbol(symbol) if symbol else None
+        symbol_export = None
+        if canonical:
+            symbol_export = await self.export_coin_analysis_json(
+                canonical,
+                include_live_analysis=include_live_analysis,
+            )
+        return {
+            "schema_version": "coin_review_v1",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "review": review_payload,
+            "symbol_export": symbol_export,
+        }
+
+    async def export_coin_review_csv(
+        self,
+        *,
+        symbol: str | None = None,
+        days: int = 7,
+        top: int = 3,
+    ) -> str:
+        review_payload = await self.get_coin_weekly_review(days=days, top=top, symbol=symbol)
+        rows: list[dict[str, Any]] = []
+        for item in list(review_payload.get("recent_trade_activity") or []):
+            rows.append(
+                {
+                    "record_type": "trade_activity",
+                    "symbol": item.get("canonical_symbol"),
+                    "ts_ms": item.get("ts_ms"),
+                    "pair_key": item.get("pair_key"),
+                    "direction": item.get("direction"),
+                    "activity_type": item.get("activity_type"),
+                    "source": item.get("source"),
+                    "state_ref": item.get("state_ref"),
+                    "rank": None,
+                    "candidate_score": None,
+                    "reason_codes": None,
+                    "payload_json": json.dumps(item.get("payload") or {}, ensure_ascii=True, sort_keys=True),
+                }
+            )
+        for item in list(review_payload.get("shortlist_history") or []):
+            rows.append(
+                {
+                    "record_type": "shortlist_candidate",
+                    "symbol": item.get("canonical_symbol"),
+                    "ts_ms": item.get("ts_ms"),
+                    "pair_key": item.get("pair_key"),
+                    "direction": item.get("direction_hint"),
+                    "activity_type": None,
+                    "source": item.get("source_name"),
+                    "state_ref": None,
+                    "rank": item.get("rank"),
+                    "candidate_score": item.get("candidate_score"),
+                    "reason_codes": json.dumps(item.get("reason_codes") or [], ensure_ascii=True, sort_keys=True),
+                    "payload_json": json.dumps(item.get("payload") or {}, ensure_ascii=True, sort_keys=True),
+                }
+            )
+        for item in list(review_payload.get("review_tags") or []):
+            rows.append(
+                {
+                    "record_type": "review_tag",
+                    "symbol": item.get("symbol"),
+                    "ts_ms": item.get("ts_ms"),
+                    "pair_key": item.get("pair_key"),
+                    "direction": item.get("direction"),
+                    "activity_type": item.get("tag"),
+                    "source": item.get("reason"),
+                    "state_ref": item.get("state_ref") or item.get("decision_id"),
+                    "rank": item.get("rank"),
+                    "candidate_score": item.get("impact_score"),
+                    "reason_codes": json.dumps([item.get("severity")] if item.get("severity") else [], ensure_ascii=True, sort_keys=True),
+                    "payload_json": json.dumps(item.get("payload") or {}, ensure_ascii=True, sort_keys=True),
+                }
+            )
+
+        output = io.StringIO()
+        fieldnames = [
+            "record_type",
+            "symbol",
+            "ts_ms",
+            "pair_key",
+            "direction",
+            "activity_type",
+            "source",
+            "state_ref",
+            "rank",
+            "candidate_score",
+            "reason_codes",
+            "payload_json",
+        ]
+        writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in sorted(rows, key=lambda item: int(_safe_float(item.get("ts_ms")) or 0), reverse=True):
+            writer.writerow(row)
+        return output.getvalue()
+
+    async def export_coin_analysis_json(
+        self,
+        symbol: str,
+        *,
+        include_live_analysis: bool = True,
+        window_minutes: int = 240,
+        funding_points: int = 96,
+        focus_limit: int = 1000,
+        funding_limit: int = 1000,
+        oi_limit: int = 1000,
+        feature_limit: int = 1000,
+        decision_limit: int = 1000,
+        outcome_limit: int = 1000,
+        paper_event_limit: int = 500,
+    ) -> dict[str, Any]:
+        canonical = normalize_symbol(symbol)
+        if not canonical:
+            raise ValueError("symbol is required")
+
+        analysis = None
+        if include_live_analysis:
+            analysis = await self.analyze_symbol(
+                canonical,
+                window_minutes=max(60, min(int(window_minutes), 4320)),
+                funding_points=max(24, min(int(funding_points), 200)),
+            )
+
+        focus_rows = await asyncio.to_thread(
+            get_focus_snapshots,
+            canonical,
+            limit=max(1, min(int(focus_limit), 5000)),
+        )
+        funding_rows = await asyncio.to_thread(
+            get_funding_history,
+            canonical,
+            limit=max(1, min(int(funding_limit), 5000)),
+        )
+        oi_rows = await asyncio.to_thread(
+            get_open_interest_history,
+            canonical,
+            limit=max(1, min(int(oi_limit), 5000)),
+        )
+        feature_rows = await asyncio.to_thread(
+            get_feature_snapshots,
+            canonical_symbol=canonical,
+            limit=max(1, min(int(feature_limit), 5000)),
+        )
+        decision_rows = await asyncio.to_thread(
+            get_decisions,
+            canonical_symbol=canonical,
+            limit=max(1, min(int(decision_limit), 5000)),
+        )
+        outcome_rows = await asyncio.to_thread(
+            get_outcomes,
+            canonical_symbol=canonical,
+            limit=max(1, min(int(outcome_limit), 5000)),
+        )
+        paper_rows = await asyncio.to_thread(get_paper_positions, status=None)
+        paper_rows = [
+            row
+            for row in paper_rows
+            if normalize_symbol(str(row.get("canonical_symbol") or "")) == canonical
+        ]
+        paper_events: dict[str, list[dict[str, Any]]] = {}
+        for row in paper_rows:
+            key = str(row.get("position_key") or "")
+            if not key:
+                continue
+            events = await asyncio.to_thread(
+                get_paper_events,
+                key,
+                limit=max(1, min(int(paper_event_limit), 5000)),
+            )
+            paper_events[key] = events
+
+        recommended_action = None
+        reason_codes: list[str] = []
+        reason_text: list[str] = []
+        if isinstance(analysis, Mapping):
+            bot_logic = analysis.get("bot_logic") or {}
+            recommended_action = bot_logic.get("recommended_action")
+            reason_codes = list(bot_logic.get("reason_codes") or bot_logic.get("pair_reasons") or [])
+            reason_text = list(bot_logic.get("reason_text") or [])
+        if recommended_action is None and decision_rows:
+            recommended_action = decision_rows[0].get("action")
+        if not reason_codes and decision_rows:
+            reason_codes = list(decision_rows[0].get("reason_codes") or [])
+        if not reason_text and decision_rows:
+            reason_text = list(decision_rows[0].get("reason_text") or [])
+
+        return {
+            "schema_version": "coin_export_v1",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "symbol": canonical,
+            "recommended_action": recommended_action,
+            "reason_list": {
+                "reason_codes": reason_codes,
+                "reason_text": reason_text,
+            },
+            "analysis": analysis,
+            "raw_market_data": {
+                "focus_snapshots": focus_rows,
+                "funding_history": funding_rows,
+                "open_interest_history": oi_rows,
+            },
+            "derived_features": feature_rows,
+            "scores": [
+                {
+                    "decision_id": row.get("decision_id"),
+                    "mode": row.get("mode"),
+                    "action": row.get("action"),
+                    "confidence_score": row.get("confidence_score"),
+                    "scores": row.get("scores"),
+                }
+                for row in decision_rows
+            ],
+            "decision_journal": decision_rows,
+            "decision_outcomes": outcome_rows,
+            "decision_outcome_summary": _build_outcomes_summary(outcome_rows),
+            "paper": {
+                "positions": paper_rows,
+                "events_by_position": paper_events,
+            },
+        }
+
+    def _build_coin_timeline_rows(
+        self,
+        export_payload: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        symbol = str(export_payload.get("symbol") or "")
+        raw_market_data = export_payload.get("raw_market_data") or {}
+        focus_rows = list(raw_market_data.get("focus_snapshots") or [])
+        for item in focus_rows:
+            rows.append(
+                {
+                    "ts_ms": item.get("ts_ms"),
+                    "record_type": "focus_snapshot",
+                    "symbol": symbol,
+                    "exchange": item.get("exchange"),
+                    "pair_key": "",
+                    "position_key": "",
+                    "direction": "",
+                    "action": "",
+                    "status": "",
+                    "value_1": item.get("mid"),
+                    "value_2": item.get("mark_price"),
+                    "value_3": item.get("funding_rate"),
+                    "payload_json": json.dumps(item, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+                }
+            )
+        funding_rows = list(raw_market_data.get("funding_history") or [])
+        for item in funding_rows:
+            rows.append(
+                {
+                    "ts_ms": item.get("ts_ms"),
+                    "record_type": "funding_history",
+                    "symbol": symbol,
+                    "exchange": item.get("exchange"),
+                    "pair_key": "",
+                    "position_key": "",
+                    "direction": "",
+                    "action": "",
+                    "status": "",
+                    "value_1": item.get("funding_rate"),
+                    "value_2": item.get("predicted_funding_rate"),
+                    "value_3": item.get("interval_hours"),
+                    "payload_json": json.dumps(item, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+                }
+            )
+        oi_rows = list(raw_market_data.get("open_interest_history") or [])
+        for item in oi_rows:
+            rows.append(
+                {
+                    "ts_ms": item.get("ts_ms"),
+                    "record_type": "oi_history",
+                    "symbol": symbol,
+                    "exchange": item.get("exchange"),
+                    "pair_key": "",
+                    "position_key": "",
+                    "direction": "",
+                    "action": "",
+                    "status": "",
+                    "value_1": item.get("oi_contracts"),
+                    "value_2": item.get("oi_notional"),
+                    "value_3": "",
+                    "payload_json": json.dumps(item, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+                }
+            )
+
+        for item in list(export_payload.get("derived_features") or []):
+            rows.append(
+                {
+                    "ts_ms": item.get("ts_ms"),
+                    "record_type": "feature_snapshot",
+                    "symbol": symbol,
+                    "exchange": "",
+                    "pair_key": item.get("pair_key"),
+                    "position_key": "",
+                    "direction": item.get("direction"),
+                    "action": "",
+                    "status": "",
+                    "value_1": ((item.get("features") or {}).get("scores") or {}).get("entry_score"),
+                    "value_2": ((item.get("features") or {}).get("scores") or {}).get("continuation_risk_score"),
+                    "value_3": "",
+                    "payload_json": json.dumps(item, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+                }
+            )
+        for item in list(export_payload.get("decision_journal") or []):
+            rows.append(
+                {
+                    "ts_ms": item.get("ts_ms"),
+                    "record_type": "decision",
+                    "symbol": symbol,
+                    "exchange": "",
+                    "pair_key": item.get("pair_key"),
+                    "position_key": item.get("state_ref") or "",
+                    "direction": item.get("direction"),
+                    "action": item.get("action"),
+                    "status": item.get("mode"),
+                    "value_1": item.get("confidence_score"),
+                    "value_2": "",
+                    "value_3": "",
+                    "payload_json": json.dumps(item, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+                }
+            )
+        for item in list(export_payload.get("decision_outcomes") or []):
+            outcome = item.get("outcome") or {}
+            rows.append(
+                {
+                    "ts_ms": item.get("evaluated_at_ms"),
+                    "record_type": "decision_outcome",
+                    "symbol": symbol,
+                    "exchange": "",
+                    "pair_key": item.get("pair_key"),
+                    "position_key": "",
+                    "direction": item.get("direction"),
+                    "action": item.get("action"),
+                    "status": outcome.get("decision_correctness"),
+                    "value_1": outcome.get("spread_delta_pct"),
+                    "value_2": outcome.get("funding_to_next_pct"),
+                    "value_3": outcome.get("net_pnl_delta_vs_alternative"),
+                    "payload_json": json.dumps(item, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+                }
+            )
+        paper = export_payload.get("paper") or {}
+        for pos in list(paper.get("positions") or []):
+            rows.append(
+                {
+                    "ts_ms": pos.get("updated_at_ms") or pos.get("opened_at_ms"),
+                    "record_type": "paper_position",
+                    "symbol": symbol,
+                    "exchange": "",
+                    "pair_key": pos.get("pair_key"),
+                    "position_key": pos.get("position_key"),
+                    "direction": pos.get("direction"),
+                    "action": "",
+                    "status": pos.get("status"),
+                    "value_1": pos.get("qty"),
+                    "value_2": "",
+                    "value_3": "",
+                    "payload_json": json.dumps(pos, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+                }
+            )
+        for position_key, events in dict(paper.get("events_by_position") or {}).items():
+            for event in list(events or []):
+                rows.append(
+                    {
+                        "ts_ms": event.get("ts_ms"),
+                        "record_type": "paper_event",
+                        "symbol": symbol,
+                        "exchange": "",
+                        "pair_key": "",
+                        "position_key": position_key,
+                        "direction": "",
+                        "action": event.get("event_type"),
+                        "status": "",
+                        "value_1": "",
+                        "value_2": "",
+                        "value_3": "",
+                        "payload_json": json.dumps(event, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
+                    }
+                )
+        rows.sort(
+            key=lambda row: int(_safe_float(row.get("ts_ms")) or 0),
+            reverse=True,
+        )
+        return rows
+
+    async def export_coin_timeline_csv(
+        self,
+        symbol: str,
+        *,
+        include_live_analysis: bool = True,
+        window_minutes: int = 240,
+        funding_points: int = 96,
+    ) -> str:
+        payload = await self.export_coin_analysis_json(
+            symbol,
+            include_live_analysis=include_live_analysis,
+            window_minutes=window_minutes,
+            funding_points=funding_points,
+        )
+        rows = self._build_coin_timeline_rows(payload)
+        columns = [
+            "ts_ms",
+            "record_type",
+            "symbol",
+            "exchange",
+            "pair_key",
+            "position_key",
+            "direction",
+            "action",
+            "status",
+            "value_1",
+            "value_2",
+            "value_3",
+            "payload_json",
+        ]
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key) for key in columns})
+        return buffer.getvalue()
+
+    async def export_coin_timeline_parquet(
+        self,
+        symbol: str,
+        *,
+        include_live_analysis: bool = True,
+        window_minutes: int = 240,
+        funding_points: int = 96,
+    ) -> bytes:
+        payload = await self.export_coin_analysis_json(
+            symbol,
+            include_live_analysis=include_live_analysis,
+            window_minutes=window_minutes,
+            funding_points=funding_points,
+        )
+        rows = self._build_coin_timeline_rows(payload)
+        try:
+            import pandas as pd  # type: ignore
+        except Exception as exc:  # pylint: disable=broad-except
+            raise ValueError("parquet export requires pandas + pyarrow") from exc
+        try:
+            frame = pd.DataFrame(rows)
+            out = io.BytesIO()
+            frame.to_parquet(out, index=False, engine="pyarrow")
+            return out.getvalue()
+        except Exception as exc:  # pylint: disable=broad-except
+            raise ValueError("failed to generate parquet timeline") from exc
+
+    async def replay_coin_candidate_signals(
+        self,
+        symbol: str,
+        *,
+        limit: int = 1000,
+        since_ts_ms: int | None = None,
+        until_ts_ms: int | None = None,
+        include_stored_decisions: bool = True,
+    ) -> dict[str, Any]:
+        canonical = normalize_symbol(symbol)
+        if not canonical:
+            raise ValueError("symbol is required")
+        safe_limit = max(1, min(int(limit), 5000))
+        feature_rows = await asyncio.to_thread(
+            get_feature_snapshots,
+            canonical_symbol=canonical,
+            since_ts_ms=since_ts_ms,
+            until_ts_ms=until_ts_ms,
+            limit=safe_limit,
+        )
+        if not feature_rows:
+            return {
+                "symbol": canonical,
+                "replay_points": 0,
+                "timeline": [],
+                "summary": {
+                    "actions": {},
+                    "decision_states": {},
+                },
+            }
+
+        decisions_by_feature: dict[str, dict[str, Any]] = {}
+        if include_stored_decisions:
+            decision_rows = await asyncio.to_thread(
+                get_decisions,
+                canonical_symbol=canonical,
+                mode="manual_candidate",
+                limit=safe_limit,
+            )
+            for item in decision_rows:
+                feature_ref = str(item.get("features_ref") or "").strip()
+                if feature_ref:
+                    decisions_by_feature[feature_ref] = item
+
+        grouped: dict[int, list[dict[str, Any]]] = {}
+        for row in feature_rows:
+            ts_ms = int(_safe_float(row.get("ts_ms")) or 0)
+            if ts_ms <= 0:
+                continue
+            grouped.setdefault(ts_ms, []).append(row)
+
+        timeline: list[dict[str, Any]] = []
+        for ts_ms in sorted(grouped.keys(), reverse=True):
+            rows = grouped[ts_ms]
+            candidates: list[dict[str, Any]] = []
+            feature_ids: list[int] = []
+            for row in rows:
+                features = row.get("features") or {}
+                common = features.get("common") or {}
+                scores = features.get("scores") or {}
+                reasons = list(features.get("reasons") or [])
+                funding = common.get("funding") or {}
+                left_interval = _safe_float(funding.get("left_interval_hours"))
+                right_interval = _safe_float(funding.get("right_interval_hours"))
+                interval_match = (
+                    left_interval is not None
+                    and right_interval is not None
+                    and abs(left_interval - right_interval) <= 0.05
+                )
+                if left_interval is None or right_interval is None:
+                    interval_match = True
+                entry_score = _safe_float(scores.get("entry_score"))
+                direction = str(row.get("direction") or "long_a_short_b")
+                pair_key = str(row.get("pair_key") or "")
+                left_exchange = str(common.get("left_exchange") or "")
+                right_exchange = str(common.get("right_exchange") or "")
+                coverage_pct = _safe_float((row.get("data_quality") or {}).get("coverage_pct"))
+                if coverage_pct is None:
+                    coverage_pct = 100.0
+                feature_id = int(_safe_float(row.get("id")) or 0)
+                if feature_id > 0:
+                    feature_ids.append(feature_id)
+                candidates.append(
+                    {
+                        "pair_key": pair_key,
+                        "left_exchange": left_exchange,
+                        "right_exchange": right_exchange,
+                        "selected_direction": direction,
+                        "selected_action": action_from_entry_score(entry_score),
+                        "score": entry_score if entry_score is not None else 0.0,
+                        "decision_phase": common.get("decision_phase") or "exploratory",
+                        "spread": {"coverage_pct": coverage_pct},
+                        "funding_interval_hours": {"match": interval_match},
+                        "reasons": reasons,
+                        "feature_snapshot_ids": {direction: feature_id},
+                    }
+                )
+            if not candidates:
+                continue
+            recomputed = evaluate_candidate_pairs(candidates)
+            recommended_pair = recomputed.get("recommended_pair") or {}
+            feature_ref = str(recommended_pair.get("feature_snapshot_id") or "")
+            stored = decisions_by_feature.get(feature_ref) if feature_ref else None
+            timeline.append(
+                {
+                    "ts_ms": ts_ms,
+                    "feature_snapshot_ids": sorted(feature_ids, reverse=True),
+                    "recomputed": {
+                        "decision": recomputed.get("decision"),
+                        "recommended_action": recomputed.get("recommended_action"),
+                        "score": recomputed.get("score"),
+                        "pair": recommended_pair,
+                        "reason_codes": list(recomputed.get("reason_codes") or []),
+                    },
+                    "stored": (
+                        {
+                            "decision_id": stored.get("decision_id"),
+                            "action": stored.get("action"),
+                            "decision_phase": stored.get("decision_phase"),
+                            "score": stored.get("confidence_score"),
+                            "reason_codes": list(stored.get("reason_codes") or []),
+                        }
+                        if stored
+                        else None
+                    ),
+                }
+            )
+
+        action_stats: dict[str, int] = {}
+        decision_stats: dict[str, int] = {}
+        for row in timeline:
+            action = str((row.get("recomputed") or {}).get("recommended_action") or "NO_TRADE")
+            action_stats[action] = action_stats.get(action, 0) + 1
+            decision = str((row.get("recomputed") or {}).get("decision") or "reject")
+            decision_stats[decision] = decision_stats.get(decision, 0) + 1
+
+        return {
+            "symbol": canonical,
+            "replay_points": len(timeline),
+            "timeline": timeline,
+            "summary": {
+                "actions": action_stats,
+                "decision_states": decision_stats,
+            },
+        }
+
+    async def get_coin_outcomes(
+        self,
+        symbol: str,
+        *,
+        limit: int = 500,
+        horizons: list[str] | None = None,
+        phase_buckets: list[str] | None = None,
+        actions: list[str] | None = None,
+    ) -> dict[str, Any]:
+        canonical = normalize_symbol(symbol)
+        if not canonical:
+            raise ValueError("symbol is required")
+        rows = await asyncio.to_thread(
+            get_outcomes,
+            canonical_symbol=canonical,
+            limit=max(1, min(int(limit), 5000)),
+        )
+        horizon_filters = {
+            str(item or "").strip().lower()
+            for item in list(horizons or [])
+            if str(item or "").strip()
+        }
+        phase_filters = {
+            _outcome_phase_bucket(item)
+            for item in list(phase_buckets or [])
+            if str(item or "").strip()
+        }
+        action_filters = {
+            str(item or "").strip().upper()
+            for item in list(actions or [])
+            if str(item or "").strip()
+        }
+        if horizon_filters or phase_filters or action_filters:
+            filtered_rows: list[dict[str, Any]] = []
+            for row in rows:
+                outcome = dict(row.get("outcome") or {})
+                row_horizon = str(row.get("horizon") or "").strip().lower()
+                row_phase_bucket = _outcome_phase_bucket(outcome.get("decision_phase"))
+                row_action = str(row.get("action") or "").strip().upper()
+                if horizon_filters and row_horizon not in horizon_filters:
+                    continue
+                if phase_filters and row_phase_bucket not in phase_filters:
+                    continue
+                if action_filters and row_action not in action_filters:
+                    continue
+                filtered_rows.append(row)
+            rows = filtered_rows
+        return {
+            "symbol": canonical,
+            "count": len(rows),
+            "filters": {
+                "horizons": sorted(horizon_filters),
+                "phase_buckets": sorted(phase_filters),
+                "actions": sorted(action_filters),
+            },
+            "summary": _build_outcomes_summary(rows),
+            "rows": rows,
+        }
+
+    async def evaluate_coin_outcomes(
+        self,
+        symbol: str,
+        *,
+        horizons: list[str] | None = None,
+        decision_limit: int = 500,
+        force: bool = False,
+        only_matured: bool = False,
+        now_ms: int | None = None,
+    ) -> dict[str, Any]:
+        canonical = normalize_symbol(symbol)
+        if not canonical:
+            raise ValueError("symbol is required")
+        now_ts_ms = int(now_ms or (time.time() * 1000))
+        raw_horizons = list(horizons or ["15m", "1h", "4h"])
+        fixed_horizon_map = {
+            "15m": 15 * 60 * 1000,
+            "1h": 60 * 60 * 1000,
+            "4h": 4 * 60 * 60 * 1000,
+        }
+        dynamic_horizons = {"to_next_funding", "to_exit"}
+        normalized_horizons: list[str] = []
+        for item in raw_horizons:
+            key = str(item or "").strip().lower()
+            if not key:
+                continue
+            if (key in fixed_horizon_map or key in dynamic_horizons) and key not in normalized_horizons:
+                normalized_horizons.append(key)
+        if not normalized_horizons:
+            raise ValueError("horizons must include any of: 15m,1h,4h,to_next_funding,to_exit")
+
+        decisions = await asyncio.to_thread(
+            get_decisions,
+            canonical_symbol=canonical,
+            limit=max(1, min(int(decision_limit), 5000)),
+        )
+        decisions = [
+            row
+            for row in decisions
+            if str(row.get("mode") or "") in {"manual_candidate", "manual_position_review"}
+        ]
+        if not decisions:
+            return {
+                "symbol": canonical,
+                "evaluated": 0,
+                "skipped": 0,
+                "deferred": 0,
+                "horizons": normalized_horizons,
+                "only_matured": bool(only_matured),
+                "summary": _build_outcomes_summary([]),
+                "rows": [],
+            }
+
+        existing_rows = await asyncio.to_thread(get_outcomes, canonical_symbol=canonical, limit=5000)
+        existing_map = {
+            (str(row.get("decision_id") or ""), str(row.get("horizon") or "")): row
+            for row in existing_rows
+        }
+
+        focus_rows = await asyncio.to_thread(get_focus_snapshots, canonical, limit=5000)
+        by_exchange: dict[str, list[dict[str, Any]]] = {}
+        for row in focus_rows:
+            exchange = str(row.get("exchange") or "").lower()
+            if not exchange:
+                continue
+            by_exchange.setdefault(exchange, []).append(row)
+        for exchange in list(by_exchange.keys()):
+            by_exchange[exchange].sort(
+                key=lambda item: int(_safe_float(item.get("ts_ms")) or 0),
+                reverse=True,
+            )
+
+        paper_positions_by_key: dict[str, dict[str, Any]] = {}
+        paper_events_by_key: dict[str, list[dict[str, Any]]] = {}
+        real_observations_by_key: dict[str, list[dict[str, Any]]] = {}
+        if "to_exit" in normalized_horizons:
+            paper_positions = await asyncio.to_thread(get_paper_positions, status=None)
+            for row in paper_positions:
+                key = str(row.get("position_key") or "").strip()
+                if key:
+                    paper_positions_by_key[key] = row
+            for key in list(paper_positions_by_key.keys()):
+                events = await asyncio.to_thread(get_paper_events, key, limit=1000)
+                paper_events_by_key[key] = list(events or [])
+            real_rows = await asyncio.to_thread(
+                get_real_position_observations,
+                canonical_symbol=canonical,
+                limit=5000,
+            )
+            for row in real_rows:
+                key = str(row.get("state_ref") or "").strip()
+                if not key:
+                    continue
+                real_observations_by_key.setdefault(key, []).append(row)
+            for key in list(real_observations_by_key.keys()):
+                real_observations_by_key[key].sort(
+                    key=lambda item: int(_safe_float(item.get("ts_ms")) or 0),
+                )
+
+        evaluated_rows: list[dict[str, Any]] = []
+        evaluated = 0
+        skipped = 0
+        deferred = 0
+        for decision in decisions:
+            decision_id = str(decision.get("decision_id") or "")
+            action = str(decision.get("action") or "").upper()
+            direction = str(decision.get("direction") or "long_a_short_b")
+            decision_ts_ms = int(_safe_float(decision.get("ts_ms")) or 0)
+            pair_key = str(decision.get("pair_key") or "")
+            pair_parts = pair_key.split("|")
+            left_exchange = pair_parts[1].lower() if len(pair_parts) >= 3 else ""
+            right_exchange = pair_parts[2].lower() if len(pair_parts) >= 3 else ""
+
+            feature_row = None
+            feature_ref = str(decision.get("features_ref") or "").strip()
+            if feature_ref.isdigit():
+                feature_row = await asyncio.to_thread(get_feature_snapshot_by_id, int(feature_ref))
+            if feature_row is None:
+                continue
+            feature_payload = dict(feature_row.get("features") or {})
+            directional = dict(feature_payload.get("directional") or {})
+            common = dict(feature_payload.get("common") or {})
+            if not left_exchange:
+                left_exchange = str(common.get("left_exchange") or "").lower()
+            if not right_exchange:
+                right_exchange = str(common.get("right_exchange") or "").lower()
+            entry_open_spread = _safe_float(directional.get("open_spread_pct"))
+            funding_to_next = _safe_float(directional.get("funding_to_next_pct"))
+            net_funding_hourly = _safe_float(directional.get("net_funding_hourly"))
+            decision_phase = str(decision.get("decision_phase") or common.get("decision_phase") or "exploratory")
+            state_ref = str(decision.get("state_ref") or "").strip()
+            hours_to_next_funding = _safe_float(common.get("hours_to_next_funding_min"))
+            left_decision_snapshot = _nearest_snapshot(
+                by_exchange.get(left_exchange, []),
+                decision_ts_ms,
+                max_distance_ms=60 * 60 * 1000,
+            )
+            right_decision_snapshot = _nearest_snapshot(
+                by_exchange.get(right_exchange, []),
+                decision_ts_ms,
+                max_distance_ms=60 * 60 * 1000,
+            )
+            next_funding_target_ts = _next_funding_target_ts_ms(
+                decision_ts_ms,
+                left_decision_snapshot,
+                right_decision_snapshot,
+                common,
+            )
+            if (
+                hours_to_next_funding is None
+                and next_funding_target_ts is not None
+                and next_funding_target_ts > decision_ts_ms
+            ):
+                hours_to_next_funding = (next_funding_target_ts - decision_ts_ms) / 3_600_000.0
+
+            for horizon in normalized_horizons:
+                key = (decision_id, horizon)
+                if key in existing_map and not force:
+                    skipped += 1
+                    continue
+                horizon_target_ts_ms = None
+                if horizon in fixed_horizon_map:
+                    horizon_target_ts_ms = decision_ts_ms + fixed_horizon_map[horizon]
+                elif horizon == "to_next_funding":
+                    horizon_target_ts_ms = next_funding_target_ts
+                elif horizon == "to_exit":
+                    if state_ref.startswith("paper-"):
+                        horizon_target_ts_ms = _paper_exit_target_ts_ms(
+                            decision_ts_ms,
+                            state_ref,
+                            paper_positions_by_key,
+                            paper_events_by_key,
+                        )
+                    elif state_ref.startswith("real-"):
+                        horizon_target_ts_ms = _real_exit_target_ts_ms(
+                            decision_ts_ms,
+                            state_ref,
+                            real_observations_by_key,
+                        )
+                target_ts = int(horizon_target_ts_ms or 0)
+                has_target_ts = target_ts > 0
+                if only_matured and not _is_horizon_matured(
+                    horizon=horizon,
+                    horizon_target_ts_ms=(target_ts if has_target_ts else None),
+                    now_ts_ms=now_ts_ms,
+                ):
+                    deferred += 1
+                    continue
+                target_plus_15m = target_ts + 15 * 60 * 1000
+                target_minus_15m = max(decision_ts_ms, target_ts - 15 * 60 * 1000)
+
+                left_target = _nearest_snapshot(by_exchange.get(left_exchange, []), target_ts) if has_target_ts else None
+                right_target = _nearest_snapshot(by_exchange.get(right_exchange, []), target_ts) if has_target_ts else None
+                future_close_spread, spread_delta = _decision_spread_delta(
+                    direction,
+                    entry_open_spread,
+                    left_target,
+                    right_target,
+                )
+
+                left_wait = _nearest_snapshot(by_exchange.get(left_exchange, []), target_plus_15m) if has_target_ts else None
+                right_wait = _nearest_snapshot(by_exchange.get(right_exchange, []), target_plus_15m) if has_target_ts else None
+                _future_wait, spread_delta_wait = _decision_spread_delta(
+                    direction,
+                    entry_open_spread,
+                    left_wait,
+                    right_wait,
+                )
+
+                left_prev = _nearest_snapshot(by_exchange.get(left_exchange, []), target_minus_15m) if has_target_ts else None
+                right_prev = _nearest_snapshot(by_exchange.get(right_exchange, []), target_minus_15m) if has_target_ts else None
+                _future_prev, spread_delta_prev = _decision_spread_delta(
+                    direction,
+                    entry_open_spread,
+                    left_prev,
+                    right_prev,
+                )
+                (
+                    fees_pnl_delta_pct,
+                    slippage_pnl_delta_pct,
+                    execution_costs_pct,
+                    action_size_ratio,
+                ) = _execution_cost_components_pct(
+                    action=action,
+                    left_exchange=left_exchange,
+                    right_exchange=right_exchange,
+                )
+                funding_component_pct = _estimate_funding_component_pct(
+                    horizon=horizon,
+                    decision_ts_ms=decision_ts_ms,
+                    horizon_target_ts_ms=target_ts,
+                    funding_to_next_pct=funding_to_next,
+                    net_funding_hourly=net_funding_hourly,
+                    hours_to_next_funding=hours_to_next_funding,
+                )
+                direction_component_correct = None
+                if spread_delta is not None and action in {"ENTRY_SMALL", "ENTRY_STRONG", "ADD_SMALL", "HOLD"}:
+                    direction_component_correct = spread_delta >= 0
+
+                spread_component_correct = None
+                if spread_delta is not None:
+                    if action in {"ENTRY_SMALL", "ENTRY_STRONG", "ADD_SMALL", "HOLD"}:
+                        spread_component_correct = spread_delta >= 0
+                    elif action in {"PARTIAL_EXIT", "FULL_EXIT", "NO_TRADE", "ADD_BLOCKED"}:
+                        spread_component_correct = spread_delta <= 0
+
+                funding_component_correct = None
+                if funding_component_pct is not None:
+                    if action in {"ENTRY_SMALL", "ENTRY_STRONG", "ADD_SMALL", "HOLD"}:
+                        funding_component_correct = funding_component_pct >= 0
+                    elif action in {"PARTIAL_EXIT", "FULL_EXIT", "NO_TRADE", "ADD_BLOCKED"}:
+                        funding_component_correct = funding_component_pct <= 0
+
+                correctness_values = [
+                    bool(value)
+                    for value in (spread_component_correct, funding_component_correct)
+                    if value is not None
+                ]
+                if not correctness_values:
+                    decision_correctness = "insufficient_data"
+                elif all(correctness_values):
+                    decision_correctness = "correct"
+                elif not any(correctness_values):
+                    decision_correctness = "incorrect"
+                else:
+                    decision_correctness = "mixed"
+
+                timing_quality = "unknown"
+                if spread_delta is not None:
+                    if action in {"ENTRY_SMALL", "ENTRY_STRONG", "ADD_SMALL", "HOLD"}:
+                        if spread_delta >= 0.08:
+                            timing_quality = "good"
+                        elif spread_delta >= 0:
+                            timing_quality = "neutral"
+                        else:
+                            timing_quality = "poor"
+                    else:
+                        if spread_delta <= -0.08:
+                            timing_quality = "good"
+                        elif spread_delta <= 0:
+                            timing_quality = "neutral"
+                        else:
+                            timing_quality = "poor"
+
+                would_waiting_15m_help = None
+                if spread_delta is not None and spread_delta_wait is not None:
+                    if action in {"ENTRY_SMALL", "ENTRY_STRONG", "ADD_SMALL", "HOLD"}:
+                        would_waiting_15m_help = spread_delta_wait > (spread_delta + 0.02)
+                    else:
+                        would_waiting_15m_help = spread_delta_wait < (spread_delta - 0.02)
+
+                would_exiting_15m_earlier_help = None
+                if spread_delta is not None and spread_delta_prev is not None:
+                    if action in {"ENTRY_SMALL", "ENTRY_STRONG", "ADD_SMALL", "HOLD"}:
+                        would_exiting_15m_earlier_help = spread_delta_prev > (spread_delta + 0.02)
+                    else:
+                        would_exiting_15m_earlier_help = spread_delta_prev < (spread_delta - 0.02)
+
+                net_pnl_delta_vs_alternative = None
+                if spread_delta is not None and spread_delta_wait is not None:
+                    funding_component_wait = _estimate_funding_component_pct(
+                        horizon=horizon,
+                        decision_ts_ms=decision_ts_ms,
+                        horizon_target_ts_ms=target_plus_15m,
+                        funding_to_next_pct=funding_to_next,
+                        net_funding_hourly=net_funding_hourly,
+                        hours_to_next_funding=hours_to_next_funding,
+                    )
+                    net_now = float(spread_delta)
+                    if funding_component_pct is not None:
+                        net_now += float(funding_component_pct)
+                    net_now += float(execution_costs_pct)
+                    net_wait = float(spread_delta_wait)
+                    if funding_component_wait is not None:
+                        net_wait += float(funding_component_wait)
+                    net_wait += float(execution_costs_pct)
+                    if action in {"ENTRY_SMALL", "ENTRY_STRONG", "ADD_SMALL", "HOLD"}:
+                        net_pnl_delta_vs_alternative = net_now - net_wait
+                    else:
+                        net_pnl_delta_vs_alternative = net_wait - net_now
+
+                net_pnl_delta_pct = float(execution_costs_pct)
+                if spread_delta is not None:
+                    net_pnl_delta_pct += float(spread_delta)
+                if funding_component_pct is not None:
+                    net_pnl_delta_pct += float(funding_component_pct)
+
+                size_appropriateness = _size_appropriateness_for_action(action, spread_delta)
+
+                outcome = {
+                    "decision_correctness": decision_correctness,
+                    "direction_component_correct": direction_component_correct,
+                    "funding_component_correct": funding_component_correct,
+                    "spread_component_correct": spread_component_correct,
+                    "size_appropriateness": size_appropriateness,
+                    "timing_quality": timing_quality,
+                    "would_waiting_15m_help": would_waiting_15m_help,
+                    "would_exiting_15m_earlier_help": would_exiting_15m_earlier_help,
+                    "net_pnl_delta_vs_alternative": net_pnl_delta_vs_alternative,
+                    "horizon": horizon,
+                    "horizon_target_ts_ms": target_ts if has_target_ts else None,
+                    "spread_delta_pct": spread_delta,
+                    "spread_pnl_delta_pct": spread_delta,
+                    "funding_pnl_delta_pct": funding_component_pct,
+                    "fees_pnl_delta_pct": fees_pnl_delta_pct,
+                    "slippage_pnl_delta_pct": slippage_pnl_delta_pct,
+                    "execution_costs_pct": execution_costs_pct,
+                    "net_pnl_delta_pct": net_pnl_delta_pct,
+                    "future_close_spread_pct": future_close_spread,
+                    "entry_open_spread_pct": entry_open_spread,
+                    "funding_to_next_pct": funding_to_next,
+                    "decision_action": action,
+                    "decision_phase": decision_phase,
+                    "pair_key": pair_key,
+                    "direction": direction,
+                    "pnl_assumptions": {
+                        "action_size_ratio": action_size_ratio,
+                        "fees_model": "taker_both_legs",
+                        "slippage_bps_per_leg": OUTCOME_ASSUMED_SLIPPAGE_BPS_PER_LEG,
+                    },
+                }
+                await asyncio.to_thread(
+                    insert_outcome,
+                    decision_id,
+                    horizon,
+                    outcome,
+                    evaluated_at_ms=int(time.time() * 1000),
+                )
+                evaluated += 1
+                evaluated_rows.append(
+                    {
+                        "decision_id": decision_id,
+                        "horizon": horizon,
+                        "outcome": outcome,
+                    }
+                )
+
+        return {
+            "symbol": canonical,
+            "evaluated": evaluated,
+            "skipped": skipped,
+            "deferred": deferred,
+            "horizons": normalized_horizons,
+            "only_matured": bool(only_matured),
+            "summary": _build_outcomes_summary(evaluated_rows),
+            "rows": evaluated_rows,
+        }
+
+    async def get_coin_outcomes_auto_status(
+        self,
+        *,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        now_ts_ms = int(time.time() * 1000)
+        last_cycle = dict(self._coin_outcomes_last_cycle or {})
+        last_cycle_ts_ms = int(_safe_float(last_cycle.get("ts_ms")) or 0)
+        last_cycle_age_sec = None
+        if last_cycle_ts_ms > 0:
+            last_cycle_age_sec = max(0.0, (now_ts_ms - last_cycle_ts_ms) / 1000.0)
+
+        health_status = "healthy"
+        health_reasons: list[str] = []
+
+        def _escalate(level: str, reason: str) -> None:
+            nonlocal health_status
+            order = {"healthy": 0, "warn": 1, "stale": 2}
+            if order.get(level, 0) > order.get(health_status, 0):
+                health_status = level
+            if reason not in health_reasons:
+                health_reasons.append(reason)
+
+        scheduler_running = bool(
+            self._coin_outcomes_task is not None and not self._coin_outcomes_task.done()
+        )
+        scheduler_enabled = bool(self._coin_outcomes_scheduler_enabled)
+        poll_sec = max(1.0, float(self._coin_outcomes_poll_sec))
+        if not scheduler_running:
+            _escalate("stale", "scheduler_not_running")
+        if not scheduler_enabled:
+            _escalate("warn", "scheduler_paused")
+        if last_cycle_ts_ms <= 0:
+            _escalate("warn", "cycle_not_started")
+        elif last_cycle_age_sec is not None:
+            if last_cycle_age_sec > (poll_sec * 4.0):
+                if scheduler_enabled:
+                    _escalate("stale", "cycle_stale")
+            elif last_cycle_age_sec > (poll_sec * 2.0):
+                if scheduler_enabled:
+                    _escalate("warn", "cycle_delayed")
+        cycle_errors = int(_safe_float(last_cycle.get("errors")) or 0)
+        if cycle_errors > 0:
+            _escalate("warn", "cycle_errors")
+
+        payload: dict[str, Any] = {
+            "scheduler_running": scheduler_running,
+            "scheduler_enabled": scheduler_enabled,
+            "poll_sec": poll_sec,
+            "auto_horizons": list(COIN_OUTCOME_AUTO_HORIZONS),
+            "last_cycle": last_cycle,
+            "recent_cycles": list(self._coin_outcomes_cycle_history[-10:]),
+            "last_cycle_age_sec": last_cycle_age_sec,
+            "now_ts_ms": now_ts_ms,
+            "health": {
+                "status": health_status,
+                "reasons": health_reasons,
+            },
+        }
+
+        if symbol is None:
+            return payload
+
+        canonical = normalize_symbol(symbol)
+        if not canonical:
+            raise ValueError("symbol is required")
+
+        decisions = await asyncio.to_thread(
+            get_decisions,
+            canonical_symbol=canonical,
+            limit=5000,
+        )
+        decisions = [
+            row
+            for row in decisions
+            if str(row.get("mode") or "") in {"manual_candidate", "manual_position_review"}
+        ]
+        outcomes = await asyncio.to_thread(
+            get_outcomes,
+            canonical_symbol=canonical,
+            limit=5000,
+        )
+        existing = {
+            (str(row.get("decision_id") or ""), str(row.get("horizon") or ""))
+            for row in outcomes
+        }
+        missing_by_horizon = {h: 0 for h in COIN_OUTCOME_AUTO_HORIZONS}
+        missing_total = 0
+        for decision in decisions:
+            decision_id = str(decision.get("decision_id") or "")
+            if not decision_id:
+                continue
+            for horizon in COIN_OUTCOME_AUTO_HORIZONS:
+                if (decision_id, horizon) in existing:
+                    continue
+                missing_total += 1
+                missing_by_horizon[horizon] += 1
+
+        payload["symbol"] = canonical
+        payload["symbol_pending"] = {
+            "decisions_total": len(decisions),
+            "missing_total": missing_total,
+            "missing_by_horizon": missing_by_horizon,
+        }
+        if missing_total >= 500:
+            _escalate("stale", "symbol_backlog_huge")
+        elif missing_total >= 100:
+            _escalate("warn", "symbol_backlog_growing")
+        payload["health"] = {
+            "status": health_status,
+            "reasons": health_reasons,
+        }
+        return payload
+
+    async def set_coin_outcomes_scheduler_enabled(self, enabled: bool) -> dict[str, Any]:
+        self._coin_outcomes_scheduler_enabled = bool(enabled)
+        return await self.get_coin_outcomes_auto_status()
+
+    async def run_coin_position_watcher_once(
+        self,
+        *,
+        force: bool = False,
+        symbols: list[str] | None = None,
+        window_minutes: int = 240,
+        funding_points: int = 96,
+    ) -> dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+        if not self._coin_position_watcher_enabled and not force:
+            cycle = {
+                "ts_ms": now_ms,
+                "enabled": False,
+                "force": bool(force),
+                "reason": "watcher_disabled",
+                "symbols_total": 0,
+                "symbols_processed": 0,
+                "symbols_skipped_cooldown": 0,
+                "errors": 0,
+                "position_decisions_saved": 0,
+            }
+            self._coin_position_watcher_last_cycle = cycle
+            return cycle
+
+        canonical_symbols: set[str] = set()
+        if symbols:
+            for item in symbols:
+                canonical = normalize_symbol(str(item or ""))
+                if canonical:
+                    canonical_symbols.add(canonical)
+        else:
+            canonical_symbols = await self._collect_coin_held_symbols()
+
+        sorted_symbols = sorted(canonical_symbols)
+        poll_window = max(60, min(int(window_minutes), 4320))
+        funding_limit = max(24, min(int(funding_points), 200))
+        cooldown_sec = max(0.0, float(COIN_POSITION_WATCHER_SYMBOL_COOLDOWN_SEC))
+        skipped_cooldown = 0
+        processed = 0
+        error_count = 0
+        position_decisions_saved = 0
+        analyzed_symbols: list[str] = []
+        cycle_errors: list[dict[str, str]] = []
+
+        for canonical in sorted_symbols:
+            if not force:
+                last_ts = float(self._coin_position_watcher_last_by_symbol_ts.get(canonical) or 0.0)
+                if last_ts > 0.0 and (time.time() - last_ts) < cooldown_sec:
+                    skipped_cooldown += 1
+                    continue
+            try:
+                payload = await self.analyze_symbol(
+                    canonical,
+                    window_minutes=poll_window,
+                    funding_points=funding_limit,
+                    use_cache=False,
+                    persist_candidate_decision=False,
+                    run_position_logic=True,
+                )
+                summary = (payload.get("position_logic") or {}).get("summary") or {}
+                position_decisions_saved += int(
+                    (_safe_float(summary.get("paper_decisions_saved")) or 0)
+                    + (_safe_float(summary.get("real_decisions_saved")) or 0)
+                )
+                processed += 1
+                analyzed_symbols.append(canonical)
+                self._coin_position_watcher_last_by_symbol_ts[canonical] = time.time()
+            except Exception as exc:  # pylint: disable=broad-except
+                error_count += 1
+                cycle_errors.append({"symbol": canonical, "error": str(exc)})
+
+        cycle = {
+            "ts_ms": now_ms,
+            "enabled": bool(self._coin_position_watcher_enabled),
+            "force": bool(force),
+            "symbols_total": len(sorted_symbols),
+            "symbols_processed": processed,
+            "symbols_skipped_cooldown": skipped_cooldown,
+            "errors": error_count,
+            "position_decisions_saved": position_decisions_saved,
+            "window_minutes": poll_window,
+            "funding_points": funding_limit,
+            "symbols_analyzed": analyzed_symbols,
+            "error_details": cycle_errors[:20],
+        }
+        self._coin_position_watcher_last_cycle = cycle
+        return cycle
+
+    async def get_coin_position_watcher_status(
+        self,
+        *,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+        last_cycle = dict(self._coin_position_watcher_last_cycle or {})
+        last_cycle_ts_ms = int(_safe_float(last_cycle.get("ts_ms")) or 0)
+        last_cycle_age_sec = None
+        if last_cycle_ts_ms > 0:
+            last_cycle_age_sec = max(0.0, (now_ms - last_cycle_ts_ms) / 1000.0)
+        payload: dict[str, Any] = {
+            "enabled": bool(self._coin_position_watcher_enabled),
+            "scheduler_running": bool(
+                self._coin_position_watcher_task is not None
+                and not self._coin_position_watcher_task.done()
+            ),
+            "poll_sec": float(self._coin_position_watcher_poll_sec),
+            "symbol_cooldown_sec": float(COIN_POSITION_WATCHER_SYMBOL_COOLDOWN_SEC),
+            "last_cycle": last_cycle,
+            "last_cycle_age_sec": last_cycle_age_sec,
+            "now_ts_ms": now_ms,
+        }
+        if symbol:
+            canonical = normalize_symbol(symbol)
+            if not canonical:
+                raise ValueError("symbol is required")
+            payload["symbol"] = canonical
+            last_symbol_ts = float(self._coin_position_watcher_last_by_symbol_ts.get(canonical) or 0.0)
+            payload["symbol_last_run_ts_ms"] = int(last_symbol_ts * 1000) if last_symbol_ts > 0 else None
+            if last_symbol_ts > 0:
+                payload["symbol_last_run_age_sec"] = max(0.0, time.time() - last_symbol_ts)
+        return payload
+
+    async def set_coin_position_watcher_enabled(self, enabled: bool) -> dict[str, Any]:
+        self._coin_position_watcher_enabled = bool(enabled)
+        return await self.get_coin_position_watcher_status()
+
+    async def coin_paper_enter(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        canonical = normalize_symbol(str(payload.get("symbol") or ""))
+        if not canonical:
+            raise ValueError("symbol is required")
+        qty = _safe_float(payload.get("qty"))
+        if qty is None or qty <= 0:
+            raise ValueError("qty must be > 0")
+        window_minutes = int(_safe_float(payload.get("window_minutes")) or 240)
+        funding_points = int(_safe_float(payload.get("funding_points")) or 96)
+        window_minutes = max(60, min(window_minutes, 4320))
+        funding_points = max(24, min(funding_points, 200))
+
+        pair_key = str(payload.get("pair_key") or "").strip()
+        direction = str(payload.get("direction") or "").strip().lower()
+        if direction not in ("long_a_short_b", "long_b_short_a"):
+            direction = ""
+
+        analysis = await self.analyze_symbol(
+            canonical,
+            window_minutes=window_minutes,
+            funding_points=funding_points,
+        )
+        bot_logic = analysis.get("bot_logic") or {}
+        recommended_pair = bot_logic.get("recommended_pair") or {}
+        if not pair_key:
+            pair_key = str(recommended_pair.get("pair_key") or "")
+        if not pair_key:
+            pair_key = build_pair_key(canonical, "binance", "kucoin")
+        if not direction:
+            direction = str(recommended_pair.get("direction") or "long_a_short_b")
+        if direction not in ("long_a_short_b", "long_b_short_a"):
+            direction = "long_a_short_b"
+
+        action = str(payload.get("action") or bot_logic.get("recommended_action") or "ENTRY_SMALL")
+        action = action.upper()
+        now_ms = int(time.time() * 1000)
+        position_key = str(payload.get("position_key") or "").strip()
+        if not position_key:
+            position_key = f"paper-{canonical.lower()}-{now_ms}-{uuid4().hex[:8]}"
+
+        pair_row = None
+        for row in list(analysis.get("pair_analysis") or []):
+            if str(row.get("pair_key") or "") == pair_key:
+                pair_row = row
+                break
+        if pair_row is None and (analysis.get("pair_analysis") or []):
+            pair_row = list(analysis.get("pair_analysis") or [])[0]
+
+        entry_context = {
+            "source": str(payload.get("source") or "coin_analysis_manual"),
+            "source_decision_id": (analysis.get("decision_journal") or {}).get("decision_id"),
+            "entry_action": action,
+            "entry_note": str(payload.get("note") or ""),
+            "bot_decision": bot_logic.get("decision"),
+            "bot_recommended_action": bot_logic.get("recommended_action"),
+            "pair_key": pair_key,
+            "direction": direction,
+            "analysis_window_minutes": window_minutes,
+            "analysis_funding_points": funding_points,
+            "entry_spread_context": {
+                "derived_spread": (pair_row or {}).get("derived_spread"),
+                "decision_phase": (pair_row or {}).get("decision_phase"),
+                "score": (pair_row or {}).get("score"),
+            },
+        }
+        await asyncio.to_thread(
+            upsert_paper_position,
+            CoinPaperPositionRow(
+                position_key=position_key,
+                opened_at_ms=now_ms,
+                closed_at_ms=None,
+                status="open",
+                canonical_symbol=canonical,
+                pair_key=pair_key,
+                direction=direction,
+                qty=float(qty),
+                entry_context=entry_context,
+                updated_at_ms=now_ms,
+            ),
+        )
+        event_id = f"paper-event-{uuid4().hex}"
+        await asyncio.to_thread(
+            insert_paper_event,
+            event_id,
+            position_key,
+            now_ms,
+            "entry",
+            {
+                "qty": float(qty),
+                "action": action,
+                "pair_key": pair_key,
+                "direction": direction,
+                "decision_id": (analysis.get("decision_journal") or {}).get("decision_id"),
+            },
+        )
+        await self._record_coin_trade_activity(
+            canonical_symbol=canonical,
+            ts_ms=now_ms,
+            pair_key=pair_key,
+            direction=direction,
+            activity_type="paper_enter",
+            source="coin_paper_enter",
+            state_ref=position_key,
+            payload={
+                "qty": float(qty),
+                "action": action,
+                "decision_id": (analysis.get("decision_journal") or {}).get("decision_id"),
+                "event_id": event_id,
+            },
+        )
+        return {
+            "ok": True,
+            "position_key": position_key,
+            "status": "open",
+            "action": action,
+            "qty": float(qty),
+            "pair_key": pair_key,
+            "direction": direction,
+            "decision_id": (analysis.get("decision_journal") or {}).get("decision_id"),
+        }
+
+    async def coin_paper_apply_action(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        position_key = str(payload.get("position_key") or "").strip()
+        if not position_key:
+            raise ValueError("position_key is required")
+        action = str(payload.get("action") or "").strip().upper()
+        if action not in {"HOLD", "PARTIAL_EXIT", "FULL_EXIT", "ADD_SMALL", "ADD_BLOCKED"}:
+            raise ValueError("action must be one of HOLD/PARTIAL_EXIT/FULL_EXIT/ADD_SMALL/ADD_BLOCKED")
+
+        all_rows = await asyncio.to_thread(get_paper_positions, status=None)
+        current = None
+        for row in all_rows:
+            if str(row.get("position_key") or "") == position_key:
+                current = row
+                break
+        if current is None:
+            raise ValueError("position_key not found")
+
+        status = str(current.get("status") or "open")
+        if status != "open":
+            raise ValueError("position is not open")
+        current_qty = _safe_float(current.get("qty")) or 0.0
+        if current_qty <= 0:
+            raise ValueError("position qty is zero")
+
+        fraction = _safe_float(payload.get("fraction"))
+        absolute_qty = _safe_float(payload.get("qty"))
+        if fraction is None:
+            if action in {"PARTIAL_EXIT", "ADD_SMALL"}:
+                fraction = 0.25
+            else:
+                fraction = 1.0
+        fraction = max(0.0, min(float(fraction), 1.0))
+
+        qty_delta = 0.0
+        if action == "PARTIAL_EXIT":
+            qty_delta = -(absolute_qty if absolute_qty is not None else current_qty * fraction)
+        elif action == "FULL_EXIT":
+            qty_delta = -current_qty
+        elif action == "ADD_SMALL":
+            qty_delta = absolute_qty if absolute_qty is not None else current_qty * fraction
+        elif action in {"HOLD", "ADD_BLOCKED"}:
+            qty_delta = 0.0
+
+        next_qty = current_qty + qty_delta
+        if next_qty < 0:
+            next_qty = 0.0
+
+        now_ms = int(time.time() * 1000)
+        next_status = "closed" if next_qty <= 1e-12 else "open"
+        closed_at_ms = now_ms if next_status == "closed" else None
+        entry_context = dict(current.get("entry_context") or {})
+        entry_context["last_paper_action"] = action
+        entry_context["last_paper_action_ts_ms"] = now_ms
+        entry_context["last_paper_action_delta"] = qty_delta
+        await asyncio.to_thread(
+            upsert_paper_position,
+            CoinPaperPositionRow(
+                position_key=position_key,
+                opened_at_ms=int(current.get("opened_at_ms") or now_ms),
+                closed_at_ms=closed_at_ms,
+                status=next_status,
+                canonical_symbol=str(current.get("canonical_symbol") or ""),
+                pair_key=str(current.get("pair_key") or ""),
+                direction=str(current.get("direction") or "long_a_short_b"),
+                qty=float(next_qty),
+                entry_context=entry_context,
+                updated_at_ms=now_ms,
+            ),
+        )
+        event_type = action.lower()
+        event_id = f"paper-event-{uuid4().hex}"
+        await asyncio.to_thread(
+            insert_paper_event,
+            event_id,
+            position_key,
+            now_ms,
+            event_type,
+            {
+                "action": action,
+                "qty_before": current_qty,
+                "qty_delta": qty_delta,
+                "qty_after": next_qty,
+                "fraction": fraction,
+            },
+        )
+        activity_type = {
+            "HOLD": "paper_hold",
+            "PARTIAL_EXIT": "paper_partial_exit",
+            "FULL_EXIT": "paper_full_exit",
+            "ADD_SMALL": "paper_add_small",
+            "ADD_BLOCKED": "paper_add_blocked",
+        }.get(action, "paper_action")
+        await self._record_coin_trade_activity(
+            canonical_symbol=str(current.get("canonical_symbol") or ""),
+            ts_ms=now_ms,
+            pair_key=str(current.get("pair_key") or ""),
+            direction=str(current.get("direction") or ""),
+            activity_type=activity_type,
+            source="coin_paper_action",
+            state_ref=position_key,
+            payload={
+                "event_id": event_id,
+                "action": action,
+                "qty_before": current_qty,
+                "qty_delta": qty_delta,
+                "qty_after": next_qty,
+                "fraction": fraction,
+            },
+        )
+        return {
+            "ok": True,
+            "position_key": position_key,
+            "action": action,
+            "status": next_status,
+            "qty_before": current_qty,
+            "qty_delta": qty_delta,
+            "qty_after": next_qty,
+            "closed_at_ms": closed_at_ms,
+        }
+
+    def _coin_analysis_selected_exchanges(self) -> list[str]:
+        exchange_flags = getattr(self._settings_manager.current, "analysis_exchanges", None) or {}
+        enabled_exchanges = {
+            normalize_exchange_name(name)
+            for name, enabled in exchange_flags.items()
+            if enabled
+        }
+        selected = [
+            ex for ex in COIN_ANALYSIS_CORE_EXCHANGES if not enabled_exchanges or ex in enabled_exchanges
+        ]
+        return selected
+
+    async def _collect_focus_symbol_snapshots(
+        self,
+        canonical_symbol: str,
+        exchanges: list[str],
+        *,
+        focus_reason: str = "symbol_session",
+    ) -> int:
+        inserted = 0
+        for exchange in exchanges:
+            try:
+                adapter = get_adapter_cached(exchange)
+            except KeyError:
+                continue
+            try:
+                snapshots = await adapter.fetch_market_snapshots_async([canonical_symbol])
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug(
+                    "Coin focus snapshot fetch failed for %s %s: %s",
+                    exchange,
+                    canonical_symbol,
+                    exc,
+                )
+                continue
+            if not snapshots:
+                continue
+            snap = snapshots[0]
+            ts_ms = int(time.time() * 1000)
+            bid = _safe_float(snap.bid)
+            ask = _safe_float(snap.ask)
+            mid = None
+            if bid is not None and ask is not None:
+                mid = (bid + ask) / 2.0
+            index_price = _safe_float(
+                ((snap.raw or {}).get("premiumIndex") or {}).get("indexPrice")
+            )
+            if index_price is None:
+                index_price = _safe_float(
+                    ((snap.raw or {}).get("contract") or {}).get("indexPrice")
+                )
+            mark_price = _safe_float(snap.mark_price)
+            premium_pct = None
+            if mark_price is not None and index_price is not None and abs(index_price) > 1e-12:
+                premium_pct = (mark_price - index_price) / index_price * 100.0
+            predicted_funding = _safe_float(
+                ((snap.raw or {}).get("contract") or {}).get("predictedFundingFeeRate")
+            )
+            next_funding_ts_ms = None
+            if snap.next_funding_time is not None:
+                try:
+                    next_funding_ts_ms = int(snap.next_funding_time.timestamp() * 1000)
+                except Exception:  # pylint: disable=broad-except
+                    next_funding_ts_ms = None
+
+            await asyncio.to_thread(
+                insert_focus_snapshot,
+                CoinFocusSnapshotRow(
+                    ts_ms=ts_ms,
+                    canonical_symbol=canonical_symbol,
+                    exchange=exchange,
+                    exchange_symbol=snap.exchange_symbol,
+                    bid=bid,
+                    ask=ask,
+                    bid_size=_safe_float(snap.bid_size),
+                    ask_size=_safe_float(snap.ask_size),
+                    mid=mid,
+                    mark_price=mark_price,
+                    index_price=index_price,
+                    premium_pct=premium_pct,
+                    funding_rate=_safe_float(snap.funding_rate),
+                    predicted_funding_rate=predicted_funding,
+                    next_funding_ts_ms=next_funding_ts_ms,
+                    quote_age_ms=0,
+                    source_type="rest_adapter",
+                    staleness_flag=False,
+                    focus_reason=focus_reason,
+                ),
+            )
+            inserted += 1
+        return inserted
+
+    async def _collect_coin_held_symbols(self) -> set[str]:
+        held_symbols: set[str] = set()
+        open_paper = await asyncio.to_thread(get_paper_positions, status="open")
+        for row in open_paper:
+            sym = normalize_symbol(str(row.get("canonical_symbol") or ""))
+            if sym:
+                held_symbols.add(sym)
+
+        snapshot = self._accounts.snapshot() or {}
+        for pos in list(snapshot.get("positions") or []):
+            sym = _normalize_manual_symbol(
+                str(
+                    pos.get("symbol_normalized")
+                    or pos.get("symbol")
+                    or pos.get("exchange_symbol")
+                    or ""
+                )
+            )
+            if sym:
+                held_symbols.add(sym)
+        return held_symbols
+
+    async def _collect_coin_focus_targets(self) -> dict[str, Any]:
+        session_rows = await self.list_active_coin_symbol_sessions()
+        session_symbols = {
+            normalize_symbol(str(item.get("canonical_symbol") or ""))
+            for item in session_rows
+            if str(item.get("canonical_symbol") or "").strip()
+        }
+        session_symbols.discard("")
+        held_symbols = await self._collect_coin_held_symbols()
+
+        all_symbols = sorted(session_symbols | held_symbols)
+        reason_by_symbol: dict[str, str] = {}
+        for sym in all_symbols:
+            in_session = sym in session_symbols
+            is_held = sym in held_symbols
+            if in_session and is_held:
+                reason_by_symbol[sym] = "session_or_held"
+            elif in_session:
+                reason_by_symbol[sym] = "symbol_session"
+            else:
+                reason_by_symbol[sym] = "held_position"
+        return {
+            "symbols": all_symbols,
+            "reason_by_symbol": reason_by_symbol,
+            "session_symbols": len(session_symbols),
+            "held_symbols": len(held_symbols),
+        }
+
+    async def collect_coin_focus_once(self) -> dict[str, int]:
+        exchanges = self._coin_analysis_selected_exchanges()
+        targets = await self._collect_coin_focus_targets()
+        symbols = list(targets.get("symbols") or [])
+        reason_by_symbol = dict(targets.get("reason_by_symbol") or {})
+        if not symbols or not exchanges:
+            return {
+                "symbols": len(symbols),
+                "rows": 0,
+                "session_symbols": int(targets.get("session_symbols") or 0),
+                "held_symbols": int(targets.get("held_symbols") or 0),
+            }
+        rows_inserted = 0
+        for symbol in symbols:
+            rows_inserted += await self._collect_focus_symbol_snapshots(
+                symbol,
+                exchanges,
+                focus_reason=str(reason_by_symbol.get(symbol) or "symbol_session"),
+            )
+        return {
+            "symbols": len(symbols),
+            "rows": rows_inserted,
+            "session_symbols": int(targets.get("session_symbols") or 0),
+            "held_symbols": int(targets.get("held_symbols") or 0),
+        }
 
     async def startup(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -1017,6 +5307,21 @@ class DataService:
             self._protective_task = asyncio.create_task(self._protective_scheduler())
         if self._auto_exit_task is None:
             self._auto_exit_task = asyncio.create_task(self._auto_exit_scheduler())
+        if self._coin_focus_task is None:
+            self._coin_focus_task = asyncio.create_task(self._coin_focus_scheduler())
+        if self._coin_outcomes_task is None:
+            self._coin_outcomes_task = asyncio.create_task(self._coin_outcomes_scheduler())
+        if self._coin_retention_task is None:
+            self._coin_retention_task = asyncio.create_task(self._coin_retention_scheduler())
+        if self._coin_position_watcher_task is None:
+            self._coin_position_watcher_task = asyncio.create_task(
+                self._coin_position_watcher_scheduler()
+            )
+        if not self._coin_retention_last_report:
+            try:
+                await self.run_coin_analysis_retention_once(reason="startup")
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Coin retention startup run failed: %s", exc)
         await self._telemetry.start()
 
     async def shutdown(self) -> None:
@@ -1048,6 +5353,34 @@ class DataService:
             except asyncio.CancelledError:
                 pass
             self._auto_exit_task = None
+        if self._coin_focus_task:
+            self._coin_focus_task.cancel()
+            try:
+                await self._coin_focus_task
+            except asyncio.CancelledError:
+                pass
+            self._coin_focus_task = None
+        if self._coin_outcomes_task:
+            self._coin_outcomes_task.cancel()
+            try:
+                await self._coin_outcomes_task
+            except asyncio.CancelledError:
+                pass
+            self._coin_outcomes_task = None
+        if self._coin_retention_task:
+            self._coin_retention_task.cancel()
+            try:
+                await self._coin_retention_task
+            except asyncio.CancelledError:
+                pass
+            self._coin_retention_task = None
+        if self._coin_position_watcher_task:
+            self._coin_position_watcher_task.cancel()
+            try:
+                await self._coin_position_watcher_task
+            except asyncio.CancelledError:
+                pass
+            self._coin_position_watcher_task = None
         if self._protective_task:
             self._protective_task.cancel()
             try:
@@ -1129,6 +5462,250 @@ class DataService:
                 pass
             self._positions_market_task = None
         self._positions_market_task = asyncio.create_task(self._positions_market_scheduler())
+
+    async def _coin_focus_scheduler(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(max(1.0, float(self._coin_focus_poll_sec)))
+                try:
+                    await self.collect_coin_focus_once()
+                    if (time.time() - float(self._coin_shortlist_last_run_ts or 0.0)) >= max(
+                        30.0,
+                        float(self._coin_shortlist_poll_sec),
+                    ):
+                        await self.collect_coin_candidate_shortlist_once(top_n=3)
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning("Coin focus collector cycle failed: %s", exc)
+        except asyncio.CancelledError:
+            raise
+
+    async def _restart_coin_focus_scheduler(self) -> None:
+        if self._loop is None or self._loop.is_closed():
+            return
+        if self._coin_focus_task:
+            self._coin_focus_task.cancel()
+            try:
+                await self._coin_focus_task
+            except asyncio.CancelledError:
+                pass
+            self._coin_focus_task = None
+        self._coin_focus_task = asyncio.create_task(self._coin_focus_scheduler())
+
+    async def _coin_outcomes_scheduler(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(max(5.0, float(self._coin_outcomes_poll_sec)))
+                if not self._coin_outcomes_scheduler_enabled:
+                    continue
+                try:
+                    await self.evaluate_matured_coin_outcomes_once()
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning("Coin outcomes evaluator cycle failed: %s", exc)
+        except asyncio.CancelledError:
+            raise
+
+    async def _restart_coin_outcomes_scheduler(self) -> None:
+        if self._loop is None or self._loop.is_closed():
+            return
+        if self._coin_outcomes_task:
+            self._coin_outcomes_task.cancel()
+            try:
+                await self._coin_outcomes_task
+            except asyncio.CancelledError:
+                pass
+            self._coin_outcomes_task = None
+        self._coin_outcomes_task = asyncio.create_task(self._coin_outcomes_scheduler())
+
+    async def _coin_position_watcher_scheduler(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(max(5.0, float(self._coin_position_watcher_poll_sec)))
+                if not self._coin_position_watcher_enabled:
+                    continue
+                try:
+                    await self.run_coin_position_watcher_once()
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning("Coin position watcher cycle failed: %s", exc)
+        except asyncio.CancelledError:
+            raise
+
+    async def _restart_coin_position_watcher_scheduler(self) -> None:
+        if self._loop is None or self._loop.is_closed():
+            return
+        if self._coin_position_watcher_task:
+            self._coin_position_watcher_task.cancel()
+            try:
+                await self._coin_position_watcher_task
+            except asyncio.CancelledError:
+                pass
+            self._coin_position_watcher_task = None
+        self._coin_position_watcher_task = asyncio.create_task(
+            self._coin_position_watcher_scheduler()
+        )
+
+    async def _coin_retention_scheduler(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(max(60.0, float(self._coin_retention_poll_sec)))
+                try:
+                    await self.run_coin_analysis_retention_once(reason="scheduler")
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning("Coin retention cycle failed: %s", exc)
+        except asyncio.CancelledError:
+            raise
+
+    async def run_coin_analysis_retention_once(
+        self,
+        *,
+        max_age_days: int | None = None,
+        closed_paper_days: int | None = None,
+        reason: str = "manual",
+    ) -> dict[str, Any]:
+        max_days = max(1, int(max_age_days or self._coin_retention_max_age_days))
+        closed_days = max(1, int(closed_paper_days or self._coin_retention_closed_paper_days))
+        now_ms = int(time.time() * 1000)
+        before = await asyncio.to_thread(get_coin_analysis_table_counts)
+        deleted = await asyncio.to_thread(
+            prune_coin_analysis_data,
+            max_age_ms=max_days * 24 * 3600 * 1000,
+            closed_paper_max_age_ms=closed_days * 24 * 3600 * 1000,
+            now_ms=now_ms,
+        )
+        after = await asyncio.to_thread(get_coin_analysis_table_counts)
+        report = {
+            "ts_ms": now_ms,
+            "reason": str(reason or "manual"),
+            "max_age_days": max_days,
+            "closed_paper_days": closed_days,
+            "deleted": deleted,
+            "before": before,
+            "after": after,
+        }
+        self._coin_retention_last_report = report
+        return report
+
+    async def get_coin_analysis_maintenance_status(self) -> dict[str, Any]:
+        counts = await asyncio.to_thread(get_coin_analysis_table_counts)
+        return {
+            "retention": {
+                "scheduler_running": bool(
+                    self._coin_retention_task is not None and not self._coin_retention_task.done()
+                ),
+                "poll_sec": float(self._coin_retention_poll_sec),
+                "max_age_days": int(self._coin_retention_max_age_days),
+                "closed_paper_days": int(self._coin_retention_closed_paper_days),
+                "last_report": dict(self._coin_retention_last_report or {}),
+            },
+            "table_counts": counts,
+        }
+
+    def _record_coin_outcomes_cycle(self, cycle: Mapping[str, Any]) -> None:
+        item = dict(cycle or {})
+        self._coin_outcomes_last_cycle = item
+        self._coin_outcomes_cycle_history.append(item)
+        limit = max(1, int(self._coin_outcomes_cycle_history_limit or 50))
+        if len(self._coin_outcomes_cycle_history) > limit:
+            self._coin_outcomes_cycle_history = self._coin_outcomes_cycle_history[-limit:]
+
+    async def evaluate_matured_coin_outcomes_once(
+        self,
+        *,
+        symbol: str | None = None,
+    ) -> dict[str, Any]:
+        now_ts_ms = int(time.time() * 1000)
+        scope_symbol = normalize_symbol(symbol) if symbol else None
+        if symbol is not None and not scope_symbol:
+            raise ValueError("symbol is required")
+
+        decisions = await asyncio.to_thread(
+            get_decisions,
+            canonical_symbol=scope_symbol,
+            limit=5000,
+        )
+        decisions = [
+            row
+            for row in decisions
+            if str(row.get("mode") or "") in {"manual_candidate", "manual_position_review"}
+        ]
+        if not decisions:
+            cycle = {
+                "ts_ms": now_ts_ms,
+                "symbols_total": 0,
+                "symbols_processed": 0,
+                "evaluated": 0,
+                "skipped": 0,
+                "deferred": 0,
+                "errors": 0,
+                "scope_symbol": scope_symbol,
+            }
+            self._record_coin_outcomes_cycle(cycle)
+            return cycle
+
+        existing = await asyncio.to_thread(get_outcomes, limit=5000)
+        existing_keys = {
+            (str(row.get("decision_id") or ""), str(row.get("horizon") or ""))
+            for row in existing
+        }
+
+        latest_ts_by_symbol: dict[str, int] = {}
+        pending_by_symbol: dict[str, int] = {}
+        for row in decisions:
+            decision_id = str(row.get("decision_id") or "")
+            symbol = normalize_symbol(str(row.get("canonical_symbol") or ""))
+            if not decision_id or not symbol:
+                continue
+            ts_ms = int(_safe_float(row.get("ts_ms")) or 0)
+            if ts_ms > latest_ts_by_symbol.get(symbol, 0):
+                latest_ts_by_symbol[symbol] = ts_ms
+            pending = 0
+            for horizon in COIN_OUTCOME_AUTO_HORIZONS:
+                if (decision_id, horizon) not in existing_keys:
+                    pending += 1
+            if pending > 0:
+                pending_by_symbol[symbol] = pending_by_symbol.get(symbol, 0) + pending
+
+        pending_symbols = pending_by_symbol.keys()
+        ordered_symbols = sorted(
+            pending_symbols,
+            key=lambda s: latest_ts_by_symbol.get(s, 0),
+            reverse=True,
+        )
+        if scope_symbol is None and COIN_OUTCOME_MAX_SYMBOLS_PER_CYCLE > 0:
+            ordered_symbols = ordered_symbols[:COIN_OUTCOME_MAX_SYMBOLS_PER_CYCLE]
+
+        total_evaluated = 0
+        total_skipped = 0
+        total_deferred = 0
+        errors = 0
+        for symbol in ordered_symbols:
+            try:
+                result = await self.evaluate_coin_outcomes(
+                    symbol,
+                    horizons=list(COIN_OUTCOME_AUTO_HORIZONS),
+                    decision_limit=1000,
+                    force=False,
+                    only_matured=True,
+                    now_ms=now_ts_ms,
+                )
+                total_evaluated += int(result.get("evaluated") or 0)
+                total_skipped += int(result.get("skipped") or 0)
+                total_deferred += int(result.get("deferred") or 0)
+            except Exception:  # pylint: disable=broad-except
+                errors += 1
+                logger.exception("Coin outcomes auto-cycle failed for %s", symbol)
+
+        cycle = {
+            "ts_ms": now_ts_ms,
+            "symbols_total": len(pending_by_symbol),
+            "symbols_processed": len(ordered_symbols),
+            "evaluated": total_evaluated,
+            "skipped": total_skipped,
+            "deferred": total_deferred,
+            "errors": errors,
+            "scope_symbol": scope_symbol,
+        }
+        self._record_coin_outcomes_cycle(cycle)
+        return cycle
 
     def _sources_due(self) -> bool:
         if self._cached_sources is None or self._last_source_refresh is None:
@@ -1302,6 +5879,8 @@ class DataService:
         await self._restart_scheduler()
         await self._restart_protective_scheduler()
         await self._restart_positions_market_scheduler()
+        await self._restart_coin_focus_scheduler()
+        await self._restart_coin_outcomes_scheduler()
         self._accounts.update_interval(self._account_interval)
         self._accounts.update_summary_interval(self._summary_interval)
         # Kick an async refresh so UI sees new cadence sooner.
@@ -1506,14 +6085,19 @@ class DataService:
             )
             fetch_and_add("history", "funding_rate_history", history_url)
         elif name == "gate":
-            base_url = getattr(adapter, "base_url", "https://api.gateio.ws/api/v4")
-            ticker_url = f"{base_url}/futures/usdt/tickers?" + urlencode(
+            base_url = getattr(adapter, "base_url", "https://fx-api.gateio.ws/api/v4")
+            settle_resolver = getattr(adapter, "settle_for_symbol", None)
+            if callable(settle_resolver):
+                settle = settle_resolver(exchange_symbol) or "usdt"
+            else:
+                settle = "btc" if str(exchange_symbol or "").upper().endswith("_USD") else "usdt"
+            ticker_url = f"{base_url}/futures/{settle}/tickers?" + urlencode(
                 {"contract": exchange_symbol}
             )
             fetch_and_add("snapshot", "tickers", ticker_url)
-            contract_url = f"{base_url}/futures/usdt/contracts/{exchange_symbol}"
+            contract_url = f"{base_url}/futures/{settle}/contracts/{exchange_symbol}"
             fetch_and_add("snapshot", "contract", contract_url)
-            history_url = f"{base_url}/futures/usdt/funding_rate?" + urlencode(
+            history_url = f"{base_url}/futures/{settle}/funding_rate?" + urlencode(
                 {"contract": exchange_symbol, "limit": history_limit}
             )
             fetch_and_add("history", "funding_rate", history_url)
@@ -2793,13 +7377,39 @@ class DataService:
     def latest_snapshot(self) -> Optional[DataSnapshot]:
         return self._snapshot
 
-    def latest_snapshot_dict(self) -> dict[str, object] | None:
-        if self._snapshot is None:
+    def _latest_snapshot_dict_cached(self) -> dict[str, object] | None:
+        snapshot = self._snapshot
+        if snapshot is None:
+            self._snapshot_dict_cache_key = None
+            self._snapshot_dict_cache = None
             return None
-        return self._snapshot.as_dict()
+        cache_key = id(snapshot)
+        if self._snapshot_dict_cache_key != cache_key or self._snapshot_dict_cache is None:
+            self._snapshot_dict_cache = snapshot.as_dict()
+            self._snapshot_dict_cache_key = cache_key
+        return self._snapshot_dict_cache
+
+    def latest_snapshot_dict(self) -> dict[str, object] | None:
+        return self._latest_snapshot_dict_cached()
+
+    def _account_state_cache_token(self, payload: Mapping[str, Any]) -> tuple[Any, ...]:
+        return (
+            payload.get("last_updated"),
+            len(payload.get("balances") or []),
+            len(payload.get("positions") or []),
+            len(payload.get("status") or []),
+            self._positions_market_last_refresh.isoformat() if self._positions_market_last_refresh else None,
+            self._positions_market_last_error,
+            len(self._positions_market_cache),
+            len(self._positions_market_status),
+            len(self._positions_market_diffs),
+            (self._margin_logic_log[-1].get("timestamp") if self._margin_logic_log else None),
+            id(self._risk_config),
+            int(self._positions_market_interval or 0),
+        )
 
     def state_payload(self) -> dict[str, object]:
-        snapshot_dict = self._snapshot.as_dict() if self._snapshot else None
+        snapshot_dict = self._latest_snapshot_dict_cached()
         status = self._status
         if status == "idle" and snapshot_dict:
             status = "ready"
@@ -2843,8 +7453,341 @@ class DataService:
             "exchange_status": list(self._exchange_status.values()),
             "settings": settings_payload,
             "auto_exit": self.auto_exit_payload(),
+            "coin_analysis": {
+                "focus_poll_sec": self._coin_focus_poll_sec,
+                "shortlist_poll_sec": self._coin_shortlist_poll_sec,
+                "shortlist_last_cycle": dict(self._coin_shortlist_last_cycle or {}),
+                "outcomes_poll_sec": self._coin_outcomes_poll_sec,
+                "outcomes_scheduler_enabled": bool(self._coin_outcomes_scheduler_enabled),
+                "outcomes_last_cycle": dict(self._coin_outcomes_last_cycle),
+                "outcomes_recent_cycles": list(self._coin_outcomes_cycle_history[-10:]),
+                "position_watcher_poll_sec": self._coin_position_watcher_poll_sec,
+                "position_watcher_enabled": bool(self._coin_position_watcher_enabled),
+                "position_watcher_last_cycle": dict(self._coin_position_watcher_last_cycle or {}),
+                "retention_poll_sec": self._coin_retention_poll_sec,
+                "retention_max_age_days": self._coin_retention_max_age_days,
+                "retention_closed_paper_days": self._coin_retention_closed_paper_days,
+                "retention_last_report": dict(self._coin_retention_last_report or {}),
+            },
             "execution": self._execution_state(),
             "accounts": self._account_state(),
+        }
+
+    def mobile_positions_payload(self) -> dict[str, Any]:
+        positions = self._accounts.snapshot().get("positions") or []
+        market_lookup, market_ts_lookup = self._positions_market_snapshot_lookup()
+        rows, grouped = self._positions_by_symbol(
+            positions,
+            return_grouped=True,
+            market_lookup=market_lookup,
+            market_ts_lookup=market_ts_lookup,
+        )
+        auto_exit = self.auto_exit_payload()
+        rules = {
+            str(key): dict(value or {})
+            for key, value in (auto_exit.get("rules") or {}).items()
+            if isinstance(key, str)
+        }
+        live_spreads = {
+            str(key): _safe_float(value)
+            for key, value in (auto_exit.get("live_spreads") or {}).items()
+            if isinstance(key, str)
+        }
+        diagnostics_by_key = {
+            str(entry.get("key") or ""): dict(entry)
+            for entry in (auto_exit.get("diagnostics") or [])
+            if isinstance(entry, Mapping) and entry.get("key")
+        }
+
+        def _parse_iso(value: Any) -> datetime | None:
+            if not value:
+                return None
+            if isinstance(value, datetime):
+                return value.astimezone(timezone.utc)
+            try:
+                return datetime.fromisoformat(str(value)).astimezone(timezone.utc)
+            except Exception:  # pylint: disable=broad-except
+                return None
+
+        def _minutes_to(value: Any) -> float | None:
+            dt = _parse_iso(value)
+            if dt is None:
+                return None
+            return round((dt - datetime.now(timezone.utc)).total_seconds() / 60.0, 2)
+
+        def _weighted_avg(items: list[Mapping[str, Any]], key: str) -> float | None:
+            total_weight = 0.0
+            total_value = 0.0
+            for item in items:
+                value = _safe_float(item.get(key))
+                weight = abs(_safe_float(item.get("quantity")) or 0.0)
+                if value is None or weight <= 0:
+                    continue
+                total_weight += weight
+                total_value += value * weight
+            if total_weight <= 0:
+                return None
+            return total_value / total_weight
+
+        def _pair_amount_usdt(longs: list[Mapping[str, Any]], shorts: list[Mapping[str, Any]]) -> float | None:
+            long_total = sum(abs(_safe_float(item.get("amount")) or 0.0) for item in longs)
+            short_total = sum(abs(_safe_float(item.get("amount")) or 0.0) for item in shorts)
+            if long_total > 0 and short_total > 0:
+                return min(long_total, short_total)
+            gross = long_total + short_total
+            return gross if gross > 0 else None
+
+        def _pair_label(summary_row: Mapping[str, Any], selected_pair: Mapping[str, Any] | None) -> str:
+            long_exchange = normalize_exchange_name(str(summary_row.get("long_exchange") or ""))
+            short_exchange = normalize_exchange_name(str(summary_row.get("short_exchange") or ""))
+            long_count = int(summary_row.get("long_legs_count") or 0)
+            short_count = int(summary_row.get("short_legs_count") or 0)
+            if long_exchange and short_exchange and long_count == 1 and short_count == 1:
+                return f"{long_exchange.upper()} / {short_exchange.upper()}"
+            if selected_pair:
+                long_sel = normalize_exchange_name(str(selected_pair.get("long_exchange") or ""))
+                short_sel = normalize_exchange_name(str(selected_pair.get("short_exchange") or ""))
+                if long_sel and short_sel:
+                    return f"{long_sel.upper()} / {short_sel.upper()} ({str(selected_pair.get('mode') or 'pair')})"
+            return "multi-leg"
+
+        def _auto_exit_state(
+            symbol: str,
+            summary_row: Mapping[str, Any],
+            legs: list[Mapping[str, Any]],
+        ) -> dict[str, Any]:
+            selected_pair = _auto_exit_select_pair_from_legs(legs)
+            candidate_keys: list[str] = []
+            if selected_pair:
+                candidate_keys.append(
+                    self._auto_exit_key(
+                        symbol,
+                        str(selected_pair.get("long_exchange") or ""),
+                        str(selected_pair.get("short_exchange") or ""),
+                    )
+                )
+            summary_long = str(summary_row.get("long_exchange") or "")
+            summary_short = str(summary_row.get("short_exchange") or "")
+            if summary_long and summary_short:
+                candidate_keys.append(self._auto_exit_key(symbol, summary_long, summary_short))
+            candidate_keys.append(self._auto_exit_key(symbol, AUTO_EXIT_MULTILEG_MARKER, AUTO_EXIT_MULTILEG_MARKER))
+            rule_key = None
+            rule = None
+            for key in candidate_keys:
+                if key in rules:
+                    rule_key = key
+                    rule = rules.get(key)
+                    break
+            if rule is None:
+                for key, item in rules.items():
+                    if normalize_symbol(str(item.get("symbol") or "")) == normalize_symbol(symbol):
+                        rule_key = key
+                        rule = item
+                        break
+            live_spread = None
+            if rule_key:
+                live_spread = live_spreads.get(rule_key)
+            if live_spread is None:
+                live_spread = _safe_float(summary_row.get("mark_price"))
+            diagnostic = diagnostics_by_key.get(rule_key or "")
+            spread_enabled = bool((rule or {}).get("enabled", False))
+            v1_enabled = bool((rule or {}).get("v1_enabled", False))
+            raw_status = str((diagnostic or {}).get("status") or "")
+            if not spread_enabled and not v1_enabled:
+                status = "off"
+            elif live_spread is None:
+                status = "no_live_spread"
+            elif raw_status in {"wait", "cooldown", "running", "skip"}:
+                status = "waiting"
+            else:
+                status = "armed"
+            return {
+                "key": rule_key,
+                "spread_enabled": spread_enabled,
+                "v1_enabled": v1_enabled,
+                "target_spread_pct": _safe_float((rule or {}).get("target_spread_pct")),
+                "live_spread_pct": live_spread,
+                "live_spread_source": "auto_exit" if rule_key and rule_key in live_spreads else "summary_mark",
+                "status": status,
+                "raw_status": raw_status or None,
+                "reason": (diagnostic or {}).get("reason"),
+                "updated_at": (rule or {}).get("updated_at"),
+                "selected_pair": dict(selected_pair or {}),
+            }
+
+        cards: list[dict[str, Any]] = []
+        for row in rows:
+            if str(row.get("type") or "") != "summary":
+                continue
+            symbol = normalize_symbol(str(row.get("symbol") or ""))
+            legs = [dict(item) for item in (grouped.get(symbol) or [])]
+            longs = [leg for leg in legs if str(leg.get("side") or "").lower() == "long"]
+            shorts = [leg for leg in legs if str(leg.get("side") or "").lower() == "short"]
+            selected_pair = _auto_exit_select_pair_from_legs(legs)
+            auto_exit_state = _auto_exit_state(symbol, row, legs)
+            next_funding_iso = row.get("next_funding")
+            minutes_to_next = _minutes_to(next_funding_iso)
+            liq_distances = [
+                abs(_safe_float(leg.get("dist_to_liq_pct")) or 0.0)
+                for leg in legs
+                if _safe_float(leg.get("dist_to_liq_pct")) is not None
+            ]
+            liq_distance_pct = min(liq_distances) if liq_distances else None
+            quantity_abs = max(
+                [abs(_safe_float(leg.get("quantity")) or 0.0) for leg in legs],
+                default=0.0,
+            )
+            pair_amount = _pair_amount_usdt(longs, shorts)
+            long_leverage = _weighted_avg(longs, "leverage")
+            short_leverage = _weighted_avg(shorts, "leverage")
+            cards.append(
+                {
+                    "symbol": symbol,
+                    "pair_label": _pair_label(row, selected_pair),
+                    "is_multi_leg": bool(selected_pair and str(selected_pair.get("mode") or "") != "single_pair"),
+                    "long_exchange": normalize_exchange_name(str(row.get("long_exchange") or "")) or None,
+                    "short_exchange": normalize_exchange_name(str(row.get("short_exchange") or "")) or None,
+                    "net_pnl": _safe_float(row.get("unrealized_pnl")),
+                    "expected_funding": _safe_float(row.get("expected_funding")),
+                    "live_spread_pct": _safe_float(auto_exit_state.get("live_spread_pct")),
+                    "next_funding": next_funding_iso,
+                    "minutes_to_next_funding": minutes_to_next,
+                    "liq_distance_pct": liq_distance_pct,
+                    "risk_level": (
+                        "high"
+                        if liq_distance_pct is not None and liq_distance_pct <= 10.0
+                        else "warn"
+                        if liq_distance_pct is not None and liq_distance_pct <= 20.0
+                        else "ok"
+                    ),
+                    "flags": {
+                        "risk": bool(liq_distance_pct is not None and liq_distance_pct <= 20.0),
+                        "funding_soon": bool(minutes_to_next is not None and minutes_to_next <= 120.0),
+                        "auto_exit_on": bool(auto_exit_state.get("spread_enabled")),
+                    },
+                    "auto_exit": auto_exit_state,
+                    "position_summary": {
+                        "quantity": quantity_abs if quantity_abs > 0 else None,
+                        "amount_usdt": pair_amount,
+                        "gross_amount_usdt": sum(abs(_safe_float(leg.get("amount")) or 0.0) for leg in legs) or None,
+                        "pair_entry_spread_pct": _safe_float(row.get("entry_price")),
+                        "pair_mark_spread_pct": _safe_float(row.get("mark_price")),
+                        "long_entry_avg": _safe_float(row.get("long_entry_avg")),
+                        "short_entry_avg": _safe_float(row.get("short_entry_avg")),
+                        "long_mark_avg": _safe_float(row.get("long_mark_avg")),
+                        "short_mark_avg": _safe_float(row.get("short_mark_avg")),
+                        "long_leverage_avg": long_leverage,
+                        "short_leverage_avg": short_leverage,
+                    },
+                    "risk": {
+                        "liq_distance_pct": liq_distance_pct,
+                        "long_liq_price": _safe_float((longs[0] if longs else {}).get("liquidation_price")),
+                        "short_liq_price": _safe_float((shorts[0] if shorts else {}).get("liquidation_price")),
+                        "long_stop_price": _safe_float((longs[0] if longs else {}).get("stop_price")),
+                        "short_stop_price": _safe_float((shorts[0] if shorts else {}).get("stop_price")),
+                        "long_take_price": _safe_float((longs[0] if longs else {}).get("take_price")),
+                        "short_take_price": _safe_float((shorts[0] if shorts else {}).get("take_price")),
+                    },
+                    "funding": {
+                        "net_funding_rate": _safe_float(row.get("funding_rate")),
+                        "expected_funding": _safe_float(row.get("expected_funding")),
+                        "next_funding": next_funding_iso,
+                        "minutes_to_next_funding": minutes_to_next,
+                    },
+                    "legs": legs,
+                }
+            )
+
+        cards.sort(
+            key=lambda item: (
+                _minutes_to(item.get("next_funding")) if item.get("next_funding") else 10**9,
+                str(item.get("symbol") or ""),
+            )
+        )
+        return {
+            "status": self._status if self._status != "idle" else ("ready" if self._snapshot else "idle"),
+            "last_updated": self._last_refreshed.isoformat() if self._last_refreshed else None,
+            "cards": cards,
+            "filters": {
+                "all": len(cards),
+                "risk": sum(1 for card in cards if bool((card.get("flags") or {}).get("risk"))),
+                "funding_soon": sum(1 for card in cards if bool((card.get("flags") or {}).get("funding_soon"))),
+                "auto_exit_on": sum(1 for card in cards if bool((card.get("flags") or {}).get("auto_exit_on"))),
+            },
+        }
+
+    def mobile_manual_defaults_payload(self) -> dict[str, Any]:
+        settings_payload = self._settings_manager.as_dict()
+        analysis_exchanges = settings_payload.get("analysis_exchanges") or {}
+        enabled_exchanges = [
+            normalize_exchange_name(str(name))
+            for name, enabled in analysis_exchanges.items()
+            if enabled
+        ]
+        if not enabled_exchanges:
+            enabled_exchanges = [
+                normalize_exchange_name(str(name))
+                for name in analysis_exchanges.keys()
+            ]
+        enabled_exchanges = [name for name in enabled_exchanges if name]
+        manual_settings = getattr(self._settings_manager.current, "manual", {}) or {}
+        return {
+            "status": self._status if self._status != "idle" else ("ready" if self._snapshot else "idle"),
+            "last_updated": self._last_refreshed.isoformat() if self._last_refreshed else None,
+            "exchanges": enabled_exchanges,
+            "actions": ["enter", "exit", "roll"],
+            "main_modes": [
+                {"id": "smart", "label": "Smart"},
+                {"id": "fast", "label": "Fast"},
+            ],
+            "roll_modes": [
+                {"id": "smart-roll", "label": "Smart"},
+                {"id": "limit-first-expensive", "label": "Limit first"},
+                {"id": "dual-limit", "label": "Dual limit"},
+                {"id": "dual-market", "label": "Dual market"},
+                {"id": "limit-then-market-fallback", "label": "Limit then market"},
+            ],
+            "expensive_leg_options": {
+                "enter_exit": [
+                    {"id": None, "label": "Auto hint"},
+                    {"id": "long", "label": "Long leg"},
+                    {"id": "short", "label": "Short leg"},
+                ],
+                "roll": [
+                    {"id": None, "label": "Auto hint"},
+                    {"id": "to", "label": "To leg"},
+                    {"id": "from", "label": "From leg"},
+                ],
+            },
+            "defaults": {
+                "max_slippage_bps": 8.0,
+                "margin_mode": "isolated",
+                "timeout_sec": 15,
+                "max_runtime_sec": 60,
+                "reprice_sec": 2.0,
+                "chunk_qty": None,
+                "chunk_notional": None,
+                "force_chunk_qty": False,
+                "hedge_order_type": "market",
+                "hedge_limit_mode": "passive",
+                "hedge_favorable_bps": 2.0,
+                "hedge_adverse_bps": 6.0,
+                "hedge_reprice_min_sec": 2.0,
+                "limit_offset_bps": 0.0,
+                "limit_offset_ticks": 0,
+                "max_limit_deviation_bps": 30.0,
+                "use_orderbook_check": True,
+                "exit_allow_flip": False,
+                "expensive_leg": None,
+                "ws_orders_health": dict(manual_settings.get("ws_orders_health") or {}),
+            },
+            "advanced_sections": [
+                "execution",
+                "chunking",
+                "hedge",
+                "safety",
+                "system",
+            ],
         }
 
     def telemetry_backlog(self, limit: int = 50) -> List[dict[str, Any]]:
@@ -2974,6 +7917,10 @@ class DataService:
 
     def _account_state(self) -> dict[str, object]:
         payload = self._accounts.snapshot()
+        cache_key = self._account_state_cache_token(payload)
+        if self._account_state_cache_key == cache_key and self._account_state_cache is not None:
+            return self._account_state_cache
+        payload = dict(payload)
         positions = payload.get("positions") or []
         balances = self._sanitize_balances(payload.get("balances") or [])
         payload["balances"] = balances
@@ -2986,22 +7933,174 @@ class DataService:
         )
         payload["positions_by_symbol"] = positions_by_symbol
         payload["reduction_candidates"] = self._reduction_candidates(grouped, balances)
-        payload["positions_market"] = self._positions_market_state()
+        payload["positions_market"] = self._positions_market_state(positions)
+        payload["margin_diagnostics"] = self._margin_diagnostics(positions, balances)
+        payload["margin_logic_log"] = list(self._margin_logic_log)
+        self._account_state_cache_key = self._account_state_cache_token(payload)
+        self._account_state_cache = payload
         return payload
+
+    def _margin_logic_event(self, event: str, payload: Mapping[str, Any]) -> None:
+        entry = {
+            "event": event,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        entry.update(dict(payload or {}))
+        self._margin_logic_log.append(entry)
+        if len(self._margin_logic_log) > self._margin_logic_log_limit:
+            self._margin_logic_log = self._margin_logic_log[-self._margin_logic_log_limit :]
+
+    def _margin_diagnostics(self, positions: list[dict[str, Any]], balances: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        protective = getattr(self._settings_manager.current, "protective", {}) or {}
+        add_enabled = bool(protective.get("auto_margin_enabled", True))
+        reduce_enabled = bool(protective.get("auto_margin_reduce_enabled", True))
+        enforce_mode = bool(protective.get("enforce_isolated_margin", True))
+        enforce_leverage = bool(protective.get("enforce_leverage", True))
+        target_leverage = _safe_float(protective.get("target_leverage"))
+        if target_leverage is None or target_leverage <= 0:
+            target_leverage = DEFAULT_MANUAL_LEVERAGE
+        kucoin_topup_only = bool(protective.get("kucoin_isolated_topup_only", True))
+        add_trigger = 0.27
+        reduce_trigger = 0.33
+        target_buffer = 0.30
+        balances_by_exchange = {
+            normalize_exchange_name(str(item.get("exchange") or "")): item
+            for item in balances or []
+            if str(item.get("exchange") or "").strip()
+        }
+        rows: list[dict[str, Any]] = []
+        for position in positions or []:
+            exchange = normalize_exchange_name(str(position.get("exchange") or ""))
+            if not exchange:
+                continue
+            symbol = _dedupe_settle(position.get("symbol_normalized") or normalize_symbol(position.get("symbol")))
+            if not symbol:
+                continue
+            side = str(position.get("side") or "").lower() or None
+            balance = balances_by_exchange.get(exchange)
+            estimates = _manual_margin_estimates(position, balance)
+            margin_mode = str(position.get("margin_mode") or "").lower() or None
+            leverage = _safe_float(position.get("leverage"))
+            liq_buffer_ratio = None
+            mark_price = _safe_float(position.get("mark_price"))
+            liq_price = _safe_float(position.get("liquidation_price"))
+            if mark_price and liq_price and mark_price > 0 and liq_price > 0:
+                if side == "long" and liq_price < mark_price:
+                    liq_buffer_ratio = (mark_price - liq_price) / mark_price
+                elif side == "short" and liq_price > mark_price:
+                    liq_buffer_ratio = (liq_price - mark_price) / mark_price
+
+            decision = "hold"
+            reason = "in_range"
+            if margin_mode != "isolated":
+                if enforce_mode:
+                    decision = "set_mode"
+                    reason = "enforce_isolated_margin"
+                else:
+                    decision = "observe"
+                    reason = "margin_mode_not_isolated"
+            elif exchange == "kucoin" and enforce_leverage:
+                if leverage is None:
+                    decision = "observe"
+                    reason = "leverage_unknown"
+                elif leverage > (float(target_leverage) + 0.05):
+                    decision = "add_margin"
+                    reason = "kucoin_target_leverage"
+                elif kucoin_topup_only:
+                    decision = "hold"
+                    reason = "kucoin_topup_only_target_met"
+                else:
+                    decision = "hold"
+                    reason = "target_leverage_met"
+            elif liq_buffer_ratio is None:
+                decision = "observe"
+                reason = "liq_buffer_unknown"
+            elif liq_buffer_ratio < add_trigger:
+                if add_enabled:
+                    decision = "add_margin"
+                    reason = "low_liq_buffer"
+                else:
+                    decision = "blocked"
+                    reason = "auto_add_disabled"
+            elif liq_buffer_ratio > reduce_trigger:
+                if exchange == "kucoin" and margin_mode == "isolated" and kucoin_topup_only:
+                    decision = "hold"
+                    reason = "kucoin_topup_only"
+                elif reduce_enabled:
+                    decision = "reduce_margin"
+                    reason = "high_liq_buffer"
+                else:
+                    decision = "blocked"
+                    reason = "auto_reduce_disabled"
+
+            key = f"{exchange}|{symbol}|{side or '-'}"
+            fingerprint = "|".join(
+                [
+                    str(decision),
+                    str(reason),
+                    str(margin_mode or ""),
+                    str(round(leverage, 4) if leverage is not None else "na"),
+                    str(round(liq_buffer_ratio, 4) if liq_buffer_ratio is not None else "na"),
+                ]
+            )
+            if self._margin_logic_state.get(key) != fingerprint:
+                self._margin_logic_state[key] = fingerprint
+                self._margin_logic_event(
+                    "decision",
+                    {
+                        "exchange": exchange,
+                        "symbol": symbol,
+                        "side": side,
+                        "decision": decision,
+                        "reason": reason,
+                        "margin_mode": margin_mode,
+                        "leverage": leverage,
+                        "liq_buffer_pct": (liq_buffer_ratio * 100.0) if liq_buffer_ratio is not None else None,
+                    },
+                )
+
+            rows.append(
+                {
+                    "key": key,
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "side": side,
+                    "margin_mode": margin_mode,
+                    "margin_mode_source": position.get("margin_mode_source"),
+                    "leverage": leverage,
+                    "leverage_source": position.get("leverage_source"),
+                    "target_leverage": target_leverage,
+                    "liq_buffer_pct": (liq_buffer_ratio * 100.0) if liq_buffer_ratio is not None else None,
+                    "add_trigger_pct": add_trigger * 100.0,
+                    "reduce_trigger_pct": reduce_trigger * 100.0,
+                    "target_buffer_pct": target_buffer * 100.0,
+                    "base_margin_est": _safe_float(estimates.get("base_margin_est")),
+                    "base_margin_source": estimates.get("base_margin_source"),
+                    "min_required_margin_est": _safe_float(estimates.get("min_required_margin_est")),
+                    "min_required_margin_source": estimates.get("min_required_margin_source"),
+                    "max_add_est": _safe_float(estimates.get("max_add_est")),
+                    "max_reduce_est": _safe_float(estimates.get("max_reduce_est")),
+                    "decision": decision,
+                    "reason": reason,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+        rows.sort(key=lambda item: (str(item.get("decision") or ""), str(item.get("exchange") or ""), str(item.get("symbol") or "")))
+        return rows
 
     def _positions_market_snapshot_lookup(
         self,
     ) -> tuple[dict[tuple[str, str], MarketSnapshot], dict[tuple[str, str], datetime]]:
         return dict(self._positions_market_cache), dict(self._positions_market_cache_ts)
 
-    def _positions_market_state(self) -> dict[str, object]:
+    def _positions_market_state(self, positions: list[dict[str, Any]] | None = None) -> dict[str, object]:
         last_updated = (
             self._positions_market_last_refresh.isoformat()
             if self._positions_market_last_refresh
             else None
         )
         symbols = len(self._positions_market_last_key or ())
-        positions = self._accounts.snapshot().get("positions") or []
+        positions = positions or []
         return {
             "last_updated": last_updated,
             "last_error": self._positions_market_last_error,
@@ -3357,6 +8456,7 @@ class DataService:
             exchange_name = str(entry.get("exchange") or "").lower()
             snapshot = None
             snapshot_ts = None
+            funding_interval_hours = None
             for sym in lookup_symbols:
                 key = (exchange_name, sym)
                 snapshot = market_lookup.get(key)
@@ -3386,6 +8486,8 @@ class DataService:
                 if snapshot.funding_rate is not None:
                     if not snapshot_funding_stale:
                         funding_rate = snapshot.funding_rate
+                if snapshot.funding_interval_hours is not None:
+                    funding_interval_hours = snapshot.funding_interval_hours
                 if snapshot.next_funding_time:
                     if not snapshot_funding_stale:
                         next_funding_iso = snapshot.next_funding_time.isoformat()
@@ -3464,6 +8566,7 @@ class DataService:
                     "mark_price": mark_price,
                     "unrealized_pnl": unrealized,
                     "funding_rate": funding_rate,
+                    "funding_interval_hours": funding_interval_hours,
                     "next_funding": next_funding_iso,
                     "next_funding_eta": next_funding_eta,
                     "leverage": entry.get("leverage"),
@@ -4015,6 +9118,9 @@ class DataService:
             cfg.stop_requote_threshold_pct = float(
                 protective.get("stop_requote_threshold_pct", cfg.stop_requote_threshold_pct)
             )
+            cfg.stop_force_requote_max_age_sec = int(
+                protective.get("stop_force_requote_max_age_sec", cfg.stop_force_requote_max_age_sec)
+            )
             cfg.fallback_liq_factor_long = float(
                 protective.get("fallback_liq_factor_long", cfg.fallback_liq_factor_long)
             )
@@ -4032,6 +9138,12 @@ class DataService:
                 protective.get("position_check_interval_sec", cfg.position_check_interval_sec)
             )
             cfg.telegram_alert_chat_id = str(protective.get("telegram_alert_chat_id", cfg.telegram_alert_chat_id))
+            cfg.notification_primary_channel = str(
+                protective.get("notification_primary_channel", cfg.notification_primary_channel)
+            )
+            cfg.notification_fallback_channel = str(
+                protective.get("notification_fallback_channel", cfg.notification_fallback_channel)
+            )
             cfg.send_missing_stop_alerts = bool(
                 protective.get("send_missing_stop_alerts", cfg.send_missing_stop_alerts)
             )
@@ -4042,6 +9154,9 @@ class DataService:
     def _apply_alert_settings(self) -> None:
         protective = getattr(self._settings_manager.current, "protective", {}) or {}
         send_margin = bool(protective.get("send_margin_alerts", True))
+        notification_primary_channel = str(protective.get("notification_primary_channel", "telegram") or "telegram")
+        notification_fallback_channel = str(protective.get("notification_fallback_channel", "none") or "none")
+        telegram_chat_id = str(protective.get("telegram_alert_chat_id", "") or "")
         warning_buffer = _safe_float(protective.get("warning_buffer_pct"))
         panic_buffer = _safe_float(protective.get("panic_buffer_pct"))
         min_free_abs = _safe_float(protective.get("min_free_balance_abs"))
@@ -4052,10 +9167,13 @@ class DataService:
         margin_add_pct = _safe_float(protective.get("margin_add_pct"))
         margin_add_panic_pct = _safe_float(protective.get("margin_add_panic_pct"))
         margin_reduce_pct = _safe_float(protective.get("margin_reduce_pct"))
+        margin_add_trigger_buffer_pct = _safe_float(protective.get("margin_add_trigger_buffer_pct"))
+        margin_reduce_trigger_buffer_pct = _safe_float(protective.get("margin_reduce_trigger_buffer_pct"))
         margin_adjust_cooldown = protective.get("margin_adjust_cooldown_sec")
         enforce_isolated_margin = protective.get("enforce_isolated_margin")
         enforce_leverage = protective.get("enforce_leverage")
         target_leverage = _safe_float(protective.get("target_leverage"))
+        kucoin_isolated_topup_only = protective.get("kucoin_isolated_topup_only")
         if warning_buffer is None:
             warning_buffer = self._risk_config.warning_buffer_pct
         if panic_buffer is None:
@@ -4069,6 +9187,9 @@ class DataService:
         self._accounts.update_alert_settings(
             send_margin_alerts=send_margin,
             send_missing_stop_alerts=bool(protective.get("send_missing_stop_alerts", True)),
+            notification_primary_channel=notification_primary_channel,
+            notification_fallback_channel=notification_fallback_channel,
+            telegram_chat_id=telegram_chat_id,
             warning_buffer_pct=warning_buffer,
             panic_buffer_pct=panic_buffer,
             min_free_balance_abs=min_free_abs,
@@ -4079,11 +9200,17 @@ class DataService:
             enforce_isolated_margin=enforce_isolated_margin if enforce_isolated_margin is not None else None,
             enforce_leverage=enforce_leverage if enforce_leverage is not None else None,
             target_leverage=target_leverage,
+            kucoin_isolated_topup_only=(
+                bool(kucoin_isolated_topup_only) if kucoin_isolated_topup_only is not None else None
+            ),
             margin_add_pct=margin_add_pct,
             margin_add_panic_pct=margin_add_panic_pct,
             margin_reduce_pct=margin_reduce_pct,
+            margin_add_trigger_buffer_pct=margin_add_trigger_buffer_pct,
+            margin_reduce_trigger_buffer_pct=margin_reduce_trigger_buffer_pct,
             margin_adjust_cooldown_sec=margin_adjust_cooldown,
         )
+        self._protective_manager.update_config(self._risk_config)
         self._send_missing_stop_alerts = bool(
             protective.get("send_missing_stop_alerts", self._send_missing_stop_alerts)
         )
@@ -4125,19 +9252,25 @@ class DataService:
                     long_ex = normalize_exchange_name(str(rule.get("long_exchange") or ""))
                     short_ex = normalize_exchange_name(str(rule.get("short_exchange") or ""))
                     target = _safe_float(rule.get("target_spread_pct"))
-                    if not symbol or not long_ex or not short_ex or target is None:
+                    spread_enabled = bool(rule.get("enabled", target is not None))
+                    v1_enabled = bool(rule.get("v1_enabled", False))
+                    if not symbol or not long_ex or not short_ex or (target is None and not v1_enabled):
                         continue
                     rule_key = f"{symbol}|{long_ex}|{short_ex}"
                     rules[rule_key] = {
                         "symbol": symbol,
                         "long_exchange": long_ex,
-                            "short_exchange": short_ex,
-                            "target_spread_pct": float(target),
-                            "enabled": bool(rule.get("enabled", True)),
-                            "last_triggered_ts": float(rule.get("last_triggered_ts") or 0.0),
-                            "updated_at": rule.get("updated_at"),
-                            "missing_since_ts": float(rule.get("missing_since_ts") or 0.0),
-                        }
+                        "short_exchange": short_ex,
+                        "target_spread_pct": float(target) if target is not None else None,
+                        "enabled": spread_enabled,
+                        "v1_enabled": v1_enabled,
+                        "persist_on_missing": bool(rule.get("persist_on_missing", True)),
+                        "last_triggered_ts": float(rule.get("last_triggered_ts") or 0.0),
+                        "last_v1_triggered_ts": float(rule.get("last_v1_triggered_ts") or 0.0),
+                        "updated_at": rule.get("updated_at"),
+                        "missing_since_ts": float(rule.get("missing_since_ts") or 0.0),
+                        "v1_pending_exit_cycles": max(0, int(rule.get("v1_pending_exit_cycles") or 0)),
+                    }
         return {"defaults": defaults, "rules": rules}
 
     @staticmethod
@@ -4147,6 +9280,8 @@ class DataService:
     def auto_exit_payload(self) -> dict[str, Any]:
         payload = json.loads(json.dumps(self._auto_exit))
         payload["live_spreads"] = dict(self._auto_exit_live_spreads)
+        payload["diagnostics"] = list(self._auto_exit_diagnostics)
+        payload["v1_diagnostics"] = list(self._auto_exit_v1_diagnostics)
         payload["events"] = list(self._auto_exit_events)
         return payload
 
@@ -4173,29 +9308,54 @@ class DataService:
         symbol = str(payload.get("symbol") or "").upper().strip()
         long_exchange = normalize_exchange_name(str(payload.get("long_exchange") or ""))
         short_exchange = normalize_exchange_name(str(payload.get("short_exchange") or ""))
-        enabled = bool(payload.get("enabled", True))
-        target = _safe_float(payload.get("target_spread_pct"))
         if not symbol or not long_exchange or not short_exchange:
             raise ValueError("symbol, long_exchange, and short_exchange are required.")
         key = self._auto_exit_key(symbol, long_exchange, short_exchange)
         async with self._auto_exit_lock:
             rules = self._auto_exit.get("rules", {})
-            if not enabled:
+            prev = dict(rules.get(key, {}) or {})
+            spread_enabled_in = payload.get("spread_enabled")
+            if spread_enabled_in is None and "enabled" in payload:
+                spread_enabled_in = payload.get("enabled")
+            v1_enabled_in = payload.get("v1_enabled")
+            persist_on_missing_in = payload.get("persist_on_missing")
+            spread_enabled = (
+                bool(prev.get("enabled", False))
+                if spread_enabled_in is None
+                else bool(spread_enabled_in)
+            )
+            v1_enabled = (
+                bool(prev.get("v1_enabled", False))
+                if v1_enabled_in is None
+                else bool(v1_enabled_in)
+            )
+            persist_on_missing = (
+                bool(prev.get("persist_on_missing", True))
+                if persist_on_missing_in is None
+                else bool(persist_on_missing_in)
+            )
+            target = _safe_float(payload.get("target_spread_pct"))
+            if target is None:
+                target = _safe_float(prev.get("target_spread_pct"))
+            if not spread_enabled and not v1_enabled:
                 rules.pop(key, None)
             else:
-                if target is None:
+                if spread_enabled and target is None:
                     raise ValueError("target_spread_pct is required when enabled.")
                 now_iso = datetime.now(timezone.utc).isoformat()
-                prev = rules.get(key, {})
                 rules[key] = {
                     "symbol": symbol,
                     "long_exchange": long_exchange,
                     "short_exchange": short_exchange,
-                    "target_spread_pct": float(target),
-                    "enabled": True,
+                    "target_spread_pct": float(target) if target is not None else None,
+                    "enabled": bool(spread_enabled),
+                    "v1_enabled": bool(v1_enabled),
+                    "persist_on_missing": bool(persist_on_missing),
                     "last_triggered_ts": float(prev.get("last_triggered_ts") or 0.0),
+                    "last_v1_triggered_ts": float(prev.get("last_v1_triggered_ts") or 0.0),
                     "updated_at": now_iso,
                     "missing_since_ts": 0.0,
+                    "v1_pending_exit_cycles": max(0, int(prev.get("v1_pending_exit_cycles") or 0)),
                 }
             self._auto_exit["rules"] = rules
             self._auto_exit_store.save(self._auto_exit)
@@ -4233,7 +9393,13 @@ class DataService:
             positions = self._accounts.snapshot().get("positions") or []
             if not positions:
                 return
-            _, grouped = self._positions_by_symbol(positions, return_grouped=True)
+            market_lookup, market_ts_lookup = self._positions_market_snapshot_lookup()
+            _, grouped = self._positions_by_symbol(
+                positions,
+                return_grouped=True,
+                market_lookup=market_lookup,
+                market_ts_lookup=market_ts_lookup,
+            )
             rules = config.get("rules") or {}
             defaults = config.get("defaults") or {}
             max_runtime_sec = int(defaults.get("max_runtime_sec", AUTO_EXIT_DEFAULTS["max_runtime_sec"]))
@@ -4244,12 +9410,21 @@ class DataService:
 
             live_spreads: dict[str, float] = {}
             live_mid_cache: dict[tuple[str, str], float | None] = {}
+            live_book_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
+
+            async def resolve_leg_book(symbol_name: str, exchange: str) -> dict[str, Any] | None:
+                key = (normalize_symbol(symbol_name), normalize_exchange_name(exchange))
+                if key in live_book_cache:
+                    return live_book_cache.get(key)
+                book = await self._market_data.get_orderbook(exchange, symbol_name, depth=20, max_age_sec=15.0)
+                live_book_cache[key] = dict(book) if book else None
+                return live_book_cache.get(key)
 
             async def resolve_leg_mid(symbol_name: str, exchange: str) -> float | None:
                 key = (normalize_symbol(symbol_name), normalize_exchange_name(exchange))
                 if key in live_mid_cache:
                     return live_mid_cache.get(key)
-                book = await self._market_data.get_orderbook(exchange, symbol_name, depth=5, max_age_sec=15.0)
+                book = await resolve_leg_book(symbol_name, exchange)
                 if not book:
                     live_mid_cache[key] = None
                     return None
@@ -4271,17 +9446,34 @@ class DataService:
                 live_mid_cache[key] = mid
                 return mid
 
-            async def resolve_live_spread(symbol_name: str, long_ex: str, short_ex: str) -> float | None:
-                spread_key = self._auto_exit_key(symbol_name, long_ex, short_ex)
-                cached = live_spreads.get(spread_key)
-                if cached is not None:
-                    return float(cached)
-                spread = await self._auto_exit_live_spread(symbol_name, long_ex, short_ex)
-                if spread is None:
-                    return None
-                spread_val = float(spread)
-                live_spreads[spread_key] = spread_val
-                return spread_val
+            async def resolve_pair_exit_metrics(
+                symbol_name: str,
+                long_ex: str,
+                short_ex: str,
+                qty_base: float,
+            ) -> dict[str, Any] | None:
+                long_book = await resolve_leg_book(symbol_name, long_ex)
+                short_book = await resolve_leg_book(symbol_name, short_ex)
+                manual_settings = getattr(self._settings_manager.current, "manual", {}) or {}
+                policy = _auto_exit_policy_for_pair(long_ex, short_ex, manual_settings=manual_settings)
+                fee_bps = _auto_exit_pair_fee_bps(long_ex, short_ex)
+                metrics = _auto_exit_executable_metrics_from_books(
+                    long_exchange=long_ex,
+                    short_exchange=short_ex,
+                    long_book=long_book,
+                    short_book=short_book,
+                    qty=qty_base,
+                    max_slippage_bps=AUTO_EXIT_EXECUTABLE_MAX_SLIPPAGE_BPS,
+                    fee_bps=fee_bps,
+                    edge_buffer_bps=_safe_float(policy.get("edge_buffer_bps")) or 0.0,
+                    chunk_notional_cap_usd=_safe_float(policy.get("chunk_notional_cap_usd")),
+                )
+                if metrics:
+                    metrics["long_book"] = long_book
+                    metrics["short_book"] = short_book
+                    metrics["policy"] = policy
+                    live_spreads[self._auto_exit_key(symbol_name, long_ex, short_ex)] = float(metrics["spread_pct"])
+                return metrics
 
             async def resolve_overall_spread(symbol_name: str, legs_list: list[dict[str, Any]]) -> float | None:
                 mids: dict[str, float] = {}
@@ -4303,11 +9495,194 @@ class DataService:
 
             async with self._auto_exit_lock:
                 self._auto_exit_live_spreads = live_spreads
+            rules_to_remove: set[str] = set()
+            rules_to_update: dict[str, dict[str, Any]] = {}
+            diagnostics_rows: list[dict[str, Any]] = []
+            v1_diagnostics_rows: list[dict[str, Any]] = []
+
+            def merge_rule_updates(rule_key: str, updates: Mapping[str, Any]) -> None:
+                merged = dict(rules_to_update.get(rule_key) or {})
+                merged.update(dict(updates or {}))
+                rules_to_update[rule_key] = merged
+
+            def append_diagnostic(
+                rule_key: str,
+                rule_state: Mapping[str, Any],
+                *,
+                status: str,
+                reason: str | None = None,
+                selected_pair: Mapping[str, Any] | None = None,
+                pair_metrics: Mapping[str, Any] | None = None,
+                overall_spread: float | None = None,
+                trigger_spread: float | None = None,
+                target_pct: float | None = None,
+                required_net_spread_pct: float | None = None,
+            ) -> None:
+                symbol = str(rule_state.get("symbol") or "").upper().strip()
+                rule_long_exchange = normalize_exchange_name(str(rule_state.get("long_exchange") or ""))
+                rule_short_exchange = normalize_exchange_name(str(rule_state.get("short_exchange") or ""))
+                selected_long_exchange = normalize_exchange_name(str((selected_pair or {}).get("long_exchange") or ""))
+                selected_short_exchange = normalize_exchange_name(str((selected_pair or {}).get("short_exchange") or ""))
+                policy = dict((pair_metrics or {}).get("policy") or {})
+                if (
+                    not policy
+                    and rule_long_exchange
+                    and rule_short_exchange
+                    and not _is_auto_exit_multileg_rule(rule_long_exchange, rule_short_exchange)
+                ):
+                    manual_settings = getattr(self._settings_manager.current, "manual", {}) or {}
+                    policy = _auto_exit_policy_for_pair(
+                        rule_long_exchange,
+                        rule_short_exchange,
+                        manual_settings=manual_settings,
+                    )
+                cleanup_status = _auto_exit_market_cleanup_status(
+                    long_exchange=selected_long_exchange or rule_long_exchange,
+                    short_exchange=selected_short_exchange or rule_short_exchange,
+                    cleanup_cap_usd=_safe_float(policy.get("market_cleanup_notional_cap_usd")),
+                    estimated_notional_usd=_safe_float((pair_metrics or {}).get("chunk_notional_usd")),
+                )
+                execution_order = _auto_exit_execution_order(
+                    long_exchange=selected_long_exchange or rule_long_exchange,
+                    short_exchange=selected_short_exchange or rule_short_exchange,
+                    long_book=(pair_metrics or {}).get("long_book"),
+                    short_book=(pair_metrics or {}).get("short_book"),
+                )
+                net_spread_pct = _safe_float((pair_metrics or {}).get("net_spread_pct"))
+                edge_delta_bps = _auto_exit_edge_delta_bps(
+                    net_spread_pct,
+                    required_net_spread_pct,
+                )
+                diagnostics_rows.append(
+                    {
+                        "key": rule_key,
+                        "symbol": symbol,
+                        "rule_long_exchange": rule_long_exchange,
+                        "rule_short_exchange": rule_short_exchange,
+                        "selected_long_exchange": selected_long_exchange or None,
+                        "selected_short_exchange": selected_short_exchange or None,
+                        "selection_mode": str((selected_pair or {}).get("mode") or ""),
+                        "long_legs": int((selected_pair or {}).get("long_legs") or 0),
+                        "short_legs": int((selected_pair or {}).get("short_legs") or 0),
+                        "status": status,
+                        "reason": reason,
+                        "target_spread_pct": float(target_pct) if target_pct is not None else None,
+                        "gross_spread_pct": float(trigger_spread) if trigger_spread is not None else None,
+                        "overall_spread_pct": float(overall_spread) if overall_spread is not None else None,
+                        "net_spread_pct": net_spread_pct,
+                        "required_net_spread_pct": float(required_net_spread_pct) if required_net_spread_pct is not None else None,
+                        "edge_delta_bps": edge_delta_bps,
+                        "chunk_qty": _safe_float((pair_metrics or {}).get("chunk_qty")),
+                        "chunk_notional_usd": _safe_float((pair_metrics or {}).get("chunk_notional_usd")),
+                        "liquidity_cap_qty": _safe_float((pair_metrics or {}).get("liquidity_cap_qty")),
+                        "safety_factor": _safe_float((pair_metrics or {}).get("safety_factor")),
+                        "fee_bps": _safe_float((pair_metrics or {}).get("fee_bps")),
+                        "edge_buffer_bps": _safe_float((pair_metrics or {}).get("edge_buffer_bps")),
+                        "policy_key": policy.get("policy_key"),
+                        "worst_tier": policy.get("worst_tier"),
+                        "primary_label": execution_order.get("primary_label"),
+                        "primary_exchange": execution_order.get("primary_exchange"),
+                        "hedge_label": execution_order.get("hedge_label"),
+                        "hedge_exchange": execution_order.get("hedge_exchange"),
+                        "decision_reason": execution_order.get("reason"),
+                        "chunk_notional_cap_usd": _safe_float(policy.get("chunk_notional_cap_usd")),
+                        "market_cleanup_notional_cap_usd": _safe_float(policy.get("market_cleanup_notional_cap_usd")),
+                        "market_cleanup_allowed": cleanup_status.get("allowed"),
+                        "market_cleanup_summary": cleanup_status.get("summary"),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+
+            def append_v1_diagnostic(
+                rule_key: str,
+                rule_state: Mapping[str, Any],
+                *,
+                status: str,
+                reason: str | None = None,
+                selected_pair: Mapping[str, Any] | None = None,
+                pair_metrics: Mapping[str, Any] | None = None,
+                decision: Mapping[str, Any] | None = None,
+                window: Mapping[str, Any] | None = None,
+                context: Mapping[str, Any] | None = None,
+                close_now_bps: float | None = None,
+                funding_to_next_bps: float | None = None,
+                reversion_credit_bps: float | None = None,
+                pending_exit_cycles: int | None = None,
+            ) -> None:
+                symbol = str(rule_state.get("symbol") or "").upper().strip()
+                rule_long_exchange = normalize_exchange_name(str(rule_state.get("long_exchange") or ""))
+                rule_short_exchange = normalize_exchange_name(str(rule_state.get("short_exchange") or ""))
+                selected_long_exchange = normalize_exchange_name(str((selected_pair or {}).get("long_exchange") or ""))
+                selected_short_exchange = normalize_exchange_name(str((selected_pair or {}).get("short_exchange") or ""))
+                decision_payload = dict(decision or {})
+                window_payload = dict(window or {})
+                context_payload = dict(context or {})
+                v1_diagnostics_rows.append(
+                    {
+                        "key": rule_key,
+                        "symbol": symbol,
+                        "rule_long_exchange": rule_long_exchange,
+                        "rule_short_exchange": rule_short_exchange,
+                        "selected_long_exchange": selected_long_exchange or None,
+                        "selected_short_exchange": selected_short_exchange or None,
+                        "selection_mode": str((selected_pair or {}).get("mode") or ""),
+                        "status": status,
+                        "reason": reason or decision_payload.get("reason"),
+                        "decision": decision_payload.get("decision"),
+                        "effective_interval_minutes": _safe_float(context_payload.get("effective_interval_minutes")),
+                        "minutes_to_event": _safe_float(context_payload.get("minutes_to_event")),
+                        "interval_bucket": window_payload.get("bucket"),
+                        "window_stage": window_payload.get("stage"),
+                        "funding_pressure_mult": _safe_float(window_payload.get("funding_pressure_mult")),
+                        "reversion_credit_mult": _safe_float(window_payload.get("reversion_credit_mult")),
+                        "hard_exit_negative_funding_bps": _safe_float(
+                            window_payload.get("hard_exit_negative_funding_bps")
+                        ),
+                        "take_profit_k": _safe_float(window_payload.get("take_profit_k")),
+                        "take_profit_threshold_bps": _safe_float(
+                            decision_payload.get("take_profit_threshold_bps")
+                        ),
+                        "wait_score_bps": _safe_float(decision_payload.get("wait_score_bps")),
+                        "risk_penalty_bps": _safe_float(decision_payload.get("risk_penalty_bps")),
+                        "close_now_bps": _safe_float(close_now_bps),
+                        "funding_to_next_bps": _safe_float(funding_to_next_bps),
+                        "reversion_credit_bps": _safe_float(reversion_credit_bps),
+                        "position_notional_usd": _safe_float(context_payload.get("position_notional_usd")),
+                        "entry_spread_pct": _safe_float(context_payload.get("entry_spread_pct")),
+                        "mark_spread_pct": _safe_float(context_payload.get("mark_spread_pct")),
+                        "chunk_qty": _safe_float((pair_metrics or {}).get("chunk_qty")),
+                        "chunk_notional_usd": _safe_float((pair_metrics or {}).get("chunk_notional_usd")),
+                        "net_spread_pct": _safe_float((pair_metrics or {}).get("net_spread_pct")),
+                        "gross_spread_pct": _safe_float((pair_metrics or {}).get("spread_pct")),
+                        "pending_exit_cycles": int(pending_exit_cycles or 0),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
 
             if not rules:
+                async with self._auto_exit_lock:
+                    self._auto_exit_diagnostics = []
+                    self._auto_exit_v1_diagnostics = []
                 return
             running = self._auto_exit_running_exec()
             if running:
+                for key, rule in rules.items():
+                    target = _safe_float(rule.get("target_spread_pct"))
+                    spread_rule_enabled = bool(rule.get("enabled", True)) and target is not None
+                    v1_rule_enabled = bool(rule.get("v1_enabled", False))
+                    if spread_rule_enabled:
+                        append_diagnostic(key, rule, status="running", reason="execution_running")
+                    if spread_rule_enabled or v1_rule_enabled:
+                        append_v1_diagnostic(
+                            key,
+                            rule,
+                            status="running",
+                            reason="execution_running",
+                            pending_exit_cycles=int(rule.get("v1_pending_exit_cycles") or 0),
+                        )
+                async with self._auto_exit_lock:
+                    self._auto_exit_diagnostics = diagnostics_rows
+                    self._auto_exit_v1_diagnostics = v1_diagnostics_rows
                 self._auto_exit_log_event(
                     "global",
                     "skip_running",
@@ -4316,16 +9691,24 @@ class DataService:
                 )
                 return
 
-            rules_to_remove: set[str] = set()
-            rules_to_update: dict[str, dict[str, Any]] = {}
-
-            def mark_missing(rule_key: str, rule_state: Mapping[str, Any], reason: str, payload: dict[str, Any]) -> bool:
+            def mark_missing(
+                rule_key: str,
+                rule_state: Mapping[str, Any],
+                reason: str,
+                payload: dict[str, Any],
+                *,
+                spread_enabled: bool,
+                v1_enabled: bool,
+                selected_pair: Mapping[str, Any] | None = None,
+                pair_metrics: Mapping[str, Any] | None = None,
+            ) -> bool:
                 missing_since = float(rule_state.get("missing_since_ts") or 0.0)
+                persist_on_missing = bool(rule_state.get("persist_on_missing", True))
                 if missing_since <= 0:
                     missing_since = now_ts
-                    rules_to_update[rule_key] = {"missing_since_ts": missing_since}
+                    merge_rule_updates(rule_key, {"missing_since_ts": missing_since})
                 elapsed = max(0.0, now_ts - missing_since)
-                if auto_clear_sec and elapsed >= auto_clear_sec:
+                if not persist_on_missing and auto_clear_sec and elapsed >= auto_clear_sec:
                     rules_to_remove.add(rule_key)
                     self._auto_exit_event(
                         "auto_clear",
@@ -4338,29 +9721,52 @@ class DataService:
                         },
                     )
                     return True
-                if auto_clear_sec:
+                if not persist_on_missing and auto_clear_sec:
                     payload["auto_clear_remaining_sec"] = round(max(0.0, auto_clear_sec - elapsed), 1)
+                if persist_on_missing:
+                    payload["persist_on_missing"] = True
                 self._auto_exit_log_event(rule_key, "skip", payload, now_ts)
+                if spread_enabled:
+                    append_diagnostic(
+                        rule_key,
+                        rule_state,
+                        status="skip",
+                        reason=reason,
+                        selected_pair=selected_pair,
+                        pair_metrics=pair_metrics,
+                    )
+                if v1_enabled:
+                    append_v1_diagnostic(
+                        rule_key,
+                        rule_state,
+                        status="skip",
+                        reason=reason,
+                        selected_pair=selected_pair,
+                        pair_metrics=pair_metrics,
+                        pending_exit_cycles=int(rule_state.get("v1_pending_exit_cycles") or 0),
+                    )
                 return True
 
             def clear_missing(rule_key: str, rule_state: Mapping[str, Any]) -> None:
                 if float(rule_state.get("missing_since_ts") or 0.0) > 0:
-                    rules_to_update[rule_key] = {"missing_since_ts": 0.0}
+                    merge_rule_updates(rule_key, {"missing_since_ts": 0.0})
 
             for key, rule in rules.items():
-                if not rule.get("enabled", True):
-                    continue
                 symbol = str(rule.get("symbol") or "").upper().strip()
                 symbol_key = normalize_symbol(symbol)
                 long_exchange = normalize_exchange_name(str(rule.get("long_exchange") or ""))
                 short_exchange = normalize_exchange_name(str(rule.get("short_exchange") or ""))
                 rule_is_multileg = _is_auto_exit_multileg_rule(long_exchange, short_exchange)
                 target = _safe_float(rule.get("target_spread_pct"))
-                if not symbol or not long_exchange or not short_exchange or target is None:
+                spread_rule_enabled = bool(rule.get("enabled", True)) and target is not None
+                v1_rule_enabled = bool(rule.get("v1_enabled", False))
+                v1_monitor_enabled = spread_rule_enabled or v1_rule_enabled
+                if not symbol or not long_exchange or not short_exchange or (not spread_rule_enabled and not v1_rule_enabled):
                     continue
-                last_trigger = float(rule.get("last_triggered_ts") or 0.0)
-                if cooldown_sec and (now_ts - last_trigger) < cooldown_sec:
-                    remaining = max(0, cooldown_sec - (now_ts - last_trigger))
+                spread_on_cooldown = False
+                if spread_rule_enabled and cooldown_sec and (now_ts - float(rule.get("last_triggered_ts") or 0.0)) < cooldown_sec:
+                    spread_on_cooldown = True
+                    remaining = max(0, cooldown_sec - (now_ts - float(rule.get("last_triggered_ts") or 0.0)))
                     self._auto_exit_log_event(
                         key,
                         "skip",
@@ -4370,9 +9776,23 @@ class DataService:
                             "short_exchange": short_exchange,
                             "reason": "cooldown",
                             "remaining_sec": round(remaining, 1),
+                            "trigger_mode": "spread",
                         },
                         now_ts,
                     )
+                    append_diagnostic(key, rule, status="cooldown", reason="cooldown")
+                v1_on_cooldown = False
+                if v1_rule_enabled and cooldown_sec and (now_ts - float(rule.get("last_v1_triggered_ts") or 0.0)) < cooldown_sec:
+                    v1_on_cooldown = True
+                    remaining = max(0, cooldown_sec - (now_ts - float(rule.get("last_v1_triggered_ts") or 0.0)))
+                    append_v1_diagnostic(
+                        key,
+                        rule,
+                        status="cooldown",
+                        reason="cooldown",
+                        pending_exit_cycles=int(rule.get("v1_pending_exit_cycles") or 0),
+                    )
+                if spread_on_cooldown and v1_on_cooldown:
                     continue
                 legs = grouped.get(symbol_key) or []
                 if not legs:
@@ -4386,6 +9806,8 @@ class DataService:
                             "short_exchange": short_exchange,
                             "reason": "no_position",
                         },
+                        spread_enabled=spread_rule_enabled and not spread_on_cooldown,
+                        v1_enabled=v1_monitor_enabled and (not v1_rule_enabled or not v1_on_cooldown),
                     )
                     continue
                 selected = _auto_exit_select_pair_from_legs(legs)
@@ -4400,6 +9822,8 @@ class DataService:
                             "short_exchange": short_exchange,
                             "reason": "legs_unavailable",
                         },
+                        spread_enabled=spread_rule_enabled and not spread_on_cooldown,
+                        v1_enabled=v1_monitor_enabled and (not v1_rule_enabled or not v1_on_cooldown),
                     )
                     continue
                 selected_mode = str(selected.get("mode") or "single_pair")
@@ -4416,6 +9840,9 @@ class DataService:
                             "short_exchange": short_exchange,
                             "reason": "legs_unavailable",
                         },
+                        spread_enabled=spread_rule_enabled and not spread_on_cooldown,
+                        v1_enabled=v1_monitor_enabled and (not v1_rule_enabled or not v1_on_cooldown),
+                        selected_pair=selected,
                     )
                     continue
                 if (
@@ -4435,6 +9862,9 @@ class DataService:
                             "long_legs": int(selected.get("long_legs") or 0),
                             "short_legs": int(selected.get("short_legs") or 0),
                         },
+                        spread_enabled=spread_rule_enabled and not spread_on_cooldown,
+                        v1_enabled=v1_monitor_enabled and (not v1_rule_enabled or not v1_on_cooldown),
+                        selected_pair=selected,
                     )
                     continue
                 if (
@@ -4456,6 +9886,9 @@ class DataService:
                             "selected_long_exchange": selected_long_exchange,
                             "selected_short_exchange": selected_short_exchange,
                         },
+                        spread_enabled=spread_rule_enabled and not spread_on_cooldown,
+                        v1_enabled=v1_monitor_enabled and (not v1_rule_enabled or not v1_on_cooldown),
+                        selected_pair=selected,
                     )
                     continue
                 qty = float(selected.get("qty") or 0.0)
@@ -4470,68 +9903,174 @@ class DataService:
                             "short_exchange": selected_short_exchange,
                             "reason": "zero_qty",
                         },
+                        spread_enabled=spread_rule_enabled and not spread_on_cooldown,
+                        v1_enabled=v1_monitor_enabled and (not v1_rule_enabled or not v1_on_cooldown),
+                        selected_pair=selected,
                     )
                     continue
                 clear_missing(key, rule)
-                selected_pair_spread = await resolve_live_spread(
+                pair_exit_metrics = await resolve_pair_exit_metrics(
                     symbol_key,
                     selected_long_exchange,
                     selected_short_exchange,
+                    qty,
+                )
+                selected_pair_spread = _safe_float((pair_exit_metrics or {}).get("spread_pct"))
+                selected_pair_net_spread = _safe_float((pair_exit_metrics or {}).get("net_spread_pct"))
+                pair_chunk_qty = _safe_float((pair_exit_metrics or {}).get("chunk_qty"))
+                pair_chunk_notional = _safe_float((pair_exit_metrics or {}).get("chunk_notional_usd"))
+                pair_policy = (pair_exit_metrics or {}).get("policy") or {}
+                edge_buffer_bps = _safe_float((pair_exit_metrics or {}).get("edge_buffer_bps")) or 0.0
+                fee_bps = _safe_float((pair_exit_metrics or {}).get("fee_bps")) or 0.0
+                edge_buffer_pct = _safe_float((pair_exit_metrics or {}).get("edge_buffer_pct")) or 0.0
+                required_net_spread_pct = (
+                    float(target) + edge_buffer_pct if target is not None else None
                 )
                 overall_spread = None
                 trigger_spread = selected_pair_spread
-                spread_scope = "pair"
+                spread_scope = "pair_executable"
                 if rule_is_multileg:
-                    spread_scope = "overall"
                     overall_spread = await resolve_overall_spread(symbol_key, legs)
-                    trigger_spread = overall_spread
-                if trigger_spread is None and require_live:
-                    self._auto_exit_log_event(
-                        key,
-                        "skip",
-                        {
-                            "symbol": symbol,
-                            "long_exchange": selected_long_exchange,
-                            "short_exchange": selected_short_exchange,
-                            "rule_long_exchange": long_exchange,
-                            "rule_short_exchange": short_exchange,
-                            "selection_mode": selected_mode,
-                            "spread_scope": spread_scope,
-                            "reason": "live_missing",
-                        },
-                        now_ts,
+                position_context: dict[str, Any] | None = None
+                funding_to_next_bps = None
+                close_now_bps = None
+                reversion_credit_bps = None
+                window: dict[str, Any] | None = None
+                v1_decision: dict[str, Any] | None = None
+                pending_cycles = max(0, int(rule.get("v1_pending_exit_cycles") or 0))
+                if v1_monitor_enabled and (not v1_rule_enabled or not v1_on_cooldown):
+                    position_context = _auto_exit_v1_position_context(legs)
+                    position_notional_usd = _safe_float(position_context.get("position_notional_usd"))
+                    funding_to_next_usd = _safe_float(position_context.get("funding_to_next_usd"))
+                    if (
+                        funding_to_next_usd is not None
+                        and position_notional_usd is not None
+                        and position_notional_usd > 0
+                    ):
+                        funding_to_next_bps = float(funding_to_next_usd) / float(position_notional_usd) * 10000.0
+                    close_now_bps = (
+                        float(selected_pair_net_spread) * 100.0
+                        if selected_pair_net_spread is not None
+                        else None
                     )
-                    continue
-                if trigger_spread is None:
-                    continue
-                if trigger_spread < float(target):
-                    self._auto_exit_log_event(
-                        key,
-                        "wait",
-                        {
-                            "symbol": symbol,
-                            "long_exchange": selected_long_exchange,
-                            "short_exchange": selected_short_exchange,
-                            "rule_long_exchange": long_exchange,
-                            "rule_short_exchange": short_exchange,
-                            "selection_mode": selected_mode,
-                            "spread_scope": spread_scope,
-                            "spread_pct": float(trigger_spread),
-                            "overall_spread_pct": float(overall_spread) if overall_spread is not None else None,
-                            "pair_spread_pct": float(selected_pair_spread) if selected_pair_spread is not None else None,
-                            "target_pct": float(target),
-                        },
-                        now_ts,
+                    entry_spread_pct = _safe_float(position_context.get("entry_spread_pct"))
+                    mark_spread_pct = _safe_float(position_context.get("mark_spread_pct"))
+                    if entry_spread_pct is not None and mark_spread_pct is not None:
+                        reversion_credit_bps = min(
+                            float(AUTO_EXIT_V1_REVERSION_CREDIT_CAP_BPS),
+                            max(0.0, (float(entry_spread_pct) - float(mark_spread_pct)) * 100.0),
+                        )
+                    window = _auto_exit_v1_window(
+                        position_context.get("effective_interval_minutes"),
+                        position_context.get("minutes_to_event"),
                     )
-                    continue
-                payload_spread_min = float(target)
-                if rule_is_multileg:
-                    pair_spread_for_exit = selected_pair_spread
-                    if pair_spread_for_exit is None:
-                        if require_live:
-                            self._auto_exit_log_event(
-                                key,
-                                "skip",
+                    v1_decision = _auto_exit_v1_decision(
+                        close_now_bps=close_now_bps,
+                        funding_to_next_bps=funding_to_next_bps,
+                        reversion_credit_bps=reversion_credit_bps,
+                        window=window,
+                    )
+                standard_triggered = False
+                if spread_rule_enabled and not spread_on_cooldown:
+                    if trigger_spread is None and require_live:
+                        self._auto_exit_log_event(
+                            key,
+                            "skip",
+                            {
+                                "symbol": symbol,
+                                "long_exchange": selected_long_exchange,
+                                "short_exchange": selected_short_exchange,
+                                "rule_long_exchange": long_exchange,
+                                "rule_short_exchange": short_exchange,
+                                "selection_mode": selected_mode,
+                                "spread_scope": spread_scope,
+                                "chunk_qty": pair_chunk_qty,
+                                "chunk_notional_usd": pair_chunk_notional,
+                                "net_spread_pct": selected_pair_net_spread,
+                                "required_net_spread_pct": required_net_spread_pct,
+                                "fee_bps": fee_bps,
+                                "edge_buffer_bps": edge_buffer_bps,
+                                "policy": pair_policy,
+                                "reason": "live_missing",
+                                "trigger_mode": "spread",
+                            },
+                            now_ts,
+                        )
+                        append_diagnostic(
+                            key,
+                            rule,
+                            status="skip",
+                            reason="live_missing",
+                            selected_pair=selected,
+                            pair_metrics=pair_exit_metrics,
+                            overall_spread=overall_spread,
+                            trigger_spread=trigger_spread,
+                            target_pct=float(target),
+                            required_net_spread_pct=required_net_spread_pct,
+                        )
+                    elif trigger_spread is None:
+                        append_diagnostic(
+                            key,
+                            rule,
+                            status="skip",
+                            reason="spread_unavailable",
+                            selected_pair=selected,
+                            pair_metrics=pair_exit_metrics,
+                            overall_spread=overall_spread,
+                            trigger_spread=trigger_spread,
+                            target_pct=float(target),
+                            required_net_spread_pct=required_net_spread_pct,
+                        )
+                    elif selected_pair_net_spread is None or selected_pair_net_spread < required_net_spread_pct:
+                        self._auto_exit_log_event(
+                            key,
+                            "wait",
+                            {
+                                "symbol": symbol,
+                                "long_exchange": selected_long_exchange,
+                                "short_exchange": selected_short_exchange,
+                                "rule_long_exchange": long_exchange,
+                                "rule_short_exchange": short_exchange,
+                                "selection_mode": selected_mode,
+                                "spread_scope": spread_scope,
+                                "spread_pct": float(trigger_spread),
+                                "overall_spread_pct": float(overall_spread) if overall_spread is not None else None,
+                                "pair_spread_pct": float(selected_pair_spread) if selected_pair_spread is not None else None,
+                                "net_spread_pct": selected_pair_net_spread,
+                                "required_net_spread_pct": required_net_spread_pct,
+                                "chunk_qty": pair_chunk_qty,
+                                "chunk_notional_usd": pair_chunk_notional,
+                                "fee_bps": fee_bps,
+                                "edge_buffer_bps": edge_buffer_bps,
+                                "policy": pair_policy,
+                                "pair_exit_metrics": pair_exit_metrics,
+                                "target_pct": float(target),
+                                "trigger_mode": "spread",
+                            },
+                            now_ts,
+                        )
+                        append_diagnostic(
+                            key,
+                            rule,
+                            status="wait",
+                            reason="target_not_reached",
+                            selected_pair=selected,
+                            pair_metrics=pair_exit_metrics,
+                            overall_spread=overall_spread,
+                            trigger_spread=trigger_spread,
+                            target_pct=float(target),
+                            required_net_spread_pct=required_net_spread_pct,
+                        )
+                    else:
+                        payload_spread_min = float(target) + (fee_bps + edge_buffer_bps) / 100.0
+                        if rule_is_multileg and selected_pair_spread is not None:
+                            payload_spread_min = max(
+                                payload_spread_min,
+                                float(selected_pair_spread) - AUTO_EXIT_MULTILEG_PAIR_BUFFER_PCT,
+                            )
+                        if not self._auto_exit_has_running():
+                            self._auto_exit_event(
+                                "trigger",
                                 {
                                     "symbol": symbol,
                                     "long_exchange": selected_long_exchange,
@@ -4539,94 +10078,337 @@ class DataService:
                                     "rule_long_exchange": long_exchange,
                                     "rule_short_exchange": short_exchange,
                                     "selection_mode": selected_mode,
+                                    "long_legs": int(selected.get("long_legs") or 0),
+                                    "short_legs": int(selected.get("short_legs") or 0),
+                                    "selected_min_side": selected.get("selected_min_side"),
+                                    "selected_min_exchange": selected.get("selected_min_exchange"),
+                                    "selected_min_qty": selected.get("selected_min_qty"),
                                     "spread_scope": spread_scope,
-                                    "reason": "pair_live_missing",
+                                    "spread_pct": float(trigger_spread),
+                                    "overall_spread_pct": float(overall_spread) if overall_spread is not None else None,
+                                    "pair_spread_pct": float(selected_pair_spread) if selected_pair_spread is not None else None,
+                                    "net_spread_pct": selected_pair_net_spread,
+                                    "required_net_spread_pct": required_net_spread_pct,
+                                    "chunk_qty": pair_chunk_qty,
+                                    "chunk_notional_usd": pair_chunk_notional,
+                                    "fee_bps": fee_bps,
+                                    "edge_buffer_bps": edge_buffer_bps,
+                                    "policy": pair_policy,
+                                    "pair_exit_metrics": pair_exit_metrics,
+                                    "target_pct": float(target),
+                                    "pair_exit_target_pct": float(payload_spread_min),
+                                    "qty": qty,
+                                    "trigger_mode": "spread",
                                 },
-                                now_ts,
+                            )
+                            append_diagnostic(
+                                key,
+                                rule,
+                                status="trigger",
+                                selected_pair=selected,
+                                pair_metrics=pair_exit_metrics,
+                                overall_spread=overall_spread,
+                                trigger_spread=trigger_spread,
+                                target_pct=float(target),
+                                required_net_spread_pct=required_net_spread_pct,
+                            )
+                            payload = {
+                                "symbol": symbol,
+                                "qty": qty,
+                                "notional": None,
+                                "mode": "smart-exit",
+                                "max_slippage_bps": 8,
+                                "spread_min_pct": float(payload_spread_min),
+                                "spread_max_pct": 10,
+                                "timeout_sec": 0,
+                                "max_runtime_sec": max_runtime_sec,
+                                "reprice_sec": 5,
+                                "chunk_qty": None,
+                                "chunk_notional": _safe_float(pair_policy.get("chunk_notional_cap_usd")),
+                                "force_chunk_qty": False,
+                                "limit_offset_bps": 0.0,
+                                "limit_offset_ticks": 0,
+                                "use_orderbook_check": False,
+                                "fallback_to_market": False,
+                                "hedge_order_type": "limit",
+                                "hedge_offset_bps": 0.0,
+                                "hedge_offset_ticks": 0,
+                                "hedge_limit_mode": "passive",
+                                "hedge_favorable_bps": 2.0,
+                                "hedge_adverse_bps": 8.0,
+                                "hedge_reprice_min_sec": 6.0,
+                                "max_limit_deviation_bps": 30.0,
+                                "async_run": True,
+                                "dry_run": False,
+                                "auto_exit_agent": True,
+                                "auto_exit_dynamic_chunk": True,
+                                "auto_exit_market_cleanup_notional_max": _safe_float(
+                                    pair_policy.get("market_cleanup_notional_cap_usd")
+                                ),
+                                "long_exchange": selected_long_exchange,
+                                "short_exchange": selected_short_exchange,
+                                "margin_mode": "isolated",
+                            }
+                            result = await self.manual_exit(payload)
+                            logger.info(
+                                "auto-exit triggered symbol=%s long=%s short=%s spread=%.4f target=%.4f pair_target=%.4f result=%s",
+                                symbol,
+                                selected_long_exchange,
+                                selected_short_exchange,
+                                float(trigger_spread),
+                                float(target),
+                                float(payload_spread_min),
+                                result,
+                            )
+                            self._auto_exit_event(
+                                "start",
+                                {
+                                    "symbol": symbol,
+                                    "long_exchange": selected_long_exchange,
+                                    "short_exchange": selected_short_exchange,
+                                    "rule_long_exchange": long_exchange,
+                                    "rule_short_exchange": short_exchange,
+                                    "selection_mode": selected_mode,
+                                    "result": result,
+                                    "trigger_mode": "spread",
+                                },
+                            )
+                            async with self._auto_exit_lock:
+                                stored_rules = self._auto_exit.get("rules", {})
+                                stored = stored_rules.get(key)
+                                if stored is not None:
+                                    stored["last_triggered_ts"] = now_ts
+                                    stored["updated_at"] = datetime.now(timezone.utc).isoformat()
+                                    self._auto_exit_store.save(self._auto_exit)
+                            standard_triggered = True
+                if (
+                    standard_triggered
+                    and not v1_rule_enabled
+                    and v1_monitor_enabled
+                    and v1_decision is not None
+                ):
+                    if pending_cycles > 0:
+                        merge_rule_updates(key, {"v1_pending_exit_cycles": 0})
+                    append_v1_diagnostic(
+                        key,
+                        rule,
+                        status="shadow" if str(v1_decision.get("decision") or "") != "skip" else "skip",
+                        reason=str(v1_decision.get("reason") or "shadow"),
+                        selected_pair=selected,
+                        pair_metrics=pair_exit_metrics,
+                        decision=v1_decision,
+                        window=window,
+                        context=position_context,
+                        close_now_bps=close_now_bps,
+                        funding_to_next_bps=funding_to_next_bps,
+                        reversion_credit_bps=reversion_credit_bps,
+                        pending_exit_cycles=0,
+                    )
+                if standard_triggered:
+                    break
+                if v1_rule_enabled and not v1_on_cooldown and v1_decision is not None:
+                    decision_name = str(v1_decision.get("decision") or "")
+                    if decision_name == "skip":
+                        if pending_cycles > 0:
+                            merge_rule_updates(key, {"v1_pending_exit_cycles": 0})
+                        append_v1_diagnostic(
+                            key,
+                            rule,
+                            status="skip",
+                            reason=str(v1_decision.get("reason") or "skip"),
+                            selected_pair=selected,
+                            pair_metrics=pair_exit_metrics,
+                            decision=v1_decision,
+                            window=window,
+                            context=position_context,
+                            close_now_bps=close_now_bps,
+                            funding_to_next_bps=funding_to_next_bps,
+                            reversion_credit_bps=reversion_credit_bps,
+                            pending_exit_cycles=pending_cycles,
+                        )
+                        continue
+                    if decision_name == "hold":
+                        if pending_cycles > 0:
+                            merge_rule_updates(key, {"v1_pending_exit_cycles": 0})
+                        append_v1_diagnostic(
+                            key,
+                            rule,
+                            status="hold",
+                            reason=str(v1_decision.get("reason") or "hold"),
+                            selected_pair=selected,
+                            pair_metrics=pair_exit_metrics,
+                            decision=v1_decision,
+                            window=window,
+                            context=position_context,
+                            close_now_bps=close_now_bps,
+                            funding_to_next_bps=funding_to_next_bps,
+                            reversion_credit_bps=reversion_credit_bps,
+                            pending_exit_cycles=0,
+                        )
+                        continue
+
+                    trigger_reason = str(v1_decision.get("reason") or "v1_exit")
+                    immediate_exit = decision_name == "exit"
+                    if not immediate_exit:
+                        pending_cycles += 1
+                        merge_rule_updates(key, {"v1_pending_exit_cycles": pending_cycles})
+                        if pending_cycles < int(AUTO_EXIT_V1_CONFIRM_CYCLES):
+                            append_v1_diagnostic(
+                                key,
+                                rule,
+                                status="wait",
+                                reason="soft_exit_confirmation",
+                                selected_pair=selected,
+                                pair_metrics=pair_exit_metrics,
+                                decision=v1_decision,
+                                window=window,
+                                context=position_context,
+                                close_now_bps=close_now_bps,
+                                funding_to_next_bps=funding_to_next_bps,
+                                reversion_credit_bps=reversion_credit_bps,
+                                pending_exit_cycles=pending_cycles,
                             )
                             continue
-                        pair_spread_for_exit = trigger_spread
-                    payload_spread_min = float(pair_spread_for_exit) - AUTO_EXIT_MULTILEG_PAIR_BUFFER_PCT
-                if self._auto_exit_has_running():
-                    break
-                self._auto_exit_event(
-                    "trigger",
-                    {
+                    if self._auto_exit_has_running():
+                        break
+                    if selected_pair_spread is None:
+                        append_v1_diagnostic(
+                            key,
+                            rule,
+                            status="skip",
+                            reason="pair_live_missing",
+                            selected_pair=selected,
+                            pair_metrics=pair_exit_metrics,
+                            decision=v1_decision,
+                            window=window,
+                            context=position_context,
+                            close_now_bps=close_now_bps,
+                            funding_to_next_bps=funding_to_next_bps,
+                            reversion_credit_bps=reversion_credit_bps,
+                            pending_exit_cycles=pending_cycles,
+                        )
+                        continue
+                    payload_spread_min = float(selected_pair_spread) - AUTO_EXIT_MULTILEG_PAIR_BUFFER_PCT
+                    self._auto_exit_event(
+                        "trigger",
+                        {
+                            "symbol": symbol,
+                            "long_exchange": selected_long_exchange,
+                            "short_exchange": selected_short_exchange,
+                            "rule_long_exchange": long_exchange,
+                            "rule_short_exchange": short_exchange,
+                            "selection_mode": selected_mode,
+                            "spread_scope": "v1_hold_exit",
+                            "spread_pct": float(selected_pair_spread),
+                            "net_spread_pct": selected_pair_net_spread,
+                            "chunk_qty": pair_chunk_qty,
+                            "chunk_notional_usd": pair_chunk_notional,
+                            "qty": qty,
+                            "trigger_mode": "v1",
+                            "v1_reason": trigger_reason,
+                            "v1_wait_score_bps": _safe_float(v1_decision.get("wait_score_bps")),
+                            "v1_funding_to_next_bps": funding_to_next_bps,
+                            "v1_close_now_bps": close_now_bps,
+                        },
+                    )
+                    append_v1_diagnostic(
+                        key,
+                        rule,
+                        status="trigger",
+                        reason=trigger_reason,
+                        selected_pair=selected,
+                        pair_metrics=pair_exit_metrics,
+                        decision=v1_decision,
+                        window=window,
+                        context=position_context,
+                        close_now_bps=close_now_bps,
+                        funding_to_next_bps=funding_to_next_bps,
+                        reversion_credit_bps=reversion_credit_bps,
+                        pending_exit_cycles=0 if immediate_exit else pending_cycles,
+                    )
+                    payload = {
                         "symbol": symbol,
-                        "long_exchange": selected_long_exchange,
-                        "short_exchange": selected_short_exchange,
-                        "rule_long_exchange": long_exchange,
-                        "rule_short_exchange": short_exchange,
-                        "selection_mode": selected_mode,
-                        "long_legs": int(selected.get("long_legs") or 0),
-                        "short_legs": int(selected.get("short_legs") or 0),
-                        "selected_min_side": selected.get("selected_min_side"),
-                        "selected_min_exchange": selected.get("selected_min_exchange"),
-                        "selected_min_qty": selected.get("selected_min_qty"),
-                        "spread_scope": spread_scope,
-                        "spread_pct": float(trigger_spread),
-                        "overall_spread_pct": float(overall_spread) if overall_spread is not None else None,
-                        "pair_spread_pct": float(selected_pair_spread) if selected_pair_spread is not None else None,
-                        "target_pct": float(target),
-                        "pair_exit_target_pct": float(payload_spread_min),
                         "qty": qty,
-                    },
-                )
-                payload = {
-                    "symbol": symbol,
-                    "qty": qty,
-                    "notional": None,
-                    "mode": "smart-exit",
-                    "max_slippage_bps": 8,
-                    "spread_min_pct": float(payload_spread_min),
-                    "spread_max_pct": 10,
-                    "timeout_sec": 0,
-                    "max_runtime_sec": max_runtime_sec,
-                    "reprice_sec": 3,
-                    "chunk_qty": None,
-                    "chunk_notional": None,
-                    "force_chunk_qty": False,
-                    "use_orderbook_check": False,
-                    "fallback_to_market": False,
-                    "async_run": True,
-                    "dry_run": False,
-                    "long_exchange": selected_long_exchange,
-                    "short_exchange": selected_short_exchange,
-                    "margin_mode": "isolated",
-                }
-                result = await self.manual_exit(payload)
-                logger.info(
-                    "auto-exit triggered symbol=%s long=%s short=%s spread=%.4f target=%.4f pair_target=%.4f result=%s",
-                    symbol,
-                    selected_long_exchange,
-                    selected_short_exchange,
-                    float(trigger_spread),
-                    float(target),
-                    float(payload_spread_min),
-                    result,
-                )
-                self._auto_exit_event(
-                    "start",
-                    {
-                        "symbol": symbol,
+                        "notional": None,
+                        "mode": "smart-exit",
+                        "max_slippage_bps": 8,
+                        "spread_min_pct": float(payload_spread_min),
+                        "spread_max_pct": 10,
+                        "timeout_sec": 0,
+                        "max_runtime_sec": max_runtime_sec,
+                        "reprice_sec": 5,
+                        "chunk_qty": None,
+                        "chunk_notional": _safe_float(pair_policy.get("chunk_notional_cap_usd")),
+                        "force_chunk_qty": False,
+                        "limit_offset_bps": 0.0,
+                        "limit_offset_ticks": 0,
+                        "use_orderbook_check": False,
+                        "fallback_to_market": False,
+                        "hedge_order_type": "limit",
+                        "hedge_offset_bps": 0.0,
+                        "hedge_offset_ticks": 0,
+                        "hedge_limit_mode": "passive",
+                        "hedge_favorable_bps": 2.0,
+                        "hedge_adverse_bps": 8.0,
+                        "hedge_reprice_min_sec": 6.0,
+                        "max_limit_deviation_bps": 30.0,
+                        "async_run": True,
+                        "dry_run": False,
+                        "auto_exit_agent": True,
+                        "auto_exit_dynamic_chunk": True,
+                        "auto_exit_market_cleanup_notional_max": _safe_float(
+                            pair_policy.get("market_cleanup_notional_cap_usd")
+                        ),
                         "long_exchange": selected_long_exchange,
                         "short_exchange": selected_short_exchange,
-                        "rule_long_exchange": long_exchange,
-                        "rule_short_exchange": short_exchange,
-                        "selection_mode": selected_mode,
-                        "result": result,
-                    },
-                )
-                async with self._auto_exit_lock:
-                    stored_rules = self._auto_exit.get("rules", {})
-                    stored = stored_rules.get(key)
-                    if stored is not None:
-                        stored["last_triggered_ts"] = now_ts
-                        stored["updated_at"] = datetime.now(timezone.utc).isoformat()
-                        self._auto_exit_store.save(self._auto_exit)
-                break
+                        "margin_mode": "isolated",
+                    }
+                    result = await self.manual_exit(payload)
+                    self._auto_exit_event(
+                        "start",
+                        {
+                            "symbol": symbol,
+                            "long_exchange": selected_long_exchange,
+                            "short_exchange": selected_short_exchange,
+                            "rule_long_exchange": long_exchange,
+                            "rule_short_exchange": short_exchange,
+                            "selection_mode": selected_mode,
+                            "result": result,
+                            "trigger_mode": "v1",
+                            "v1_reason": trigger_reason,
+                        },
+                    )
+                    async with self._auto_exit_lock:
+                        stored_rules = self._auto_exit.get("rules", {})
+                        stored = stored_rules.get(key)
+                        if stored is not None:
+                            stored["last_v1_triggered_ts"] = now_ts
+                            stored["updated_at"] = datetime.now(timezone.utc).isoformat()
+                            stored["v1_pending_exit_cycles"] = 0
+                            self._auto_exit_store.save(self._auto_exit)
+                    break
+                if not v1_rule_enabled and v1_monitor_enabled and v1_decision is not None:
+                    if pending_cycles > 0:
+                        merge_rule_updates(key, {"v1_pending_exit_cycles": 0})
+                    append_v1_diagnostic(
+                        key,
+                        rule,
+                        status="shadow" if str(v1_decision.get("decision") or "") != "skip" else "skip",
+                        reason=str(v1_decision.get("reason") or "shadow"),
+                        selected_pair=selected,
+                        pair_metrics=pair_exit_metrics,
+                        decision=v1_decision,
+                        window=window,
+                        context=position_context,
+                        close_now_bps=close_now_bps,
+                        funding_to_next_bps=funding_to_next_bps,
+                        reversion_credit_bps=reversion_credit_bps,
+                        pending_exit_cycles=0,
+                    )
             async with self._auto_exit_lock:
                 self._auto_exit_live_spreads = dict(live_spreads)
+                self._auto_exit_diagnostics = diagnostics_rows
+                self._auto_exit_v1_diagnostics = v1_diagnostics_rows
             if rules_to_remove or rules_to_update:
                 async with self._auto_exit_lock:
                     stored_rules = self._auto_exit.get("rules", {})
@@ -4876,7 +10658,68 @@ class DataService:
             )
         self._rebalance_prev_positions = current
 
-    async def _maybe_sync_protective_orders(self) -> None:
+    async def _on_margin_adjust_events(self, events: list[dict[str, Any]]) -> None:
+        if not events:
+            return
+        for item in events:
+            self._margin_logic_event(
+                "action",
+                {
+                    "exchange": normalize_exchange_name(str(item.get("exchange") or "")),
+                    "symbol": normalize_symbol(item.get("symbol")),
+                    "side": str(item.get("side") or "").lower() or None,
+                    "action": item.get("action"),
+                    "amount": _safe_float(item.get("amount")),
+                    "buffer_pct": (
+                        (_safe_float(item.get("buffer_pct")) or 0.0) * 100.0
+                        if item.get("buffer_pct") is not None
+                        else None
+                    ),
+                    "target_buffer_pct": (
+                        (_safe_float(item.get("target_buffer_pct")) or 0.0) * 100.0
+                        if item.get("target_buffer_pct") is not None
+                        else None
+                    ),
+                },
+            )
+        exchanges = {
+            normalize_exchange_name(str(item.get("exchange") or ""))
+            for item in events
+            if str(item.get("exchange") or "").strip()
+        }
+        symbols = {
+            normalize_symbol(item.get("symbol"))
+            for item in events
+            if normalize_symbol(item.get("symbol"))
+        }
+        logger.info(
+            "margin adjust events: count=%s exchanges=%s symbols=%s; triggering protective sync",
+            len(events),
+            sorted(exchanges),
+            sorted(symbols),
+        )
+        # Force a fresh positions pull before protective resync so target stops use
+        # current liquidation prices right after margin changes.
+        await self._accounts.refresh_now_for_protective(force_env=True)
+        await self._maybe_sync_protective_orders(
+            target_exchanges=exchanges or None,
+            target_symbols=symbols or None,
+            reason="margin_adjust",
+            force_fetch_existing=True,
+            verify_after_sync=True,
+            emergency_retry=True,
+        )
+
+    async def _maybe_sync_protective_orders(
+        self,
+        *,
+        target_exchanges: set[str] | None = None,
+        target_symbols: set[str] | None = None,
+        reason: str = "scheduler",
+        force_fetch_existing: bool = False,
+        verify_after_sync: bool = False,
+        emergency_retry: bool = False,
+    ) -> None:
         """Best-effort protective order sync if enabled in settings."""
         settings = self._settings_manager.current
         protective = getattr(settings, "protective", {}) or {}
@@ -4887,16 +10730,36 @@ class DataService:
             return
         snapshot = self._accounts.snapshot()
         positions = snapshot.get("positions") or []
+        if target_exchanges or target_symbols:
+            filtered: list[dict[str, Any]] = []
+            for pos in positions:
+                exchange = normalize_exchange_name(str(pos.get("exchange") or ""))
+                symbol = normalize_symbol(pos.get("symbol") or pos.get("symbol_normalized"))
+                if target_exchanges and exchange not in target_exchanges:
+                    continue
+                if target_symbols and symbol not in target_symbols:
+                    continue
+                filtered.append(pos)
+            positions = filtered
+            if not positions:
+                logger.info(
+                    "protective sync skipped (%s): no matching positions for exchanges=%s symbols=%s",
+                    reason,
+                    sorted(target_exchanges or set()),
+                    sorted(target_symbols or set()),
+                )
+                return
         if auto_protect or auto_take:
             try:
                 actions = await self._protective_manager.sync_protective_orders(
                     positions,
+                    force_fetch_existing=force_fetch_existing,
                 )
                 if actions:
                     if self._send_missing_stop_alerts:
                         await self._handle_mexc_protective_alerts(actions)
                     summary = {
-                        "message": "Protective orders synced",
+                        "message": f"Protective orders synced ({reason})",
                         "count": len(actions),
                         "updated": sum(1 for a in actions if a.get("status") == "updated"),
                         "unchanged": sum(1 for a in actions if a.get("status") == "unchanged"),
@@ -4911,14 +10774,14 @@ class DataService:
                         status = action.get("status")
                         stop_val = action.get("target_stop")
                         take_val = action.get("target_take")
-                        reason = action.get("reason") or action.get("error")
+                        action_reason = action.get("reason") or action.get("error")
                         parts = [f"{exch}: {status}"]
                         if stop_val is not None:
                             parts.append(f"sl={stop_val}")
                         if take_val is not None:
                             parts.append(f"tp={take_val}")
-                        if reason:
-                            parts.append(f"reason={reason}")
+                        if action_reason:
+                            parts.append(f"reason={action_reason}")
                         per_symbol.setdefault(sym, []).append(", ".join(parts))
                     summary["details"] = {k: v for k, v in per_symbol.items()}
                     self._record_event("protective:sync", summary)
@@ -4929,12 +10792,94 @@ class DataService:
                         logger.warning(
                             "protective sync issues: %s",
                             "; ".join(
-                                f"{f.get('exchange')} {f.get('symbol')} status={f.get('status')} err={f.get('error') or f.get('reason')}"
+                                (
+                                    f"{f.get('exchange')} {f.get('symbol')} "
+                                    f"status={_protective_issue_kind(f.get('error') or f.get('reason')) or f.get('status')} "
+                                    f"err={f.get('error') or f.get('reason')}"
+                                )
                                 for f in failures
                             ),
                         )
                     else:
                         logger.info("protective sync ok: all stops/takes placed")
+                if verify_after_sync:
+                    verify_actions = await self._protective_manager.verify_protective_orders(
+                        positions,
+                        force_fetch_existing=True,
+                    )
+                    verify_issues = [
+                        item
+                        for item in verify_actions
+                        if str(item.get("status") or "").lower() in {"issue", "error"}
+                    ]
+                    self._record_event(
+                        "protective:verify",
+                        {
+                            "message": f"Protective verify completed ({reason})",
+                            "count": len(verify_actions),
+                            "issues": len(verify_issues),
+                        },
+                    )
+                    if verify_issues:
+                        logger.warning(
+                            "protective verify issues (%s): %s",
+                            reason,
+                            "; ".join(
+                                f"{v.get('exchange')} {v.get('symbol')} side={v.get('side')} reason={v.get('reason')}"
+                                for v in verify_issues
+                            ),
+                        )
+                        if emergency_retry:
+                            issue_keys = {
+                                (
+                                    normalize_exchange_name(str(v.get("exchange") or "")),
+                                    normalize_symbol(v.get("symbol")),
+                                    str(v.get("side") or "").lower(),
+                                )
+                                for v in verify_issues
+                            }
+                            retry_positions: list[dict[str, Any]] = []
+                            for pos in positions:
+                                ex = normalize_exchange_name(str(pos.get("exchange") or ""))
+                                sym = normalize_symbol(pos.get("symbol") or pos.get("symbol_normalized"))
+                                side = str(pos.get("side") or "").lower()
+                                if (ex, sym, side) in issue_keys:
+                                    retry_positions.append(pos)
+                            if retry_positions:
+                                retry_actions = await self._protective_manager.sync_protective_orders(
+                                    retry_positions,
+                                    force_fetch_existing=True,
+                                )
+                                self._record_event(
+                                    "protective:emergency_retry",
+                                    {
+                                        "message": f"Protective emergency retry executed ({reason})",
+                                        "count": len(retry_actions),
+                                    },
+                                )
+                                final_verify = await self._protective_manager.verify_protective_orders(
+                                    retry_positions,
+                                    force_fetch_existing=True,
+                                )
+                                unresolved = [
+                                    item
+                                    for item in final_verify
+                                    if str(item.get("status") or "").lower() in {"issue", "error"}
+                                ]
+                                if unresolved:
+                                    logger.error(
+                                        "protective emergency unresolved (%s): %s",
+                                        reason,
+                                        "; ".join(
+                                            f"{u.get('exchange')} {u.get('symbol')} side={u.get('side')} reason={u.get('reason')}"
+                                            for u in unresolved
+                                        ),
+                                    )
+                                else:
+                                    logger.info(
+                                        "protective emergency retry resolved all verify issues (%s)",
+                                        reason,
+                                    )
             except Exception as exc:  # pylint: disable=broad-except
                 logger.warning("Protective sync failed: %s", exc)
         if auto_rebalance:
@@ -4949,38 +10894,35 @@ class DataService:
         *,
         window_minutes: int = 4320,
         funding_points: int = 120,
+        use_cache: bool = True,
+        persist_candidate_decision: bool = True,
+        run_position_logic: bool = True,
     ) -> dict[str, Any]:
         """Collect on-demand historical analytics for a symbol."""
         canonical = normalize_symbol(symbol)
         if not canonical:
             raise ValueError("Symbol must be provided for analysis.")
+        session_state = await self.bootstrap_symbol_session(canonical)
 
         window = max(60, min(int(window_minutes), 4320))
         funding_limit = max(24, min(int(funding_points), 200))
 
-        exchange_flags = getattr(self._settings_manager.current, "analysis_exchanges", None) or {}
-        enabled_exchanges = {
-            normalize_exchange_name(name)
-            for name, enabled in exchange_flags.items()
-            if enabled
-        }
-        selected_exchanges = [
-            ex for ex in COIN_ANALYSIS_CORE_EXCHANGES if not enabled_exchanges or ex in enabled_exchanges
-        ]
+        selected_exchanges = self._coin_analysis_selected_exchanges()
         if not selected_exchanges:
-            raise ValueError("Enable at least one core analysis exchange (binance/okx).")
+            raise ValueError("Enable at least one core analysis exchange (binance/kucoin).")
         global_warnings: list[str] = []
         if len(selected_exchanges) < 2:
             global_warnings.append("pair_analysis_limited: less than 2 core exchanges enabled")
 
         cache_key = (canonical, window, funding_limit, tuple(selected_exchanges))
         now_ts = time.time()
-        cached = self._coin_analysis_cache.get(cache_key)
+        cached = self._coin_analysis_cache.get(cache_key) if use_cache else None
         if cached:
             cached_at, cached_payload = cached
             if now_ts - cached_at <= COIN_ANALYSIS_CACHE_TTL_SEC:
                 out = dict(cached_payload)
                 out["cache_hit"] = True
+                out["symbol_session"] = session_state
                 return out
 
         tasks = [
@@ -4997,6 +10939,26 @@ class DataService:
                     self._analyze_pair(exchange_rows[i], exchange_rows[j], window)
                 )
         bot_logic = self._decide_coin_candidate(pair_analysis)
+        visual_analysis = self._build_coin_visual_analysis(
+            exchange_rows,
+            pair_analysis,
+            bot_logic,
+        )
+        decision_journal: dict[str, Any] | None = None
+        if persist_candidate_decision:
+            decision_journal = await asyncio.to_thread(
+                self._persist_coin_candidate_decision,
+                canonical,
+                bot_logic,
+                pair_analysis,
+            )
+        position_logic: dict[str, Any] = {}
+        if run_position_logic:
+            position_logic = await asyncio.to_thread(
+                self._evaluate_symbol_positions,
+                canonical,
+                pair_analysis,
+            )
 
         response = {
             "symbol": canonical,
@@ -5008,15 +10970,20 @@ class DataService:
             "exchanges": exchange_rows,
             "pair_analysis": pair_analysis,
             "bot_logic": bot_logic,
+            "visual_analysis": visual_analysis,
+            "decision_journal": decision_journal or {},
+            "position_logic": position_logic,
+            "symbol_session": session_state,
             "cache_hit": False,
         }
-        self._coin_analysis_cache[cache_key] = (now_ts, response)
-        if len(self._coin_analysis_cache) > 32:
-            oldest_key = min(
-                self._coin_analysis_cache.keys(),
-                key=lambda key_item: self._coin_analysis_cache[key_item][0],
-            )
-            self._coin_analysis_cache.pop(oldest_key, None)
+        if use_cache:
+            self._coin_analysis_cache[cache_key] = (now_ts, response)
+            if len(self._coin_analysis_cache) > 32:
+                oldest_key = min(
+                    self._coin_analysis_cache.keys(),
+                    key=lambda key_item: self._coin_analysis_cache[key_item][0],
+                )
+                self._coin_analysis_cache.pop(oldest_key, None)
         return response
 
     async def _analyze_symbol_on_exchange(
@@ -5094,6 +11061,13 @@ class DataService:
             _safe_float(snapshot_dict.get("funding_interval_hours")),
         )
         result["funding_interval_hours_resolved"] = funding_interval_hours
+        funding_rows_upserted = await asyncio.to_thread(
+            self._persist_coin_funding_history,
+            canonical_symbol,
+            exchange,
+            funding_history,
+            funding_interval_hours,
+        )
         latest_funding_rate = None
         if funding_history:
             latest_funding_rate = _safe_float(funding_history[0].get("rate"))
@@ -5130,6 +11104,12 @@ class DataService:
             window_minutes,
         )
         result["open_interest"] = oi_payload
+        oi_rows_upserted = await asyncio.to_thread(
+            self._persist_coin_open_interest_history,
+            canonical_symbol,
+            exchange,
+            oi_payload,
+        )
         if oi_payload.get("status") not in ("ok", "partial"):
             warnings.append(f"oi:{oi_payload.get('status') or 'unavailable'}")
 
@@ -5142,6 +11122,8 @@ class DataService:
             "candles_coverage_pct": round(coverage_pct, 2),
             "funding_points_received": len(funding_history),
             "oi_points_received": len(oi_payload.get("history") or []),
+            "funding_rows_upserted": funding_rows_upserted,
+            "oi_rows_upserted": oi_rows_upserted,
         }
         if coverage_pct < 70:
             warnings.append("candles_coverage_low")
@@ -5160,6 +11142,121 @@ class DataService:
             result["warnings"] = warnings
         return result
 
+    def _persist_coin_funding_history(
+        self,
+        canonical_symbol: str,
+        exchange: str,
+        history: list[dict[str, Any]],
+        fallback_interval_hours: float | None,
+    ) -> int:
+        rows: list[CoinFundingHistoryRow] = []
+        for item in history or []:
+            ts_ms = _funding_history_ts_ms(
+                item.get("ts_ms")
+                or item.get("timestamp")
+                or item.get("timepoint")
+                or item.get("timePoint")
+                or item.get("fundingTime")
+            )
+            if not ts_ms:
+                continue
+            interval_hours = _safe_float(
+                item.get("interval_hours")
+                or item.get("intervalHours")
+                or item.get("funding_interval_hours")
+            )
+            rows.append(
+                CoinFundingHistoryRow(
+                    canonical_symbol=canonical_symbol,
+                    exchange=exchange,
+                    ts_ms=int(ts_ms),
+                    funding_rate=_safe_float(
+                        item.get("rate")
+                        or item.get("fundingRate")
+                        or item.get("funding_rate")
+                    ),
+                    predicted_funding_rate=_safe_float(
+                        item.get("predicted_rate")
+                        or item.get("predictedFundingRate")
+                        or item.get("predicted_funding_rate")
+                    ),
+                    interval_hours=interval_hours if interval_hours is not None else fallback_interval_hours,
+                    mark_price=_safe_float(item.get("mark_price") or item.get("markPrice")),
+                    source_type=str(
+                        item.get("source_type")
+                        or item.get("source")
+                        or "adapter_funding_history"
+                    ),
+                )
+            )
+        return upsert_funding_history_rows(rows)
+
+    def _persist_coin_open_interest_history(
+        self,
+        canonical_symbol: str,
+        exchange: str,
+        oi_payload: Mapping[str, Any],
+    ) -> int:
+        source = str(oi_payload.get("source") or "open_interest_snapshot")
+        rows: list[CoinOpenInterestHistoryRow] = []
+        seen_ts: set[int] = set()
+        for item in list(oi_payload.get("history") or []):
+            ts_ms = _funding_history_ts_ms(item.get("ts_ms") or item.get("timestamp"))
+            if not ts_ms:
+                continue
+            ts_int = int(ts_ms)
+            seen_ts.add(ts_int)
+            rows.append(
+                CoinOpenInterestHistoryRow(
+                    canonical_symbol=canonical_symbol,
+                    exchange=exchange,
+                    ts_ms=ts_int,
+                    oi_contracts=_safe_float(
+                        item.get("open_interest_contracts")
+                        or item.get("oi_contracts")
+                        or item.get("openInterestAmount")
+                        or item.get("openInterest")
+                    ),
+                    oi_notional=_safe_float(
+                        item.get("open_interest_notional")
+                        or item.get("oi_notional")
+                        or item.get("openInterestValue")
+                        or item.get("openInterestUsd")
+                    ),
+                    interval_label=str(item.get("interval_label") or "1h"),
+                    source_type=source,
+                )
+            )
+
+        current = oi_payload.get("current") or {}
+        current_ts = _funding_history_ts_ms(current.get("ts_ms") or current.get("timestamp"))
+        if current_ts:
+            current_ts_int = int(current_ts)
+            if current_ts_int not in seen_ts:
+                rows.append(
+                    CoinOpenInterestHistoryRow(
+                        canonical_symbol=canonical_symbol,
+                        exchange=exchange,
+                        ts_ms=current_ts_int,
+                        oi_contracts=_safe_float(
+                            current.get("open_interest_contracts")
+                            or current.get("oi_contracts")
+                            or current.get("openInterestAmount")
+                            or current.get("openInterest")
+                        ),
+                        oi_notional=_safe_float(
+                            current.get("open_interest_notional")
+                            or current.get("oi_notional")
+                            or current.get("openInterestValue")
+                            or current.get("openInterestUsd")
+                        ),
+                        interval_label="current",
+                        source_type=source,
+                    )
+                )
+
+        return upsert_open_interest_history_rows(rows)
+
     def _analyze_pair(
         self,
         left: Mapping[str, Any],
@@ -5168,32 +11265,80 @@ class DataService:
     ) -> dict[str, Any]:
         left_ex = str(left.get("exchange") or "")
         right_ex = str(right.get("exchange") or "")
+        canonical_symbol = str(left.get("symbol") or right.get("symbol") or "")
+        pair_key = build_pair_key(canonical_symbol, left_ex, right_ex)
         series = _spread_series_from_candles(
             list(left.get("candles_1m") or []),
             list(right.get("candles_1m") or []),
         )
         now_ts_ms = int(time.time() * 1000)
+        coverage_pct = (len(series) / max(1, window_minutes)) * 100.0
         spread_values = [float(row.get("spread_pct") or 0.0) for row in series]
-        current_spread = spread_values[0] if spread_values else None
         p25 = _percentile(spread_values, 25)
         p50 = _percentile(spread_values, 50)
         p75 = _percentile(spread_values, 75)
         p95 = _percentile([abs(v) for v in spread_values], 95)
-        mean = sum(spread_values) / len(spread_values) if spread_values else None
-        std = None
-        if spread_values and len(spread_values) > 1 and mean is not None:
-            var = sum((v - mean) ** 2 for v in spread_values) / len(spread_values)
-            std = math.sqrt(max(0.0, var))
-        z_score = None
-        if current_spread is not None and mean is not None and std and std > 1e-12:
-            z_score = (current_spread - mean) / std
         weighted_mean = _weighted_mean_recent(
             series,
             value_key="spread_pct",
             now_ts_ms=now_ts_ms,
             half_life_hours=24.0,
         )
-        coverage_pct = (len(series) / max(1, window_minutes)) * 100.0
+
+        feature_pack = build_pair_feature_snapshots(
+            pair_key=pair_key,
+            canonical_symbol=canonical_symbol,
+            left_exchange=left_ex,
+            right_exchange=right_ex,
+            left=left,
+            right=right,
+            spread_series=series,
+            coverage_pct=coverage_pct,
+            now_ts_ms=now_ts_ms,
+        )
+        direction_rows = list(feature_pack.get("directions") or [])
+        if not direction_rows:
+            direction_rows = [
+                {
+                    "direction": "long_a_short_b",
+                    "action": "NO_TRADE",
+                    "reasons": ["data_quality_low"],
+                    "scores": {"entry_score": 0.0},
+                    "directional": {},
+                }
+            ]
+        selected = max(
+            direction_rows,
+            key=lambda row: _safe_float((row.get("scores") or {}).get("entry_score")) or 0.0,
+        )
+
+        feature_snapshot_ids: dict[str, int] = {}
+        for item in direction_rows:
+            direction = str(item.get("direction") or "")
+            if not direction:
+                continue
+            payload_features = {
+                "common": feature_pack.get("common") or {},
+                "directional": item.get("directional") or {},
+                "scores": item.get("scores") or {},
+                "reasons": list(item.get("reasons") or []),
+            }
+            try:
+                feature_id = insert_feature_snapshot(
+                    CoinFeatureSnapshotRow(
+                        ts_ms=now_ts_ms,
+                        pair_key=pair_key,
+                        canonical_symbol=canonical_symbol,
+                        context_mode="candidate",
+                        feature_set_version=COIN_ANALYSIS_FEATURE_SET_VERSION,
+                        direction=direction,
+                        features=payload_features,
+                        data_quality=feature_pack.get("data_quality") or {},
+                    )
+                )
+                feature_snapshot_ids[direction] = feature_id
+            except Exception:  # pylint: disable=broad-except
+                continue
 
         int_left = _safe_float(left.get("funding_interval_hours_resolved"))
         int_right = _safe_float(right.get("funding_interval_hours_resolved"))
@@ -5221,39 +11366,28 @@ class DataService:
         if oi_left_6h is not None and oi_right_6h is not None:
             oi_divergence_6h = abs(oi_left_6h - oi_right_6h)
 
-        score = 50.0
-        reasons: list[str] = []
-        if not interval_match:
-            score -= 30.0
-            reasons.append("funding_interval_mismatch")
-        if coverage_pct < 70.0:
-            score -= 20.0
-            reasons.append("spread_history_low_coverage")
-        if funding_delta_hourly is not None:
-            score += min(25.0, abs(funding_delta_hourly) * 100000.0)
-        else:
-            score -= 10.0
-            reasons.append("funding_delta_unavailable")
-        if z_score is not None and abs(z_score) >= 2.5:
-            score -= 15.0
-            reasons.append("spread_extreme_zscore")
-        if p95 is not None and current_spread is not None and abs(current_spread) > 1e-9:
-            tail_ratio = p95 / abs(current_spread)
-            if tail_ratio >= 3.0:
-                score -= 10.0
-                reasons.append("historical_tail_risk")
-        if oi_divergence_6h is not None and oi_divergence_6h >= 25.0:
-            score -= 10.0
-            reasons.append("oi_divergence_high")
-
-        score = max(0.0, min(100.0, score))
+        selected_scores = selected.get("scores") or {}
+        score = _safe_float(selected_scores.get("entry_score")) or 0.0
+        reasons = list(selected.get("reasons") or [])
+        selected_action = str(selected.get("action") or "NO_TRADE")
+        selected_direction = str(selected.get("direction") or "long_a_short_b")
         recommendation = "reject"
-        if interval_match and coverage_pct >= 70.0 and score >= 70.0:
+        if interval_match and selected_action == "ENTRY_STRONG" and score >= 70.0:
             recommendation = "enter_candidate"
-        elif interval_match and coverage_pct >= 50.0 and score >= 50.0:
+        elif interval_match and selected_action in ("ENTRY_SMALL", "ENTRY_STRONG") and score >= 50.0:
             recommendation = "watch"
 
+        spread_features = (
+            ((feature_pack.get("common") or {}).get("spread_features") or {})
+            if isinstance(feature_pack.get("common"), Mapping)
+            else {}
+        )
+        current_spread = _safe_float(spread_features.get("current_spread_pct"))
+        z_score = _safe_float(spread_features.get("spread_zscore_1h"))
+
         return {
+            "pair_key": pair_key,
+            "canonical_symbol": canonical_symbol,
             "left_exchange": left_ex,
             "right_exchange": right_ex,
             "window_minutes": window_minutes,
@@ -5278,6 +11412,15 @@ class DataService:
                 "p95_abs_pct": p95,
                 "z_score": z_score,
             },
+            "derived_spread": (feature_pack.get("common") or {}).get("derived_spread"),
+            "decision_phase": (feature_pack.get("common") or {}).get("decision_phase"),
+            "hours_to_next_funding_min": _safe_float(
+                (feature_pack.get("common") or {}).get("hours_to_next_funding_min")
+            ),
+            "directional_features": direction_rows,
+            "selected_direction": selected_direction,
+            "selected_action": selected_action,
+            "feature_snapshot_ids": feature_snapshot_ids,
             "open_interest": {
                 "left_change_6h_pct": oi_left_6h,
                 "right_change_6h_pct": oi_right_6h,
@@ -5288,37 +11431,683 @@ class DataService:
             "reasons": reasons,
         }
 
-    def _decide_coin_candidate(self, pairs: list[Mapping[str, Any]]) -> dict[str, Any]:
-        if not pairs:
-            return {
-                "decision": "reject",
-                "reason": "no_pairs_available",
-                "recommended_pair": None,
-                "score": 0,
-            }
-        ordered = sorted(
-            pairs,
-            key=lambda row: float(row.get("score") or 0.0),
-            reverse=True,
+    def _build_coin_visual_analysis(
+        self,
+        exchange_rows: list[Mapping[str, Any]],
+        pair_analysis: list[Mapping[str, Any]],
+        bot_logic: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not exchange_rows or not pair_analysis:
+            return {}
+
+        recommended_pair = dict(bot_logic.get("recommended_pair") or {})
+        target_pair_key = str(recommended_pair.get("pair_key") or "")
+        selected_pair = None
+        if target_pair_key:
+            for item in pair_analysis:
+                if str(item.get("pair_key") or "") == target_pair_key:
+                    selected_pair = dict(item)
+                    break
+        if selected_pair is None:
+            selected_pair = dict(
+                max(
+                    pair_analysis,
+                    key=lambda row: _safe_float(row.get("score")) or 0.0,
+                )
+            )
+
+        left_exchange = str(selected_pair.get("left_exchange") or "")
+        right_exchange = str(selected_pair.get("right_exchange") or "")
+        exchange_map = {
+            str(item.get("exchange") or ""): item
+            for item in exchange_rows
+            if item
+        }
+        left_row = exchange_map.get(left_exchange)
+        right_row = exchange_map.get(right_exchange)
+        if not left_row or not right_row:
+            return {}
+
+        direction = str(
+            selected_pair.get("selected_direction")
+            or recommended_pair.get("direction")
+            or "long_a_short_b"
         )
-        best = ordered[0]
-        best_score = float(best.get("score") or 0.0)
-        reco = str(best.get("recommendation") or "reject")
-        decision = "reject"
-        if reco == "enter_candidate":
-            decision = "enter_candidate"
-        elif reco == "watch":
-            decision = "watch"
+        spread_series = _spread_series_from_candles(
+            list(left_row.get("candles_1m") or []),
+            list(right_row.get("candles_1m") or []),
+        )
+        spread_chart_rows = list(reversed(spread_series))
+        funding_series = _funding_net_hourly_series(
+            list(left_row.get("funding_history") or []),
+            list(right_row.get("funding_history") or []),
+            left_interval_hours=_safe_float(left_row.get("funding_interval_hours_resolved")),
+            right_interval_hours=_safe_float(right_row.get("funding_interval_hours_resolved")),
+            direction=direction,
+        )
+        window_rows = _build_visual_window_rows(spread_series, funding_series)
+        spread_values = [
+            float(_safe_float(item.get("spread_pct")) or 0.0)
+            for item in spread_series
+            if _safe_float(item.get("spread_pct")) is not None
+        ]
+        net_values = [
+            float(_safe_float(item.get("net_bps")) or 0.0)
+            for item in funding_series
+            if _safe_float(item.get("net_bps")) is not None
+        ]
+        direction_label = _direction_label(direction, left_exchange, right_exchange)
+        notes = [
+            "Funding is normalized to hourly carry and compared in bps for mixed intervals.",
+            "Spread chart uses synchronized 1m candle closes, so it is indicative rather than executable.",
+        ]
+        if not funding_series:
+            notes.append("Funding chart is empty because one side has no usable history window yet.")
+        if not spread_series:
+            notes.append("Spread chart is empty because overlapping candle timestamps were not found.")
+
         return {
-            "decision": decision,
-            "score": round(best_score, 2),
-            "recommended_pair": {
-                "left_exchange": best.get("left_exchange"),
-                "right_exchange": best.get("right_exchange"),
+            "pair_key": str(selected_pair.get("pair_key") or ""),
+            "pair_label": f"{left_exchange} vs {right_exchange}",
+            "direction": direction,
+            "direction_label": direction_label,
+            "selected_action": str(selected_pair.get("selected_action") or bot_logic.get("recommended_action") or "NO_TRADE"),
+            "recommendation": str(selected_pair.get("recommendation") or "reject"),
+            "score": _safe_float(selected_pair.get("score")),
+            "summary": {
+                "spread_current_pct": (
+                    _safe_float(spread_series[0].get("spread_pct"))
+                    if spread_series
+                    else None
+                ),
+                "spread_mean_pct": (
+                    sum(spread_values) / len(spread_values)
+                    if spread_values
+                    else None
+                ),
+                "funding_net_hourly_bps": (
+                    sum(net_values[-4:]) / len(net_values[-4:])
+                    if net_values
+                    else None
+                ),
+                "funding_positive_share_pct": (
+                    len([value for value in net_values if value > 0]) / len(net_values) * 100.0
+                    if net_values
+                    else None
+                ),
             },
-            "reason": "best_pair_score",
-            "pair_reasons": list(best.get("reasons") or []),
-            "note": "decision is advisory; execute only after manual dry-run checks",
+            "windows": window_rows,
+            "charts": {
+                "spread": {
+                    "points": _downsample_chart_points(spread_chart_rows, value_key="spread_pct", max_points=120),
+                    "value_key": "spread_pct",
+                },
+                "funding": {
+                    "points": _downsample_chart_points(funding_series, value_key="net_bps", max_points=120),
+                    "value_key": "net_bps",
+                },
+            },
+            "notes": notes,
+        }
+
+    def _decide_coin_candidate(self, pairs: list[Mapping[str, Any]]) -> dict[str, Any]:
+        return evaluate_candidate_pairs(pairs)
+
+    def _persist_coin_candidate_decision(
+        self,
+        canonical_symbol: str,
+        bot_logic: Mapping[str, Any],
+        pair_analysis: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+        recommended_pair = dict(bot_logic.get("recommended_pair") or {})
+        pair_key = str(
+            recommended_pair.get("pair_key")
+            or (pair_analysis[0].get("pair_key") if pair_analysis else build_pair_key(canonical_symbol, "binance", "kucoin"))
+            or build_pair_key(canonical_symbol, "binance", "kucoin")
+        )
+        direction = str(recommended_pair.get("direction") or "long_a_short_b")
+        action = str(bot_logic.get("recommended_action") or "NO_TRADE")
+        decision_phase = str(
+            bot_logic.get("decision_phase")
+            or recommended_pair.get("decision_phase")
+            or "exploratory"
+        )
+        score = _safe_float(bot_logic.get("score")) or 0.0
+        reason_codes = normalize_reason_codes(
+            list(bot_logic.get("reason_codes") or bot_logic.get("pair_reasons") or [])
+        )
+        if not reason_codes:
+            reason_codes = ["data_quality_low"]
+        reason_text = [
+            str(item)
+            for item in list(bot_logic.get("reason_text") or [])
+            if str(item).strip()
+        ]
+        if not reason_text:
+            reason_text = [str(bot_logic.get("reason") or "candidate_rule_engine")]
+        scores = dict(bot_logic.get("scores") or {})
+        scores.setdefault("best_pair_score", score)
+
+        decision_id = f"ca-{canonical_symbol.lower()}-{now_ms}-{uuid4().hex[:8]}"
+        insert_decision(
+            CoinDecisionRow(
+                decision_id=decision_id,
+                ts_ms=now_ms,
+                mode="manual_candidate",
+                canonical_symbol=canonical_symbol,
+                pair_key=pair_key,
+                direction=direction,
+                action=action,
+                decision_phase=decision_phase,
+                confidence_score=float(score),
+                reason_codes=reason_codes,
+                reason_text=reason_text,
+                scores=scores,
+                features_ref=(
+                    str(recommended_pair.get("feature_snapshot_id"))
+                    if recommended_pair.get("feature_snapshot_id") is not None
+                    else None
+                ),
+            )
+        )
+        return {
+            "decision_id": decision_id,
+            "pair_key": pair_key,
+            "direction": direction,
+            "action": action,
+            "decision_phase": decision_phase,
+            "score": round(score, 2),
+            "reason_codes": reason_codes,
+        }
+
+    def _evaluate_symbol_positions(
+        self,
+        canonical_symbol: str,
+        pair_analysis: list[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        def _pair_row_for_exchanges(
+            long_exchange: str,
+            short_exchange: str,
+        ) -> tuple[Mapping[str, Any] | None, str]:
+            for row in pair_analysis:
+                left_ex = normalize_exchange_name(str(row.get("left_exchange") or ""))
+                right_ex = normalize_exchange_name(str(row.get("right_exchange") or ""))
+                if long_exchange == left_ex and short_exchange == right_ex:
+                    return row, "long_a_short_b"
+                if long_exchange == right_ex and short_exchange == left_ex:
+                    return row, "long_b_short_a"
+            return (pair_analysis[0], "long_a_short_b") if pair_analysis else (None, "long_a_short_b")
+
+        def _direction_feature_for_pair(
+            pair_row: Mapping[str, Any] | None,
+            direction: str,
+        ) -> Mapping[str, Any] | None:
+            if pair_row is None:
+                return None
+            for item in list((pair_row or {}).get("directional_features") or []):
+                if str(item.get("direction") or "") == direction:
+                    return item
+            return None
+
+        open_paper = get_paper_positions(status="open")
+        paper_positions = [
+            row
+            for row in open_paper
+            if normalize_symbol(str(row.get("canonical_symbol") or "")) == canonical_symbol
+        ]
+
+        by_pair_key = {
+            str(row.get("pair_key") or ""): row
+            for row in pair_analysis
+            if row.get("pair_key")
+        }
+        paper_rows_out: list[dict[str, Any]] = []
+        real_rows_out: list[dict[str, Any]] = []
+        saved_paper = 0
+        saved_real = 0
+        now_ms = int(time.time() * 1000)
+        historical_reviews = get_decisions(
+            canonical_symbol=canonical_symbol,
+            mode="manual_position_review",
+            limit=5000,
+        )
+        historical_outcomes = get_outcomes(
+            canonical_symbol=canonical_symbol,
+            limit=5000,
+        )
+        latest_outcome_by_decision_id: dict[str, dict[str, Any]] = {}
+        for row in historical_outcomes:
+            decision_id = str(row.get("decision_id") or "")
+            if not decision_id or decision_id in latest_outcome_by_decision_id:
+                continue
+            latest_outcome_by_decision_id[decision_id] = row
+        latest_review_by_state_ref: dict[str, dict[str, Any]] = {}
+        for row in historical_reviews:
+            state_ref = str(row.get("state_ref") or "").strip()
+            decision_id = str(row.get("decision_id") or "")
+            if not state_ref or not decision_id or state_ref in latest_review_by_state_ref:
+                continue
+            outcome_row = latest_outcome_by_decision_id.get(decision_id)
+            if not outcome_row:
+                continue
+            outcome_payload = dict(outcome_row.get("outcome") or {})
+            latest_review_by_state_ref[state_ref] = {
+                "latest_review_decision_id": decision_id,
+                "latest_review_decision_ts_ms": int(_safe_float(row.get("ts_ms")) or 0),
+                "latest_review_horizon": str(outcome_row.get("horizon") or ""),
+                "latest_review_evaluated_at_ms": int(
+                    _safe_float(outcome_row.get("evaluated_at_ms")) or 0
+                ),
+                "latest_correctness": str(
+                    outcome_payload.get("decision_correctness") or ""
+                ).strip().lower()
+                or None,
+                "latest_timing_quality": str(
+                    outcome_payload.get("timing_quality") or ""
+                ).strip().lower()
+                or None,
+            }
+
+        def _apply_latest_review_payload(
+            row: dict[str, Any],
+            *,
+            state_ref: str | None,
+        ) -> None:
+            key = str(state_ref or "").strip()
+            if not key:
+                return
+            review = latest_review_by_state_ref.get(key) or {}
+            if not review:
+                return
+            row.update(review)
+
+        for pos in paper_positions:
+            position_key = str(pos.get("position_key") or "")
+            pair_key = str(pos.get("pair_key") or "")
+            pair_row = by_pair_key.get(pair_key)
+            if pair_row is None and pair_analysis:
+                pair_row = pair_analysis[0]
+                pair_key = str(pair_row.get("pair_key") or pair_key)
+            direction = str(pos.get("direction") or "")
+            if not direction and pair_row is not None:
+                direction = str(pair_row.get("selected_direction") or "long_a_short_b")
+            if not direction:
+                direction = "long_a_short_b"
+            decision_phase = str(
+                (pair_row or {}).get("decision_phase") or "exploratory"
+            )
+            spread_coverage_pct = _safe_float(
+                ((pair_row or {}).get("spread") or {}).get("coverage_pct")
+            ) or 0.0
+            direction_feature = None
+            for item in list((pair_row or {}).get("directional_features") or []):
+                if str(item.get("direction") or "") == direction:
+                    direction_feature = item
+                    break
+            signal = evaluate_position_signal(
+                position_key=position_key,
+                pair_key=pair_key,
+                direction=direction,
+                qty=_safe_float(pos.get("qty")) or 0.0,
+                decision_phase=decision_phase,
+                spread_coverage_pct=spread_coverage_pct,
+                direction_feature=direction_feature,
+            )
+            feature_snapshot_id = ((pair_row or {}).get("feature_snapshot_ids") or {}).get(direction)
+            decision_id = f"ca-pos-{canonical_symbol.lower()}-{now_ms}-{uuid4().hex[:8]}"
+            insert_decision(
+                CoinDecisionRow(
+                    decision_id=decision_id,
+                    ts_ms=now_ms,
+                    mode="manual_position_review",
+                    canonical_symbol=canonical_symbol,
+                    pair_key=pair_key or build_pair_key(canonical_symbol, "binance", "kucoin"),
+                    direction=direction,
+                    action=str(signal.get("action") or "HOLD"),
+                    decision_phase=str(signal.get("decision_phase") or "exploratory"),
+                    confidence_score=_safe_float(signal.get("confidence_score")) or 0.0,
+                    reason_codes=normalize_reason_codes(list(signal.get("reason_codes") or [])),
+                    reason_text=[str(x) for x in list(signal.get("reason_text") or [])],
+                    scores=dict(signal.get("scores") or {}),
+                    features_ref=(
+                        str(feature_snapshot_id) if feature_snapshot_id is not None else None
+                    ),
+                    state_ref=position_key or None,
+                )
+            )
+            saved_paper += 1
+            paper_rows_out.append(
+                {
+                    "decision_id": decision_id,
+                    "decision_ts_ms": now_ms,
+                    "position_key": position_key,
+                    "pair_key": pair_key,
+                    "direction": direction,
+                    "action": signal.get("action"),
+                    "position_source": "paper",
+                    "decision_phase": signal.get("decision_phase"),
+                    "minutes_to_next_funding": _safe_float(
+                        (pair_row or {}).get("hours_to_next_funding_min")
+                    ),
+                    "confidence_score": signal.get("confidence_score"),
+                    "reason_codes": list(signal.get("reason_codes") or []),
+                    "reason_text": list(signal.get("reason_text") or []),
+                    "scores": dict(signal.get("scores") or {}),
+                    "features_ref": str(feature_snapshot_id) if feature_snapshot_id is not None else None,
+                }
+            )
+            _apply_latest_review_payload(paper_rows_out[-1], state_ref=position_key)
+
+        snapshot = self._accounts.snapshot() or {}
+        raw_positions = list(snapshot.get("positions") or [])
+        symbol_positions_raw: list[dict[str, Any]] = []
+        for pos in raw_positions:
+            exchange = normalize_exchange_name(str(pos.get("exchange") or ""))
+            if not exchange:
+                continue
+            symbol_norm = _normalize_manual_symbol(
+                str(
+                    pos.get("symbol_normalized")
+                    or pos.get("symbol")
+                    or pos.get("exchange_symbol")
+                    or ""
+                )
+            )
+            if symbol_norm != canonical_symbol:
+                continue
+            qty_raw = self._rebalance_position_qty(pos)
+            side = self._rebalance_position_side(pos, qty_raw)
+            if qty_raw is None or not side:
+                continue
+            qty_abs = abs(float(qty_raw))
+            if qty_abs <= 0:
+                continue
+            symbol_positions_raw.append(
+                {
+                    "exchange": exchange,
+                    "side": side,
+                    "qty": qty_abs,
+                    "raw": dict(pos),
+                }
+            )
+
+        aggregated: dict[tuple[str, str], float] = {}
+        for item in symbol_positions_raw:
+            key = (str(item.get("exchange") or ""), str(item.get("side") or ""))
+            aggregated[key] = aggregated.get(key, 0.0) + float(item.get("qty") or 0.0)
+        symbol_positions: list[dict[str, Any]] = []
+        for (exchange, side), qty in aggregated.items():
+            if qty <= 0:
+                continue
+            symbol_positions.append(
+                {
+                    "exchange": exchange,
+                    "side": side,
+                    "qty": qty,
+                }
+            )
+
+        long_legs = [dict(item) for item in symbol_positions if str(item.get("side") or "") == "long"]
+        short_legs = [dict(item) for item in symbol_positions if str(item.get("side") or "") == "short"]
+        observed_real_keys: set[str] = set()
+        if long_legs and short_legs:
+            while long_legs and short_legs:
+                best: tuple[int, int, int, int] | None = None
+                best_pair_row: Mapping[str, Any] | None = None
+                best_direction = "long_a_short_b"
+                for li, long_leg in enumerate(long_legs):
+                    for si, short_leg in enumerate(short_legs):
+                        pair_row, direction = _pair_row_for_exchanges(
+                            str(long_leg.get("exchange") or ""),
+                            str(short_leg.get("exchange") or ""),
+                        )
+                        matched_qty = min(
+                            float(long_leg.get("qty") or 0.0),
+                            float(short_leg.get("qty") or 0.0),
+                        )
+                        if matched_qty <= 0:
+                            continue
+                        pair_priority = 1 if pair_row is not None else 0
+                        candidate = (pair_priority, int(matched_qty * 1_000_000), li, si)
+                        if best is None or candidate > best:
+                            best = candidate
+                            best_pair_row = pair_row
+                            best_direction = direction
+                if best is None:
+                    break
+                _priority, _qty_key, li, si = best
+                long_leg = long_legs[li]
+                short_leg = short_legs[si]
+                matched_qty = min(
+                    float(long_leg.get("qty") or 0.0),
+                    float(short_leg.get("qty") or 0.0),
+                )
+                if matched_qty <= 0:
+                    break
+                long_exchange = str(long_leg.get("exchange") or "")
+                short_exchange = str(short_leg.get("exchange") or "")
+                pair_row = best_pair_row
+                pair_key = str((pair_row or {}).get("pair_key") or "")
+                if not pair_key:
+                    pair_key = build_pair_key(canonical_symbol, "binance", "kucoin")
+                decision_phase = str((pair_row or {}).get("decision_phase") or "exploratory")
+                spread_coverage_pct = _safe_float(
+                    ((pair_row or {}).get("spread") or {}).get("coverage_pct")
+                ) or 0.0
+                direction_feature = _direction_feature_for_pair(pair_row, best_direction)
+                feature_snapshot_id = ((pair_row or {}).get("feature_snapshot_ids") or {}).get(best_direction)
+                position_key = (
+                    f"real-{canonical_symbol.lower()}-"
+                    f"{long_exchange}-long-{short_exchange}-short"
+                )
+                observed_real_keys.add(position_key)
+                signal = evaluate_position_signal(
+                    position_key=position_key,
+                    pair_key=pair_key,
+                    direction=best_direction,
+                    qty=matched_qty,
+                    decision_phase=decision_phase,
+                    spread_coverage_pct=spread_coverage_pct,
+                    direction_feature=direction_feature,
+                )
+                decision_id = f"ca-real-{canonical_symbol.lower()}-{now_ms}-{uuid4().hex[:8]}"
+                insert_decision(
+                    CoinDecisionRow(
+                        decision_id=decision_id,
+                        ts_ms=now_ms,
+                        mode="manual_position_review",
+                        canonical_symbol=canonical_symbol,
+                        pair_key=pair_key,
+                        direction=best_direction,
+                        action=str(signal.get("action") or "HOLD"),
+                        decision_phase=str(signal.get("decision_phase") or "exploratory"),
+                        confidence_score=_safe_float(signal.get("confidence_score")) or 0.0,
+                        reason_codes=normalize_reason_codes(list(signal.get("reason_codes") or [])),
+                        reason_text=[str(x) for x in list(signal.get("reason_text") or [])],
+                        scores=dict(signal.get("scores") or {}),
+                        features_ref=(
+                            str(feature_snapshot_id) if feature_snapshot_id is not None else None
+                        ),
+                        state_ref=position_key,
+                    )
+                )
+                saved_real += 1
+                real_rows_out.append(
+                    {
+                        "decision_id": decision_id,
+                        "decision_ts_ms": now_ms,
+                        "position_key": position_key,
+                        "pair_key": pair_key,
+                        "direction": best_direction,
+                        "action": signal.get("action"),
+                        "position_source": "real_manual",
+                        "long_exchange": long_exchange,
+                        "short_exchange": short_exchange,
+                        "matched_qty": matched_qty,
+                        "decision_phase": signal.get("decision_phase"),
+                        "minutes_to_next_funding": _safe_float(
+                            (pair_row or {}).get("hours_to_next_funding_min")
+                        ),
+                        "confidence_score": signal.get("confidence_score"),
+                        "reason_codes": list(signal.get("reason_codes") or []),
+                        "reason_text": list(signal.get("reason_text") or []),
+                        "scores": dict(signal.get("scores") or {}),
+                        "features_ref": str(feature_snapshot_id) if feature_snapshot_id is not None else None,
+                    }
+                )
+                _apply_latest_review_payload(real_rows_out[-1], state_ref=position_key)
+                insert_real_position_observation(
+                    CoinRealPositionObservationRow(
+                        state_ref=position_key,
+                        ts_ms=now_ms,
+                        canonical_symbol=canonical_symbol,
+                        pair_key=pair_key,
+                        direction=best_direction,
+                        long_exchange=long_exchange,
+                        short_exchange=short_exchange,
+                        qty=matched_qty,
+                        status="open",
+                        payload={
+                            "source": "analyze_symbol",
+                            "action": signal.get("action"),
+                            "decision_id": decision_id,
+                        },
+                    )
+                )
+                insert_trade_activity(
+                    CoinTradeActivityRow(
+                        event_id=f"coin-activity-{position_key}-{now_ms}-open",
+                        ts_ms=now_ms,
+                        canonical_symbol=canonical_symbol,
+                        pair_key=pair_key,
+                        direction=best_direction,
+                        activity_type="real_open_detected",
+                        source="analyze_symbol",
+                        state_ref=position_key,
+                        payload={
+                            "qty": matched_qty,
+                            "decision_id": decision_id,
+                            "action": signal.get("action"),
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                        },
+                    )
+                )
+
+                long_left = max(0.0, float(long_leg.get("qty") or 0.0) - matched_qty)
+                short_left = max(0.0, float(short_leg.get("qty") or 0.0) - matched_qty)
+                if long_left <= 1e-9:
+                    long_legs.pop(li)
+                else:
+                    long_legs[li]["qty"] = long_left
+                if short_left <= 1e-9:
+                    short_legs.pop(si)
+                else:
+                    short_legs[si]["qty"] = short_left
+
+        latest_real_status: dict[str, str] = {}
+        for row in get_real_position_observations(canonical_symbol=canonical_symbol, limit=5000):
+            key = str(row.get("state_ref") or "")
+            if not key or key in latest_real_status:
+                continue
+            latest_real_status[key] = str(row.get("status") or "")
+        for state_ref, status in latest_real_status.items():
+            if status != "open":
+                continue
+            if state_ref in observed_real_keys:
+                continue
+            insert_real_position_observation(
+                CoinRealPositionObservationRow(
+                    state_ref=state_ref,
+                    ts_ms=now_ms,
+                    canonical_symbol=canonical_symbol,
+                    qty=0.0,
+                    status="closed",
+                    payload={
+                        "source": "analyze_symbol",
+                        "reason": "missing_in_current_snapshot",
+                    },
+                )
+            )
+            insert_trade_activity(
+                CoinTradeActivityRow(
+                    event_id=f"coin-activity-{state_ref}-{now_ms}-closed",
+                    ts_ms=now_ms,
+                    canonical_symbol=canonical_symbol,
+                    activity_type="real_closed_detected",
+                    source="analyze_symbol",
+                    state_ref=state_ref,
+                    payload={
+                        "reason": "missing_in_current_snapshot",
+                    },
+                )
+            )
+
+        unmatched_legs = len(long_legs) + len(short_legs)
+
+        return {
+            "paper": paper_rows_out,
+            "real_manual": real_rows_out,
+            "summary": {
+                "paper_positions": len(paper_positions),
+                "paper_decisions_saved": saved_paper,
+                "real_positions": len(real_rows_out),
+                "real_decisions_saved": saved_real,
+                "real_legs_detected": len(symbol_positions),
+                "real_unpaired_legs": unmatched_legs,
+                "real_observations_open": len(observed_real_keys),
+            },
+        }
+
+    def _fetch_kucoin_open_interest_snapshot(self, canonical_symbol: str) -> dict[str, Any] | None:
+        try:
+            adapter = get_adapter_cached("kucoin")
+        except KeyError:
+            return None
+        try:
+            snapshots = adapter.fetch_market_snapshots([canonical_symbol])
+        except Exception:  # pylint: disable=broad-except
+            return None
+        if not snapshots:
+            return None
+        snap = snapshots[0]
+        raw = snap.raw or {}
+        contract = raw.get("contract") or {}
+        ticker = raw.get("ticker") or {}
+        oi_contracts = _safe_float(
+            contract.get("openInterest")
+            or contract.get("openInterestSize")
+            or contract.get("openInterestAmount")
+            or ticker.get("openInterest")
+        )
+        oi_notional = _safe_float(
+            contract.get("openInterestValue")
+            or contract.get("openInterestUsd")
+            or ticker.get("turnoverOf24h")
+            or ticker.get("turnover24h")
+        )
+        if oi_contracts is None and oi_notional is None:
+            return None
+        ts_ms = _funding_history_ts_ms(
+            contract.get("ts")
+            or contract.get("timestamp")
+            or ticker.get("ts")
+            or ticker.get("time")
+        )
+        if not ts_ms:
+            ts_ms = int(time.time() * 1000)
+        point = {
+            "ts_ms": int(ts_ms),
+            "open_interest_contracts": oi_contracts,
+            "open_interest_notional": oi_notional,
+        }
+        return {
+            "status": "partial",
+            "history": [point],
+            "current": point,
+            "symbol": snap.exchange_symbol,
+            "source": "kucoin_contract_snapshot",
         }
 
     def _fetch_open_interest_for_exchange(
@@ -5328,25 +12117,32 @@ class DataService:
         window_minutes: int,
     ) -> dict[str, Any]:
         name = normalize_exchange_name(exchange)
-        if name not in ("binance", "okx"):
+        if name not in ("binance", "okx", "kucoin"):
             return {
                 "status": "unsupported",
                 "history": [],
                 "current": None,
                 "error": "oi_history_not_supported_in_phase",
             }
+
         client = _ccxt_client(name)
         if client is None:
+            if name == "kucoin":
+                fallback = self._fetch_kucoin_open_interest_snapshot(canonical_symbol)
+                if fallback:
+                    return fallback
             return {
                 "status": "error",
                 "history": [],
                 "current": None,
                 "error": "ccxt_client_unavailable",
             }
+
         try:
             client.load_markets()
         except Exception:
             pass
+
         candidates = [
             _ccxt_perp_symbol(canonical_symbol),
             canonical_symbol,
@@ -5367,6 +12163,7 @@ class DataService:
                     break
             except Exception:
                 continue
+
         history: list[dict[str, Any]] = []
         for row in history_raw or []:
             ts_ms = _funding_history_ts_ms(row.get("timestamp") or row.get("ts"))
@@ -5387,29 +12184,40 @@ class DataService:
                     "ts_ms": ts_ms,
                     "open_interest_contracts": oi_contracts,
                     "open_interest_notional": oi_notional,
+                    "interval_label": "1h",
                 }
             )
         history.sort(key=lambda item: item.get("ts_ms") or 0, reverse=True)
 
         current = None
-        if symbol_used:
+        for cand in [symbol_used, *candidates]:
+            if not cand:
+                continue
             try:
-                now_row = client.fetch_open_interest(symbol_used)
-                current = {
-                    "ts_ms": _funding_history_ts_ms(now_row.get("timestamp")),
-                    "open_interest_contracts": _safe_float(
-                        now_row.get("openInterestAmount")
-                        or now_row.get("openInterest")
-                        or now_row.get("baseVolume")
-                    ),
-                    "open_interest_notional": _safe_float(
-                        now_row.get("openInterestValue")
-                        or now_row.get("quoteVolume")
-                        or now_row.get("openInterestUsd")
-                    ),
-                }
+                now_row = client.fetch_open_interest(cand)
             except Exception:
-                current = None
+                continue
+            current = {
+                "ts_ms": _funding_history_ts_ms(now_row.get("timestamp")) or int(time.time() * 1000),
+                "open_interest_contracts": _safe_float(
+                    now_row.get("openInterestAmount")
+                    or now_row.get("openInterest")
+                    or now_row.get("baseVolume")
+                ),
+                "open_interest_notional": _safe_float(
+                    now_row.get("openInterestValue")
+                    or now_row.get("quoteVolume")
+                    or now_row.get("openInterestUsd")
+                ),
+            }
+            symbol_used = cand
+            break
+
+        if not history and not current and name == "kucoin":
+            fallback = self._fetch_kucoin_open_interest_snapshot(canonical_symbol)
+            if fallback:
+                return fallback
+
         if not history and not current:
             return {
                 "status": "empty",
@@ -5482,7 +12290,7 @@ class DataService:
                     f"нужно поставить {target_stop}"
                 )
             text = f"MEXC: {text}"
-            sent = await self._accounts.send_telegram_message(text)
+            sent = await self._accounts.send_notification_message(text, title="FeeArb MEXC protective alert")
             if sent:
                 self._last_mexc_alert[key] = now
 

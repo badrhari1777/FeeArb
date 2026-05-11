@@ -3,6 +3,14 @@ from __future__ import annotations
 import unittest
 
 from webapp.services import (
+    _auto_exit_edge_delta_bps,
+    _auto_exit_executable_metrics_from_books,
+    _auto_exit_execution_order,
+    _auto_exit_market_cleanup_status,
+    _auto_exit_pair_fee_bps,
+    _auto_exit_policy_for_pair,
+    _auto_exit_v1_decision,
+    _auto_exit_v1_window,
     _auto_exit_overall_spread_from_legs,
     _auto_exit_select_pair_from_legs,
     _is_auto_exit_multileg_rule,
@@ -120,6 +128,142 @@ class AutoExitMultilegSelectTestCase(unittest.TestCase):
         self.assertIsNotNone(spread)
         assert spread is not None
         self.assertAlmostEqual(spread, 2.0, places=6)
+
+    def test_pair_policy_uses_worst_tier(self) -> None:
+        policy = _auto_exit_policy_for_pair("binance", "okx")
+        self.assertEqual(policy["worst_tier"], 2)
+        self.assertAlmostEqual(float(policy["chunk_notional_cap_usd"]), 250.0)
+        self.assertAlmostEqual(float(policy["market_cleanup_notional_cap_usd"]), 800.0)
+        self.assertAlmostEqual(float(policy["edge_buffer_bps"]), 4.0)
+
+    def test_pair_policy_uses_manual_settings_override(self) -> None:
+        policy = _auto_exit_policy_for_pair(
+            "binance",
+            "okx",
+            manual_settings={
+                "auto_exit_policy": {
+                    "tier2": {
+                        "chunk_notional_cap_usd": 7777.0,
+                        "market_cleanup_notional_cap_usd": 555.0,
+                        "edge_buffer_bps": 6.5,
+                    }
+                }
+            },
+        )
+        self.assertEqual(policy["policy_key"], "tier2")
+        self.assertAlmostEqual(float(policy["chunk_notional_cap_usd"]), 7777.0)
+        self.assertAlmostEqual(float(policy["market_cleanup_notional_cap_usd"]), 555.0)
+        self.assertAlmostEqual(float(policy["edge_buffer_bps"]), 6.5)
+
+    def test_executable_metrics_use_exit_sides_and_book_capped_chunk(self) -> None:
+        metrics = _auto_exit_executable_metrics_from_books(
+            long_exchange="binance",
+            short_exchange="gate",
+            long_book={
+                "bids": [[100.0, 5.0], [99.9, 5.0]],
+                "asks": [[100.1, 5.0]],
+            },
+            short_book={
+                "bids": [[97.8, 5.0]],
+                "asks": [[98.0, 5.0], [98.1, 5.0]],
+            },
+            qty=10.0,
+            max_slippage_bps=8.0,
+            fee_bps=_auto_exit_pair_fee_bps("binance", "gate"),
+            edge_buffer_bps=8.0,
+            chunk_notional_cap_usd=500.0,
+        )
+        self.assertIsNotNone(metrics)
+        assert metrics is not None
+        self.assertAlmostEqual(float(metrics["liquidity_cap_qty"]), 10.0, places=6)
+        self.assertAlmostEqual(float(metrics["chunk_qty"]), 5.0, places=6)
+        self.assertAlmostEqual(float(metrics["chunk_notional_usd"]), 500.0, places=6)
+        self.assertAlmostEqual(float(metrics["avg_sell_long"]), 100.0, places=6)
+        self.assertAlmostEqual(float(metrics["avg_buy_short"]), 98.0, places=6)
+        self.assertAlmostEqual(float(metrics["spread_pct"]), 2.0, places=6)
+        self.assertAlmostEqual(float(metrics["net_spread_pct"]), 1.91, places=6)
+        self.assertIsNone(metrics["safety_factor"])
+
+    def test_market_cleanup_status_blocks_lower_tier_venue(self) -> None:
+        status = _auto_exit_market_cleanup_status(
+            long_exchange="binance",
+            short_exchange="gate",
+            cleanup_cap_usd=2500.0,
+            estimated_notional_usd=1000.0,
+        )
+        self.assertFalse(status["allowed"])
+        self.assertIn("BINANCE:allow", status["summary"])
+        self.assertIn("GATE:block:tier_blocked", status["summary"])
+
+    def test_market_cleanup_status_blocks_by_notional_cap(self) -> None:
+        status = _auto_exit_market_cleanup_status(
+            long_exchange="okx",
+            short_exchange="binance",
+            cleanup_cap_usd=2500.0,
+            estimated_notional_usd=3000.0,
+        )
+        self.assertFalse(status["allowed"])
+        self.assertIn("OKX:block:notional_cap", status["summary"])
+        self.assertIn("BINANCE:block:notional_cap", status["summary"])
+
+    def test_execution_order_prefers_lower_tier_as_primary(self) -> None:
+        order = _auto_exit_execution_order(
+            long_exchange="binance",
+            short_exchange="gate",
+            long_book={"bids": [[100.0, 10.0], [99.9, 10.0], [99.8, 10.0]]},
+            short_book={"asks": [[98.0, 5.0], [98.1, 5.0], [98.2, 5.0]]},
+        )
+        self.assertEqual(order["primary_label"], "short")
+        self.assertEqual(order["primary_exchange"], "gate")
+        self.assertEqual(order["hedge_label"], "long")
+        self.assertEqual(order["hedge_exchange"], "binance")
+        self.assertEqual(order["reason"], "lower_venue_tier")
+
+    def test_edge_delta_bps_positive_and_negative(self) -> None:
+        self.assertAlmostEqual(_auto_exit_edge_delta_bps(1.95, 1.91), 4.0)
+        self.assertAlmostEqual(_auto_exit_edge_delta_bps(1.88, 1.91), -3.0)
+        self.assertIsNone(_auto_exit_edge_delta_bps(None, 1.91))
+
+    def test_v1_window_uses_short_interval_decision_bucket(self) -> None:
+        window = _auto_exit_v1_window(60.0, 8.0)
+        self.assertEqual(window["bucket"], "1h")
+        self.assertEqual(window["stage"], "decision")
+        self.assertAlmostEqual(float(window["take_profit_k"]), 4.0)
+        self.assertAlmostEqual(float(window["hard_exit_negative_funding_bps"]), -2.0)
+
+    def test_v1_decision_exits_on_negative_funding_inside_decision_window(self) -> None:
+        window = _auto_exit_v1_window(60.0, 8.0)
+        decision = _auto_exit_v1_decision(
+            close_now_bps=1.0,
+            funding_to_next_bps=-3.0,
+            reversion_credit_bps=0.0,
+            window=window,
+        )
+        self.assertEqual(decision["decision"], "exit")
+        self.assertEqual(decision["reason"], "negative_funding_decision_window")
+
+    def test_v1_take_profit_requires_at_least_40_bps(self) -> None:
+        window = _auto_exit_v1_window(240.0, 200.0)
+        decision = _auto_exit_v1_decision(
+            close_now_bps=30.0,
+            funding_to_next_bps=5.0,
+            reversion_credit_bps=0.0,
+            window=window,
+        )
+        self.assertEqual(decision["decision"], "hold")
+        self.assertAlmostEqual(float(decision["take_profit_threshold_bps"]), 40.0)
+
+    def test_v1_take_profit_uses_4x_funding_when_above_floor(self) -> None:
+        window = _auto_exit_v1_window(240.0, 200.0)
+        decision = _auto_exit_v1_decision(
+            close_now_bps=85.0,
+            funding_to_next_bps=20.5,
+            reversion_credit_bps=0.0,
+            window=window,
+        )
+        self.assertEqual(decision["decision"], "exit")
+        self.assertEqual(decision["reason"], "take_profit_multiple")
+        self.assertAlmostEqual(float(decision["take_profit_threshold_bps"]), 82.0)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,7 @@ from config import BASE_DIR
 from execution.accounts import EXCHANGE_SPECS, ExchangeGateway, _bootstrap_env
 
 KUCOIN_PRIVATE_REST_URL = "https://api-futures.kucoin.com/api/v1/bullet-private"
+KUCOIN_SERVER_TIME_URL = "https://api-futures.kucoin.com/api/v1/timestamp"
 
 logger = logging.getLogger(__name__)
 _RAW_LOGGER = logging.getLogger("ws_trade_kucoin_raw")
@@ -42,6 +43,14 @@ def _sign_kucoin(secret: str, payload: str) -> str:
     return base64.b64encode(
         hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
     ).decode("utf-8")
+
+
+def _is_kucoin_timestamp_error(payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    code = str(payload.get("code") or "").strip()
+    message = str(payload.get("msg") or payload.get("message") or "").lower()
+    return code == "400002" or "kc-api-timestamp" in message
 
 
 class WsTradeKucoinRawStream:
@@ -126,10 +135,6 @@ class WsTradeKucoinRawStream:
             await self._log_line("[err] kucoin api key/secret/passphrase missing")
             return None
         timestamp = str(int(time.time() * 1000))
-        method = "POST"
-        path = "/api/v1/bullet-private"
-        prehash = f"{timestamp}{method}{path}"
-        signature = _sign_kucoin(api_secret, prehash)
         options = getattr(gateway, "options", None) or getattr(gateway.spec, "options", None) or {}
         key_version = str(
             os.getenv("KUCOIN_API_KEY_VERSION")
@@ -140,21 +145,28 @@ class WsTradeKucoinRawStream:
         passphrase_value = passphrase
         if key_version == "2":
             passphrase_value = _sign_kucoin(api_secret, passphrase)
-        headers = {
-            "KC-API-KEY": api_key,
-            "KC-API-SIGN": signature,
-            "KC-API-TIMESTAMP": timestamp,
-            "KC-API-PASSPHRASE": passphrase_value,
-            "KC-API-KEY-VERSION": key_version,
-        }
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    KUCOIN_PRIVATE_REST_URL,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    payload = await resp.json()
+                server_timestamp = await self._fetch_server_timestamp(session)
+                payload = await self._post_private_bullet(
+                    session,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    passphrase_value=passphrase_value,
+                    key_version=key_version,
+                    timestamp=server_timestamp or timestamp,
+                )
+                if _is_kucoin_timestamp_error(payload):
+                    retry_timestamp = await self._fetch_server_timestamp(session)
+                    if retry_timestamp:
+                        payload = await self._post_private_bullet(
+                            session,
+                            api_key=api_key,
+                            api_secret=api_secret,
+                            passphrase_value=passphrase_value,
+                            key_version=key_version,
+                            timestamp=retry_timestamp,
+                        )
         except Exception as exc:  # pylint: disable=broad-except
             await self._log_line(f"[err] bullet-private failed: {exc}")
             return None
@@ -168,6 +180,54 @@ class WsTradeKucoinRawStream:
             await self._log_line(f"[err] bullet-private response: {payload}")
             return None
         return f"{endpoint}?token={token}"
+
+    async def _fetch_server_timestamp(self, session: aiohttp.ClientSession) -> str | None:
+        try:
+            async with session.get(
+                KUCOIN_SERVER_TIME_URL,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                payload = await resp.json()
+        except Exception:
+            return None
+        raw = payload.get("data") if isinstance(payload, dict) else None
+        try:
+            value = int(float(raw))
+        except Exception:
+            return None
+        if value <= 0:
+            return None
+        if value < 1_000_000_000_000:
+            value *= 1000
+        return str(value)
+
+    async def _post_private_bullet(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        api_key: str,
+        api_secret: str,
+        passphrase_value: str,
+        key_version: str,
+        timestamp: str,
+    ) -> dict:
+        method = "POST"
+        path = "/api/v1/bullet-private"
+        prehash = f"{timestamp}{method}{path}"
+        signature = _sign_kucoin(api_secret, prehash)
+        headers = {
+            "KC-API-KEY": api_key,
+            "KC-API-SIGN": signature,
+            "KC-API-TIMESTAMP": timestamp,
+            "KC-API-PASSPHRASE": passphrase_value,
+            "KC-API-KEY-VERSION": key_version,
+        }
+        async with session.post(
+            KUCOIN_PRIVATE_REST_URL,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            return await resp.json()
 
     async def _send_raw(self, message: dict) -> None:
         if not self._remote_ws:

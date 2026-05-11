@@ -13,7 +13,6 @@ import asyncio
 import json
 import logging
 import math
-import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
@@ -26,10 +25,10 @@ except Exception:  # pragma: no cover - fallback when ccxt missing
     RequestTimeout = tuple()  # type: ignore
 from risk.config import RiskConfig
 from utils.cache_db import SymbolMeta, get_or_fetch_symbol_meta, upsert_symbol_meta
+from utils.notifications import NotificationRouter
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-import aiohttp
 
 logger = logging.getLogger(__name__)
 protective_logger = logging.getLogger("protective")
@@ -94,16 +93,37 @@ def _as_bool_text(value: bool) -> str:
 class ProtectiveOrderManager:
     """Best-effort protective order synchroniser built on ccxt gateways."""
 
-    def __init__(self, risk_config: RiskConfig, blocked_exchanges: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        risk_config: RiskConfig,
+        blocked_exchanges: set[str] | None = None,
+        notifier: NotificationRouter | None = None,
+    ) -> None:
         self._risk_config = risk_config
         self._gateways: dict[str, ExchangeGateway] = {
             spec.slug: ExchangeGateway(spec) for spec in EXCHANGE_SPECS
         }
         self._blocked = {ex.lower() for ex in (blocked_exchanges or {"mexc"})}
+        self._notifier = notifier or NotificationRouter(
+            primary_channel=getattr(risk_config, "notification_primary_channel", "telegram"),
+            fallback_channel=getattr(risk_config, "notification_fallback_channel", "none"),
+            telegram_chat_id=getattr(risk_config, "telegram_alert_chat_id", ""),
+        )
         self._lock = asyncio.Lock()
         self._warned_at: dict[str, float] = {}
         self._existing_cache: dict[tuple[str, str, str | None, str | None, float | None, float | None], tuple[dict[str, Any], float]] = {}
         self._existing_cache_ttl = 30.0
+
+    async def _call_with_time_sync_retry(
+        self,
+        gateway: ExchangeGateway,
+        operation: str,
+        callback,
+    ) -> Any:
+        retry = getattr(gateway, "_call_with_time_sync_retry", None)
+        if callable(retry):
+            return await retry(operation, callback)
+        return await callback()
 
     def _refresh_symbol_meta(self, gateway: ExchangeGateway, symbol: str) -> SymbolMeta | None:
         if gateway.slug != "binance":
@@ -203,6 +223,10 @@ class ProtectiveOrderManager:
             "symbol": exch_symbol,
             "side": side,
             "type": order_type,
+            # Keep trigger basis aligned with liquidation/mark-risk logic and
+            # guard against transient contract-price dislocations.
+            "workingType": "MARK_PRICE",
+            "priceProtect": "TRUE",
         }
         symbol_for_precision = target.symbol
         try:
@@ -229,10 +253,17 @@ class ProtectiveOrderManager:
 
     def update_config(self, risk_config: RiskConfig) -> None:
         self._risk_config = risk_config
+        self._notifier.update_config(
+            primary_channel=getattr(risk_config, "notification_primary_channel", "telegram"),
+            fallback_channel=getattr(risk_config, "notification_fallback_channel", "none"),
+            telegram_chat_id=getattr(risk_config, "telegram_alert_chat_id", ""),
+        )
 
     async def sync_protective_orders(
         self,
         positions: Iterable[Mapping[str, Any]],
+        *,
+        force_fetch_existing: bool = False,
     ) -> list[dict[str, Any]]:
         """Compute and place protective orders for the supplied positions."""
         async with self._lock:
@@ -244,7 +275,7 @@ class ProtectiveOrderManager:
                 for target in targets:
                     tasks.append(
                         asyncio.create_task(
-                            self._sync_leg(target)
+                            self._sync_leg(target, force_fetch_existing=force_fetch_existing)
                         )
                     )
             if tasks:
@@ -254,6 +285,34 @@ class ProtectiveOrderManager:
                         actions.append(result)
                     elif isinstance(result, Exception):
                         logger.warning("Protective sync error: %s", result)
+            return actions
+
+    async def verify_protective_orders(
+        self,
+        positions: Iterable[Mapping[str, Any]],
+        *,
+        force_fetch_existing: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Verify that protective orders currently match computed targets without placing orders."""
+        async with self._lock:
+            tasks = []
+            actions: list[dict[str, Any]] = []
+            grouped = self._group_by_symbol(list(positions))
+            for symbol, legs in grouped.items():
+                targets = self._compute_targets(symbol, legs)
+                for target in targets:
+                    tasks.append(
+                        asyncio.create_task(
+                            self._verify_leg(target, force_fetch_existing=force_fetch_existing)
+                        )
+                    )
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, dict):
+                        actions.append(result)
+                    elif isinstance(result, Exception):
+                        logger.warning("Protective verify error: %s", result)
             return actions
 
     def _group_by_symbol(self, positions: List[Mapping[str, Any]]) -> dict[str, list[Mapping[str, Any]]]:
@@ -460,10 +519,13 @@ class ProtectiveOrderManager:
     async def _sync_leg(
         self,
         target: ProtectiveTarget,
+        *,
+        force_fetch_existing: bool = False,
     ) -> dict[str, Any]:
         gw = self._gateways.get(target.exchange)
         threshold = max(0.0, float(self._risk_config.stop_requote_threshold_pct))
         qty_threshold = max(0.01, threshold)
+        max_stop_age_sec = max(0, int(getattr(self._risk_config, "stop_force_requote_max_age_sec", 120) or 0))
         if gw is None:
             return {"exchange": target.exchange, "symbol": target.symbol, "status": "skipped", "reason": "adapter_missing"}
         if target.quantity <= 0:
@@ -493,6 +555,7 @@ class ProtectiveOrderManager:
                         target.side,
                         mark_price=target.mark_price,
                         entry_price=target.entry_price,
+                        force_fetch=force_fetch_existing,
                     )
             except Exception:  # pylint: disable=broad-except
                 existing = {"order_ids": [], "error": "existing_fetch_failed"}
@@ -502,7 +565,23 @@ class ProtectiveOrderManager:
                 target.quantity,
                 threshold,
                 qty_threshold,
+                max_age_sec=max_stop_age_sec,
             )
+            stop_age = None
+            stop_stale = False
+            blocked_stop_orders = existing.get("stop_orders") or []
+            if max_stop_age_sec > 0 and len(blocked_stop_orders) == 1:
+                stop_age = self._order_age_sec(blocked_stop_orders[0])
+                stop_stale = stop_age is not None and stop_age > float(max_stop_age_sec)
+                if stop_stale:
+                    protective_logger.warning(
+                        "stale stop detected exchange=%s symbol=%s side=%s age_sec=%.1f max_age_sec=%s",
+                        target.exchange,
+                        target.symbol,
+                        target.side,
+                        stop_age,
+                        max_stop_age_sec,
+                    )
             take_diff, take_delta = self._needs_take_update(
                 existing.get("take_orders") or [],
                 target.takes,
@@ -536,6 +615,8 @@ class ProtectiveOrderManager:
                 "reason": reason,
                 "delta_stop": stop_delta,
                 "delta_take": take_delta,
+                "stop_age_sec": stop_age,
+                "stop_stale": stop_stale,
             }
             protective_logger.info(
                 "protective action %s %s %s stop=%s take=%s qty=%s status=%s error=%s d_stop=%s d_take=%s",
@@ -573,6 +654,7 @@ class ProtectiveOrderManager:
             target.side,
             mark_price=target.mark_price,
             entry_price=target.entry_price,
+            force_fetch=force_fetch_existing,
         )
         actions: dict[str, Any] = {
             "exchange": target.exchange,
@@ -595,13 +677,30 @@ class ProtectiveOrderManager:
             target.quantity,
             threshold,
             qty_threshold,
+            max_age_sec=max_stop_age_sec,
         )
+        stop_age = None
+        stop_stale = False
+        if max_stop_age_sec > 0 and len(existing_stop_orders) == 1:
+            stop_age = self._order_age_sec(existing_stop_orders[0])
+            stop_stale = stop_age is not None and stop_age > float(max_stop_age_sec)
+            if stop_stale:
+                protective_logger.warning(
+                    "stale stop detected exchange=%s symbol=%s side=%s age_sec=%.1f max_age_sec=%s",
+                    target.exchange,
+                    target.symbol,
+                    target.side,
+                    stop_age,
+                    max_stop_age_sec,
+                )
         take_diff, take_delta = self._needs_take_update(
             existing_take_orders,
             target.takes,
             threshold,
             qty_threshold,
         )
+        actions["stop_age_sec"] = stop_age
+        actions["stop_stale"] = stop_stale
 
         invalid_side = bool(existing.get("invalid_side"))
         if invalid_side:
@@ -624,7 +723,10 @@ class ProtectiveOrderManager:
         take_skipped_min = False
         stop_skipped_invalid = False
         take_skipped_invalid = False
+        place_stop_required = bool(target.stop and (stop_diff or invalid_side))
+        place_take_required = bool(target.takes and (take_diff or invalid_side))
         try:
+            cancel_failures: list[str] = []
             if to_cancel:
                 algo_ids = set(existing.get("algo_order_ids") or [])
                 for oid in to_cancel:
@@ -635,47 +737,112 @@ class ProtectiveOrderManager:
                         if gw.slug == "gate":
                             cancel_params["trigger"] = True
                         if gw.slug == "binance" and oid in algo_ids:
-                            await self._cancel_binance_algo_order(gw, algo_id=oid)
+                            await self._call_with_time_sync_retry(
+                                gw,
+                                "cancel_binance_algo_order",
+                                lambda: self._cancel_binance_algo_order(gw, algo_id=oid),
+                            )
                             continue
                         if gw.slug == "okx" and oid in algo_ids:
                             cancel_params["trigger"] = True
-                        await gw.client.cancel_order(oid, target.symbol, params=cancel_params)
-                    except Exception:  # pragma: no cover - defensive
-                        logger.debug("%s cancel %s failed", target.exchange, oid)
-            if target.stop and stop_diff:
-                try:
-                    await self._place_stop(gw, target, target.stop)
-                except InvalidProtectivePrice as exc:
-                    stop_skipped_invalid = True
-                    actions["error"] = str(exc)
-                    logger.info("Skipping stop placement (invalid price) for %s %s: %s", target.exchange, target.symbol, exc)
-            if target.takes and take_diff:
-                for take in target.takes:
-                    if take.quantity <= 0:
-                        continue
-                    try:
-                        await self._place_take(gw, target, take.price, quantity=take.quantity)
-                    except InvalidProtectivePrice as exc:
-                        take_skipped_invalid = True
-                        actions["error"] = str(exc)
-                        logger.info("Skipping take placement (invalid price) for %s %s: %s", target.exchange, target.symbol, exc)
-                    except Exception as exc:  # pylint: disable=broad-except
-                        msg = str(exc)
-                        # Bybit enforces TP >=10% of position size; degrade gracefully.
-                        if "10_pcnt" in msg or "PartialTakeProfit" in msg:
-                            take_skipped_min = True
-                            actions["error"] = msg
-                            logger.info("Skipping take placement (min-size) for %s %s: %s", target.exchange, target.symbol, msg)
-                        else:
-                            raise
-            if stop_skipped_invalid:
-                actions["status"] = "stop_skipped_invalid_price"
-            elif take_skipped_invalid:
-                actions["status"] = "take_skipped_invalid_price"
-            elif take_skipped_min:
-                actions["status"] = "take_skipped_min_size"
+                        await self._call_with_time_sync_retry(
+                            gw,
+                            "cancel_order",
+                            lambda: gw.client.cancel_order(oid, target.symbol, params=cancel_params),
+                        )
+                    except Exception as exc:  # pragma: no cover - defensive
+                        cancel_failures.append(str(oid))
+                        logger.warning(
+                            "%s cancel %s failed for %s: %s",
+                            target.exchange,
+                            oid,
+                            target.symbol,
+                            exc,
+                        )
+            if cancel_failures:
+                actions["status"] = "cancel_failed"
+                actions["error"] = f"cancel_failed:{','.join(cancel_failures)}"
+                actions["cancel_failures"] = cancel_failures
             else:
-                actions["status"] = "updated" if (stop_diff or take_diff) else "unchanged"
+                lingering_cancel_ids: list[str] = []
+                if to_cancel:
+                    existing_after_cancel = await self._fetch_existing(
+                        gw,
+                        target.symbol,
+                        target.position_id,
+                        target.side,
+                        mark_price=target.mark_price,
+                        entry_price=target.entry_price,
+                        force_fetch=True,
+                    )
+                    active_ids = {
+                        str(order_id)
+                        for order_id in (existing_after_cancel.get("order_ids") or [])
+                        if order_id
+                    }
+                    lingering_cancel_ids = [oid for oid in to_cancel if oid in active_ids]
+                    if lingering_cancel_ids:
+                        actions["status"] = "cancel_pending"
+                        actions["error"] = f"cancel_pending:{','.join(lingering_cancel_ids)}"
+                        actions["cancel_pending_ids"] = lingering_cancel_ids
+                        actions["existing_after_cancel"] = existing_after_cancel
+                        logger.warning(
+                            "%s cancel not confirmed for %s %s: %s",
+                            target.exchange,
+                            target.symbol,
+                            target.side,
+                            ",".join(lingering_cancel_ids),
+                        )
+                if not lingering_cancel_ids:
+                    if place_stop_required:
+                        try:
+                            await self._place_stop(gw, target, target.stop)
+                        except InvalidProtectivePrice as exc:
+                            stop_skipped_invalid = True
+                            actions["error"] = str(exc)
+                            logger.info(
+                                "Skipping stop placement (invalid price) for %s %s: %s",
+                                target.exchange,
+                                target.symbol,
+                                exc,
+                            )
+                    if place_take_required:
+                        for take in target.takes:
+                            if take.quantity <= 0:
+                                continue
+                            try:
+                                await self._place_take(gw, target, take.price, quantity=take.quantity)
+                            except InvalidProtectivePrice as exc:
+                                take_skipped_invalid = True
+                                actions["error"] = str(exc)
+                                logger.info(
+                                    "Skipping take placement (invalid price) for %s %s: %s",
+                                    target.exchange,
+                                    target.symbol,
+                                    exc,
+                                )
+                            except Exception as exc:  # pylint: disable=broad-except
+                                msg = str(exc)
+                                # Bybit enforces TP >=10% of position size; degrade gracefully.
+                                if "10_pcnt" in msg or "PartialTakeProfit" in msg:
+                                    take_skipped_min = True
+                                    actions["error"] = msg
+                                    logger.info(
+                                        "Skipping take placement (min-size) for %s %s: %s",
+                                        target.exchange,
+                                        target.symbol,
+                                        msg,
+                                    )
+                                else:
+                                    raise
+                    if stop_skipped_invalid:
+                        actions["status"] = "stop_skipped_invalid_price"
+                    elif take_skipped_invalid:
+                        actions["status"] = "take_skipped_invalid_price"
+                    elif take_skipped_min:
+                        actions["status"] = "take_skipped_min_size"
+                    else:
+                        actions["status"] = "updated" if (place_stop_required or place_take_required) else "unchanged"
         except Exception as exc:  # pylint: disable=broad-except
             if RequestTimeout and isinstance(exc, RequestTimeout):
                 actions["status"] = "timeout"
@@ -729,6 +896,120 @@ class ProtectiveOrderManager:
             )
         return actions
 
+    async def _verify_leg(
+        self,
+        target: ProtectiveTarget,
+        *,
+        force_fetch_existing: bool = True,
+    ) -> dict[str, Any]:
+        gw = self._gateways.get(target.exchange)
+        threshold = max(0.0, float(self._risk_config.stop_requote_threshold_pct))
+        qty_threshold = max(0.01, threshold)
+        max_stop_age_sec = max(0, int(getattr(self._risk_config, "stop_force_requote_max_age_sec", 120) or 0))
+        if gw is None:
+            return {
+                "exchange": target.exchange,
+                "symbol": target.symbol,
+                "side": target.side,
+                "status": "skipped",
+                "reason": "adapter_missing",
+            }
+        if target.quantity <= 0:
+            return {
+                "exchange": target.exchange,
+                "symbol": target.symbol,
+                "side": target.side,
+                "status": "skipped",
+                "reason": "zero_quantity",
+            }
+        if target.stop is None and not target.takes:
+            return {
+                "exchange": target.exchange,
+                "symbol": target.symbol,
+                "side": target.side,
+                "status": "skipped",
+                "reason": "no_targets",
+            }
+        try:
+            await gw.refresh_credentials_async()
+            await gw.ensure_client()
+        except Exception as exc:  # pylint: disable=broad-except
+            return {
+                "exchange": target.exchange,
+                "symbol": target.symbol,
+                "side": target.side,
+                "status": "error",
+                "reason": f"client_init_failed: {exc}",
+            }
+        if not gw.client:
+            return {
+                "exchange": target.exchange,
+                "symbol": target.symbol,
+                "side": target.side,
+                "status": "skipped",
+                "reason": "no_client",
+            }
+        existing = await self._fetch_existing(
+            gw,
+            target.symbol,
+            target.position_id,
+            target.side,
+            mark_price=target.mark_price,
+            entry_price=target.entry_price,
+            force_fetch=force_fetch_existing,
+        )
+        existing_stop_orders = existing.get("stop_orders") or []
+        existing_take_orders = existing.get("take_orders") or []
+        stop_diff, stop_delta = self._needs_stop_update(
+            existing_stop_orders,
+            target.stop,
+            target.quantity,
+            threshold,
+            qty_threshold,
+            max_age_sec=max_stop_age_sec,
+        )
+        take_diff, take_delta = self._needs_take_update(
+            existing_take_orders,
+            target.takes,
+            threshold,
+            qty_threshold,
+        )
+        missing_parts = []
+        if target.stop and not existing_stop_orders:
+            missing_parts.append("stop")
+        if target.takes and not existing_take_orders:
+            missing_parts.append("take")
+        status = "ok"
+        reasons: list[str] = []
+        if bool(existing.get("invalid_side")):
+            status = "issue"
+            reasons.append("invalid_side")
+        if missing_parts:
+            status = "issue"
+            reasons.append(f"missing:{','.join(missing_parts)}")
+        if stop_diff:
+            status = "issue"
+            reasons.append("stop_mismatch")
+        if take_diff:
+            status = "issue"
+            reasons.append("take_mismatch")
+        if not reasons:
+            reasons.append("match")
+        return {
+            "exchange": target.exchange,
+            "symbol": target.symbol,
+            "position_id": target.position_id,
+            "side": target.side,
+            "status": status,
+            "reason": ";".join(reasons),
+            "existing": existing,
+            "target_stop": target.stop,
+            "target_take": self._summarize_takes(target.takes),
+            "target_takes": [{"price": t.price, "qty": t.quantity} for t in target.takes],
+            "delta_stop": stop_delta,
+            "delta_take": take_delta,
+        }
+
     async def _fetch_existing(
         self,
         gateway: ExchangeGateway,
@@ -738,6 +1019,7 @@ class ProtectiveOrderManager:
         *,
         mark_price: float | None = None,
         entry_price: float | None = None,
+        force_fetch: bool = False,
     ) -> dict[str, Any]:
         cache_key = self._existing_cache_key(
             gateway.slug,
@@ -747,11 +1029,12 @@ class ProtectiveOrderManager:
             mark_price,
             entry_price,
         )
-        cached = self._existing_cache.get(cache_key)
-        if cached:
-            payload, ts = cached
-            if time.time() - ts <= self._existing_cache_ttl:
-                return self._clone_existing(payload)
+        if not force_fetch:
+            cached = self._existing_cache.get(cache_key)
+            if cached:
+                payload, ts = cached
+                if time.time() - ts <= self._existing_cache_ttl:
+                    return self._clone_existing(payload)
         orders: list[dict[str, Any]] = []
         try:
             # KuCoin stop orders live in a separate endpoint; fetch both.
@@ -975,7 +1258,8 @@ class ProtectiveOrderManager:
                 mark_price=mark_price,
                 entry_price=entry_price,
             )
-            payload = {"id": oid, "price": order_price, "qty": order_qty}
+            order_ts = self._extract_order_created_ts(order, info)
+            payload = {"id": oid, "price": order_price, "qty": order_qty, "created_ts": order_ts}
             if kind == "take":
                 take_orders.append(payload)
             elif kind == "stop":
@@ -1125,6 +1409,30 @@ class ProtectiveOrderManager:
             return None
         return abs(qty)
 
+    def _extract_order_created_ts(self, order: Mapping[str, Any], info: Mapping[str, Any]) -> float | None:
+        candidates = (
+            order.get("timestamp"),
+            order.get("lastUpdateTimestamp"),
+            order.get("updateTime"),
+            info.get("timestamp"),
+            info.get("time"),
+            info.get("createdTime"),
+            info.get("cTime"),
+            info.get("uTime"),
+            info.get("ts"),
+        )
+        for raw in candidates:
+            val = _safe_float(raw)
+            if val is None or val <= 0:
+                continue
+            # Normalize ms to seconds.
+            if val > 1e12:
+                return val / 1000.0
+            if val > 1e10:
+                return val / 1000.0
+            return val
+        return None
+
     def _needs_update(self, current: float | None, target: float | None, threshold: float) -> tuple[bool, float | None]:
         if target is None:
             return False, None
@@ -1147,6 +1455,16 @@ class ProtectiveOrderManager:
             return True
         return delta >= threshold
 
+    def _order_age_sec(self, order: Mapping[str, Any]) -> float | None:
+        ts_val = _safe_float(order.get("created_ts") or order.get("timestamp"))
+        if ts_val is None or ts_val <= 0:
+            return None
+        try:
+            now = time.time()
+            return max(0.0, now - ts_val)
+        except Exception:
+            return None
+
     def _needs_stop_update(
         self,
         existing: list[Mapping[str, Any]],
@@ -1154,6 +1472,8 @@ class ProtectiveOrderManager:
         target_qty: float,
         price_threshold: float,
         qty_threshold: float,
+        *,
+        max_age_sec: int = 0,
     ) -> tuple[bool, float | None]:
         if target_stop is None:
             return False, None
@@ -1166,7 +1486,11 @@ class ProtectiveOrderManager:
             return True, None
         price_diff, delta = self._needs_update(existing_stop, target_stop, price_threshold)
         qty_diff = self._needs_qty_update(_safe_float(existing[0].get("qty")), target_qty, qty_threshold)
-        if price_diff or qty_diff:
+        stale = False
+        if max_age_sec > 0:
+            age_sec = self._order_age_sec(existing[0])
+            stale = age_sec is not None and age_sec > float(max_age_sec)
+        if price_diff or qty_diff or stale:
             return True, delta
         return False, delta
 
@@ -1238,6 +1562,7 @@ class ProtectiveOrderManager:
             params.update(
                 {
                     "stopLossPrice": rounded,
+                    "slTriggerBy": "MarkPrice",
                     "tpslMode": "Full",
                 }
             )
@@ -1267,6 +1592,7 @@ class ProtectiveOrderManager:
                 params["marginCoin"] = margin_coin
         elif gateway.slug == "okx":
             params["stopLossPrice"] = rounded
+            params["slTriggerPxType"] = "mark"
             pos_side = target.pos_side or target.side
             if pos_side in ("net", "long", "short"):
                 params["posSide"] = pos_side
@@ -1277,20 +1603,39 @@ class ProtectiveOrderManager:
             params.update(
                 {
                     "stopPrice": rounded,
+                    "stopPriceType": "MP",
                     "stop": trigger,
                     "closeOrder": True,  # ensure position-closing behaviour
                 }
             )
             if target.margin_mode:
                 params["marginMode"] = target.margin_mode
+        elif gateway.slug == "gate":
+            params.update(
+                {
+                    "stopLossPrice": rounded,
+                    "price_type": 1,
+                }
+            )
+        elif gateway.slug == "bingx":
+            params.update(
+                {
+                    "stopLossPrice": rounded,
+                    "workingType": "MARK_PRICE",
+                }
+            )
         else:
             params["stopLossPrice"] = rounded
-        await gateway.client.create_order(  # type: ignore[union-attr]
-            symbol=symbol,
-            type=order_type,
-            side="sell" if target.side == "long" else "buy",
-            amount=target.quantity,
-            params=params,
+        await self._call_with_time_sync_retry(
+            gateway,
+            "create_order",
+            lambda: gateway.client.create_order(  # type: ignore[union-attr]
+                symbol=symbol,
+                type=order_type,
+                side="sell" if target.side == "long" else "buy",
+                amount=target.quantity,
+                params=params,
+            ),
         )
 
     async def _place_take(
@@ -1319,6 +1664,7 @@ class ProtectiveOrderManager:
             params.update(
                 {
                     "takeProfitPrice": rounded,
+                    "tpTriggerBy": "MarkPrice",
                     "tpslMode": "Full",
                 }
             )
@@ -1349,6 +1695,7 @@ class ProtectiveOrderManager:
                 params["marginCoin"] = margin_coin
         elif gateway.slug == "okx":
             params["takeProfitPrice"] = rounded
+            params["tpTriggerPxType"] = "mark"
             pos_side = target.pos_side or target.side
             if pos_side in ("net", "long", "short"):
                 params["posSide"] = pos_side
@@ -1359,21 +1706,40 @@ class ProtectiveOrderManager:
             params.update(
                 {
                     "stopPrice": rounded,
+                    "stopPriceType": "MP",
                     "stop": trigger,
                     "closeOrder": True,
                 }
             )
             if target.margin_mode:
                 params["marginMode"] = target.margin_mode
+        elif gateway.slug == "gate":
+            params.update(
+                {
+                    "takeProfitPrice": rounded,
+                    "price_type": 1,
+                }
+            )
+        elif gateway.slug == "bingx":
+            params.update(
+                {
+                    "takeProfitPrice": rounded,
+                    "workingType": "MARK_PRICE",
+                }
+            )
         else:
             params["takeProfitPrice"] = rounded
         order_qty = quantity if quantity is not None else target.quantity
-        await gateway.client.create_order(  # type: ignore[union-attr]
-            symbol=symbol,
-            type=order_type,
-            side="sell" if target.side == "long" else "buy",
-            amount=order_qty,
-            params=params,
+        await self._call_with_time_sync_retry(
+            gateway,
+            "create_order",
+            lambda: gateway.client.create_order(  # type: ignore[union-attr]
+                symbol=symbol,
+                type=order_type,
+                side="sell" if target.side == "long" else "buy",
+                amount=order_qty,
+                params=params,
+            ),
         )
 
     async def _round_price(
@@ -1419,7 +1785,7 @@ class ProtectiveOrderManager:
         return max(base * 0.01, base * (1.0 - ratio))
 
     async def _send_telegram_warning(self, text: str, *, key: str | None = None) -> None:
-        """Lightweight Telegram notifier for protective issues with cooldown."""
+        """Lightweight notifier for protective issues with cooldown."""
         if hasattr(self._risk_config, "send_missing_stop_alerts") and not self._risk_config.send_missing_stop_alerts:
             return
         cooldown = max(0, int(self._risk_config.protective_warn_cooldown_sec or 0))
@@ -1428,19 +1794,8 @@ class ProtectiveOrderManager:
         last = self._warned_at.get(warn_key, 0)
         if cooldown and (now - last) < cooldown:
             return
-        token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip() or str(self._risk_config.telegram_alert_chat_id or "").strip()
-        if not token or not chat_id:
-            return
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = {"chat_id": chat_id, "text": text}
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.post(url, data=data) as resp:
-                    if resp.status >= 400:
-                        body = await resp.text()
-                        logger.debug("Telegram protective warn failed (%s): %s", resp.status, body)
-                        return
-            self._warned_at[warn_key] = now
+            if await self._notifier.send_text(text, title="FeeArb protective alert"):
+                self._warned_at[warn_key] = now
         except Exception as exc:  # pylint: disable=broad-except
-            logger.debug("Telegram protective warn error: %s", exc)
+            logger.debug("Protective notify error: %s", exc)

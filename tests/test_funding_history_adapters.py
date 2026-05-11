@@ -91,6 +91,21 @@ class FundingHistoryAdaptersTestCase(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertAlmostEqual(float(rows[0].get("interval_hours") or 0.0), 4.0, places=6)
 
+    def test_gate_history_uses_btc_settle_for_inverse_contracts(self) -> None:
+        seen_urls: list[str] = []
+
+        def _fake_get_json(url: str):  # noqa: ANN001
+            seen_urls.append(url)
+            return []
+
+        with patch("exchanges.gate._get_json", side_effect=_fake_get_json), patch(
+            "exchanges.gate.get_or_fetch_funding_history",
+            side_effect=_cache_passthrough,
+        ):
+            GateAdapter().funding_history("BTCUSD", limit=2)
+        self.assertEqual(len(seen_urls), 1)
+        self.assertIn("/futures/btc/funding_rate?", seen_urls[0])
+
     def test_bitget_history_infers_interval(self) -> None:
         payload = {
             "code": "00000",

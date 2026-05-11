@@ -1177,6 +1177,7 @@
     var longStatusEl = document.getElementById('manual-ws-long-status');
     var shortStatusEl = document.getElementById('manual-ws-short-status');
     var symbolEl = document.getElementById('manual-symbol');
+    var enabledEl = document.getElementById('manual-ws-raw-enabled');
     if (!longLogEl || !shortLogEl) {
       return;
     }
@@ -1184,9 +1185,27 @@
     var maxLines = 500;
     var longLogger = createRawLogger(longLogEl, maxLines);
     var shortLogger = createRawLogger(shortLogEl, maxLines);
+    var inputTimer = null;
 
     var longClient = createWsOrderRawClient(longLogger, longStatusEl);
     var shortClient = createWsOrderRawClient(shortLogger, shortStatusEl);
+
+    function isEnabled() {
+      return enabledEl ? !!enabledEl.checked : false;
+    }
+
+    function disconnectClients() {
+      longClient.disconnect();
+      shortClient.disconnect();
+      setStatus(longStatusEl, 'WS raw disabled', 'info');
+      setStatus(shortStatusEl, 'WS raw disabled', 'info');
+      if (longLogger && longLogger.clear) {
+        longLogger.clear();
+      }
+      if (shortLogger && shortLogger.clear) {
+        shortLogger.clear();
+      }
+    }
 
     function resolveExchange(side) {
       var action = currentAction();
@@ -1203,19 +1222,48 @@
     }
 
     function updateClients() {
+      if (!isEnabled()) {
+        disconnectClients();
+        return;
+      }
       var symbol = symbolEl ? symbolEl.value : '';
       longClient.connect(resolveExchange('long'), symbol);
       shortClient.connect(resolveExchange('short'), symbol);
     }
 
+    function scheduleUpdateClients() {
+      if (!isEnabled()) {
+        disconnectClients();
+        return;
+      }
+      if (inputTimer) {
+        window.clearTimeout(inputTimer);
+      }
+      inputTimer = window.setTimeout(function () {
+        inputTimer = null;
+        updateClients();
+      }, 700);
+    }
+
     var form = document.getElementById('manual-form');
     if (form) {
-      form.addEventListener('change', updateClients);
+      form.addEventListener('change', function (evt) {
+        var target = evt && evt.target ? evt.target : null;
+        if (target && target.id === 'manual-ws-raw-enabled') {
+          if (isEnabled()) {
+            updateClients();
+          } else {
+            disconnectClients();
+          }
+          return;
+        }
+        updateClients();
+      });
     }
     if (symbolEl) {
-      symbolEl.addEventListener('input', updateClients);
+      symbolEl.addEventListener('input', scheduleUpdateClients);
     }
-    updateClients();
+    disconnectClients();
 
     function getSelectValue(id) {
       var el = document.getElementById(id);

@@ -1,0 +1,2 @@
+"""Coin analysis collectors package."""
+

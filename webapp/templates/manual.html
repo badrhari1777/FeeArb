@@ -370,6 +370,11 @@
         </div>
         <pre id="manual-exec-log" class="code-block code-block--log code-block--wrap">Execution log will appear here after Execute now.</pre>
         <div class="panel-label">WS order raw streams</div>
+        <label class="settings-checkbox">
+          <input type="checkbox" id="manual-ws-raw-enabled" />
+          Enable WS raw streams
+        </label>
+        <p class="muted">WS raw streams open extra websocket connections. Through Tailscale + BasicAuth this can trigger repeated auth prompts on mobile.</p>
         <div class="manual-ws-raw-grid">
           <div>
             <div class="code-block-header">

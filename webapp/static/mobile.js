@@ -24,6 +24,7 @@
     action: document.getElementById('mobile-action'),
     symbol: document.getElementById('mobile-symbol'),
     qty: document.getElementById('mobile-qty'),
+    chunkQty: document.getElementById('mobile-chunk-qty'),
     longExchange: document.getElementById('mobile-long-exchange'),
     shortExchange: document.getElementById('mobile-short-exchange'),
     fromExchange: document.getElementById('mobile-from-exchange'),
@@ -327,6 +328,7 @@
   function buildManualPayload(action, dryRun) {
     var symbol = elements.symbol ? String(elements.symbol.value || '').trim().toUpperCase() : '';
     var qty = parseOptionalFloat(elements.qty ? elements.qty.value : null);
+    var chunkQty = parseOptionalFloat(elements.chunkQty ? elements.chunkQty.value : null);
     if (!symbol) {
       return { error: 'Symbol is required.', payload: null };
     }
@@ -344,7 +346,7 @@
       timeout_sec: 0,
       max_runtime_sec: 600,
       reprice_sec: 3,
-      chunk_qty: null,
+      chunk_qty: chunkQty,
       chunk_notional: null,
       force_chunk_qty: false,
       use_orderbook_check: true,
@@ -410,6 +412,12 @@
     if (plan.recommended_notional !== undefined && plan.recommended_notional !== null) {
       lines.push('Recommended notional: ' + formatNumber(plan.recommended_notional, 2));
     }
+    if (plan.min_chunk_qty !== undefined && plan.min_chunk_qty !== null) {
+      lines.push('Min chunk qty: ' + formatNumber(plan.min_chunk_qty, 6));
+    }
+    if (plan.recommended_chunk_qty !== undefined && plan.recommended_chunk_qty !== null) {
+      lines.push('Recommended chunk qty: ' + formatNumber(plan.recommended_chunk_qty, 6));
+    }
     if (!lines.length) {
       try {
         return JSON.stringify(plan, null, 2);
@@ -418,6 +426,23 @@
       }
     }
     return lines.join('\n');
+  }
+
+  function applyPlanChunkHint(plan) {
+    if (!elements.chunkQty || !plan) {
+      return;
+    }
+    var current = String(elements.chunkQty.value || '').trim();
+    if (current) {
+      return;
+    }
+    if (plan.recommended_chunk_qty !== undefined && plan.recommended_chunk_qty !== null) {
+      elements.chunkQty.value = plan.recommended_chunk_qty;
+      return;
+    }
+    if (plan.min_chunk_qty !== undefined && plan.min_chunk_qty !== null) {
+      elements.chunkQty.value = plan.min_chunk_qty;
+    }
   }
 
   function formatExecLogs(logs) {
@@ -720,6 +745,7 @@
       if (elements.plan) {
         elements.plan.textContent = formatPlan(data);
       }
+      applyPlanChunkHint(data);
       if (data && data.errors && data.errors.length) {
         setStatus('Analyze completed with errors.', 'error');
       } else {
@@ -746,6 +772,8 @@
       if (elements.plan) {
         elements.plan.textContent = formatPlan(preflight);
       }
+      applyPlanChunkHint(preflight);
+      preflightPayload.chunk_qty = parseOptionalFloat(elements.chunkQty ? elements.chunkQty.value : null);
       if (preflight && preflight.errors && preflight.errors.length) {
         setStatus('Preflight failed. Fix errors first.', 'error');
         return;
@@ -756,6 +784,7 @@
       var confirmText = 'Submit ' + action.toUpperCase() +
         '\nSymbol: ' + preflightPayload.symbol +
         '\nQty: ' + (preflightPayload.qty === null || preflightPayload.qty === undefined ? 'auto' : preflightPayload.qty) +
+        '\nChunk qty: ' + (preflightPayload.chunk_qty === null || preflightPayload.chunk_qty === undefined ? 'auto' : preflightPayload.chunk_qty) +
         '\nSpread: ' + spread +
         '\n\nContinue?';
       if (!window.confirm(confirmText)) {

@@ -29,6 +29,14 @@ DEFAULT_LIMIT_IMPROVE_TICKS = 1
 PRECHECK_RETRIES = 3
 PRECHECK_RETRY_DELAY_SEC = 0.75
 PRECHECK_BALANCE_BUFFER_PCT = 0.05
+DEFAULT_VENUE_LIQUIDITY_TIER = 3
+VENUE_LIQUIDITY_TIERS = {
+    "binance": 1,
+    "okx": 2,
+}
+AUTO_EXIT_RECOMMENDED_CHUNK_SAFETY_FACTOR = 0.5
+AUTO_EXIT_FALLBACK_CHUNK_PCT = 0.25
+AUTO_EXIT_MARKET_FALLBACK_MAX_TIER = 2
 
 
 def _now_iso() -> str:
@@ -470,6 +478,31 @@ def _binance_margin_mode_blocked(exc: Exception) -> bool:
     return "position side cannot be changed" in message or "-4067" in message
 
 
+def _binance_leverage_noop(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "no need to change leverage" in message
+        or ("leverage" in message and "already exist" in message)
+    )
+
+
+def _binance_retryable_leverage_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "requesttimeout" in message
+        or "read timed out" in message
+        or "timed out" in message
+        or "connection reset" in message
+        or "connection aborted" in message
+        or "service unavailable" in message
+        or "temporarily unavailable" in message
+        or "exchange not available" in message
+        or "networkerror" in message
+        or "network error" in message
+        or "binanceusdm post https://fapi.binance.com/fapi/v1/leverage" in message
+    )
+
+
 def _kucoin_margin_mode_noop(exc: Exception) -> bool:
     message = str(exc).lower()
     if "margin" not in message:
@@ -501,6 +534,82 @@ def _is_min_order_size_error(error: Any) -> bool:
         "amount precision",
     )
     return any(pattern in message for pattern in patterns)
+
+
+def _classify_submit_error(error: Any) -> str | None:
+    message = str(error or "")
+    lower = message.lower()
+    if not lower:
+        return None
+    if "invalid api-key" in lower or "permissions for action" in lower or "authenticationerror" in lower:
+        return "auth_error"
+    if "tradfi-perps agreement" in lower:
+        return "tradfi_agreement_required"
+    if "position risk control" in lower and "reduce-only" in lower:
+        return "reduce_only_required"
+    if "reduce-only" in lower and (
+        "no open position" in lower
+        or "position qty" in lower
+        or "exceeds open position" in lower
+        or "no reducible position" in lower
+    ):
+        return "reduce_only_required"
+    if (
+        "price band" in lower
+        or "price limit" in lower
+        or "outside price limits" in lower
+        or "above max price" in lower
+        or "below min price" in lower
+    ):
+        return "price_band"
+    if "tick size" in lower:
+        return "tick_size"
+    if _is_min_order_size_error(message) or "notional must be no smaller than 5" in lower:
+        return "min_order_size"
+    if "maximum risk limit" in lower or "\"code\":\"300005\"" in lower or "\"code\":300005" in lower:
+        return "risk_limit"
+    return None
+
+
+def _normalize_submit_values(
+    *,
+    qty: float,
+    price: float | None,
+    side: str,
+    order_type: str,
+    min_qty: float | None,
+    min_notional: float | None,
+    amount_step: float | None,
+    price_step: float | None,
+    price_min: float | None = None,
+    price_max: float | None = None,
+) -> tuple[float | None, float | None, str | None]:
+    qty_base = float(qty)
+    if amount_step and amount_step > 0:
+        qty_base = _round_to_step(qty_base, amount_step, mode="down")
+    if qty_base <= 0:
+        return None, None, "qty_below_step"
+    qty_tol = (amount_step * 0.5) if amount_step and amount_step > 0 else 1e-12
+    if min_qty is not None and qty_base + qty_tol < float(min_qty):
+        return None, None, f"qty {qty_base:g} below min qty {float(min_qty):g}"
+    adjusted_price = float(price) if price is not None else None
+    if adjusted_price is not None and adjusted_price <= 0:
+        return None, None, "invalid_price"
+    if adjusted_price is not None and price_step and price_step > 0 and order_type == "limit":
+        round_mode = "down" if str(side).lower() == "buy" else "up"
+        adjusted_price = _round_to_step(adjusted_price, price_step, mode=round_mode)
+        if adjusted_price <= 0:
+            return None, None, "price_below_step"
+    if adjusted_price is not None and price_min is not None and adjusted_price < float(price_min):
+        return None, None, f"price {adjusted_price:g} below min price {float(price_min):g}"
+    if adjusted_price is not None and price_max is not None and adjusted_price > float(price_max):
+        return None, None, f"price {adjusted_price:g} above max price {float(price_max):g}"
+    if min_notional is not None and adjusted_price is not None and adjusted_price > 0:
+        if qty_base * adjusted_price + 1e-12 < float(min_notional):
+            return None, None, (
+                f"order notional {(qty_base * adjusted_price):g} below min notional {float(min_notional):g}"
+            )
+    return qty_base, adjusted_price, None
 
 
 def _resolve_timeout(payload: Mapping[str, Any], default: int) -> int:
@@ -739,6 +848,11 @@ def spread_pct(long_price: float | None, short_price: float | None) -> float | N
     return (long_price - short_price) / long_price * 100.0
 
 
+def venue_liquidity_tier(exchange: str | None) -> int:
+    normalized = normalize_exchange_name(str(exchange or ""))
+    return int(VENUE_LIQUIDITY_TIERS.get(normalized, DEFAULT_VENUE_LIQUIDITY_TIER))
+
+
 def max_qty_for_slippage(
     levels: Iterable[Iterable[float]],
     *,
@@ -809,28 +923,35 @@ def suggest_expensive_leg(
     short_fee_bps = short_fee * 10_000.0
     long_liq = float(liquidity.get(long_exchange, 0.0))
     short_liq = float(liquidity.get(short_exchange, 0.0))
+    long_tier = venue_liquidity_tier(long_exchange)
+    short_tier = venue_liquidity_tier(short_exchange)
     suggestion = "long"
     reason = "higher_taker_fee"
-    fee_diff = long_fee_bps - short_fee_bps
-    if abs(fee_diff) >= 1.0:
-        suggestion = "long" if fee_diff > 0 else "short"
-        reason = "higher_taker_fee"
+    if long_tier != short_tier:
+        suggestion = "long" if long_tier > short_tier else "short"
+        reason = "lower_venue_tier"
     else:
-        ratio = (long_liq / short_liq) if short_liq else float("inf")
-        if ratio < 0.8:
-            suggestion = "long"
-            reason = "lower_liquidity"
-        elif ratio > 1.25:
-            suggestion = "short"
-            reason = "lower_liquidity"
+        fee_diff = long_fee_bps - short_fee_bps
+        if abs(fee_diff) >= 1.0:
+            suggestion = "long" if fee_diff > 0 else "short"
+            reason = "higher_taker_fee"
         else:
-            suggestion = "long"
-            reason = "tie_break"
+            ratio = (long_liq / short_liq) if short_liq else float("inf")
+            if ratio < 0.8:
+                suggestion = "long"
+                reason = "lower_liquidity"
+            elif ratio > 1.25:
+                suggestion = "short"
+                reason = "lower_liquidity"
+            else:
+                suggestion = "long"
+                reason = "tie_break"
     return {
         "suggested_leg": suggestion,
         "reason": reason,
         "taker_fee_bps": {"long": long_fee_bps, "short": short_fee_bps},
         "top3_liquidity_usd": {"long": long_liq, "short": short_liq},
+        "venue_tier": {"long": long_tier, "short": short_tier},
     }
 
 
@@ -880,6 +1001,102 @@ class ManualTradeManager:
             return bool(self._stop_check())
         except Exception:
             return False
+
+    def _auto_exit_market_fallback_allowed(
+        self,
+        payload: Mapping[str, Any] | None,
+        exchange: str | None,
+        *,
+        notional_usd: float | None = None,
+    ) -> bool:
+        if not payload or not bool(payload.get("auto_exit_agent")):
+            return True
+        tier_limit = int(
+            _safe_float(payload.get("auto_exit_market_tier_max")) or AUTO_EXIT_MARKET_FALLBACK_MAX_TIER
+        )
+        if venue_liquidity_tier(exchange) > max(1, tier_limit):
+            return False
+        cleanup_cap = _safe_float(payload.get("auto_exit_market_cleanup_notional_max"))
+        if cleanup_cap is not None:
+            if cleanup_cap <= 0:
+                return False
+            if notional_usd is not None and notional_usd > cleanup_cap:
+                return False
+        return True
+
+    def _apply_auto_exit_exit_overrides(
+        self,
+        payload: Mapping[str, Any],
+        plan: Mapping[str, Any],
+        *,
+        log_cb: Optional[callable] = None,
+    ) -> Mapping[str, Any]:
+        if str(plan.get("action") or "") != "exit" or not bool(payload.get("auto_exit_agent")):
+            return payload
+        updated_payload = dict(payload)
+        changes: dict[str, Any] = {}
+
+        suggested_leg = (plan.get("suggested_expensive_leg") or {}).get("suggested_leg")
+        if not updated_payload.get("expensive_leg") and suggested_leg in ("long", "short"):
+            updated_payload["expensive_leg"] = suggested_leg
+            changes["expensive_leg"] = suggested_leg
+
+        requested_chunk = _safe_float(updated_payload.get("chunk_qty"))
+        dynamic_chunking = bool(updated_payload.get("auto_exit_dynamic_chunk"))
+        recommended_chunk = _safe_float(plan.get("recommended_chunk_qty"))
+        min_chunk_qty = _safe_float(plan.get("min_chunk_qty"))
+        qty = _safe_float(plan.get("qty"))
+        if (requested_chunk is None or requested_chunk <= 0) and not dynamic_chunking:
+            safe_chunk = None
+            if recommended_chunk and recommended_chunk > 0:
+                safe_chunk = recommended_chunk * AUTO_EXIT_RECOMMENDED_CHUNK_SAFETY_FACTOR
+            elif qty and qty > 0:
+                safe_chunk = qty * AUTO_EXIT_FALLBACK_CHUNK_PCT
+            amount_steps = [
+                _safe_float((info or {}).get("amount_step"))
+                for info in (plan.get("market_constraints") or {}).values()
+            ]
+            amount_step = max([step for step in amount_steps if step], default=None)
+            if safe_chunk and min_chunk_qty:
+                safe_chunk = max(safe_chunk, min_chunk_qty)
+            if safe_chunk and qty:
+                safe_chunk = min(safe_chunk, qty)
+            if safe_chunk and amount_step:
+                safe_chunk = _round_to_step(safe_chunk, amount_step, mode="down")
+                if min_chunk_qty and safe_chunk < min_chunk_qty:
+                    safe_chunk = _round_to_step(min_chunk_qty, amount_step, mode="up")
+            if safe_chunk and safe_chunk > 0:
+                updated_payload["chunk_qty"] = safe_chunk
+                changes["chunk_qty"] = safe_chunk
+
+        if not updated_payload.get("hedge_order_type"):
+            updated_payload["hedge_order_type"] = "limit"
+            changes["hedge_order_type"] = "limit"
+        if not updated_payload.get("hedge_limit_mode"):
+            updated_payload["hedge_limit_mode"] = "aggressive"
+            changes["hedge_limit_mode"] = "aggressive"
+        if updated_payload.get("hedge_offset_ticks") is None and updated_payload.get("hedge_offset_bps") is None:
+            updated_payload["hedge_offset_ticks"] = 1
+            changes["hedge_offset_ticks"] = 1
+        if updated_payload.get("hedge_favorable_bps") is None:
+            updated_payload["hedge_favorable_bps"] = 2.0
+            changes["hedge_favorable_bps"] = 2.0
+        if updated_payload.get("hedge_adverse_bps") is None:
+            updated_payload["hedge_adverse_bps"] = 6.0
+            changes["hedge_adverse_bps"] = 6.0
+        if updated_payload.get("hedge_reprice_min_sec") is None:
+            updated_payload["hedge_reprice_min_sec"] = 2.0
+            changes["hedge_reprice_min_sec"] = 2.0
+        if updated_payload.get("max_limit_deviation_bps") is None:
+            updated_payload["max_limit_deviation_bps"] = 20.0
+            changes["max_limit_deviation_bps"] = 20.0
+        if updated_payload.get("auto_exit_market_tier_max") is None:
+            updated_payload["auto_exit_market_tier_max"] = AUTO_EXIT_MARKET_FALLBACK_MAX_TIER
+            changes["auto_exit_market_tier_max"] = AUTO_EXIT_MARKET_FALLBACK_MAX_TIER
+
+        if changes:
+            self._emit_log(log_cb, "decision", "auto-exit safety overrides applied", changes)
+        return updated_payload
 
     async def _ensure_ws_positions(
         self,
@@ -1395,6 +1612,11 @@ class ManualTradeManager:
                 return plan
             adjusted_payload = payload
             adjusted_plan = plan
+            adjusted_payload = self._apply_auto_exit_exit_overrides(
+                adjusted_payload,
+                adjusted_plan,
+                log_cb=log_cb,
+            )
             precheck_errors: list[str] = []
             if action == "enter":
                 balances, balance_errors = await self._fetch_balances_with_retry(
@@ -2157,8 +2379,50 @@ class ManualTradeManager:
         ccxt_symbol: str,
         log_cb: Optional[callable] = None,
     ) -> dict[str, Any]:
+        settings: dict[str, Any] = {}
+        if hasattr(client, "fetch_leverage"):
+            try:
+                leverage_info = await client.fetch_leverage(ccxt_symbol)
+            except Exception as exc:  # pylint: disable=broad-except
+                self._emit_log(
+                    log_cb,
+                    "warn",
+                    "binance leverage fetch failed",
+                    {"exchange": "binance", "symbol": symbol, "error": str(exc)},
+                )
+            else:
+                if isinstance(leverage_info, Mapping):
+                    leverage = None
+                    for key in ("leverage", "longLeverage", "shortLeverage"):
+                        leverage = _safe_float(leverage_info.get(key))
+                        if leverage is not None:
+                            break
+                    if leverage is None:
+                        info = leverage_info.get("info") or {}
+                        if isinstance(info, Mapping):
+                            for key in ("leverage", "longLeverage", "shortLeverage"):
+                                leverage = _safe_float(info.get(key))
+                                if leverage is not None:
+                                    break
+                    if leverage is not None:
+                        settings["leverage"] = leverage
+                    margin_mode = (
+                        leverage_info.get("marginMode")
+                        or leverage_info.get("margin_mode")
+                        or leverage_info.get("marginType")
+                    )
+                    if not margin_mode:
+                        info = leverage_info.get("info") or {}
+                        if isinstance(info, Mapping):
+                            margin_mode = (
+                                info.get("marginMode")
+                                or info.get("margin_mode")
+                                or info.get("marginType")
+                            )
+                    if margin_mode:
+                        settings["margin_mode"] = str(margin_mode).strip().lower()
         if not hasattr(client, "fetch_positions"):
-            return {}
+            return settings
         positions = None
         async def _fetch_positions_once() -> Any:
             try:
@@ -2179,7 +2443,7 @@ class ManualTradeManager:
                         "binance positions fetch failed",
                         {"exchange": "binance", "symbol": symbol, "error": str(retry_exc)},
                     )
-                    return {}
+                    return settings
             else:
                 self._emit_log(
                     log_cb,
@@ -2187,7 +2451,7 @@ class ManualTradeManager:
                     "binance positions fetch failed",
                     {"exchange": "binance", "symbol": symbol, "error": str(exc)},
                 )
-                return {}
+                return settings
         if positions is None:
             self._emit_log(
                 log_cb,
@@ -2195,7 +2459,7 @@ class ManualTradeManager:
                 "binance positions fetch failed",
                 {"exchange": "binance", "symbol": symbol, "error": "empty_positions_response"},
             )
-            return {}
+            return settings
         canonical = normalize_symbol(symbol)
         for pos in positions or []:
             info = pos.get("info") or {}
@@ -2212,13 +2476,56 @@ class ManualTradeManager:
                 qty = _safe_float(info.get("positionAmt"))
             has_position = qty is not None and abs(qty) > 0
             if margin_mode or leverage is not None or has_position:
-                return {
-                    "margin_mode": margin_mode,
-                    "leverage": leverage,
-                    "has_position": has_position,
-                    "position_qty": qty,
-                }
-        return {}
+                if margin_mode:
+                    settings["margin_mode"] = margin_mode
+                if leverage is not None:
+                    settings["leverage"] = leverage
+                settings["has_position"] = has_position
+                settings["position_qty"] = qty
+                return settings
+        return settings
+
+    async def _set_binance_leverage_precheck(
+        self,
+        client: Any,
+        *,
+        symbol: str,
+        ccxt_symbol: str,
+        target: int,
+        log_cb: Optional[callable] = None,
+    ) -> tuple[bool, dict[str, Any] | None, Exception | None]:
+        last_exc: Exception | None = None
+        for attempt in range(1, PRECHECK_RETRIES + 1):
+            try:
+                await client.set_leverage(target, ccxt_symbol, {})
+                return True, None, None
+            except Exception as exc:  # pylint: disable=broad-except
+                last_exc = exc
+                if _binance_leverage_noop(exc):
+                    return True, None, exc
+                if _is_binance_time_sync_error(exc) and hasattr(client, "load_time_difference"):
+                    try:
+                        await client.load_time_difference()
+                    except Exception as sync_exc:  # pylint: disable=broad-except
+                        self._emit_log(
+                            log_cb,
+                            "warn",
+                            "binance leverage time sync failed",
+                            {"exchange": "binance", "symbol": symbol, "error": str(sync_exc)},
+                        )
+                refreshed = await self._fetch_binance_symbol_settings(
+                    client,
+                    symbol=symbol,
+                    ccxt_symbol=ccxt_symbol,
+                    log_cb=log_cb,
+                )
+                refreshed_leverage = _safe_float(refreshed.get("leverage"))
+                if refreshed_leverage is not None and abs(refreshed_leverage - target) <= 0.05:
+                    return True, refreshed, exc
+                if attempt >= PRECHECK_RETRIES or not _binance_retryable_leverage_error(exc):
+                    return False, refreshed, exc
+                await asyncio.sleep(PRECHECK_RETRY_DELAY_SEC)
+        return False, None, last_exc
 
     async def _fetch_kucoin_symbol_margin_mode(
         self,
@@ -2476,58 +2783,75 @@ class ManualTradeManager:
                     {"exchange": exchange, "symbol": symbol, "leverage": current_leverage},
                 )
                 continue
-            try:
-                await client.set_leverage(target, ccxt_symbol, {})
+            note = None
+            success = False
+            refreshed = None
+            exc: Exception | None = None
+            success, refreshed, exc = await self._set_binance_leverage_precheck(
+                client,
+                symbol=symbol,
+                ccxt_symbol=ccxt_symbol,
+                target=target,
+                log_cb=log_cb,
+            )
+            if success:
+                if exc is not None and _binance_leverage_noop(exc):
+                    note = "already_set"
+                elif refreshed and _safe_float(refreshed.get("leverage")) is not None:
+                    note = "verified_after_error"
+                payload = {"exchange": exchange, "symbol": symbol, "leverage": target}
+                if note:
+                    payload["note"] = note
+                    if exc is not None:
+                        payload["error"] = str(exc)
                 self._emit_log(
                     log_cb,
                     "precheck",
                     "binance leverage set",
-                    {"exchange": exchange, "symbol": symbol, "leverage": target},
+                    payload,
                 )
-            except Exception as exc:  # pylint: disable=broad-except
-                if _binance_margin_mode_blocked(exc):
-                    await self._cancel_open_orders_for_symbol(
-                        client,
-                        exchange=exchange,
-                        symbol=symbol,
-                        ccxt_symbol=ccxt_symbol,
-                        log_cb=log_cb,
+                continue
+            if exc is not None and _binance_margin_mode_blocked(exc):
+                await self._cancel_open_orders_for_symbol(
+                    client,
+                    exchange=exchange,
+                    symbol=symbol,
+                    ccxt_symbol=ccxt_symbol,
+                    log_cb=log_cb,
+                )
+                success, refreshed, retry_exc = await self._set_binance_leverage_precheck(
+                    client,
+                    symbol=symbol,
+                    ccxt_symbol=ccxt_symbol,
+                    target=target,
+                    log_cb=log_cb,
+                )
+                if success:
+                    payload = {"exchange": exchange, "symbol": symbol, "leverage": target, "note": "post_cancel"}
+                    if refreshed and _safe_float(refreshed.get("leverage")) is not None:
+                        payload["verified"] = True
+                    if retry_exc is not None and _binance_leverage_noop(retry_exc):
+                        payload["error"] = str(retry_exc)
+                    self._emit_log(
+                        log_cb,
+                        "precheck",
+                        "binance leverage set",
+                        payload,
                     )
-                    try:
-                        await client.set_leverage(target, ccxt_symbol, {})
-                        self._emit_log(
-                            log_cb,
-                            "precheck",
-                            "binance leverage set",
-                            {"exchange": exchange, "symbol": symbol, "leverage": target, "note": "post_cancel"},
-                        )
-                        continue
-                    except Exception as exc2:  # pylint: disable=broad-except
-                        errors.append(f"{exchange}: set leverage failed")
-                        self._emit_log(
-                            log_cb,
-                            "error",
-                            "binance leverage set failed",
-                            {
-                                "exchange": exchange,
-                                "symbol": symbol,
-                                "leverage": target,
-                                "error": str(exc2),
-                            },
-                        )
-                        continue
-                errors.append(f"{exchange}: set leverage failed")
-                self._emit_log(
-                    log_cb,
-                    "error",
-                    "binance leverage set failed",
-                    {
-                        "exchange": exchange,
-                        "symbol": symbol,
-                        "leverage": target,
-                        "error": str(exc),
-                    },
-                )
+                    continue
+                exc = retry_exc or exc
+            errors.append(f"{exchange}: set leverage failed")
+            self._emit_log(
+                log_cb,
+                "error",
+                "binance leverage set failed",
+                {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "leverage": target,
+                    "error": str(exc) if exc is not None else "unknown_error",
+                },
+            )
         return errors
 
     async def _build_plan(
@@ -3037,6 +3361,7 @@ class ManualTradeManager:
                 "actions": actions,
                 "errors": [f"{mode} is not supported for action {action}."],
                 "warnings": plan.get("warnings") or [],
+                "risk_flags": self._collect_risk_flags(actions, plan.get("warnings") or []),
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -3058,19 +3383,16 @@ class ManualTradeManager:
                 "actions": actions,
                 "errors": errors,
                 "warnings": plan.get("warnings") or [],
+                "risk_flags": self._collect_risk_flags(actions, plan.get("warnings") or []),
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             }
 
-        leg_by_label = {leg["label"]: leg for leg in legs}
         if mode == "limit-first-expensive":
-            limit_label = self._resolve_expensive_label(expensive_leg, leg_by_label)
-            if not limit_label:
-                limit_label = "long" if "long" in leg_by_label else legs[0]["label"]
-            market_label = "short" if limit_label == "long" and "short" in leg_by_label else None
-            if not market_label:
-                market_label = next((leg["label"] for leg in legs if leg["label"] != limit_label), limit_label)
-            limit_leg = leg_by_label.get(limit_label)
-            market_leg = leg_by_label.get(market_label)
+            _, limit_leg, market_leg = self._resolve_primary_hedge_legs(
+                explicit=expensive_leg,
+                plan=plan,
+                legs=legs,
+            )
             if not limit_leg or not market_leg:
                 errors.append("Unable to resolve legs for limit-first-expensive.")
             else:
@@ -3170,6 +3492,7 @@ class ManualTradeManager:
             "actions": actions,
             "errors": errors + self._collect_action_errors(actions),
             "warnings": plan.get("warnings") or [],
+            "risk_flags": self._collect_risk_flags(actions, plan.get("warnings") or []),
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -3205,12 +3528,11 @@ class ManualTradeManager:
 
         if exit_allow_flip:
             legs = [dict(leg, reduce_only=False) for leg in legs]
-        leg_by_label = {leg["label"]: leg for leg in legs}
-        expensive_label = self._resolve_expensive_label(payload.get("expensive_leg"), leg_by_label)
-        if not expensive_label:
-            expensive_label = "long" if "long" in leg_by_label else legs[0]["label"] if legs else ""
-        primary_leg = leg_by_label.get(expensive_label)
-        hedge_leg = next((leg for leg in legs if leg is not primary_leg), None)
+        expensive_label, primary_leg, hedge_leg = self._resolve_primary_hedge_legs(
+            explicit=payload.get("expensive_leg"),
+            plan=plan,
+            legs=legs,
+        )
         actions: list[dict[str, Any]] = []
         errors: list[str] = []
         warnings: list[str] = list(plan.get("warnings") or [])
@@ -3312,6 +3634,7 @@ class ManualTradeManager:
                     "actions": actions,
                     "errors": errors,
                     "warnings": warnings,
+                    "risk_flags": self._collect_risk_flags(actions, warnings),
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                 }
         exchange_list = [
@@ -3783,7 +4106,7 @@ class ManualTradeManager:
             pending_hedge_qty = 0.0
 
         async def _hedge_pending(reason: str) -> None:
-            nonlocal pending_hedge_qty, hedge_failed, hedge_filled_total
+            nonlocal pending_hedge_qty, hedge_failed, hedge_filled_total, warnings
             hedge_qty = pending_hedge_qty
             if hedge_qty <= 0:
                 return
@@ -3821,6 +4144,9 @@ class ManualTradeManager:
             self._emit_log(log_cb, "result", "hedge result", hedge_result)
             hedge_filled_total += _safe_float(hedge_result.get("filled_qty")) or 0.0
             if hedge_result.get("status") == "error":
+                if primary_filled_total > hedge_filled_total:
+                    hedge_result["risk_state"] = "partial_fill_exposure"
+                    warnings.append("partial_fill_exposure")
                 errors.append(
                     f"hedge failed on {hedge_leg['exchange']}: {hedge_result.get('error') or 'unknown_error'}"
                 )
@@ -4365,6 +4691,20 @@ class ManualTradeManager:
                     "sources": sources,
                 },
             )
+            def _reconcile_price_for_exchange(exchange: str) -> float | None:
+                for pos in post_positions:
+                    pos_exchange = normalize_exchange_name(str(pos.get("exchange") or ""))
+                    if pos_exchange != normalize_exchange_name(exchange):
+                        continue
+                    pos_symbol = str(pos.get("symbol") or pos.get("symbol_normalized") or "")
+                    if not _symbol_matches(symbol, pos_symbol):
+                        continue
+                    mark = _safe_float(pos.get("mark_price"))
+                    if mark is None:
+                        mark = _safe_float(pos.get("entry_price"))
+                    if mark and mark > 0:
+                        return float(mark)
+                return None
             if use_observed:
                 self._emit_log(
                     log_cb,
@@ -4406,11 +4746,34 @@ class ManualTradeManager:
                     qty_needed = abs(imbalance)
                 qty_needed = _round_to_step(qty_needed, step, mode="down") if step else qty_needed
                 if qty_needed > 0:
+                    reconcile_price = _reconcile_price_for_exchange(leg.get("exchange"))
+                    reconcile_notional = (
+                        qty_needed * reconcile_price if reconcile_price and reconcile_price > 0 else None
+                    )
                     if threshold and qty_needed < threshold:
                         _vlog(
                             "wait",
                             "final imbalance below fallback threshold",
                             {"imbalance": imbalance, "min_qty": threshold},
+                        )
+                    elif not self._auto_exit_market_fallback_allowed(
+                        payload,
+                        leg.get("exchange"),
+                        notional_usd=reconcile_notional,
+                    ):
+                        warnings.append(
+                            f"{leg['exchange']}: final reconcile market skipped by auto-exit tier guard"
+                        )
+                        self._emit_log(
+                            log_cb,
+                            "warn",
+                            "final reconcile market skipped by auto-exit tier guard",
+                            {
+                                "exchange": leg.get("exchange"),
+                                "qty": qty_needed,
+                                "venue_tier": venue_liquidity_tier(leg.get("exchange")),
+                                "market_notional_est": reconcile_notional,
+                            },
                         )
                     else:
                         self._emit_log(
@@ -4453,6 +4816,7 @@ class ManualTradeManager:
             "actions": actions,
             "errors": errors + self._collect_action_errors(actions),
             "warnings": warnings,
+            "risk_flags": self._collect_risk_flags(actions, warnings),
             "remaining_qty": remaining,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -4514,6 +4878,13 @@ class ManualTradeManager:
         awaiting_ws_update = False
         if exit_allow_flip:
             legs = [dict(leg, reduce_only=False) for leg in legs]
+        _, primary_leg, hedge_leg = self._resolve_primary_hedge_legs(
+            explicit=payload.get("expensive_leg"),
+            plan=plan,
+            legs=legs,
+        )
+        if primary_leg and hedge_leg:
+            legs = [primary_leg, hedge_leg]
         actions: list[dict[str, Any]] = []
         errors: list[str] = []
         warnings: list[str] = list(plan.get("warnings") or [])
@@ -4943,6 +5314,7 @@ class ManualTradeManager:
             "actions": actions,
             "errors": errors + self._collect_action_errors(actions),
             "warnings": warnings,
+            "risk_flags": self._collect_risk_flags(actions, warnings),
             "remaining_qty": remaining,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -4977,16 +5349,11 @@ class ManualTradeManager:
         fallback_to_market = False
         verbose_logs = bool(payload.get("verbose_logs", True))
 
-        leg_by_label = {leg["label"]: leg for leg in legs}
-        expensive_label = self._resolve_expensive_label(payload.get("expensive_leg"), leg_by_label)
-        if not expensive_label:
-            suggested = (plan.get("suggested_expensive_leg") or {}).get("suggested_leg")
-            if suggested in leg_by_label:
-                expensive_label = suggested
-        if not expensive_label:
-            expensive_label = "long" if "long" in leg_by_label else legs[0]["label"] if legs else ""
-        primary_leg = leg_by_label.get(expensive_label)
-        hedge_leg = next((leg for leg in legs if leg is not primary_leg), None)
+        expensive_label, primary_leg, hedge_leg = self._resolve_primary_hedge_legs(
+            explicit=payload.get("expensive_leg"),
+            plan=plan,
+            legs=legs,
+        )
         actions: list[dict[str, Any]] = []
         errors: list[str] = []
         warnings: list[str] = list(plan.get("warnings") or [])
@@ -5019,6 +5386,7 @@ class ManualTradeManager:
                 "actions": actions,
                 "errors": errors,
                 "warnings": warnings,
+                "risk_flags": self._collect_risk_flags(actions, warnings),
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -5083,6 +5451,7 @@ class ManualTradeManager:
                 "actions": actions,
                 "errors": errors,
                 "warnings": warnings,
+                "risk_flags": self._collect_risk_flags(actions, warnings),
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             }
         exchange_list = [
@@ -5680,7 +6049,7 @@ class ManualTradeManager:
             self._emit_log(log_cb, "result", "final reconcile result", result)
 
         async def _hedge_pending(reason: str) -> None:
-            nonlocal pending_hedge_qty, hedge_failed, hedge_filled_total
+            nonlocal pending_hedge_qty, hedge_failed, hedge_filled_total, warnings
             hedge_qty = pending_hedge_qty
             if hedge_qty <= 0:
                 return
@@ -5808,6 +6177,9 @@ class ManualTradeManager:
             self._emit_log(log_cb, "result", "hedge result", hedge_result)
             hedge_filled_total += _safe_float(hedge_result.get("filled_qty")) or 0.0
             if hedge_result.get("status") == "error":
+                if primary_filled_total > hedge_filled_total:
+                    hedge_result["risk_state"] = "partial_fill_exposure"
+                    warnings.append("partial_fill_exposure")
                 errors.append(
                     f"hedge failed on {hedge_leg['exchange']}: {hedge_result.get('error') or 'unknown_error'}"
                 )
@@ -6376,6 +6748,7 @@ class ManualTradeManager:
             "actions": actions,
             "errors": errors + self._collect_action_errors(actions),
             "warnings": warnings,
+            "risk_flags": self._collect_risk_flags(actions, warnings),
             "remaining_qty": remaining,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -6430,6 +6803,13 @@ class ManualTradeManager:
             exchange: _min_qty_with_buffer(min_qty, per_leg_amount_step.get(exchange))
             for exchange, min_qty in per_leg_min_qty.items()
         }
+        _, primary_leg, hedge_leg = self._resolve_primary_hedge_legs(
+            explicit=payload.get("expensive_leg"),
+            plan=plan,
+            legs=legs,
+        )
+        if primary_leg and hedge_leg:
+            legs = [primary_leg, hedge_leg]
 
         actions: list[dict[str, Any]] = []
         errors: list[str] = []
@@ -6517,6 +6897,7 @@ class ManualTradeManager:
                 "actions": actions,
                 "errors": errors,
                 "warnings": warnings,
+                "risk_flags": self._collect_risk_flags(actions, warnings),
                 "remaining_qty": remaining,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -6771,6 +7152,7 @@ class ManualTradeManager:
                     "actions": actions,
                     "errors": errors + self._collect_action_errors(actions),
                     "warnings": warnings,
+                    "risk_flags": self._collect_risk_flags(actions, warnings),
                     "remaining_qty": remaining,
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                 }
@@ -6837,6 +7219,7 @@ class ManualTradeManager:
             "actions": actions,
             "errors": errors + self._collect_action_errors(actions),
             "warnings": warnings,
+            "risk_flags": self._collect_risk_flags(actions, warnings),
             "remaining_qty": remaining,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -7377,10 +7760,90 @@ class ManualTradeManager:
             market = client.markets.get(ccxt_symbol) if getattr(client, "markets", None) else None
         except Exception:
             market = None
+        constraints = self._extract_market_constraints(client, ccxt_symbol)
+        min_qty = _safe_float(constraints.get("min_qty"))
+        min_notional = _safe_float(constraints.get("min_notional"))
+        amount_step = _safe_float(constraints.get("amount_step"))
+        price_step = _safe_float(constraints.get("price_step"))
+        price_min = _safe_float(constraints.get("price_min"))
+        price_max = _safe_float(constraints.get("price_max"))
+        normalized_qty, normalized_price, normalize_error = _normalize_submit_values(
+            qty=float(qty),
+            price=price,
+            side=str(leg.get("side") or ""),
+            order_type=order_type,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            amount_step=amount_step,
+            price_step=price_step,
+            price_min=price_min,
+            price_max=price_max,
+        )
+        if normalize_error:
+            error_type = _classify_submit_error(normalize_error) or "precheck"
+            self._emit_log(
+                log_cb,
+                "error",
+                "order precheck failed",
+                {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "order_type": order_type,
+                    "side": leg.get("side"),
+                    "qty_base": float(qty),
+                    "price": price if order_type == "limit" else None,
+                    "error": normalize_error,
+                    "error_type": error_type,
+                },
+            )
+            return {
+                "exchange": exchange,
+                "status": "error",
+                "error": normalize_error,
+                "error_type": error_type,
+                "ts": _now_iso(),
+            }
         contract_size = _safe_float(market.get("contractSize")) if isinstance(market, dict) else None
+        qty = float(normalized_qty if normalized_qty is not None else qty)
+        if normalized_price is not None:
+            price = float(normalized_price)
         order_qty = float(qty)
         if contract_size and contract_size > 0:
             order_qty = order_qty / contract_size
+        if reduce_only:
+            reduce_only_error = await self._precheck_reduce_only_qty(
+                client,
+                exchange=exchange,
+                symbol=symbol,
+                ccxt_symbol=ccxt_symbol,
+                leg=leg,
+                qty_base=float(qty),
+                contract_size=contract_size,
+                log_cb=log_cb,
+            )
+            if reduce_only_error:
+                error_type = _classify_submit_error(reduce_only_error) or "reduce_only_required"
+                self._emit_log(
+                    log_cb,
+                    "error",
+                    "reduce-only precheck failed",
+                    {
+                        "exchange": exchange,
+                        "symbol": symbol,
+                        "order_type": order_type,
+                        "side": leg.get("side"),
+                        "qty_base": float(qty),
+                        "error": reduce_only_error,
+                        "error_type": error_type,
+                    },
+                )
+                return {
+                    "exchange": exchange,
+                    "status": "error",
+                    "error": reduce_only_error,
+                    "error_type": error_type,
+                    "ts": _now_iso(),
+                }
         params = {}
         if reduce_only:
             params["reduceOnly"] = True
@@ -7503,6 +7966,7 @@ class ManualTradeManager:
                 "params": params,
                 "leverage": DEFAULT_MANUAL_LEVERAGE,
                 "contract_size": contract_size,
+                "constraints": constraints or None,
             },
         )
         try:
@@ -7588,6 +8052,7 @@ class ManualTradeManager:
                     }
                 except Exception as retry_exc:  # pylint: disable=broad-except
                     message = str(retry_exc)
+            error_type = _classify_submit_error(message)
             self._emit_log(
                 log_cb,
                 "error",
@@ -7601,12 +8066,14 @@ class ManualTradeManager:
                     "price": price if order_type == "limit" else None,
                     "params": params,
                     "error": message,
+                    "error_type": error_type,
                 },
             )
             return {
                 "exchange": exchange,
                 "status": "error",
                 "error": message,
+                "error_type": error_type,
                 "ts": _now_iso(),
             }
 
@@ -8399,6 +8866,33 @@ class ManualTradeManager:
                         )
                         await asyncio.sleep(max(0.5, hedge_reprice_min_sec))
                         continue
+                    market_price_est = (
+                        stats.best_ask if leg["side"] == "buy" else stats.best_bid
+                    ) or order_price
+                    market_notional_est = (
+                        remaining * market_price_est if market_price_est and market_price_est > 0 else None
+                    )
+                    if not self._auto_exit_market_fallback_allowed(
+                        payload,
+                        leg.get("exchange"),
+                        notional_usd=market_notional_est,
+                    ):
+                        order_id = None
+                        order_price = None
+                        self._emit_log(
+                            log_cb,
+                            "reprice",
+                            "hedge adverse move on lower-tier venue; repricing limit instead of market",
+                            {
+                                "exchange": leg.get("exchange"),
+                                "adverse_bps": adverse_bps,
+                                "adverse_ticks": adverse_ticks,
+                                "remaining_qty": remaining,
+                                "venue_tier": venue_liquidity_tier(leg.get("exchange")),
+                                "market_notional_est": market_notional_est,
+                            },
+                        )
+                        continue
                     self._emit_story(
                         log_cb,
                         f"Hedge adverse move; switching to market {leg['exchange']} qty={remaining:g}",
@@ -8772,11 +9266,14 @@ class ManualTradeManager:
         limits = market.get("limits") or {}
         amount_limits = limits.get("amount") or {}
         cost_limits = limits.get("cost") or {}
+        price_limits = limits.get("price") or {}
         info = market.get("info") or {}
         if not isinstance(info, dict):
             info = {}
         raw_min_qty = _safe_float(amount_limits.get("min"))
         min_notional = _safe_float(cost_limits.get("min"))
+        price_min = _safe_float(price_limits.get("min"))
+        price_max = _safe_float(price_limits.get("max"))
         if raw_min_qty is None:
             raw_min_qty = _safe_float(
                 info.get("minQty")
@@ -8798,6 +9295,10 @@ class ManualTradeManager:
                 or info.get("minTradeAmount")
                 or info.get("minTradeAmt")
             )
+        if price_min is None:
+            price_min = _safe_float(info.get("minPrice"))
+        if price_max is None:
+            price_max = _safe_float(info.get("maxPrice"))
         precision = market.get("precision") or {}
         amount_step = _precision_to_step(precision.get("amount"))
         price_step = _precision_to_step(precision.get("price"))
@@ -8813,6 +9314,8 @@ class ManualTradeManager:
             "min_notional": min_notional,
             "amount_step": amount_step,
             "price_step": price_step,
+            "price_min": price_min,
+            "price_max": price_max,
             "contract_size": contract_size,
             "min_qty_contracts": raw_min_qty,
         }
@@ -8825,8 +9328,98 @@ class ManualTradeManager:
                 continue
             exchange = action.get("exchange") or "unknown"
             reason = action.get("error") or "unknown error"
+            risk_state = str(action.get("risk_state") or "").strip()
+            if risk_state:
+                reason = f"{reason} ({risk_state})"
             errors.append(f"{exchange}: {reason}")
         return errors
+
+    def _collect_risk_flags(
+        self,
+        actions: Iterable[Mapping[str, Any]],
+        warnings: Iterable[Any] = (),
+    ) -> list[str]:
+        flags: list[str] = []
+        seen: set[str] = set()
+
+        def _add(flag: Any) -> None:
+            text = str(flag or "").strip()
+            if not text or text in seen:
+                return
+            seen.add(text)
+            flags.append(text)
+
+        for action in actions:
+            _add(action.get("risk_state"))
+        for warning in warnings:
+            if str(warning or "").strip() == "partial_fill_exposure":
+                _add(warning)
+        return flags
+
+    async def _precheck_reduce_only_qty(
+        self,
+        client: Any,
+        *,
+        exchange: str,
+        symbol: str,
+        ccxt_symbol: str,
+        leg: Mapping[str, Any],
+        qty_base: float,
+        contract_size: float | None,
+        log_cb: Optional[callable] = None,
+    ) -> str | None:
+        if qty_base <= 0 or not hasattr(client, "fetch_positions"):
+            return None
+
+        async def _fetch_positions_once() -> Any:
+            try:
+                return await client.fetch_positions([ccxt_symbol])
+            except Exception:
+                return await client.fetch_positions()
+
+        try:
+            positions = await _fetch_positions_once()
+        except Exception as exc:  # pylint: disable=broad-except
+            self._emit_log(
+                log_cb,
+                "warn",
+                "reduce-only precheck positions fetch failed",
+                {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "error": str(exc),
+                },
+            )
+            return None
+
+        expected_side = _exit_position_side(leg)
+        if not expected_side:
+            return None
+        canonical = normalize_symbol(symbol)
+        position_qty = 0.0
+        for pos in positions or []:
+            info = pos.get("info") or {}
+            pos_symbol = pos.get("symbol") or pos.get("id") or info.get("symbol") or info.get("instId") or ""
+            candidate = normalize_symbol(str(pos_symbol))
+            if canonical and not _symbol_matches(canonical, candidate):
+                continue
+            qty = _safe_float(pos.get("contracts"))
+            if qty is None:
+                qty = _safe_float(pos.get("amount"))
+            if qty is None and isinstance(info, dict):
+                qty = _safe_float(info.get("positionAmt"))
+            qty_value = _to_base_qty(qty, contract_size)
+            pos_side = _normalize_position_side(pos.get("side"), qty_value)
+            if pos_side != expected_side:
+                continue
+            position_qty += abs(qty_value or 0.0)
+
+        qty_tol = 1e-9
+        if position_qty <= qty_tol:
+            return f"reduce-only no open position for {expected_side}"
+        if qty_base - position_qty > max(qty_tol, position_qty * 0.001):
+            return f"reduce-only qty {qty_base:g} exceeds open position qty {position_qty:g}"
+        return None
 
     async def _finalize_exit_dust(
         self,
@@ -8998,6 +9591,26 @@ class ManualTradeManager:
             exchange = str(item.get("exchange") or "")
             close_qty = _safe_float(item.get("close_qty")) or 0.0
             if close_qty <= 0:
+                continue
+            residual_notional = _safe_float(item.get("residual_notional"))
+            if not self._auto_exit_market_fallback_allowed(
+                payload,
+                exchange,
+                notional_usd=residual_notional,
+            ):
+                warnings.append(f"{exchange}: dust finalize skipped by auto-exit tier guard")
+                self._emit_log(
+                    log_cb,
+                    "warn",
+                    "dust finalize skipped by auto-exit tier guard",
+                    {
+                        "exchange": exchange,
+                        "symbol": symbol,
+                        "qty": close_qty,
+                        "venue_tier": venue_liquidity_tier(exchange),
+                        "market_notional_est": residual_notional,
+                    },
+                )
                 continue
             self._emit_log(
                 log_cb,
@@ -9776,12 +10389,38 @@ class ManualTradeManager:
 
     def _resolve_expensive_label(self, explicit: Any, leg_by_label: dict[str, Any]) -> str | None:
         if explicit in ("long", "short", "to", "from"):
-            return explicit
+            if explicit in leg_by_label:
+                return str(explicit)
+            if explicit == "long" and "to" in leg_by_label:
+                return "to"
+            if explicit == "short" and "from" in leg_by_label:
+                return "from"
         if explicit in ("auto", None, ""):
-            suggestion = leg_by_label.get("long") or leg_by_label.get("to")
-            if suggestion:
-                return suggestion.get("label")
+            return None
         return None
+
+    def _resolve_primary_hedge_legs(
+        self,
+        *,
+        explicit: Any,
+        plan: Mapping[str, Any],
+        legs: list[dict[str, Any]],
+    ) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+        leg_by_label = {leg["label"]: leg for leg in legs}
+        expensive_label = self._resolve_expensive_label(explicit, leg_by_label)
+        if not expensive_label:
+            suggested = (plan.get("suggested_expensive_leg") or {}).get("suggested_leg")
+            expensive_label = self._resolve_expensive_label(suggested, leg_by_label)
+        if not expensive_label:
+            if "long" in leg_by_label:
+                expensive_label = "long"
+            elif "to" in leg_by_label:
+                expensive_label = "to"
+            elif legs:
+                expensive_label = str(legs[0].get("label") or "")
+        primary_leg = leg_by_label.get(expensive_label) if expensive_label else None
+        hedge_leg = next((leg for leg in legs if leg is not primary_leg), None)
+        return expensive_label, primary_leg, hedge_leg
 
     async def _fetch_funding_meta(self, symbol: str, exchanges: Iterable[str]) -> dict[str, dict[str, Any]]:
         results: dict[str, dict[str, Any]] = {}

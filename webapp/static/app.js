@@ -16,11 +16,17 @@
     auto_take_enabled: true,
     send_margin_alerts: true,
     send_missing_stop_alerts: true,
+    notification_primary_channel: 'telegram',
+    notification_fallback_channel: 'none',
     auto_margin_enabled: true,
     auto_margin_reduce_enabled: true,
+    enforce_isolated_margin: true,
+    enforce_leverage: true,
+    target_leverage: 3,
+    kucoin_isolated_topup_only: true,
     auto_rebalance_enabled: false,
-    stop_gap_from_liq_pct: 0.07,
-    stop_requote_threshold_pct: 0.005,
+    stop_gap_from_liq_pct: 0.025,
+    stop_requote_threshold_pct: 0.0025,
     fallback_liq_factor_long: 0.33,
     fallback_liq_factor_short: 1.66,
     rebalance_delta_pct: 0.2,
@@ -28,6 +34,26 @@
     rebalance_limit_timeout_sec: 10,
     rebalance_limit_offset_bps: 2,
     rebalance_max_slippage_bps: 8
+  };
+
+  var manualDefaults = {
+    auto_exit_policy: {
+      tier1: {
+        chunk_notional_cap_usd: 350,
+        market_cleanup_notional_cap_usd: 1500,
+        edge_buffer_bps: 2
+      },
+      tier2: {
+        chunk_notional_cap_usd: 250,
+        market_cleanup_notional_cap_usd: 800,
+        edge_buffer_bps: 4
+      },
+      lower_tier: {
+        chunk_notional_cap_usd: 150,
+        market_cleanup_notional_cap_usd: 0,
+        edge_buffer_bps: 8
+      }
+    }
   };
 
   var defaultSettings = {
@@ -43,7 +69,8 @@
     stop_requote_threshold_pct: protectiveDefaults.stop_requote_threshold_pct,
     fallback_liq_factor_long: protectiveDefaults.fallback_liq_factor_long,
     fallback_liq_factor_short: protectiveDefaults.fallback_liq_factor_short,
-    protective: clone(protectiveDefaults)
+    protective: clone(protectiveDefaults),
+    manual: clone(manualDefaults)
   };
 
   var defaultExecution = {
@@ -58,6 +85,8 @@
     status: [],
     positions: [],
     positions_by_symbol: [],
+    margin_diagnostics: [],
+    margin_logic_log: [],
     last_updated: null,
     positions_market: null
   };
@@ -70,6 +99,8 @@
     },
     rules: {},
     live_spreads: {},
+    diagnostics: [],
+    v1_diagnostics: [],
     events: []
   };
 
@@ -132,9 +163,15 @@
     positionsMarketInput: document.getElementById('positions-market-interval'),
     protectAuto: document.getElementById('protect-auto'),
     takeAuto: document.getElementById('take-auto'),
+    notificationPrimary: document.getElementById('notification-primary'),
+    notificationFallback: document.getElementById('notification-fallback'),
     alertMargin: document.getElementById('alert-margin'),
     autoMarginAdd: document.getElementById('auto-margin-add'),
     autoMarginReduce: document.getElementById('auto-margin-reduce'),
+    enforceIsolatedMargin: document.getElementById('enforce-isolated-margin'),
+    enforceLeverage: document.getElementById('enforce-leverage'),
+    targetLeverage: document.getElementById('target-leverage'),
+    kucoinTopupOnly: document.getElementById('kucoin-topup-only'),
     alertMissingStops: document.getElementById('alert-missing-stops'),
     stopGapInput: document.getElementById('stop-gap'),
     requoteInput: document.getElementById('stop-requote'),
@@ -149,6 +186,15 @@
     autoExitRuntimeInput: document.getElementById('auto-exit-runtime'),
     autoExitCooldownInput: document.getElementById('auto-exit-cooldown'),
     autoExitRequireLive: document.getElementById('auto-exit-require-live'),
+    autoExitTier1ChunkCap: document.getElementById('auto-exit-tier1-chunk-cap'),
+    autoExitTier1CleanupCap: document.getElementById('auto-exit-tier1-cleanup-cap'),
+    autoExitTier1EdgeBuffer: document.getElementById('auto-exit-tier1-edge-buffer'),
+    autoExitTier2ChunkCap: document.getElementById('auto-exit-tier2-chunk-cap'),
+    autoExitTier2CleanupCap: document.getElementById('auto-exit-tier2-cleanup-cap'),
+    autoExitTier2EdgeBuffer: document.getElementById('auto-exit-tier2-edge-buffer'),
+    autoExitLowerChunkCap: document.getElementById('auto-exit-lower-chunk-cap'),
+    autoExitLowerCleanupCap: document.getElementById('auto-exit-lower-cleanup-cap'),
+    autoExitLowerEdgeBuffer: document.getElementById('auto-exit-lower-edge-buffer'),
     settingsStatus: document.getElementById('settings-status'),
     settingsSubmit: document.getElementById('settings-submit'),
     refreshButton: document.getElementById('refresh-button'),
@@ -166,9 +212,17 @@
     symbolPositionsTable: document.getElementById('symbol-positions-body'),
     symbolPositionsMeta: document.getElementById('symbol-positions-meta'),
     symbolPositionsDiffs: document.getElementById('symbol-positions-diffs'),
+    marginDiagnosticsBody: document.getElementById('margin-diagnostics-body'),
+    marginDiagnosticsEmpty: document.getElementById('margin-diagnostics-empty'),
+    marginLogicLog: document.getElementById('margin-logic-log'),
+    marginLogicLogEmpty: document.getElementById('margin-logic-log-empty'),
     autoExitLog: document.getElementById('auto-exit-log'),
     autoExitLogEmpty: document.getElementById('auto-exit-log-empty'),
     autoExitLogCopy: document.getElementById('auto-exit-log-copy'),
+    autoExitDiagnosticsBody: document.getElementById('auto-exit-diagnostics-body'),
+    autoExitDiagnosticsEmpty: document.getElementById('auto-exit-diagnostics-empty'),
+    autoExitV1DiagnosticsBody: document.getElementById('auto-exit-v1-diagnostics-body'),
+    autoExitV1DiagnosticsEmpty: document.getElementById('auto-exit-v1-diagnostics-empty'),
     autoExitAgentStatus: document.getElementById('auto-exit-agent-status'),
     autoExitAgentMeta: document.getElementById('auto-exit-agent-meta'),
     autoExitAgentErrors: document.getElementById('auto-exit-agent-errors'),
@@ -204,6 +258,36 @@
       }
       return copy;
     }
+  }
+
+  function mergeAutoExitPolicy(policy) {
+    var merged = clone(manualDefaults.auto_exit_policy) || {};
+    var tierKey;
+    var fieldName;
+    var defaults;
+    var section;
+    if (!policy || typeof policy !== 'object') {
+      return merged;
+    }
+    for (tierKey in merged) {
+      if (!Object.prototype.hasOwnProperty.call(merged, tierKey)) {
+        continue;
+      }
+      defaults = merged[tierKey] || {};
+      section = policy[tierKey];
+      if (!section || typeof section !== 'object') {
+        continue;
+      }
+      for (fieldName in defaults) {
+        if (Object.prototype.hasOwnProperty.call(defaults, fieldName) && section[fieldName] !== undefined && section[fieldName] !== null && section[fieldName] !== '') {
+          var numericValue = parseFloat(section[fieldName]);
+          if (!isNaN(numericValue)) {
+            merged[tierKey][fieldName] = numericValue;
+          }
+        }
+      }
+    }
+    return merged;
   }
 
   function normalizeSettings(settings) {
@@ -276,6 +360,19 @@
         }
       }
       normalized.protective = mergedProtective;
+      var incomingManual = (settings && typeof settings.manual === 'object') ? settings.manual : null;
+      var mergedManual = clone(manualDefaults) || {};
+      if (incomingManual) {
+        for (key in incomingManual) {
+          if (Object.prototype.hasOwnProperty.call(incomingManual, key) && key !== 'auto_exit_policy') {
+            mergedManual[key] = clone(incomingManual[key]);
+          }
+        }
+      }
+      mergedManual.auto_exit_policy = mergeAutoExitPolicy(incomingManual ? incomingManual.auto_exit_policy : null);
+      normalized.manual = mergedManual;
+    } else {
+      normalized.manual = clone(manualDefaults) || {};
     }
     return normalized;
   }
@@ -311,6 +408,8 @@
       status: [],
       positions: [],
       positions_by_symbol: [],
+      margin_diagnostics: [],
+      margin_logic_log: [],
       last_updated: null,
       positions_market: null
     };
@@ -328,6 +427,12 @@
     }
     if (Array.isArray(accounts.positions_by_symbol)) {
       normalized.positions_by_symbol = clone(accounts.positions_by_symbol) || [];
+    }
+    if (Array.isArray(accounts.margin_diagnostics)) {
+      normalized.margin_diagnostics = clone(accounts.margin_diagnostics) || [];
+    }
+    if (Array.isArray(accounts.margin_logic_log)) {
+      normalized.margin_logic_log = clone(accounts.margin_logic_log) || [];
     }
     normalized.last_updated = accounts.last_updated || null;
     normalized.positions_market = accounts.positions_market || null;
@@ -361,6 +466,12 @@
     }
     if (config.live_spreads && typeof config.live_spreads === 'object') {
       normalized.live_spreads = clone(config.live_spreads) || {};
+    }
+    if (Array.isArray(config.diagnostics)) {
+      normalized.diagnostics = clone(config.diagnostics) || [];
+    }
+    if (Array.isArray(config.v1_diagnostics)) {
+      normalized.v1_diagnostics = clone(config.v1_diagnostics) || [];
     }
     if (Array.isArray(config.events)) {
       normalized.events = clone(config.events) || [];
@@ -447,6 +558,28 @@
     }
     var places = typeof digits === 'number' ? digits : 2;
     return number.toFixed(places);
+  }
+
+  function formatTrimmedNumber(value, maxDigits, minDigits) {
+    var number = typeof value === 'number' ? value : parseFloat(value);
+    if (isNaN(number)) {
+      return '-';
+    }
+    var maxPlaces = typeof maxDigits === 'number' ? maxDigits : 2;
+    var minPlaces = typeof minDigits === 'number' ? minDigits : 0;
+    var text = number.toFixed(maxPlaces);
+    if (maxPlaces <= minPlaces || text.indexOf('.') === -1) {
+      return text;
+    }
+    var parts = text.split('.');
+    var fraction = parts[1] || '';
+    while (fraction.length > minPlaces && fraction.charAt(fraction.length - 1) === '0') {
+      fraction = fraction.slice(0, -1);
+    }
+    if (!fraction.length) {
+      return parts[0];
+    }
+    return parts[0] + '.' + fraction;
   }
 
   function formatDate(value) {
@@ -844,6 +977,100 @@
     elements.accountBalanceTable.innerHTML = html;
   }
 
+  function renderMarginDiagnostics(entries) {
+    if (!elements.marginDiagnosticsBody || !elements.marginDiagnosticsEmpty) {
+      return;
+    }
+    var rows = entries || [];
+    var html = '';
+    var i;
+    for (i = 0; i < rows.length; i += 1) {
+      var row = rows[i] || {};
+      var liqBufferText = row.liq_buffer_pct !== null && row.liq_buffer_pct !== undefined
+        ? formatNumber(row.liq_buffer_pct, 2) + '%'
+        : '-';
+      var levText = row.leverage !== null && row.leverage !== undefined
+        ? formatNumber(row.leverage, 2)
+        : '-';
+      var targetLevText = row.target_leverage !== null && row.target_leverage !== undefined
+        ? formatNumber(row.target_leverage, 2)
+        : '-';
+      var decisionStatus = 'unknown';
+      if (row.decision === 'add_margin') {
+        decisionStatus = 'ok';
+      } else if (row.decision === 'reduce_margin' || row.decision === 'blocked') {
+        decisionStatus = 'error';
+      } else if (row.decision === 'observe' || row.decision === 'set_mode') {
+        decisionStatus = 'pending';
+      }
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.exchange || '-') + '</td>' +
+        '<td>' + escapeHtml(row.symbol || '-') + '</td>' +
+        '<td>' + escapeHtml(row.side || '-') + '</td>' +
+        '<td>' + escapeHtml(row.margin_mode || '-') + '</td>' +
+        '<td>' + levText + '</td>' +
+        '<td>' + escapeHtml(row.leverage_source || '-') + '</td>' +
+        '<td>' + targetLevText + '</td>' +
+        '<td>' + liqBufferText + '</td>' +
+        '<td>' + formatNumber(row.base_margin_est, 2) + '</td>' +
+        '<td>' + formatNumber(row.min_required_margin_est, 2) + '</td>' +
+        '<td>' + formatNumber(row.max_add_est, 2) + '</td>' +
+        '<td>' + formatNumber(row.max_reduce_est, 2) + '</td>' +
+        '<td><span class="status-chip status-chip--' + decisionStatus + '">' + escapeHtml(row.decision || '-') + '</span></td>' +
+        '<td>' + escapeHtml(row.reason || '-') + '</td>' +
+        '<td>' + escapeHtml(formatDate(row.updated_at)) + '</td>' +
+      '</tr>';
+    }
+    if (!html) {
+      html = '<tr><td colspan="15" class="muted">Margin diagnostics will appear after the first refresh.</td></tr>';
+      elements.marginDiagnosticsEmpty.style.display = '';
+    } else {
+      elements.marginDiagnosticsEmpty.style.display = 'none';
+    }
+    elements.marginDiagnosticsBody.innerHTML = html;
+  }
+
+  function formatMarginLogicEvent(entry) {
+    if (!entry || typeof entry !== 'object') {
+      return '-';
+    }
+    if (entry.event === 'action') {
+      var amount = entry.amount !== undefined && entry.amount !== null ? formatNumber(entry.amount, 2) : '-';
+      var buffer = entry.buffer_pct !== undefined && entry.buffer_pct !== null ? formatNumber(entry.buffer_pct, 2) + '%' : '-';
+      var targetBuffer = entry.target_buffer_pct !== undefined && entry.target_buffer_pct !== null ? formatNumber(entry.target_buffer_pct, 2) + '%' : '-';
+      return (entry.exchange || '-') + ' ' + (entry.symbol || '-') + ' ' + (entry.side || '-') +
+        ' action=' + (entry.action || '-') + ' amount=' + amount + ' buffer=' + buffer + ' target=' + targetBuffer;
+    }
+    var leverage = entry.leverage !== undefined && entry.leverage !== null ? formatNumber(entry.leverage, 2) : '-';
+    var liqBuffer = entry.liq_buffer_pct !== undefined && entry.liq_buffer_pct !== null ? formatNumber(entry.liq_buffer_pct, 2) + '%' : '-';
+    return (entry.exchange || '-') + ' ' + (entry.symbol || '-') + ' ' + (entry.side || '-') +
+      ' decision=' + (entry.decision || '-') + ' reason=' + (entry.reason || '-') +
+      ' lev=' + leverage + ' buffer=' + liqBuffer + ' mode=' + (entry.margin_mode || '-');
+  }
+
+  function renderMarginLogicLog(entries) {
+    if (!elements.marginLogicLog || !elements.marginLogicLogEmpty) {
+      return;
+    }
+    var rows = entries || [];
+    if (!rows.length) {
+      elements.marginLogicLog.innerHTML = '';
+      elements.marginLogicLogEmpty.style.display = '';
+      return;
+    }
+    elements.marginLogicLogEmpty.style.display = 'none';
+    var html = '';
+    var i;
+    var start = rows.length > MAX_RENDERED_EVENTS ? rows.length - MAX_RENDERED_EVENTS : 0;
+    for (i = rows.length - 1; i >= start; i -= 1) {
+      var row = rows[i] || {};
+      html += '<li class="event-log__item"><span class="event-log__time">' +
+        escapeHtml(formatDate(row.timestamp)) + '</span><span class="event-log__message">' +
+        escapeHtml(formatMarginLogicEvent(row)) + '</span></li>';
+    }
+    elements.marginLogicLog.innerHTML = html;
+  }
+
   function formatNextFunding(ts) {
     if (!ts) {
       return '-';
@@ -897,6 +1124,12 @@
     if (entry.event === 'trigger') {
       var triggerMsg = 'Trigger ' + (entry.symbol || '-') + ' ' + (entry.long_exchange || '-') + '/' + (entry.short_exchange || '-') +
         ' spread=' + formatNumber(entry.spread_pct, 2) + '% target=' + formatNumber(entry.target_pct, 2) + '% qty=' + formatNumber(entry.qty, 4);
+      if (entry.trigger_mode) {
+        triggerMsg += ' mode=' + entry.trigger_mode;
+      }
+      if (entry.v1_reason) {
+        triggerMsg += ' reason=' + entry.v1_reason;
+      }
       if (entry.spread_scope) {
         triggerMsg += ' scope=' + entry.spread_scope;
       }
@@ -934,7 +1167,14 @@
     }
     if (entry.event === 'start') {
       var execId = entry.result && entry.result.execution_id ? entry.result.execution_id : '-';
-      return 'Started ' + (entry.symbol || '-') + ' exec_id=' + execId;
+      var startMsg = 'Started ' + (entry.symbol || '-') + ' exec_id=' + execId;
+      if (entry.trigger_mode) {
+        startMsg += ' mode=' + entry.trigger_mode;
+      }
+      if (entry.v1_reason) {
+        startMsg += ' reason=' + entry.v1_reason;
+      }
+      return startMsg;
     }
     return entry.event;
   }
@@ -986,14 +1226,13 @@
       var fundingText = row.funding_rate !== null && row.funding_rate !== undefined
         ? formatPercent(row.funding_rate, 4)
         : '-';
-      var marginUsedText = isSummary ? '-' : formatNumber(row.margin_used, 2);
       var liqPriceText = isSummary ? '-' : formatNumber(row.liquidation_price, 4);
       var liqDistText = row.dist_to_liq_pct !== null && row.dist_to_liq_pct !== undefined
         ? formatNumber(row.dist_to_liq_pct, 3) + '%'
         : '-';
       var leverageText = isSummary ? '-' : formatNumber(row.leverage, 2);
       var expectedFundingText = row.expected_funding !== null && row.expected_funding !== undefined
-        ? formatNumber(row.expected_funding, 6)
+        ? formatTrimmedNumber(row.expected_funding, 3)
         : '-';
       var stopPriceText = row.stop_price !== null && row.stop_price !== undefined
         ? formatNumber(row.stop_price, 6)
@@ -1023,7 +1262,8 @@
         var ruleShort = isMultileg ? 'multileg' : shortEx;
         if (hasBothSides && ruleLong && ruleShort) {
           var rule = autoExitRuleFor(row.symbol, ruleLong, ruleShort);
-          var enabled = rule && rule.enabled;
+          var spreadEnabled = rule && rule.enabled;
+          var v1Enabled = rule && rule.v1_enabled;
           var targetVal = rule && rule.target_spread_pct !== undefined && rule.target_spread_pct !== null
             ? formatNumber(rule.target_spread_pct, 2)
             : '';
@@ -1032,13 +1272,16 @@
             ? formatNumber(liveSpread, 2) + '%'
             : (isMultileg ? '<span class="muted">n/a</span>' : '-');
           var key = autoExitKey(row.symbol, ruleLong, ruleShort);
-          var checkbox = '<input type="checkbox" class="auto-exit-toggle" data-key="' + escapeHtml(key) + '" data-symbol="' +
+          var spreadCheckbox = '<label class="inline-toggle"><input type="checkbox" class="auto-exit-toggle" data-key="' + escapeHtml(key) + '" data-symbol="' +
             escapeHtml(row.symbol || '') + '" data-long="' + escapeHtml(ruleLong) + '" data-short="' + escapeHtml(ruleShort) + '"' +
-            (enabled ? ' checked' : '') + ' />';
+            (spreadEnabled ? ' checked' : '') + ' /> spread</label>';
+          var v1Checkbox = '<label class="inline-toggle"><input type="checkbox" class="auto-exit-v1-toggle" data-key="' + escapeHtml(key) + '" data-symbol="' +
+            escapeHtml(row.symbol || '') + '" data-long="' + escapeHtml(ruleLong) + '" data-short="' + escapeHtml(ruleShort) + '"' +
+            (v1Enabled ? ' checked' : '') + ' /> v1</label>';
           var input = '<input type="number" class="auto-exit-target" step="0.01" placeholder="-7.9" value="' + escapeHtml(targetVal) +
             '" data-key="' + escapeHtml(key) + '" data-symbol="' + escapeHtml(row.symbol || '') + '" data-long="' +
             escapeHtml(ruleLong) + '" data-short="' + escapeHtml(ruleShort) + '" />';
-          autoExitToggle = checkbox + (isMultileg ? ' <span class="muted">multi-leg</span>' : '');
+          autoExitToggle = spreadCheckbox + ' ' + v1Checkbox + (isMultileg ? ' <span class="muted">multi-leg</span>' : '');
           autoExitTarget = input;
         } else {
           autoExitToggle = '<span class="muted">one-side</span>';
@@ -1054,12 +1297,11 @@
       html += '<tr class="' + classes + '"'+ symbolAttr + '>' +
         '<td>' + (showSymbol ? escapeHtml(row.symbol || '-') : '-') + '</td>' +
         '<td>' + escapeHtml(isSummary ? (row.exchange || 'TOTAL') : (row.exchange || '-')) + '</td>' +
-        '<td>' + formatNumber(row.quantity, 4) + '</td>' +
+        '<td>' + formatTrimmedNumber(row.quantity, 2) + '</td>' +
         '<td>' + formatNumber(row.amount, 2) + '</td>' +
-        '<td>' + marginUsedText + '</td>' +
         '<td>' + entryText + '</td>' +
         '<td>' + markText + '</td>' +
-        '<td class="' + pnlClass + '">' + formatNumber(row.unrealized_pnl, 4) + '</td>' +
+        '<td class="' + pnlClass + '">' + formatTrimmedNumber(row.unrealized_pnl, 2) + '</td>' +
         '<td>' + liqPriceText + '</td>' +
         '<td>' + liqDistText + '</td>' +
         '<td>' + leverageText + '</td>' +
@@ -1075,7 +1317,7 @@
       lastSymbol = row.symbol;
     }
     if (!html) {
-      html = '<tr><td colspan="19" class="muted">No live positions.</td></tr>';
+      html = '<tr><td colspan="18" class="muted">No live positions.</td></tr>';
     }
     elements.symbolPositionsTable.innerHTML = html;
     attachSymbolHover(elements.symbolPositionsTable);
@@ -1187,6 +1429,190 @@
         '</span><span class="event-log__message">' + messageHtml + '</span></li>';
     }
     elements.autoExitLog.innerHTML = html;
+  }
+
+  function formatAutoExitPair(longExchange, shortExchange) {
+    if (!longExchange || !shortExchange) {
+      return '-';
+    }
+    return String(longExchange).toUpperCase() + ' / ' + String(shortExchange).toUpperCase();
+  }
+
+  function formatAutoExitTier(row) {
+    if (!row) {
+      return '-';
+    }
+    if (row.policy_key === 'tier1') {
+      return 'tier1';
+    }
+    if (row.policy_key === 'tier2') {
+      return 'tier2';
+    }
+    if (row.policy_key === 'lower_tier') {
+      return 'lower-tier';
+    }
+    if (row.worst_tier !== undefined && row.worst_tier !== null) {
+      return 'tier' + row.worst_tier;
+    }
+    return '-';
+  }
+
+  function formatAutoExitLeg(exchange, label) {
+    if (!exchange || !label) {
+      return '-';
+    }
+    return String(exchange).toUpperCase() + ' ' + String(label);
+  }
+
+  function formatSignedBps(value) {
+    var number = typeof value === 'number' ? value : parseFloat(value);
+    if (!isFinite(number)) {
+      return '-';
+    }
+    return (number > 0 ? '+' : '') + formatNumber(number, 1);
+  }
+
+  function autoExitValueClass(value) {
+    var number = typeof value === 'number' ? value : parseFloat(value);
+    if (!isFinite(number)) {
+      return '';
+    }
+    if (number > 0) {
+      return 'value-pos';
+    }
+    if (number < 0) {
+      return 'value-neg';
+    }
+    return '';
+  }
+
+  function autoExitStatusChipClass(status) {
+    var normalized = String(status || '').toLowerCase();
+    if (normalized === 'trigger') {
+      return 'status-chip status-chip--ok';
+    }
+    if (normalized === 'wait' || normalized === 'running' || normalized === 'hold' || normalized === 'shadow') {
+      return 'status-chip status-chip--pending';
+    }
+    if (normalized === 'skip' || normalized === 'cooldown') {
+      return 'status-chip status-chip--unknown';
+    }
+    return 'status-chip status-chip--unknown';
+  }
+
+  function autoExitCleanupClass(summary) {
+    var text = String(summary || '').toLowerCase();
+    if (!text || text === '-') {
+      return '';
+    }
+    if (text.indexOf('block:') >= 0) {
+      return 'value-neg';
+    }
+    if (text.indexOf(':allow') >= 0) {
+      return 'value-pos';
+    }
+    return '';
+  }
+
+  function renderAutoExitDiagnostics(autoExit) {
+    if (!elements.autoExitDiagnosticsBody || !elements.autoExitDiagnosticsEmpty) {
+      return;
+    }
+    var rows = (autoExit && Array.isArray(autoExit.diagnostics)) ? autoExit.diagnostics : [];
+    if (!rows.length) {
+      elements.autoExitDiagnosticsBody.innerHTML = '<tr><td colspan="18" class="muted">No auto-exit diagnostics yet.</td></tr>';
+      elements.autoExitDiagnosticsEmpty.style.display = '';
+      return;
+    }
+    elements.autoExitDiagnosticsEmpty.style.display = 'none';
+    var html = '';
+    var i;
+    for (i = 0; i < rows.length; i += 1) {
+      var row = rows[i] || {};
+      var statusText = String(row.status || '-');
+      if (row.reason) {
+        statusText += ' (' + row.reason + ')';
+      }
+      var selectedPair = formatAutoExitPair(row.selected_long_exchange, row.selected_short_exchange);
+      if ((!row.selected_long_exchange || !row.selected_short_exchange) && row.selection_mode === 'multileg_min_leg') {
+        selectedPair = 'multileg pending';
+      }
+      var chunkText = row.chunk_qty !== undefined && row.chunk_qty !== null
+        ? formatNumber(row.chunk_qty, 4)
+        : '-';
+      if (row.safety_factor !== undefined && row.safety_factor !== null) {
+        chunkText += ' @' + formatNumber(row.safety_factor, 2) + 'x';
+      }
+      var edgeDeltaClass = autoExitValueClass(row.edge_delta_bps);
+      var cleanupClass = autoExitCleanupClass(row.market_cleanup_summary);
+      var statusChip = '<span class="' + autoExitStatusChipClass(row.status) + '">' + escapeHtml(statusText) + '</span>';
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.symbol || '-') + '</td>' +
+        '<td>' + escapeHtml(formatAutoExitPair(row.rule_long_exchange, row.rule_short_exchange)) + '</td>' +
+        '<td>' + escapeHtml(selectedPair) + '</td>' +
+        '<td>' + escapeHtml(formatAutoExitTier(row)) + '</td>' +
+        '<td>' + statusChip + '</td>' +
+        '<td>' + escapeHtml(formatAutoExitLeg(row.primary_exchange, row.primary_label)) + '</td>' +
+        '<td>' + escapeHtml(formatAutoExitLeg(row.hedge_exchange, row.hedge_label)) + '</td>' +
+        '<td>' + escapeHtml(row.decision_reason || '-') + '</td>' +
+        '<td>' + (row.gross_spread_pct !== undefined && row.gross_spread_pct !== null ? formatNumber(row.gross_spread_pct, 2) + '%' : '-') + '</td>' +
+        '<td>' + (row.net_spread_pct !== undefined && row.net_spread_pct !== null ? formatNumber(row.net_spread_pct, 2) + '%' : '-') + '</td>' +
+        '<td>' + (row.required_net_spread_pct !== undefined && row.required_net_spread_pct !== null ? formatNumber(row.required_net_spread_pct, 2) + '%' : '-') + '</td>' +
+        '<td class="' + edgeDeltaClass + '">' + escapeHtml(formatSignedBps(row.edge_delta_bps)) + '</td>' +
+        '<td>' + escapeHtml(chunkText) + '</td>' +
+        '<td>' + (row.chunk_notional_usd !== undefined && row.chunk_notional_usd !== null ? formatNumber(row.chunk_notional_usd, 2) : '-') + '</td>' +
+        '<td>' + (row.chunk_notional_cap_usd !== undefined && row.chunk_notional_cap_usd !== null ? formatNumber(row.chunk_notional_cap_usd, 2) : '-') + '</td>' +
+        '<td>' + (row.market_cleanup_notional_cap_usd !== undefined && row.market_cleanup_notional_cap_usd !== null ? formatNumber(row.market_cleanup_notional_cap_usd, 2) : '-') + '</td>' +
+        '<td class="' + cleanupClass + '">' + escapeHtml(row.market_cleanup_summary || '-') + '</td>' +
+        '<td>' + escapeHtml(formatDate(row.updated_at)) + '</td>' +
+      '</tr>';
+    }
+    elements.autoExitDiagnosticsBody.innerHTML = html;
+  }
+
+  function renderAutoExitV1Diagnostics(autoExit) {
+    if (!elements.autoExitV1DiagnosticsBody || !elements.autoExitV1DiagnosticsEmpty) {
+      return;
+    }
+    var rows = (autoExit && Array.isArray(autoExit.v1_diagnostics)) ? autoExit.v1_diagnostics : [];
+    if (!rows.length) {
+      elements.autoExitV1DiagnosticsBody.innerHTML = '<tr><td colspan="15" class="muted">No experimental v1 diagnostics yet.</td></tr>';
+      elements.autoExitV1DiagnosticsEmpty.style.display = '';
+      return;
+    }
+    elements.autoExitV1DiagnosticsEmpty.style.display = 'none';
+    var html = '';
+    var i;
+    for (i = 0; i < rows.length; i += 1) {
+      var row = rows[i] || {};
+      var statusText = String(row.status || '-');
+      if (row.reason) {
+        statusText += ' (' + row.reason + ')';
+      }
+      var selectedPair = formatAutoExitPair(row.selected_long_exchange, row.selected_short_exchange);
+      var statusChip = '<span class="' + autoExitStatusChipClass(row.status) + '">' + escapeHtml(statusText) + '</span>';
+      var waitScoreClass = autoExitValueClass(row.wait_score_bps);
+      var fundingClass = autoExitValueClass(row.funding_to_next_bps);
+      var closeClass = autoExitValueClass(row.close_now_bps);
+      html += '<tr>' +
+        '<td>' + escapeHtml(row.symbol || '-') + '</td>' +
+        '<td>' + escapeHtml(formatAutoExitPair(row.rule_long_exchange, row.rule_short_exchange)) + '</td>' +
+        '<td>' + escapeHtml(selectedPair) + '</td>' +
+        '<td>' + statusChip + '</td>' +
+        '<td>' + escapeHtml(row.window_stage || '-') + '</td>' +
+        '<td>' + (row.effective_interval_minutes !== undefined && row.effective_interval_minutes !== null ? formatNumber(row.effective_interval_minutes, 1) : '-') + '</td>' +
+        '<td>' + (row.minutes_to_event !== undefined && row.minutes_to_event !== null ? formatNumber(row.minutes_to_event, 1) : '-') + '</td>' +
+        '<td class="' + fundingClass + '">' + escapeHtml(formatSignedBps(row.funding_to_next_bps)) + '</td>' +
+        '<td class="' + closeClass + '">' + escapeHtml(formatSignedBps(row.close_now_bps)) + '</td>' +
+        '<td>' + escapeHtml(formatSignedBps(row.reversion_credit_bps)) + '</td>' +
+        '<td class="' + waitScoreClass + '">' + escapeHtml(formatSignedBps(row.wait_score_bps)) + '</td>' +
+        '<td>' + (row.take_profit_threshold_bps !== undefined && row.take_profit_threshold_bps !== null ? formatSignedBps(row.take_profit_threshold_bps) : '-') + '</td>' +
+        '<td>' + (row.take_profit_k !== undefined && row.take_profit_k !== null ? formatNumber(row.take_profit_k, 1) + 'x' : '-') + '</td>' +
+        '<td>' + escapeHtml(row.decision || '-') + '</td>' +
+        '<td>' + escapeHtml(String(row.pending_exit_cycles !== undefined && row.pending_exit_cycles !== null ? row.pending_exit_cycles : '-')) + '</td>' +
+      '</tr>';
+    }
+    elements.autoExitV1DiagnosticsBody.innerHTML = html;
   }
 
   function latestAutoExitExecId(autoExit) {
@@ -1428,6 +1854,8 @@
     renderAccountBalances(data.balances || []);
     renderSymbolPositions(data.positions_by_symbol || []);
     renderSymbolPositionsDiagnostics(data.positions_market || null);
+    renderMarginDiagnostics(data.margin_diagnostics || []);
+    renderMarginLogicLog(data.margin_logic_log || []);
     if (elements.accountLastUpdated) {
       elements.accountLastUpdated.textContent = data.last_updated ? formatDate(data.last_updated) : '-';
     }
@@ -1496,6 +1924,8 @@
     renderExecution(globalState.execution);
     renderAccounts(globalState.accounts);
     renderAutoExitLog(globalState.auto_exit || {});
+    renderAutoExitDiagnostics(globalState.auto_exit || {});
+    renderAutoExitV1Diagnostics(globalState.auto_exit || {});
     syncAutoExitExecId(globalState.auto_exit || {});
     renderAutoExitAgent();
     renderMessages(collectMessages(globalState));
@@ -1738,7 +2168,8 @@
       table_refresh_seconds: defaultSettings.table_refresh_seconds,
       account_refresh_seconds: defaultSettings.account_refresh_seconds,
       positions_market_refresh_seconds: defaultSettings.positions_market_refresh_seconds,
-      protective: {}
+      protective: {},
+      manual: {}
     };
     if (!elements.settingsForm) {
       return result;
@@ -1793,10 +2224,16 @@
       auto_take_enabled: elements.takeAuto ? !!elements.takeAuto.checked : true,
       send_margin_alerts: elements.alertMargin ? !!elements.alertMargin.checked : true,
       send_missing_stop_alerts: elements.alertMissingStops ? !!elements.alertMissingStops.checked : true,
+      notification_primary_channel: elements.notificationPrimary ? String(elements.notificationPrimary.value || 'telegram') : 'telegram',
+      notification_fallback_channel: elements.notificationFallback ? String(elements.notificationFallback.value || 'none') : 'none',
       auto_margin_enabled: elements.autoMarginAdd ? !!elements.autoMarginAdd.checked : true,
       auto_margin_reduce_enabled: elements.autoMarginReduce ? !!elements.autoMarginReduce.checked : true,
-      stop_gap_from_liq_pct: elements.stopGapInput ? parseFloat(elements.stopGapInput.value) || defaultSettings.stop_gap_from_liq_pct || 0.07 : 0.07,
-      stop_requote_threshold_pct: elements.requoteInput ? parseFloat(elements.requoteInput.value) || 0.005 : 0.005,
+      enforce_isolated_margin: elements.enforceIsolatedMargin ? !!elements.enforceIsolatedMargin.checked : true,
+      enforce_leverage: elements.enforceLeverage ? !!elements.enforceLeverage.checked : true,
+      target_leverage: elements.targetLeverage ? parseFloat(elements.targetLeverage.value) || 3 : 3,
+      kucoin_isolated_topup_only: elements.kucoinTopupOnly ? !!elements.kucoinTopupOnly.checked : true,
+      stop_gap_from_liq_pct: elements.stopGapInput ? parseFloat(elements.stopGapInput.value) || defaultSettings.stop_gap_from_liq_pct || 0.025 : 0.025,
+      stop_requote_threshold_pct: elements.requoteInput ? parseFloat(elements.requoteInput.value) || 0.0025 : 0.0025,
       fallback_liq_factor_long: elements.fallbackLongInput ? parseFloat(elements.fallbackLongInput.value) || 0.33 : 0.33,
       fallback_liq_factor_short: elements.fallbackShortInput ? parseFloat(elements.fallbackShortInput.value) || 1.66 : 1.66,
       auto_rebalance_enabled: elements.rebalanceAuto ? !!elements.rebalanceAuto.checked : false,
@@ -1806,6 +2243,25 @@
       rebalance_limit_offset_bps: elements.rebalanceOffsetInput ? parseFloat(elements.rebalanceOffsetInput.value) || 2 : 2,
       rebalance_max_slippage_bps: elements.rebalanceSlippageInput ? parseFloat(elements.rebalanceSlippageInput.value) || 8 : 8
     };
+    var manual = clone((globalState.settings && globalState.settings.manual) ? globalState.settings.manual : defaultSettings.manual) || {};
+    manual.auto_exit_policy = mergeAutoExitPolicy({
+      tier1: {
+        chunk_notional_cap_usd: elements.autoExitTier1ChunkCap ? elements.autoExitTier1ChunkCap.value : null,
+        market_cleanup_notional_cap_usd: elements.autoExitTier1CleanupCap ? elements.autoExitTier1CleanupCap.value : null,
+        edge_buffer_bps: elements.autoExitTier1EdgeBuffer ? elements.autoExitTier1EdgeBuffer.value : null
+      },
+      tier2: {
+        chunk_notional_cap_usd: elements.autoExitTier2ChunkCap ? elements.autoExitTier2ChunkCap.value : null,
+        market_cleanup_notional_cap_usd: elements.autoExitTier2CleanupCap ? elements.autoExitTier2CleanupCap.value : null,
+        edge_buffer_bps: elements.autoExitTier2EdgeBuffer ? elements.autoExitTier2EdgeBuffer.value : null
+      },
+      lower_tier: {
+        chunk_notional_cap_usd: elements.autoExitLowerChunkCap ? elements.autoExitLowerChunkCap.value : null,
+        market_cleanup_notional_cap_usd: elements.autoExitLowerCleanupCap ? elements.autoExitLowerCleanupCap.value : null,
+        edge_buffer_bps: elements.autoExitLowerEdgeBuffer ? elements.autoExitLowerEdgeBuffer.value : null
+      }
+    });
+    result.manual = manual;
     return result;
   }
 
@@ -1933,6 +2389,12 @@
     if (elements.takeAuto) {
       elements.takeAuto.checked = protective.hasOwnProperty('auto_take_enabled') ? !!protective.auto_take_enabled : true;
     }
+    if (elements.notificationPrimary) {
+      elements.notificationPrimary.value = protective.notification_primary_channel !== undefined ? protective.notification_primary_channel : 'telegram';
+    }
+    if (elements.notificationFallback) {
+      elements.notificationFallback.value = protective.notification_fallback_channel !== undefined ? protective.notification_fallback_channel : 'none';
+    }
     if (elements.alertMargin) {
       elements.alertMargin.checked = protective.hasOwnProperty('send_margin_alerts') ? !!protective.send_margin_alerts : true;
     }
@@ -1942,14 +2404,26 @@
     if (elements.autoMarginReduce) {
       elements.autoMarginReduce.checked = protective.hasOwnProperty('auto_margin_reduce_enabled') ? !!protective.auto_margin_reduce_enabled : true;
     }
+    if (elements.enforceIsolatedMargin) {
+      elements.enforceIsolatedMargin.checked = protective.hasOwnProperty('enforce_isolated_margin') ? !!protective.enforce_isolated_margin : true;
+    }
+    if (elements.enforceLeverage) {
+      elements.enforceLeverage.checked = protective.hasOwnProperty('enforce_leverage') ? !!protective.enforce_leverage : true;
+    }
+    if (elements.targetLeverage) {
+      elements.targetLeverage.value = protective.target_leverage !== undefined ? protective.target_leverage : 3;
+    }
+    if (elements.kucoinTopupOnly) {
+      elements.kucoinTopupOnly.checked = protective.hasOwnProperty('kucoin_isolated_topup_only') ? !!protective.kucoin_isolated_topup_only : true;
+    }
     if (elements.alertMissingStops) {
       elements.alertMissingStops.checked = protective.hasOwnProperty('send_missing_stop_alerts') ? !!protective.send_missing_stop_alerts : true;
     }
     if (elements.stopGapInput) {
-      elements.stopGapInput.value = protective.stop_gap_from_liq_pct !== undefined ? protective.stop_gap_from_liq_pct : 0.07;
+      elements.stopGapInput.value = protective.stop_gap_from_liq_pct !== undefined ? protective.stop_gap_from_liq_pct : 0.025;
     }
     if (elements.requoteInput) {
-      elements.requoteInput.value = protective.stop_requote_threshold_pct !== undefined ? protective.stop_requote_threshold_pct : 0.005;
+      elements.requoteInput.value = protective.stop_requote_threshold_pct !== undefined ? protective.stop_requote_threshold_pct : 0.0025;
     }
     if (elements.fallbackLongInput) {
       elements.fallbackLongInput.value = protective.fallback_liq_factor_long !== undefined ? protective.fallback_liq_factor_long : 0.33;
@@ -1975,6 +2449,35 @@
     if (elements.rebalanceSlippageInput) {
       elements.rebalanceSlippageInput.value = protective.rebalance_max_slippage_bps !== undefined ? protective.rebalance_max_slippage_bps : 8;
     }
+    var manual = settings.manual || {};
+    var autoExitPolicy = mergeAutoExitPolicy(manual.auto_exit_policy);
+    if (elements.autoExitTier1ChunkCap) {
+      elements.autoExitTier1ChunkCap.value = autoExitPolicy.tier1.chunk_notional_cap_usd;
+    }
+    if (elements.autoExitTier1CleanupCap) {
+      elements.autoExitTier1CleanupCap.value = autoExitPolicy.tier1.market_cleanup_notional_cap_usd;
+    }
+    if (elements.autoExitTier1EdgeBuffer) {
+      elements.autoExitTier1EdgeBuffer.value = autoExitPolicy.tier1.edge_buffer_bps;
+    }
+    if (elements.autoExitTier2ChunkCap) {
+      elements.autoExitTier2ChunkCap.value = autoExitPolicy.tier2.chunk_notional_cap_usd;
+    }
+    if (elements.autoExitTier2CleanupCap) {
+      elements.autoExitTier2CleanupCap.value = autoExitPolicy.tier2.market_cleanup_notional_cap_usd;
+    }
+    if (elements.autoExitTier2EdgeBuffer) {
+      elements.autoExitTier2EdgeBuffer.value = autoExitPolicy.tier2.edge_buffer_bps;
+    }
+    if (elements.autoExitLowerChunkCap) {
+      elements.autoExitLowerChunkCap.value = autoExitPolicy.lower_tier.chunk_notional_cap_usd;
+    }
+    if (elements.autoExitLowerCleanupCap) {
+      elements.autoExitLowerCleanupCap.value = autoExitPolicy.lower_tier.market_cleanup_notional_cap_usd;
+    }
+    if (elements.autoExitLowerEdgeBuffer) {
+      elements.autoExitLowerEdgeBuffer.value = autoExitPolicy.lower_tier.edge_buffer_bps;
+    }
     toggleRebalanceFields(elements.rebalanceAuto ? elements.rebalanceAuto.checked : false);
   }
 
@@ -1983,7 +2486,7 @@
       return;
     }
     var target = event.target;
-    if (!(target.classList && (target.classList.contains('auto-exit-toggle') || target.classList.contains('auto-exit-target')))) {
+    if (!(target.classList && (target.classList.contains('auto-exit-toggle') || target.classList.contains('auto-exit-v1-toggle') || target.classList.contains('auto-exit-target')))) {
       return;
     }
     var row = target.closest('tr');
@@ -1991,8 +2494,9 @@
       return;
     }
     var toggle = row.querySelector('.auto-exit-toggle');
+    var v1Toggle = row.querySelector('.auto-exit-v1-toggle');
     var input = row.querySelector('.auto-exit-target');
-    if (!toggle || !input) {
+    if (!toggle || !v1Toggle || !input) {
       return;
     }
     var symbol = input.dataset.symbol || toggle.dataset.symbol;
@@ -2001,9 +2505,10 @@
     if (!symbol || !longExchange || !shortExchange) {
       return;
     }
-    var enabled = !!toggle.checked;
+    var spreadEnabled = !!toggle.checked;
+    var v1Enabled = !!v1Toggle.checked;
     var targetVal = parseFloat(input.value);
-    if (enabled && (isNaN(targetVal) || !isFinite(targetVal))) {
+    if (spreadEnabled && (isNaN(targetVal) || !isFinite(targetVal))) {
       renderMessages(['Auto-exit target spread is required.']);
       return;
     }
@@ -2011,8 +2516,10 @@
       symbol: symbol,
       long_exchange: longExchange,
       short_exchange: shortExchange,
-      enabled: enabled,
-      target_spread_pct: enabled ? targetVal : null
+      enabled: spreadEnabled,
+      spread_enabled: spreadEnabled,
+      v1_enabled: v1Enabled,
+      target_spread_pct: spreadEnabled ? targetVal : null
     };
     request('POST', '/api/auto-exit/rule', payload, function (err, data) {
       if (err) {

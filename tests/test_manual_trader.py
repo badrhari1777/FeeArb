@@ -9,8 +9,10 @@ from execution.manual import (
     _cap_qty_to_absolute_target,
     _cap_qty_to_target,
     _choose_chunk_qty,
+    _classify_submit_error,
     _is_min_order_size_error,
     _min_qty_required,
+    _normalize_submit_values,
     _precision_to_step,
     _round_to_step,
     _symbol_matches,
@@ -20,6 +22,7 @@ from execution.manual import (
     slippage_bps,
     spread_pct,
     suggest_expensive_leg,
+    venue_liquidity_tier,
 )
 
 
@@ -61,6 +64,95 @@ class ManualTradeHelpersTestCase(unittest.TestCase):
         )
         self.assertEqual(suggestion["suggested_leg"], "long")
 
+    def test_suggest_expensive_leg_prefers_lower_tier_venue(self) -> None:
+        suggestion = suggest_expensive_leg(
+            "binance",
+            "gate",
+            fee_table={
+                "binance": {"taker": 0.001},
+                "gate": {"taker": 0.0},
+            },
+            liquidity={"binance": 100000.0, "gate": 100000.0},
+        )
+        self.assertEqual(suggestion["suggested_leg"], "short")
+        self.assertEqual(suggestion["reason"], "lower_venue_tier")
+        self.assertEqual(suggestion["venue_tier"], {"long": 1, "short": 3})
+
+    def test_venue_liquidity_tier_defaults(self) -> None:
+        self.assertEqual(venue_liquidity_tier("binance"), 1)
+        self.assertEqual(venue_liquidity_tier("okx"), 2)
+        self.assertEqual(venue_liquidity_tier("gate"), 3)
+
+    def test_resolve_primary_hedge_legs_uses_suggested_leg_for_auto_hint(self) -> None:
+        manager = ManualTradeManager()
+        label, primary, hedge = manager._resolve_primary_hedge_legs(
+            explicit=None,
+            plan={"suggested_expensive_leg": {"suggested_leg": "short"}},
+            legs=[
+                {"label": "long", "exchange": "binance"},
+                {"label": "short", "exchange": "gate"},
+            ],
+        )
+        self.assertEqual(label, "short")
+        self.assertEqual(primary, {"label": "short", "exchange": "gate"})
+        self.assertEqual(hedge, {"label": "long", "exchange": "binance"})
+
+    def test_resolve_primary_hedge_legs_maps_roll_suggestion_to_to_from(self) -> None:
+        manager = ManualTradeManager()
+        label, primary, hedge = manager._resolve_primary_hedge_legs(
+            explicit=None,
+            plan={"suggested_expensive_leg": {"suggested_leg": "long"}},
+            legs=[
+                {"label": "to", "exchange": "okx"},
+                {"label": "from", "exchange": "gate"},
+            ],
+        )
+        self.assertEqual(label, "to")
+        self.assertEqual(primary, {"label": "to", "exchange": "okx"})
+        self.assertEqual(hedge, {"label": "from", "exchange": "gate"})
+
+    def test_auto_exit_market_fallback_allowed_only_on_tier_one_two(self) -> None:
+        manager = ManualTradeManager()
+        payload = {"auto_exit_agent": True}
+        self.assertTrue(manager._auto_exit_market_fallback_allowed(payload, "binance"))
+        self.assertTrue(manager._auto_exit_market_fallback_allowed(payload, "okx"))
+        self.assertFalse(manager._auto_exit_market_fallback_allowed(payload, "gate"))
+
+    def test_auto_exit_market_fallback_respects_notional_cap(self) -> None:
+        manager = ManualTradeManager()
+        payload = {
+            "auto_exit_agent": True,
+            "auto_exit_market_cleanup_notional_max": 2500.0,
+        }
+        self.assertTrue(
+            manager._auto_exit_market_fallback_allowed(payload, "okx", notional_usd=2000.0)
+        )
+        self.assertFalse(
+            manager._auto_exit_market_fallback_allowed(payload, "okx", notional_usd=3000.0)
+        )
+
+    def test_auto_exit_dynamic_chunk_keeps_chunk_qty_unset(self) -> None:
+        manager = ManualTradeManager()
+        updated = manager._apply_auto_exit_exit_overrides(
+            {
+                "auto_exit_agent": True,
+                "auto_exit_dynamic_chunk": True,
+                "chunk_notional": 2500.0,
+            },
+            {
+                "action": "exit",
+                "qty": 200.0,
+                "recommended_chunk_qty": 100.0,
+                "min_chunk_qty": 10.0,
+                "market_constraints": {},
+            },
+        )
+        self.assertIsNone(updated.get("chunk_qty"))
+        self.assertEqual(updated.get("hedge_order_type"), "limit")
+        self.assertEqual(updated.get("hedge_limit_mode"), "aggressive")
+        self.assertEqual(updated.get("hedge_adverse_bps"), 6.0)
+        self.assertEqual(updated.get("hedge_reprice_min_sec"), 2.0)
+
     def test_spread_pct(self) -> None:
         self.assertAlmostEqual(spread_pct(100.0, 101.0), -1.0)
 
@@ -92,6 +184,35 @@ class ManualTradeHelpersTestCase(unittest.TestCase):
         )
         self.assertIsNone(chunk)
         self.assertTrue(warnings)
+
+    def test_normalize_submit_values_rounds_limit_price_to_tick(self) -> None:
+        qty, price, error = _normalize_submit_values(
+            qty=200.0,
+            price=0.63539,
+            side="sell",
+            order_type="limit",
+            min_qty=1.0,
+            min_notional=5.0,
+            amount_step=0.1,
+            price_step=0.001,
+        )
+        self.assertIsNone(error)
+        self.assertAlmostEqual(qty or 0.0, 200.0)
+        self.assertAlmostEqual(price or 0.0, 0.636)
+
+    def test_classify_submit_error_detects_tradfi_agreement(self) -> None:
+        self.assertEqual(
+            _classify_submit_error(
+                'binanceusdm {"code":-4411,"msg":"Please sign TradFi-Perps agreement contract fapi."}'
+            ),
+            "tradfi_agreement_required",
+        )
+
+    def test_classify_submit_error_detects_price_band(self) -> None:
+        self.assertEqual(
+            _classify_submit_error('okx {"code":"51006","msg":"Order price is above max price limit."}'),
+            "price_band",
+        )
 
     def test_cap_qty_to_target(self) -> None:
         self.assertAlmostEqual(
@@ -219,6 +340,131 @@ class ManualTradeBinanceCancelTestCase(unittest.TestCase):
         )
 
         self.assertFalse(ok)
+
+
+class _BinanceLeverageClient:
+    def __init__(
+        self,
+        *,
+        leverage_before: float | None = None,
+        leverage_after: float | None = None,
+        set_error: str | None = None,
+        margin_mode: str = "isolated",
+    ) -> None:
+        self.leverage_before = leverage_before
+        self.leverage_after = leverage_after if leverage_after is not None else leverage_before
+        self.set_error = set_error
+        self.margin_mode = margin_mode
+        self.fetch_positions_calls = 0
+        self.fetch_leverage_calls = 0
+        self.set_leverage_calls = 0
+        self.set_margin_mode_calls = 0
+        self.cancel_all_calls: list[str] = []
+
+    async def fetch_positions(self, symbols=None):  # noqa: D401, ARG002
+        self.fetch_positions_calls += 1
+        return []
+
+    async def fetch_leverage(self, symbol):  # noqa: D401, ARG002
+        self.fetch_leverage_calls += 1
+        leverage = self.leverage_before if self.set_leverage_calls <= 0 else self.leverage_after
+        if leverage is None:
+            return {"symbol": symbol, "marginMode": self.margin_mode}
+        return {
+            "symbol": symbol,
+            "longLeverage": leverage,
+            "shortLeverage": leverage,
+            "marginMode": self.margin_mode,
+        }
+
+    async def set_leverage(self, leverage, symbol, params=None):  # noqa: D401, ARG002
+        self.set_leverage_calls += 1
+        if self.set_error:
+            raise RuntimeError(self.set_error)
+        self.leverage_after = float(leverage)
+        return {"symbol": symbol, "leverage": leverage}
+
+    async def set_margin_mode(self, margin_mode, symbol):  # noqa: D401, ARG002
+        self.set_margin_mode_calls += 1
+        self.margin_mode = str(margin_mode)
+        return {"symbol": symbol, "marginMode": margin_mode}
+
+    async def cancel_all_orders(self, symbol):  # noqa: D401, ARG002
+        self.cancel_all_calls.append(symbol)
+
+    async def fetch_open_orders(self, symbol):  # noqa: D401, ARG002
+        return []
+
+    async def request(self, path: str, api: str, method: str, params: dict):  # noqa: ARG002
+        if path == "openAlgoOrders" and method.upper() == "GET":
+            return []
+        raise RuntimeError(f"unsupported request path={path} method={method}")
+
+
+class _BinanceLeverageManager(ManualTradeManager):
+    def __init__(self, client) -> None:
+        super().__init__()
+        self._client = client
+
+    async def _ensure_client(self, exchange, errors):  # noqa: D401, ARG002
+        return self._client
+
+    async def _resolve_market_symbol(self, client, symbol):  # noqa: D401, ARG002
+        return "CLO/USDT:USDT"
+
+
+class ManualTradeBinanceLeveragePrecheckTestCase(unittest.TestCase):
+    def test_binance_leverage_skips_set_when_fetch_leverage_already_matches(self) -> None:
+        client = _BinanceLeverageClient(leverage_before=3.0)
+        manager = _BinanceLeverageManager(client)
+
+        errors = asyncio.run(
+            manager._ensure_binance_leverage_for_legs(
+                [{"exchange": "binance", "side": "sell", "margin_mode": "isolated", "reduce_only": False}],
+                "CLO",
+            )
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(client.set_leverage_calls, 0)
+        self.assertGreaterEqual(client.fetch_leverage_calls, 1)
+
+    def test_binance_leverage_error_is_accepted_when_readback_confirms_target(self) -> None:
+        client = _BinanceLeverageClient(
+            leverage_before=10.0,
+            leverage_after=3.0,
+            set_error="binanceusdm POST https://fapi.binance.com/fapi/v1/leverage",
+        )
+        manager = _BinanceLeverageManager(client)
+
+        errors = asyncio.run(
+            manager._ensure_binance_leverage_for_legs(
+                [{"exchange": "binance", "side": "sell", "margin_mode": "isolated", "reduce_only": False}],
+                "CLO",
+            )
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(client.set_leverage_calls, 1)
+        self.assertGreaterEqual(client.fetch_leverage_calls, 2)
+
+    def test_binance_leverage_error_blocks_when_readback_still_mismatched(self) -> None:
+        client = _BinanceLeverageClient(
+            leverage_before=10.0,
+            leverage_after=10.0,
+            set_error="binanceusdm POST https://fapi.binance.com/fapi/v1/leverage",
+        )
+        manager = _BinanceLeverageManager(client)
+
+        errors = asyncio.run(
+            manager._ensure_binance_leverage_for_legs(
+                [{"exchange": "binance", "side": "sell", "margin_mode": "isolated", "reduce_only": False}],
+                "CLO",
+            )
+        )
+
+        self.assertEqual(errors, ["binance: set leverage failed"])
+        self.assertEqual(client.set_leverage_calls, 3)
 
 
 class _HedgeFallbackManager(ManualTradeManager):
@@ -358,7 +604,69 @@ class _HedgeFallbackSubmittedManager(_HedgeFallbackManager):
         }
 
 
+class _LimitFirstAutoHintManager(ManualTradeManager):
+    async def _place_limit_then_wait(
+        self,
+        leg,
+        symbol,
+        qty,
+        timeout,
+        payload,
+        log_cb=None,
+    ):  # noqa: D401, ARG002
+        return {
+            "exchange": leg["exchange"],
+            "status": "filled",
+            "filled_qty": float(qty),
+            "avg_price": 100.0,
+        }
+
+    async def _place_market(
+        self,
+        leg,
+        symbol,
+        qty,
+        payload,
+        *,
+        reason=None,
+        require_ws=True,
+        log_cb=None,
+    ):  # noqa: D401, ARG002
+        return {
+            "exchange": leg["exchange"],
+            "status": "filled",
+            "filled_qty": float(qty),
+            "avg_price": 100.0,
+            "reason": reason,
+        }
+
+
 class ManualTradeHedgeFallbackTestCase(unittest.TestCase):
+    def test_limit_first_expensive_uses_auto_hint_suggested_leg(self) -> None:
+        manager = _LimitFirstAutoHintManager()
+        result = asyncio.run(
+            manager._execute_plan(
+                {
+                    "action": "enter",
+                    "symbol": "SIREN",
+                    "qty": 1.0,
+                    "legs": [
+                        {"exchange": "binance", "side": "buy", "label": "long", "reduce_only": False},
+                        {"exchange": "gate", "side": "sell", "label": "short", "reduce_only": False},
+                    ],
+                    "suggested_expensive_leg": {"suggested_leg": "short"},
+                    "warnings": [],
+                },
+                mode="limit-first-expensive",
+                payload={"expensive_leg": None},
+            )
+        )
+
+        actions = result.get("actions") or []
+        self.assertEqual(len(actions), 2)
+        self.assertEqual(actions[0].get("exchange"), "gate")
+        self.assertEqual(actions[1].get("exchange"), "binance")
+
     def test_hedge_adverse_market_fallback_counts_market_fill(self) -> None:
         manager = _HedgeFallbackManager()
         leg = {
@@ -543,6 +851,416 @@ class _DustFinalizeManager(ManualTradeManager):
             "filled_qty": float(qty),
             "avg_price": 1.0,
         }
+
+
+class _SubmitOrderClient:
+    def __init__(
+        self,
+        *,
+        create_error: str | None = None,
+        positions: list[dict[str, object]] | None = None,
+    ) -> None:
+        self.create_error = create_error
+        self.positions = list(positions or [])
+        self.calls: list[dict[str, object]] = []
+        self.markets = {
+            "SIREN/USDT:USDT": {
+                "precision": {"amount": 1, "price": 3},
+                "limits": {"amount": {"min": 1.0}, "cost": {"min": 5.0}},
+                "contractSize": 1.0,
+                "info": {},
+            }
+        }
+
+    async def create_order(self, symbol, order_type, side, amount, price=None, params=None):  # noqa: D401
+        self.calls.append(
+            {
+                "symbol": symbol,
+                "order_type": order_type,
+                "side": side,
+                "amount": amount,
+                "price": price,
+                "params": params,
+            }
+        )
+        if self.create_error:
+            raise RuntimeError(self.create_error)
+        return {"id": "OID-1", "filled": 0.0, "average": None, "status": "open"}
+
+    async def fetch_positions(self, symbols=None):  # noqa: D401, ARG002
+        return list(self.positions)
+
+
+class _SubmitOrderManager(ManualTradeManager):
+    def __init__(self, client) -> None:
+        super().__init__()
+        self._client = client
+
+    async def _ensure_client(self, exchange, errors):  # noqa: D401, ARG002
+        return self._client
+
+    async def _resolve_market_symbol(self, client, symbol):  # noqa: D401, ARG002
+        return "SIREN/USDT:USDT"
+
+    async def _ensure_ws_orders_recovered(self, exchange, reason="submit", log_cb=None):  # noqa: D401, ARG002
+        return True
+
+
+class _SmartEnterPartialExposureManager(ManualTradeManager):
+    async def _ensure_ws_positions(self, exchanges, contract_sizes=None):  # noqa: D401, ARG002
+        return None
+
+    async def _ensure_ws_orders(self, exchanges, contract_sizes=None, symbol=None, log_cb=None):  # noqa: D401, ARG002
+        return None
+
+    async def _fetch_positions_with_retry(self, exchanges, symbol, log_cb=None):  # noqa: D401, ARG002
+        return [], []
+
+    async def _fetch_positions_for_symbol(
+        self,
+        *,
+        exchanges,
+        symbol,
+        allow_ws=True,
+        contract_sizes=None,
+    ):  # noqa: D401, ARG002
+        exchange_set = {str(exchange) for exchange in exchanges}
+        if exchange_set == {"okx"}:
+            return ([], [])
+        return (
+            [
+                {
+                    "exchange": "binance",
+                    "symbol": f"{symbol}/USDT:USDT",
+                    "side": "long",
+                    "coin_qty": 1.0,
+                    "mark_price": 100.0,
+                },
+                {
+                    "exchange": "okx",
+                    "symbol": f"{symbol}/USDT:USDT",
+                    "side": "short",
+                    "coin_qty": 1.0,
+                    "mark_price": 100.0,
+                },
+            ],
+            [],
+        )
+
+    async def _snapshot_legs(self, symbol, legs, max_slippage_bps=0.0):  # noqa: D401, ARG002
+        stats = {}
+        constraints = {}
+        orderbooks = {}
+        for leg in legs:
+            exchange = leg["exchange"]
+            stats[exchange] = OrderBookStats(
+                best_bid=99.0,
+                best_ask=101.0,
+                spread=2.0,
+                mid=100.0,
+                bid_liquidity_top3=1000.0,
+                ask_liquidity_top3=1000.0,
+                min_liquidity_top3=1000.0,
+            )
+            constraints[exchange] = {
+                "price_step": 0.1,
+                "amount_step": 0.1,
+                "min_qty_required": 0.1,
+            }
+            orderbooks[exchange] = {
+                "bids": [[99.0, 100.0]],
+                "asks": [[101.0, 100.0]],
+            }
+        return {
+            "errors": [],
+            "stats": stats,
+            "constraints": constraints,
+            "orderbooks": orderbooks,
+            "spread_pct": 0.0,
+            "mid_price": 100.0,
+            "orderbook_sources": {leg["exchange"]: "rest" for leg in legs},
+        }
+
+    def _ws_orders_live(self, exchange):  # noqa: D401, ARG002
+        return False
+
+    async def _submit_order(
+        self,
+        leg,
+        symbol,
+        qty,
+        order_type,
+        *,
+        price,
+        reduce_only,
+        require_ws=True,
+        log_cb=None,
+    ):  # noqa: D401, ARG002
+        return {
+            "exchange": leg["exchange"],
+            "status": "submitted",
+            "order_id": "P1",
+            "filled_qty": 0.0,
+            "avg_price": None,
+        }
+
+    async def _wait_for_order_with_spread(
+        self,
+        leg,
+        symbol,
+        order_id,
+        timeout,
+        spread_min_pct,
+        spread_max_pct,
+        spread_legs,
+        reprice_sec,
+        *,
+        cancel_on_timeout=True,
+        log_cb=None,
+    ):  # noqa: D401, ARG002
+        return {
+            "exchange": leg["exchange"],
+            "status": "filled",
+            "order_id": order_id,
+            "filled_qty": 1.0,
+            "avg_price": 100.0,
+        }
+
+    async def _hedge_position(
+        self,
+        leg,
+        symbol,
+        qty,
+        *,
+        hedge_order_type,
+        hedge_offset_bps,
+        hedge_offset_ticks,
+        hedge_limit_mode,
+        hedge_favorable_bps,
+        hedge_adverse_bps,
+        hedge_adverse_ticks,
+        hedge_reprice_min_sec,
+        payload,
+        min_qty_required=None,
+        log_cb=None,
+    ):  # noqa: D401, ARG002
+        return {
+            "exchange": leg["exchange"],
+            "status": "error",
+            "error": "hedge_submit_rejected",
+            "error_type": "tick_size",
+            "filled_qty": 0.0,
+        }
+
+    async def _cancel_order(self, leg, symbol, order_id):  # noqa: D401, ARG002
+        return {"exchange": leg["exchange"], "status": "canceled", "order_id": order_id}
+
+
+class ManualTradeSubmitOrderValidationTestCase(unittest.TestCase):
+    def test_submit_order_rounds_price_to_tick_before_create(self) -> None:
+        client = _SubmitOrderClient()
+        manager = _SubmitOrderManager(client)
+
+        result = asyncio.run(
+            manager._submit_order(
+                {"exchange": "binance", "side": "sell"},
+                "SIREN",
+                200.0,
+                "limit",
+                price=0.63539,
+                reduce_only=False,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(result.get("status"), "submitted")
+        self.assertEqual(len(client.calls), 1)
+        self.assertAlmostEqual(float(client.calls[0]["price"]), 0.636)
+
+    def test_submit_order_blocks_below_min_notional_before_create(self) -> None:
+        client = _SubmitOrderClient()
+        manager = _SubmitOrderManager(client)
+
+        result = asyncio.run(
+            manager._submit_order(
+                {"exchange": "binance", "side": "sell"},
+                "SIREN",
+                6.0,
+                "limit",
+                price=0.77,
+                reduce_only=False,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(result.get("status"), "error")
+        self.assertEqual(result.get("error_type"), "min_order_size")
+        self.assertEqual(client.calls, [])
+
+    def test_submit_order_classifies_tradfi_error(self) -> None:
+        client = _SubmitOrderClient(
+            create_error='binanceusdm {"code":-4411,"msg":"Please sign TradFi-Perps agreement contract fapi."}'
+        )
+        manager = _SubmitOrderManager(client)
+
+        result = asyncio.run(
+            manager._submit_order(
+                {"exchange": "binance", "side": "sell"},
+                "SIREN",
+                20.0,
+                "market",
+                price=None,
+                reduce_only=False,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(result.get("status"), "error")
+        self.assertEqual(result.get("error_type"), "tradfi_agreement_required")
+
+    def test_submit_order_blocks_static_price_limit_before_create(self) -> None:
+        client = _SubmitOrderClient()
+        client.markets["SIREN/USDT:USDT"]["limits"]["price"] = {"max": 0.7}
+        manager = _SubmitOrderManager(client)
+
+        result = asyncio.run(
+            manager._submit_order(
+                {"exchange": "okx", "side": "sell"},
+                "SIREN",
+                20.0,
+                "limit",
+                price=0.8,
+                reduce_only=False,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(result.get("status"), "error")
+        self.assertEqual(result.get("error_type"), "price_band")
+        self.assertEqual(client.calls, [])
+
+    def test_submit_order_blocks_reduce_only_without_position(self) -> None:
+        client = _SubmitOrderClient()
+        manager = _SubmitOrderManager(client)
+
+        result = asyncio.run(
+            manager._submit_order(
+                {"exchange": "binance", "side": "sell"},
+                "SIREN",
+                20.0,
+                "market",
+                price=None,
+                reduce_only=True,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(result.get("status"), "error")
+        self.assertEqual(result.get("error_type"), "reduce_only_required")
+        self.assertEqual(client.calls, [])
+
+    def test_submit_order_blocks_reduce_only_above_position_qty(self) -> None:
+        client = _SubmitOrderClient(
+            positions=[
+                {
+                    "symbol": "SIREN/USDT:USDT",
+                    "side": "long",
+                    "contracts": 5.0,
+                }
+            ]
+        )
+        manager = _SubmitOrderManager(client)
+
+        result = asyncio.run(
+            manager._submit_order(
+                {"exchange": "binance", "side": "sell"},
+                "SIREN",
+                20.0,
+                "market",
+                price=None,
+                reduce_only=True,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(result.get("status"), "error")
+        self.assertEqual(result.get("error_type"), "reduce_only_required")
+        self.assertIn("exceeds open position qty", str(result.get("error") or ""))
+        self.assertEqual(client.calls, [])
+
+    def test_collect_action_errors_marks_partial_fill_exposure(self) -> None:
+        manager = ManualTradeManager()
+        errors = manager._collect_action_errors(
+            [
+                {
+                    "exchange": "binance",
+                    "status": "error",
+                    "error": 'binanceusdm {"code":-4014,"msg":"Price not increased by tick size."}',
+                    "risk_state": "partial_fill_exposure",
+                }
+            ]
+        )
+        self.assertEqual(len(errors), 1)
+        self.assertIn("partial_fill_exposure", errors[0])
+
+    def test_smart_enter_returns_partial_fill_risk_flag_when_hedge_fails(self) -> None:
+        manager = _SmartEnterPartialExposureManager()
+        result = asyncio.run(
+            manager._execute_smart_enter(
+                {
+                    "action": "enter",
+                    "symbol": "SIREN",
+                    "qty": 1.0,
+                    "legs": [
+                        {"exchange": "binance", "side": "buy", "label": "long", "reduce_only": False},
+                        {"exchange": "okx", "side": "sell", "label": "short", "reduce_only": False},
+                    ],
+                    "market_constraints": {
+                        "binance": {"amount_step": 0.1, "min_qty_required": 0.1, "price_step": 0.1},
+                        "okx": {"amount_step": 0.1, "min_qty_required": 0.1, "price_step": 0.1},
+                    },
+                },
+                {"verbose_logs": False},
+            )
+        )
+
+        self.assertIn("partial_fill_exposure", result.get("risk_flags") or [])
+        self.assertTrue(
+            any("partial_fill_exposure" in str(err) for err in (result.get("errors") or []))
+        )
+        hedge_errors = [
+            action
+            for action in (result.get("actions") or [])
+            if action.get("exchange") == "okx" and action.get("status") == "error"
+        ]
+        self.assertEqual(len(hedge_errors), 1)
+        self.assertEqual(hedge_errors[0].get("risk_state"), "partial_fill_exposure")
+
+    def test_smart_enter_uses_auto_hint_suggested_leg_as_primary(self) -> None:
+        manager = _SmartEnterPartialExposureManager()
+        result = asyncio.run(
+            manager._execute_smart_enter(
+                {
+                    "action": "enter",
+                    "symbol": "SIREN",
+                    "qty": 1.0,
+                    "legs": [
+                        {"exchange": "binance", "side": "buy", "label": "long", "reduce_only": False},
+                        {"exchange": "okx", "side": "sell", "label": "short", "reduce_only": False},
+                    ],
+                    "market_constraints": {
+                        "binance": {"amount_step": 0.1, "min_qty_required": 0.1, "price_step": 0.1},
+                        "okx": {"amount_step": 0.1, "min_qty_required": 0.1, "price_step": 0.1},
+                    },
+                    "suggested_expensive_leg": {"suggested_leg": "short"},
+                },
+                {"verbose_logs": False, "expensive_leg": None},
+            )
+        )
+
+        actions = result.get("actions") or []
+        self.assertTrue(actions)
+        self.assertEqual(actions[0].get("exchange"), "okx")
 
 
 class ManualTradeExitDustTestCase(unittest.TestCase):
