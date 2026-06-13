@@ -24,8 +24,8 @@ class RiskConfig:
     protective_warn_cooldown_sec: int = 600
 
     telegram_alert_chat_id: str = ""
-    notification_primary_channel: str = "telegram"
-    notification_fallback_channel: str = "none"
+    notification_primary_channel: str = "ntfy"
+    notification_fallback_channel: str = "telegram"
     send_missing_stop_alerts: bool = True
 
 

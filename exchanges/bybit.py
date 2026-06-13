@@ -184,13 +184,14 @@ class BybitAdapter(ExchangeAdapter):
                 )
             return enrich_history_intervals(out)
 
-        return get_or_fetch_funding_history(
+        history = get_or_fetch_funding_history(
             self.name,
             exchange_symbol,
             _fetch,
             max_age_seconds=120,
             limit=limit,
         )
+        return _correct_history_interval_from_timestamps(history)
 
 
 def _derive_interval_hours(item: dict) -> float | None:
@@ -206,6 +207,33 @@ def _derive_interval_hours(item: dict) -> float | None:
     if delta <= 0:
         return None
     return delta
+
+
+def _correct_history_interval_from_timestamps(history: list[dict]) -> list[dict]:
+    rows = [dict(item) for item in history or []]
+    points: list[int] = []
+    for row in rows:
+        ts_ms = parse_timestamp_ms(row.get("ts_ms") or row.get("timestamp"))
+        if ts_ms is not None:
+            points.append(int(ts_ms))
+    unique = sorted(set(points), reverse=True)
+    if len(unique) < 2:
+        return rows
+    buckets: dict[float, int] = {}
+    for idx in range(len(unique) - 1):
+        diff_hours = abs(unique[idx] - unique[idx + 1]) / 1000.0 / 3600.0
+        if diff_hours <= 0:
+            continue
+        bucket = round(diff_hours * 4.0) / 4.0
+        buckets[bucket] = buckets.get(bucket, 0) + 1
+    if not buckets:
+        return rows
+    timestamp_interval = max(buckets.items(), key=lambda item: (item[1], -item[0]))[0]
+    for row in rows:
+        declared = _to_float(row.get("interval_hours"))
+        if declared is None or abs(declared - timestamp_interval) > max(0.1, min(declared, timestamp_interval) * 0.2):
+            row["interval_hours"] = timestamp_interval
+    return rows
 
 
 def _get_json(url: str) -> dict:

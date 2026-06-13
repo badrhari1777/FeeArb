@@ -22,6 +22,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ListAlt
+import androidx.compose.material.icons.outlined.AccountBalanceWallet
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.SwapHoriz
 import androidx.compose.material3.AssistChip
@@ -52,17 +53,23 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.feearb.mobile.ui.theme.FeeArbTheme
 import kotlin.math.absoluteValue
 
-private enum class AppTab { Positions, Manual, Settings }
+private enum class AppTab(val title: String) {
+    Balances("Balances"),
+    Positions("Positions"),
+    Manual("Manual"),
+    Settings("Settings"),
+}
 
 @Composable
 fun FeeArbApp(viewModel: MobileViewModel) {
     FeeArbTheme {
-        var currentTab by remember { mutableStateOf(AppTab.Positions) }
+        var currentTab by remember { mutableStateOf(AppTab.Balances) }
         val state = viewModel.uiState
         state.executeConfirmationText?.let { confirmationText ->
             AlertDialog(
@@ -81,12 +88,35 @@ fun FeeArbApp(viewModel: MobileViewModel) {
                 },
             )
         }
+        state.positionActionConfirmationText?.let { confirmationText ->
+            AlertDialog(
+                onDismissRequest = viewModel::cancelPositionAction,
+                title = { Text("Confirm position action") },
+                text = { Text(confirmationText) },
+                confirmButton = {
+                    Button(
+                        onClick = viewModel::confirmPositionAction,
+                        enabled = !state.positionActionLoading,
+                    ) {
+                        Text(if (state.positionActionLoading) "Submitting..." else "Execute")
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = viewModel::cancelPositionAction,
+                        enabled = !state.positionActionLoading,
+                    ) {
+                        Text("Cancel")
+                    }
+                },
+            )
+        }
         Scaffold(
             topBar = {
                 TopAppBar(
                     title = {
                         Column {
-                            Text("FeeArb Mobile")
+                            Text(currentTab.title)
                             Text(
                                 text = state.statusText,
                                 style = MaterialTheme.typography.labelSmall,
@@ -98,7 +128,11 @@ fun FeeArbApp(viewModel: MobileViewModel) {
                     },
                     actions = {
                         TextButton(onClick = {
-                            if (currentTab == AppTab.Positions) viewModel.refreshPositions() else viewModel.refreshAll()
+                            if (currentTab == AppTab.Manual || currentTab == AppTab.Settings) {
+                                viewModel.refreshAll()
+                            } else {
+                                viewModel.refreshPositions()
+                            }
                         }) {
                             Text("Refresh")
                         }
@@ -107,6 +141,12 @@ fun FeeArbApp(viewModel: MobileViewModel) {
             },
             bottomBar = {
                 NavigationBar {
+                    NavigationBarItem(
+                        selected = currentTab == AppTab.Balances,
+                        onClick = { currentTab = AppTab.Balances },
+                        icon = { Icon(Icons.Outlined.AccountBalanceWallet, contentDescription = null) },
+                        label = { Text("Balances") },
+                    )
                     NavigationBarItem(
                         selected = currentTab == AppTab.Positions,
                         onClick = { currentTab = AppTab.Positions },
@@ -129,6 +169,13 @@ fun FeeArbApp(viewModel: MobileViewModel) {
             },
         ) { padding ->
             when (currentTab) {
+                AppTab.Balances -> BalancesScreen(
+                    balances = state.positionsResponse.balances,
+                    loading = state.positionsLoading,
+                    errorText = state.positionsErrorText,
+                    lastUpdated = state.positionsResponse.account_last_updated ?: state.positionsResponse.last_updated,
+                    modifier = Modifier.padding(padding),
+                )
                 AppTab.Positions -> PositionsScreen(
                     cards = viewModel.visibleCards(),
                     totalCards = state.positionsResponse.cards.size,
@@ -140,30 +187,107 @@ fun FeeArbApp(viewModel: MobileViewModel) {
                     filters = state.positionsResponse.filters,
                     onFilterSelected = viewModel::updateFilter,
                     onSortSelected = viewModel::updateSort,
-                    onSaveAutoExit = viewModel::saveAutoExit,
                     onUseInManual = {
                         viewModel.prefillManualFromPosition(it)
                         currentTab = AppTab.Manual
                     },
+                    onPositionAction = viewModel::startPositionAction,
+                    onSaveAutoExit = viewModel::saveAutoExit,
+                    actionLoading = state.positionActionLoading,
                     modifier = Modifier.padding(padding),
                 )
                 AppTab.Manual -> ManualScreen(
                     state = state,
                     onFormChange = viewModel::updateManualForm,
+                    onAdvancedChange = viewModel::updateAdvancedSettings,
                     onAnalyze = viewModel::analyzeManual,
                     onExecute = viewModel::executeManual,
                     onStop = viewModel::stopExecution,
+                    onRefreshSpread = viewModel::refreshManualSpread,
                     onReloadDefaults = viewModel::loadManualDefaults,
                     modifier = Modifier.padding(padding),
                 )
                 AppTab.Settings -> SettingsScreen(
                     state = state,
                     onBaseUrlChange = viewModel::updateBaseUrl,
-                    onApplyBaseUrl = viewModel::applyBaseUrl,
+                    onRemoteAccessTokenChange = viewModel::updateRemoteAccessToken,
+                    onApplyConnectionSettings = viewModel::applyConnectionSettings,
                     onAdvancedChange = viewModel::updateAdvancedSettings,
                     modifier = Modifier.padding(padding),
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun BalancesScreen(
+    balances: List<BalanceDto>,
+    loading: Boolean,
+    errorText: String?,
+    lastUpdated: String?,
+    modifier: Modifier = Modifier,
+) {
+    val totalBalance = balances.mapNotNull { it.total }.sum()
+    val availableBalance = balances.mapNotNull { it.available }.sum()
+    val usedBalance = balances.mapNotNull { it.used }.sum()
+    val assets = balances.mapNotNull { it.asset?.uppercase() }.distinct()
+    val totalLabel = if (assets.size == 1) "Total ${assets.first()}" else "Total balance"
+    val healthyCount = balances.count { it.status == "ok" }
+
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f))) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(totalLabel, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        formatMoney(totalBalance),
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                        MetricBlock("Available", formatMoney(availableBalance), Modifier.weight(1f))
+                        MetricBlock("Used", formatMoney(usedBalance), Modifier.weight(1f))
+                    }
+                    KeyValue("Exchanges reporting", "${balances.size}")
+                    KeyValue("Healthy", "$healthyCount / ${balances.size}")
+                    if (!lastUpdated.isNullOrBlank()) {
+                        Text(
+                            "Updated: $lastUpdated",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+        if (loading) {
+            item {
+                StateCard(
+                    title = "Refreshing balances",
+                    body = "Fetching current exchange balances from backend.",
+                    loading = true,
+                )
+            }
+        }
+        if (!errorText.isNullOrBlank()) {
+            item { StateCard(title = "Balance refresh error", body = errorText) }
+        }
+        if (balances.isEmpty() && !loading) {
+            item {
+                StateCard(
+                    title = "No balances",
+                    body = "Backend returned no exchange balances.",
+                )
+            }
+        }
+        items(balances, key = { "${it.exchange}-${it.asset}" }) { balance ->
+            BalanceCard(balance)
         }
     }
 }
@@ -180,40 +304,61 @@ private fun PositionsScreen(
     filters: Map<String, Int>,
     onFilterSelected: (PositionFilter) -> Unit,
     onSortSelected: (PositionSort) -> Unit,
-    onSaveAutoExit: (PositionCardDto, Boolean, String) -> Unit,
     onUseInManual: (PositionCardDto) -> Unit,
+    onPositionAction: (PositionCardDto, String, String) -> Unit,
+    onSaveAutoExit: (PositionCardDto, Boolean, String, String) -> Unit,
+    actionLoading: Boolean,
     modifier: Modifier = Modifier,
 ) {
+    var filtersExpanded by remember { mutableStateOf(false) }
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item {
-            SectionCard("Filters") {
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    PositionFilter.entries.forEach { filter ->
-                        val count = when (filter) {
-                            PositionFilter.All -> filters["all"] ?: cards.size
-                            PositionFilter.Risk -> filters["risk"] ?: 0
-                            PositionFilter.FundingSoon -> filters["funding_soon"] ?: 0
-                            PositionFilter.AutoExitOn -> filters["auto_exit_on"] ?: 0
-                        }
-                        FilterChip(
-                            selected = selectedFilter == filter,
-                            onClick = { onFilterSelected(filter) },
-                            label = { Text("${filter.label} ($count)") },
-                        )
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "${cards.size} positions · ${selectedFilter.label} · ${selectedSort.label}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(onClick = { filtersExpanded = !filtersExpanded }) {
+                        Text(if (filtersExpanded) "Hide filters" else "Filters")
                     }
                 }
-                Spacer(Modifier.height(10.dp))
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    PositionSort.entries.forEach { sort ->
-                        FilterChip(
-                            selected = selectedSort == sort,
-                            onClick = { onSortSelected(sort) },
-                            label = { Text(sort.label) },
-                        )
+                AnimatedVisibility(filtersExpanded) {
+                    SectionCard("Filters") {
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            PositionFilter.entries.forEach { filter ->
+                                val count = when (filter) {
+                                    PositionFilter.All -> filters["all"] ?: cards.size
+                                    PositionFilter.Risk -> filters["risk"] ?: 0
+                                    PositionFilter.FundingSoon -> filters["funding_soon"] ?: 0
+                                    PositionFilter.AutoExitOn -> filters["auto_exit_on"] ?: 0
+                                }
+                                FilterChip(
+                                    selected = selectedFilter == filter,
+                                    onClick = { onFilterSelected(filter) },
+                                    label = { Text("${filter.label} ($count)") },
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            PositionSort.entries.forEach { sort ->
+                                FilterChip(
+                                    selected = selectedSort == sort,
+                                    onClick = { onSortSelected(sort) },
+                                    label = { Text(sort.label) },
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -248,59 +393,189 @@ private fun PositionsScreen(
             }
         }
         items(cards, key = { "${it.symbol}-${it.pair_label}" }) { card ->
-            PositionCard(card = card, onSaveAutoExit = { enabled, target -> onSaveAutoExit(card, enabled, target) }, onUseInManual = { onUseInManual(card) })
+            PositionCard(
+                card = card,
+                actionLoading = actionLoading,
+                onUseInManual = { onUseInManual(card) },
+                onPositionAction = { action, percent -> onPositionAction(card, action, percent) },
+                onSaveAutoExit = { enabled, target, percent ->
+                    onSaveAutoExit(card, enabled, target, percent)
+                },
+            )
         }
     }
 }
 
 @Composable
-private fun PositionCard(card: PositionCardDto, onSaveAutoExit: (Boolean, String) -> Unit, onUseInManual: () -> Unit) {
-    var expanded by remember(card.symbol, card.pair_label) { mutableStateOf(false) }
-    var autoEnabled by remember(card.symbol, card.pair_label, card.auto_exit.spread_enabled) { mutableStateOf(card.auto_exit.spread_enabled) }
-    var targetText by remember(card.symbol, card.pair_label, card.auto_exit.target_spread_pct) { mutableStateOf(card.auto_exit.target_spread_pct?.toString().orEmpty()) }
+private fun BalanceCard(balance: BalanceDto) {
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Column {
+                Text(balance.exchange.uppercase(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text(balance.asset ?: "USDT", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            StatusPill(balance.status ?: "unknown")
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+            MetricBlock("Total", formatMoney(balance.total), Modifier.weight(1f))
+            MetricBlock("Available", formatMoney(balance.available), Modifier.weight(1f))
+        }
+        MetricBlock("Used", formatMoney(balance.used))
+        KeyValue("Margin", formatRatio(balance.margin_ratio))
+        if (!balance.updated_at.isNullOrBlank()) {
+            Text(
+                "Updated: ${balance.updated_at}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        }
+    }
+}
+
+@Composable
+private fun PositionCard(
+    card: PositionCardDto,
+    actionLoading: Boolean,
+    onUseInManual: () -> Unit,
+    onPositionAction: (String, String) -> Unit,
+    onSaveAutoExit: (Boolean, String, String) -> Unit,
+) {
+    var expanded by remember(card.symbol, card.pair_label) { mutableStateOf(false) }
+    var actionPercent by remember(card.symbol, card.pair_label) { mutableStateOf("100") }
+    var autoExitEnabled by remember(card.symbol, card.auto_exit.spread_enabled) {
+        mutableStateOf(card.auto_exit.spread_enabled)
+    }
+    var autoExitTarget by remember(card.symbol, card.auto_exit.target_spread_pct) {
+        mutableStateOf(card.auto_exit.target_spread_pct?.let(::formatNumber).orEmpty())
+    }
+    var autoExitPercent by remember(card.symbol, card.auto_exit.exit_percent) {
+        mutableStateOf(formatNumber(card.auto_exit.exit_percent ?: 100.0))
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)),
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
                 Column {
                     Text(card.symbol, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text(card.pair_label, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                Spacer(Modifier.width(8.dp))
                 RiskChip(card.liq_distance_pct, card.risk_level)
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
-                MetricBlock("Net PnL", formatSigned(card.net_pnl))
-                MetricBlock("Exp. Funding", formatSigned(card.expected_funding))
+                MetricBlock("Hedged qty", formatNumber(card.position_summary.hedged_quantity), Modifier.weight(1f))
+                MetricBlock("Net PnL", formatSigned(card.net_pnl), Modifier.weight(1f))
+                MetricBlock("Exp. funding", formatSigned(card.expected_funding), Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
-                MetricBlock("Live spread", formatPercent(card.live_spread_pct))
-                MetricBlock("Next funding", formatMinutes(card.minutes_to_next_funding))
-                MetricBlock("Liq dist", formatPercent(card.liq_distance_pct))
+                MetricBlock("Enter spread", formatPercent(card.position_summary.pair_entry_spread_pct), Modifier.weight(1f))
+                MetricBlock("Next funding", formatMinutes(card.minutes_to_next_funding), Modifier.weight(1f))
+                MetricBlock("Liq dist", formatPercent(card.liq_distance_pct), Modifier.weight(1f))
             }
-            SectionCard("Auto Exit") {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Spread Exit")
-                    Spacer(Modifier.width(8.dp))
-                    StatusPill(card.auto_exit.status ?: "off")
-                    Spacer(Modifier.width(8.dp))
-                    Switch(checked = autoEnabled, onCheckedChange = { autoEnabled = it })
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock("Live spread", formatPercent(card.live_spread_pct), Modifier.weight(1f))
+                MetricBlock("Long qty", formatNumber(card.position_summary.long_quantity), Modifier.weight(1f))
+                MetricBlock("Short qty", formatNumber(card.position_summary.short_quantity), Modifier.weight(1f))
+            }
+            HorizontalDivider()
+            Text("Position size", style = MaterialTheme.typography.labelLarge)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("25", "50", "75", "100").forEach { value ->
+                    FilterChip(
+                        selected = actionPercent == value,
+                        onClick = { actionPercent = value },
+                        label = { Text("$value%") },
+                    )
                 }
-                OutlinedTextField(value = targetText, onValueChange = { targetText = it }, label = { Text("Target spread %") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("-0.5", "-1.0", "-2.0").forEach { preset ->
-                        AssistChip(onClick = { targetText = preset }, label = { Text(preset) })
-                    }
+            }
+            OutlinedTextField(
+                value = actionPercent,
+                onValueChange = { actionPercent = it },
+                label = { Text("Custom percent") },
+                suffix = { Text("%") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                Button(
+                    onClick = { onPositionAction("add", actionPercent) },
+                    enabled = !actionLoading,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Add $actionPercent%")
                 }
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { onSaveAutoExit(autoEnabled, targetText) }) { Text("Save") }
-                    Button(onClick = onUseInManual) { Text("Manual") }
-                    Button(onClick = { expanded = !expanded }) { Text(if (expanded) "Collapse" else "Expand") }
+                Button(
+                    onClick = { onPositionAction("exit", actionPercent) },
+                    enabled = !actionLoading,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Text("Exit $actionPercent%")
                 }
+            }
+            HorizontalDivider()
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column {
+                    Text("Auto exit", style = MaterialTheme.typography.labelLarge)
+                    Text(
+                        "${card.auto_exit.status ?: "off"} · one time",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = autoExitEnabled, onCheckedChange = { autoExitEnabled = it })
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                OutlinedTextField(
+                    value = autoExitTarget,
+                    onValueChange = { autoExitTarget = it },
+                    label = { Text("Spread target") },
+                    suffix = { Text("%") },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = autoExitPercent,
+                    onValueChange = { autoExitPercent = it },
+                    label = { Text("Exit size") },
+                    suffix = { Text("%") },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                )
+            }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("25", "50", "75", "100").forEach { value ->
+                    AssistChip(
+                        onClick = { autoExitPercent = value },
+                        label = { Text("$value%") },
+                    )
+                }
+                Button(onClick = { onSaveAutoExit(autoExitEnabled, autoExitTarget, autoExitPercent) }) {
+                    Text("Save auto exit")
+                }
+            }
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                TextButton(onClick = onUseInManual) { Text("Manual setup") }
+                TextButton(onClick = { expanded = !expanded }) { Text(if (expanded) "Hide details" else "Details") }
             }
             AnimatedVisibility(expanded) {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     SectionCard("Position Summary") {
                         KeyValue("Quantity", formatNumber(card.position_summary.quantity))
+                        KeyValue("Hedged quantity", formatNumber(card.position_summary.hedged_quantity))
+                        KeyValue("Long quantity", formatNumber(card.position_summary.long_quantity))
+                        KeyValue("Short quantity", formatNumber(card.position_summary.short_quantity))
+                        KeyValue("Imbalance quantity", formatNumber(card.position_summary.imbalance_quantity))
                         KeyValue("Amount USDT", formatNumber(card.position_summary.amount_usdt))
                         KeyValue("Gross amount", formatNumber(card.position_summary.gross_amount_usdt))
                         KeyValue("Entry spread", formatPercent(card.position_summary.pair_entry_spread_pct))
@@ -345,9 +620,11 @@ private fun PositionCard(card: PositionCardDto, onSaveAutoExit: (Boolean, String
 private fun ManualScreen(
     state: MobileUiState,
     onFormChange: ((ManualFormUiState) -> ManualFormUiState) -> Unit,
+    onAdvancedChange: ((AdvancedSettingsUiState) -> AdvancedSettingsUiState) -> Unit,
     onAnalyze: () -> Unit,
     onExecute: () -> Unit,
     onStop: () -> Unit,
+    onRefreshSpread: () -> Unit,
     onReloadDefaults: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -402,7 +679,11 @@ private fun ManualScreen(
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(value = state.manualForm.qty, onValueChange = { value -> onFormChange { it.copy(qty = value) } }, label = { Text("Qty") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
                 Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = state.manualForm.notional, onValueChange = { value -> onFormChange { it.copy(notional = value) } }, label = { Text("Notional") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(value = state.manualForm.notional, onValueChange = { value -> onFormChange { it.copy(notional = value) } }, label = { Text("Notional USDT") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(value = state.advancedSettings.chunkQty, onValueChange = { value -> onAdvancedChange { it.copy(chunkQty = value) } }, label = { Text("Chunk qty") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(value = state.advancedSettings.chunkNotional, onValueChange = { value -> onAdvancedChange { it.copy(chunkNotional = value) } }, label = { Text("Chunk notional USDT") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
                 Spacer(Modifier.height(10.dp))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf("smart", "fast").forEach { mode ->
@@ -440,12 +721,16 @@ private fun ManualScreen(
                     onFormChange { it.copy(expensiveLeg = option?.id) }
                 }
                 Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = state.advancedSettings.maxSlippageBps, onValueChange = {}, label = { Text("Max slippage (Settings)") }, modifier = Modifier.fillMaxWidth(), enabled = false, singleLine = true)
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = state.advancedSettings.marginMode, onValueChange = {}, label = { Text("Margin mode (Settings)") }, modifier = Modifier.fillMaxWidth(), enabled = false, singleLine = true)
+                Text("Spread Preview", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                MonoBlock(state.manualSpreadText)
+                Button(onClick = onRefreshSpread, enabled = manualReady && !state.manualSpreadLoading) {
+                    Text(if (state.manualSpreadLoading) "Loading..." else "Refresh spread")
+                }
+                KeyValue("Max slippage", "${state.advancedSettings.maxSlippageBps.ifBlank { "-" }} bps")
+                KeyValue("Margin mode", state.advancedSettings.marginMode.ifBlank { "-" })
                 Spacer(Modifier.height(10.dp))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = onAnalyze, enabled = manualReady && !state.manualLoading) { Text("Analyze") }
+                    Button(onClick = onAnalyze, enabled = manualReady && !state.manualLoading) { Text("Dry Run") }
                     Button(onClick = onExecute, enabled = manualReady && !state.manualLoading) { Text("Execute") }
                     Button(onClick = onStop, enabled = state.executionId != null && !state.manualLoading) { Text("Stop") }
                 }
@@ -474,7 +759,8 @@ private fun ManualScreen(
 private fun SettingsScreen(
     state: MobileUiState,
     onBaseUrlChange: (String) -> Unit,
-    onApplyBaseUrl: () -> Unit,
+    onRemoteAccessTokenChange: (String) -> Unit,
+    onApplyConnectionSettings: () -> Unit,
     onAdvancedChange: ((AdvancedSettingsUiState) -> AdvancedSettingsUiState) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -482,47 +768,36 @@ private fun SettingsScreen(
         item {
             SectionCard("Connection") {
                 OutlinedTextField(value = state.baseUrl, onValueChange = onBaseUrlChange, label = { Text("Backend base URL") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                OutlinedTextField(
+                    value = state.remoteAccessToken,
+                    onValueChange = onRemoteAccessTokenChange,
+                    label = { Text("Remote access token") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                )
+                Text(
+                    "Leave the token empty for local or Tailscale access.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 Spacer(Modifier.height(8.dp))
-                Button(onClick = onApplyBaseUrl) { Text("Apply") }
+                Button(onClick = onApplyConnectionSettings) { Text("Apply") }
             }
         }
         item {
-            SectionCard("Execution") {
+            SectionCard("Trading Safety") {
                 SettingsField("Max slippage bps", state.advancedSettings.maxSlippageBps) { value -> onAdvancedChange { it.copy(maxSlippageBps = value) } }
-                SettingsField("Timeout sec", state.advancedSettings.timeoutSec) { value -> onAdvancedChange { it.copy(timeoutSec = value) } }
-                SettingsField("Max runtime sec", state.advancedSettings.maxRuntimeSec) { value -> onAdvancedChange { it.copy(maxRuntimeSec = value) } }
-                SettingsField("Reprice sec", state.advancedSettings.repriceSec) { value -> onAdvancedChange { it.copy(repriceSec = value) } }
-            }
-        }
-        item {
-            SectionCard("Chunking") {
-                SettingsField("Chunk qty", state.advancedSettings.chunkQty) { value -> onAdvancedChange { it.copy(chunkQty = value) } }
-                SettingsField("Chunk notional", state.advancedSettings.chunkNotional) { value -> onAdvancedChange { it.copy(chunkNotional = value) } }
+                SimpleSelect("Margin mode", state.advancedSettings.marginMode, listOf("isolated", "cross")) { selected -> onAdvancedChange { it.copy(marginMode = selected) } }
+                Spacer(Modifier.height(8.dp))
+                BooleanSetting("Use orderbook check", state.advancedSettings.useOrderbookCheck) { value -> onAdvancedChange { it.copy(useOrderbookCheck = value) } }
+                BooleanSetting("Exit allow flip", state.advancedSettings.exitAllowFlip) { value -> onAdvancedChange { it.copy(exitAllowFlip = value) } }
                 BooleanSetting("Force chunk qty", state.advancedSettings.forceChunkQty) { value -> onAdvancedChange { it.copy(forceChunkQty = value) } }
             }
         }
         item {
-            SectionCard("Hedge") {
-                SimpleSelect("Hedge order type", state.advancedSettings.hedgeOrderType, listOf("market", "limit")) { selected -> onAdvancedChange { it.copy(hedgeOrderType = selected) } }
-                Spacer(Modifier.height(8.dp))
-                SimpleSelect("Hedge limit mode", state.advancedSettings.hedgeLimitMode, listOf("passive", "aggressive")) { selected -> onAdvancedChange { it.copy(hedgeLimitMode = selected) } }
-                SettingsField("Favorable bps", state.advancedSettings.hedgeFavorableBps) { value -> onAdvancedChange { it.copy(hedgeFavorableBps = value) } }
-                SettingsField("Adverse bps", state.advancedSettings.hedgeAdverseBps) { value -> onAdvancedChange { it.copy(hedgeAdverseBps = value) } }
-            }
-        }
-        item {
-            SectionCard("Safety") {
-                SettingsField("Limit offset bps", state.advancedSettings.limitOffsetBps) { value -> onAdvancedChange { it.copy(limitOffsetBps = value) } }
-                SettingsField("Limit offset ticks", state.advancedSettings.limitOffsetTicks) { value -> onAdvancedChange { it.copy(limitOffsetTicks = value) } }
-                SettingsField("Max limit deviation bps", state.advancedSettings.maxLimitDeviationBps) { value -> onAdvancedChange { it.copy(maxLimitDeviationBps = value) } }
-                BooleanSetting("Use orderbook check", state.advancedSettings.useOrderbookCheck) { value -> onAdvancedChange { it.copy(useOrderbookCheck = value) } }
-                BooleanSetting("Exit allow flip", state.advancedSettings.exitAllowFlip) { value -> onAdvancedChange { it.copy(exitAllowFlip = value) } }
-                SimpleSelect("Margin mode", state.advancedSettings.marginMode, listOf("isolated", "cross")) { selected -> onAdvancedChange { it.copy(marginMode = selected) } }
-            }
-        }
-        item {
             SectionCard("System") {
-                Text("WS health / reconnect controls stay on backend in v1 and are intentionally hidden from the main phone workflow.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Timeouts, reprice controls, hedge offsets, and WS controls stay on the backend in this mobile build.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -651,12 +926,20 @@ private fun formatNumber(value: Double?): String = value?.let {
     text.trimEnd('0').trimEnd('.')
 } ?: "-"
 
+private fun formatMoney(value: Double?): String = value?.let {
+    String.format("%,.2f", it)
+} ?: "-"
+
+private fun formatMoney(value: Double): String = String.format("%,.2f", value)
+
 private fun formatSigned(value: Double?): String = value?.let {
     val prefix = if (it > 0) "+" else ""
     prefix + formatNumber(it)
 } ?: "-"
 
 private fun formatPercent(value: Double?): String = value?.let { "${formatNumber(it)}%" } ?: "-"
+
+private fun formatRatio(value: Double?): String = value?.let { "${formatNumber(it * 100.0)}%" } ?: "-"
 
 private fun formatMinutes(value: Double?): String {
     if (value == null) return "-"

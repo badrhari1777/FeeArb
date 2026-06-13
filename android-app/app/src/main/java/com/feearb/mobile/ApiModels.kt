@@ -5,8 +5,21 @@ import com.google.gson.JsonObject
 data class MobilePositionsResponse(
     val status: String? = null,
     val last_updated: String? = null,
+    val account_last_updated: String? = null,
+    val balances: List<BalanceDto> = emptyList(),
     val cards: List<PositionCardDto> = emptyList(),
     val filters: Map<String, Int> = emptyMap(),
+)
+
+data class BalanceDto(
+    val exchange: String = "",
+    val asset: String? = null,
+    val total: Double? = null,
+    val available: Double? = null,
+    val used: Double? = null,
+    val margin_ratio: Double? = null,
+    val status: String? = null,
+    val updated_at: String? = null,
 )
 
 data class PositionCardDto(
@@ -35,6 +48,8 @@ data class AutoExitStateDto(
     val spread_enabled: Boolean = false,
     val v1_enabled: Boolean = false,
     val target_spread_pct: Double? = null,
+    val exit_percent: Double? = 100.0,
+    val exit_once: Boolean = true,
     val live_spread_pct: Double? = null,
     val live_spread_source: String? = null,
     val status: String? = null,
@@ -45,6 +60,11 @@ data class AutoExitStateDto(
 
 data class PositionSummaryDto(
     val quantity: Double? = null,
+    val long_quantity: Double? = null,
+    val short_quantity: Double? = null,
+    val hedged_quantity: Double? = null,
+    val imbalance_quantity: Double? = null,
+    val imbalance_pct: Double? = null,
     val amount_usdt: Double? = null,
     val gross_amount_usdt: Double? = null,
     val pair_entry_spread_pct: Double? = null,
@@ -143,7 +163,20 @@ data class AutoExitRuleRequest(
     val long_exchange: String,
     val short_exchange: String,
     val enabled: Boolean,
+    val spread_enabled: Boolean? = null,
     val target_spread_pct: Double?,
+    val exit_percent: Double? = null,
+    val exit_once: Boolean? = true,
+)
+
+data class PositionActionRequest(
+    val symbol: String,
+    val long_exchange: String,
+    val short_exchange: String,
+    val action: String,
+    val percent: Double,
+    val dry_run: Boolean,
+    val async_run: Boolean,
 )
 
 data class ManualRequest(
@@ -181,6 +214,45 @@ data class ManualRequest(
     val side: String? = null,
     val exit_allow_flip: Boolean? = null,
     val action: String? = null,
+)
+
+data class MobileManualSpreadRequest(
+    val symbol: String,
+    val action: String = "enter",
+    val long_exchange: String? = null,
+    val short_exchange: String? = null,
+    val from_exchange: String? = null,
+    val to_exchange: String? = null,
+    val side: String? = null,
+)
+
+data class MobileManualSpreadResponse(
+    val status: String? = null,
+    val symbol: String? = null,
+    val action: String? = null,
+    val side: String? = null,
+    val buy_exchange: String? = null,
+    val sell_exchange: String? = null,
+    val buy_price: Double? = null,
+    val sell_price: Double? = null,
+    val spread_pct: Double? = null,
+    val quotes: Map<String, ManualQuoteDto> = emptyMap(),
+    val errors: List<String> = emptyList(),
+    val warnings: List<String> = emptyList(),
+    val generated_at: String? = null,
+)
+
+data class ManualQuoteDto(
+    val exchange: String? = null,
+    val symbol: String? = null,
+    val bid: Double? = null,
+    val ask: Double? = null,
+    val mid: Double? = null,
+    val mark_price: Double? = null,
+    val source: String? = null,
+    val updated_at: String? = null,
+    val age_sec: Double? = null,
+    val error: String? = null,
 )
 
 data class ManualExecStatusResponse(

@@ -115,6 +115,8 @@
       </dl>
       <button id="refresh-button" class="button" type="button">Manual refresh</button>
       <a class="button" href="/manual">Manual trading</a>
+      <a class="button" href="/auto-arbitrage">Auto arbitrage</a>
+      <a class="button" href="/funding-history">Funding history</a>
       <a class="button" href="/mobile">Mobile UI</a>
       <p class="hint">UI refresh: {{ refresh_interval }} s | Parser: {{ parser_interval }} s | Exchange poll: {{ exchange_interval }} s | Account refresh: {{ account_interval }} s | Positions market: {{ positions_market_interval }} s</p>
     </div>
@@ -204,16 +206,18 @@
             <label>
               Notification primary
               <select id="notification-primary">
-                <option value="telegram" {% if settings.get('protective', {}).get('notification_primary_channel', 'telegram') == 'telegram' %}selected{% endif %}>Telegram</option>
-                <option value="pushbullet" {% if settings.get('protective', {}).get('notification_primary_channel', 'telegram') == 'pushbullet' %}selected{% endif %}>Pushbullet</option>
+                <option value="telegram" {% if settings.get('protective', {}).get('notification_primary_channel', 'ntfy') == 'telegram' %}selected{% endif %}>Telegram</option>
+                <option value="pushbullet" {% if settings.get('protective', {}).get('notification_primary_channel', 'ntfy') == 'pushbullet' %}selected{% endif %}>Pushbullet</option>
+                <option value="ntfy" {% if settings.get('protective', {}).get('notification_primary_channel', 'ntfy') == 'ntfy' %}selected{% endif %}>Ntfy</option>
               </select>
             </label>
             <label>
               Notification fallback
               <select id="notification-fallback">
-                <option value="none" {% if settings.get('protective', {}).get('notification_fallback_channel', 'none') == 'none' %}selected{% endif %}>None</option>
-                <option value="telegram" {% if settings.get('protective', {}).get('notification_fallback_channel', 'none') == 'telegram' %}selected{% endif %}>Telegram</option>
-                <option value="pushbullet" {% if settings.get('protective', {}).get('notification_fallback_channel', 'none') == 'pushbullet' %}selected{% endif %}>Pushbullet</option>
+                <option value="none" {% if settings.get('protective', {}).get('notification_fallback_channel', 'telegram') == 'none' %}selected{% endif %}>None</option>
+                <option value="telegram" {% if settings.get('protective', {}).get('notification_fallback_channel', 'telegram') == 'telegram' %}selected{% endif %}>Telegram</option>
+                <option value="pushbullet" {% if settings.get('protective', {}).get('notification_fallback_channel', 'telegram') == 'pushbullet' %}selected{% endif %}>Pushbullet</option>
+                <option value="ntfy" {% if settings.get('protective', {}).get('notification_fallback_channel', 'telegram') == 'ntfy' %}selected{% endif %}>Ntfy</option>
               </select>
             </label>
           </div>
@@ -290,6 +294,14 @@
             <input type="checkbox" id="auto-exit-require-live" checked />
             Require live spread (WS)
           </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="auto-exit-restore-spread" checked />
+            Restore spread toggles after missing positions
+          </label>
+          <div class="settings-actions">
+            <button class="button button-secondary" type="button" id="auto-exit-clear-spread-cache">Clear spread cache</button>
+            <span class="settings-note muted">Disables saved spread auto-exit toggles; v1-only rules stay enabled.</span>
+          </div>
           <div class="settings-intervals">
             <label>
               Binance chunk cap (USDT)
@@ -367,6 +379,88 @@
             </label>
           </div>
           <p class="settings-note muted">KuCoin isolated top-up only blocks auto margin reduction on KuCoin and only adds margin when effective leverage rises above target.</p>
+        </fieldset>
+        <fieldset class="settings-fieldset">
+          <legend>Emergency De-Risk</legend>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="derisk-enabled" {% if settings.get('protective', {}).get('auto_derisk_enabled', False) %}checked{% endif %} />
+            Enable emergency de-risk
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="derisk-shadow-mode" {% if settings.get('protective', {}).get('auto_derisk_shadow_mode', True) %}checked{% endif %} />
+            Shadow mode only
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="orphan-cleanup-enabled" {% if settings.get('protective', {}).get('orphan_cleanup_enabled', True) %}checked{% endif %} />
+            Orphan detection / cleanup
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="derisk-market-cleanup-only-emergency" {% if settings.get('protective', {}).get('derisk_market_cleanup_only_in_emergency', True) %}checked{% endif %} />
+            Market cleanup only in panic
+          </label>
+          <div class="settings-intervals">
+            <label>
+              Poll (seconds)
+              <input type="number" id="derisk-poll-sec" step="1" min="2" value="{{ settings.get('protective', {}).get('derisk_poll_sec', 5) }}" />
+            </label>
+            <label>
+              Target buffer
+              <input type="number" id="derisk-target-buffer" step="0.01" min="0" value="{{ settings.get('protective', {}).get('derisk_target_buffer_pct', 0.30) }}" />
+            </label>
+            <label>
+              Warning buffer
+              <input type="number" id="derisk-warning-buffer" step="0.01" min="0" value="{{ settings.get('protective', {}).get('derisk_warning_buffer_pct', 0.20) }}" />
+            </label>
+            <label>
+              Panic buffer
+              <input type="number" id="derisk-panic-buffer" step="0.01" min="0" value="{{ settings.get('protective', {}).get('derisk_panic_buffer_pct', 0.15) }}" />
+            </label>
+            <label>
+              Recovery buffer
+              <input type="number" id="derisk-recovery-buffer" step="0.01" min="0" value="{{ settings.get('protective', {}).get('derisk_recovery_buffer_pct', 0.35) }}" />
+            </label>
+            <label>
+              Min free balance
+              <input type="number" id="derisk-min-free-balance" step="1" min="0" value="{{ settings.get('protective', {}).get('derisk_min_free_balance_abs', 500.0) }}" />
+            </label>
+          </div>
+          <div class="settings-intervals">
+            <label>
+              Stale positions max (sec)
+              <input type="number" id="derisk-stale-max" step="1" min="10" value="{{ settings.get('protective', {}).get('derisk_stale_positions_max_sec', 180) }}" />
+            </label>
+            <label>
+              Failure block count
+              <input type="number" id="derisk-failure-block" step="1" min="1" value="{{ settings.get('protective', {}).get('derisk_failure_block_count', 2) }}" />
+            </label>
+            <label>
+              Confirm cycles
+              <input type="number" id="derisk-confirm-cycles" step="1" min="1" value="{{ settings.get('protective', {}).get('derisk_confirm_cycles', 2) }}" />
+            </label>
+            <label>
+              Cooldown (sec)
+              <input type="number" id="derisk-cooldown-sec" step="1" min="0" value="{{ settings.get('protective', {}).get('derisk_cooldown_sec', 120) }}" />
+            </label>
+            <label>
+              Velocity trigger (bps)
+              <input type="number" id="derisk-velocity-bps" step="1" min="0" value="{{ settings.get('protective', {}).get('derisk_velocity_trigger_bps', 120.0) }}" />
+            </label>
+            <label>
+              Qty tolerance
+              <input type="number" id="derisk-qty-tolerance" step="0.01" min="0" value="{{ settings.get('protective', {}).get('derisk_qty_tolerance_pct', 0.10) }}" />
+            </label>
+          </div>
+          <div class="settings-intervals">
+            <label>
+              Max single action (USDT)
+              <input type="number" id="derisk-max-action-notional" step="10" min="0" value="{{ settings.get('protective', {}).get('derisk_max_single_action_notional_usd', 500.0) }}" />
+            </label>
+            <label>
+              Dust notional (USDT)
+              <input type="number" id="derisk-dust-notional" step="1" min="0" value="{{ settings.get('protective', {}).get('derisk_dust_notional_usd', 10.0) }}" />
+            </label>
+          </div>
+          <p class="settings-note muted">Emergency de-risk only acts on confirmed hedged clusters. If exchange API health is stale/auth-failed, orphan detection is blocked and only diagnostics/logs update.</p>
         </fieldset>
         <div class="settings-actions">
           <button type="submit" class="button" id="settings-submit">Save settings</button>
@@ -654,6 +748,16 @@
       </table>
     </section>
 
+    <section class="panel" id="grid-strategies-panel">
+      <div class="panel-heading">
+        <h2>Grid Strategies</h2>
+        <a class="button button--ghost" href="/auto-arbitrage">Open Grid</a>
+      </div>
+      <div id="grid-strategies-list" class="auto-arb-rule-grid">
+        <p class="muted">No grid strategies.</p>
+      </div>
+    </section>
+
     <section class="panel" id="symbol-positions-panel">
       <h2>Symbol Positions</h2>
       <table class="data-table data-table--wide data-table--symbol-positions">
@@ -677,6 +781,7 @@
             <th><span class="th-wrap">Live<br>Spread %</span></th>
             <th>Auto Exit</th>
             <th><span class="th-wrap">Exit<br>Spread %</span></th>
+            <th><span class="th-wrap">Position<br>Action</span></th>
           </tr>
         </thead>
                 <tbody id="symbol-positions-body">
@@ -744,10 +849,11 @@
               <td>-</td>
               <td>-</td>
               <td>-</td>
+              <td>-</td>
             </tr>
           {% endfor %}
           {% if symbol_position_rows | length == 0 %}
-            <tr><td colspan="18" class="muted">No live positions detected.</td></tr>
+            <tr><td colspan="19" class="muted">No live positions detected.</td></tr>
           {% endif %}
         </tbody>
       </table>
@@ -818,6 +924,139 @@
         </div>
         <div class="muted" id="margin-logic-log-empty">No margin logic events yet.</div>
       </div>
+    </section>
+
+    <section class="panel" id="derisk-health-panel">
+      <h2>Emergency De-Risk Exchange Health</h2>
+      <table class="data-table data-table--wide">
+        <thead>
+          <tr>
+            <th>Exchange</th>
+            <th>Health</th>
+            <th>Last Status</th>
+            <th>Failures</th>
+            <th>Stale Sec</th>
+            <th>Error Kind</th>
+            <th>Last Error</th>
+          </tr>
+        </thead>
+        <tbody id="derisk-exchange-health-body">
+          <tr><td colspan="7" class="muted">No exchange health data yet.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="hedge-clusters-panel">
+      <div class="panel-header">
+        <h2>Hedge Clusters</h2>
+      </div>
+      <form id="hedge-cluster-form">
+        <div class="settings-intervals">
+          <label>
+            Symbol
+            <input type="text" id="hedge-cluster-symbol" placeholder="BTCUSDT" />
+          </label>
+          <label>
+            Kind
+            <select id="hedge-cluster-kind">
+              <option value="hedged_pair">Hedged pair</option>
+              <option value="standalone">Standalone</option>
+            </select>
+          </label>
+          <label>
+            Long exchange
+            <input type="text" id="hedge-cluster-long-exchange" placeholder="binance" />
+          </label>
+          <label>
+            Short exchange
+            <input type="text" id="hedge-cluster-short-exchange" placeholder="okx" />
+          </label>
+          <label>
+            Exchange
+            <input type="text" id="hedge-cluster-exchange" placeholder="gate" />
+          </label>
+          <label>
+            Side
+            <select id="hedge-cluster-side">
+              <option value="">Any</option>
+              <option value="long">Long</option>
+              <option value="short">Short</option>
+            </select>
+          </label>
+          <label>
+            Qty tolerance
+            <input type="number" id="hedge-cluster-qty-tolerance" step="0.01" min="0" value="0.10" />
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="hedge-cluster-enabled" checked />
+            Enabled
+          </label>
+          <label class="settings-checkbox">
+            <input type="checkbox" id="hedge-cluster-rehedge" />
+            Re-hedge allowed
+          </label>
+        </div>
+        <div class="settings-actions">
+          <button type="submit" class="button" id="hedge-cluster-submit">Save cluster rule</button>
+          <span class="settings-status" id="hedge-cluster-status" aria-live="polite"></span>
+        </div>
+      </form>
+      <table class="data-table data-table--wide">
+        <thead>
+          <tr>
+            <th>Symbol</th>
+            <th>Kind</th>
+            <th>Pair / Venue</th>
+            <th>Side</th>
+            <th>Enabled</th>
+            <th>Qty Tol.</th>
+            <th>Re-hedge</th>
+            <th>Source</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody id="hedge-clusters-body">
+          <tr><td colspan="9" class="muted">No hedge clusters yet.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel" id="derisk-diagnostics-panel">
+      <h2>Emergency De-Risk Diagnostics</h2>
+      <table class="data-table data-table--wide">
+        <thead>
+          <tr>
+            <th>Kind</th>
+            <th>Symbol</th>
+            <th>Status</th>
+            <th>Reason</th>
+            <th>Long</th>
+            <th>Short</th>
+            <th>Health</th>
+            <th>Missing</th>
+            <th>Stress</th>
+            <th>Action Qty</th>
+            <th>Action Mode</th>
+            <th>Score</th>
+            <th>Residual</th>
+            <th>Funding Next</th>
+            <th>PNL</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody id="derisk-diagnostics-body">
+          <tr><td colspan="16" class="muted">No emergency de-risk diagnostics yet.</td></tr>
+        </tbody>
+      </table>
+      <div class="muted" id="derisk-diagnostics-empty">Rows appear after the next de-risk cycle.</div>
+    </section>
+
+    <section class="panel" id="derisk-log-panel">
+      <h2>Emergency De-Risk Log</h2>
+      <div class="log-box">
+        <ul class="event-log" id="derisk-event-log"></ul>
+      </div>
+      <div class="muted" id="derisk-event-log-empty">No emergency de-risk events yet.</div>
     </section>
 
     <section class="panel" id="auto-exit-log-panel">

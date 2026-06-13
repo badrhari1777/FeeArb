@@ -853,6 +853,191 @@ class _DustFinalizeManager(ManualTradeManager):
         }
 
 
+class _FastExitForceFinalizeManager(ManualTradeManager):
+    def __init__(self, *, force_finalize: bool, end_positions: list[dict[str, object]]) -> None:
+        super().__init__()
+        self._force_finalize = force_finalize
+        self._end_positions = list(end_positions)
+        self.market_calls: list[dict[str, object]] = []
+        self.finalize_calls = 0
+        self._stop_check = lambda: {
+            "requested": True,
+            "force_finalize": self._force_finalize,
+            "reason": "panic_priority",
+        }
+
+    async def _ensure_ws_orders(self, exchanges, contract_sizes=None, symbol=None, log_cb=None):  # noqa: D401, ARG002
+        return None
+
+    async def _fetch_positions_with_retry(self, exchanges, symbol, log_cb=None):  # noqa: D401, ARG002
+        return (
+            [
+                {"exchange": "binance", "symbol": f"{symbol}/USDT:USDT", "side": "long", "coin_qty": 10.0},
+                {"exchange": "okx", "symbol": f"{symbol}/USDT:USDT", "side": "short", "coin_qty": 10.0},
+            ],
+            [],
+        )
+
+    async def _fetch_positions_for_symbol(
+        self,
+        *,
+        exchanges,
+        symbol,
+        allow_ws=True,
+        contract_sizes=None,
+    ):  # noqa: D401, ARG002
+        return (list(self._end_positions), [])
+
+    async def _place_market(
+        self,
+        leg,
+        symbol,
+        qty,
+        payload,
+        *,
+        reason=None,
+        require_ws=True,
+        log_cb=None,
+    ):  # noqa: D401, ARG002
+        self.market_calls.append(
+            {
+                "exchange": str(leg.get("exchange") or ""),
+                "symbol": symbol,
+                "qty": float(qty),
+                "reason": reason,
+            }
+        )
+        return {
+            "exchange": leg.get("exchange"),
+            "status": "submitted",
+            "order_id": f"force-{leg.get('exchange')}",
+            "filled_qty": float(qty),
+            "avg_price": 100.0,
+        }
+
+    async def _finalize_exit_dust(
+        self,
+        *,
+        symbol,
+        legs,
+        start_qty_by_exchange,
+        requested_exit_qty,
+        constraints,
+        payload,
+        actions,
+        warnings,
+        log_cb=None,
+    ):  # noqa: D401, ARG002
+        self.finalize_calls += 1
+
+
+class _OrphanCleanupManager(ManualTradeManager):
+    def __init__(
+        self,
+        *,
+        fetch_responses: list[list[dict[str, object]]],
+        rebalance_result: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__()
+        self._fetch_responses = [list(item) for item in fetch_responses]
+        self._rebalance_result = dict(rebalance_result or {"status": "filled", "filled_qty": 3.0, "remaining_qty": 0.0})
+        self.market_calls: list[dict[str, object]] = []
+        self.rebalance_calls: list[dict[str, object]] = []
+        self.finalize_calls = 0
+
+    async def _snapshot_legs(self, symbol, legs, max_slippage_bps=0.0):  # noqa: D401, ARG002
+        exchange = str((legs or [{}])[0].get("exchange") or "")
+        return {
+            "errors": [],
+            "constraints": {
+                exchange: {
+                    "amount_step": 0.1,
+                    "min_qty_required": 0.1,
+                }
+            },
+            "stats": {},
+            "orderbooks": {},
+        }
+
+    async def agent_rebalance(
+        self,
+        *,
+        exchange,
+        symbol,
+        side,
+        qty_base,
+        margin_mode="isolated",
+        limit_timeout_sec=6,
+        limit_offset_bps=1.0,
+        max_slippage_bps=8.0,
+        log_cb=None,
+    ):  # noqa: D401, ARG002
+        self.rebalance_calls.append(
+            {
+                "exchange": exchange,
+                "symbol": symbol,
+                "side": side,
+                "qty_base": float(qty_base),
+                "margin_mode": margin_mode,
+            }
+        )
+        return dict(self._rebalance_result)
+
+    async def _finalize_exit_dust(
+        self,
+        *,
+        symbol,
+        legs,
+        start_qty_by_exchange,
+        requested_exit_qty,
+        constraints,
+        payload,
+        actions,
+        warnings,
+        log_cb=None,
+    ):  # noqa: D401, ARG002
+        self.finalize_calls += 1
+
+    async def _fetch_positions_for_symbol(
+        self,
+        *,
+        exchanges,
+        symbol,
+        allow_ws=True,
+        contract_sizes=None,
+    ):  # noqa: D401, ARG002
+        if self._fetch_responses:
+            return (self._fetch_responses.pop(0), [])
+        return ([], [])
+
+    async def _place_market(
+        self,
+        leg,
+        symbol,
+        qty,
+        payload,
+        *,
+        reason=None,
+        require_ws=True,
+        log_cb=None,
+    ):  # noqa: D401, ARG002
+        self.market_calls.append(
+            {
+                "exchange": str(leg.get("exchange") or ""),
+                "symbol": symbol,
+                "qty": float(qty),
+                "reason": reason,
+            }
+        )
+        return {
+            "exchange": leg.get("exchange"),
+            "status": "submitted",
+            "order_id": f"orphan-{len(self.market_calls)}",
+            "filled_qty": float(qty),
+            "avg_price": 100.0,
+        }
+
+
 class _SubmitOrderClient:
     def __init__(
         self,
@@ -1076,6 +1261,33 @@ class ManualTradeSubmitOrderValidationTestCase(unittest.TestCase):
         self.assertEqual(result.get("status"), "submitted")
         self.assertEqual(len(client.calls), 1)
         self.assertAlmostEqual(float(client.calls[0]["price"]), 0.636)
+
+    def test_submit_order_prefers_binance_price_filter_tick_size(self) -> None:
+        client = _SubmitOrderClient()
+        client.markets["SIREN/USDT:USDT"]["info"] = {
+            "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.005"},
+                {"filterType": "LOT_SIZE", "stepSize": "1", "minQty": "1"},
+                {"filterType": "MIN_NOTIONAL", "notional": "5"},
+            ]
+        }
+        manager = _SubmitOrderManager(client)
+
+        result = asyncio.run(
+            manager._submit_order(
+                {"exchange": "binance", "side": "sell"},
+                "SIREN",
+                200.0,
+                "limit",
+                price=0.63539,
+                reduce_only=False,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(result.get("status"), "submitted")
+        self.assertEqual(len(client.calls), 1)
+        self.assertAlmostEqual(float(client.calls[0]["price"]), 0.64)
 
     def test_submit_order_blocks_below_min_notional_before_create(self) -> None:
         client = _SubmitOrderClient()
@@ -1386,6 +1598,167 @@ class ManualTradeExitDustTestCase(unittest.TestCase):
 
         self.assertEqual(actions, [])
         self.assertEqual(manager.market_calls, [])
+
+
+class ManualTradeForcedFinalizeTestCase(unittest.TestCase):
+    def test_fast_exit_force_finalize_reconciles_lagging_leg_on_stop(self) -> None:
+        manager = _FastExitForceFinalizeManager(
+            force_finalize=True,
+            end_positions=[
+                {"exchange": "binance", "symbol": "BTC/USDT:USDT", "side": "long", "coin_qty": 5.0},
+                {"exchange": "okx", "symbol": "BTC/USDT:USDT", "side": "short", "coin_qty": 10.0},
+            ],
+        )
+
+        result = asyncio.run(
+            manager._execute_fast_exit(
+                {
+                    "action": "exit",
+                    "symbol": "BTC",
+                    "qty": 10.0,
+                    "legs": [
+                        {"exchange": "binance", "side": "sell", "label": "long", "reduce_only": True},
+                        {"exchange": "okx", "side": "buy", "label": "short", "reduce_only": True},
+                    ],
+                    "market_constraints": {
+                        "binance": {"amount_step": 0.1, "min_qty_required": 0.1},
+                        "okx": {"amount_step": 0.1, "min_qty_required": 0.1},
+                    },
+                },
+                {},
+            )
+        )
+
+        self.assertEqual(result.get("mode"), "fast-exit")
+        self.assertEqual(len(manager.market_calls), 1)
+        self.assertEqual(manager.market_calls[0]["exchange"], "okx")
+        self.assertAlmostEqual(float(manager.market_calls[0]["qty"]), 5.0)
+        self.assertEqual(manager.market_calls[0]["reason"], "final_reconcile")
+        self.assertEqual(manager.finalize_calls, 1)
+
+    def test_fast_exit_plain_stop_skips_force_finalize(self) -> None:
+        manager = _FastExitForceFinalizeManager(
+            force_finalize=False,
+            end_positions=[
+                {"exchange": "binance", "symbol": "BTC/USDT:USDT", "side": "long", "coin_qty": 5.0},
+                {"exchange": "okx", "symbol": "BTC/USDT:USDT", "side": "short", "coin_qty": 10.0},
+            ],
+        )
+
+        result = asyncio.run(
+            manager._execute_fast_exit(
+                {
+                    "action": "exit",
+                    "symbol": "BTC",
+                    "qty": 10.0,
+                    "legs": [
+                        {"exchange": "binance", "side": "sell", "label": "long", "reduce_only": True},
+                        {"exchange": "okx", "side": "buy", "label": "short", "reduce_only": True},
+                    ],
+                    "market_constraints": {
+                        "binance": {"amount_step": 0.1, "min_qty_required": 0.1},
+                        "okx": {"amount_step": 0.1, "min_qty_required": 0.1},
+                    },
+                },
+                {},
+            )
+        )
+
+        self.assertEqual(result.get("mode"), "fast-exit")
+        self.assertEqual(manager.market_calls, [])
+        self.assertEqual(manager.finalize_calls, 0)
+
+
+class ManualTradeOrphanCleanupTestCase(unittest.TestCase):
+    def test_orphan_cleanup_non_panic_uses_rebalance_path(self) -> None:
+        manager = _OrphanCleanupManager(fetch_responses=[[]])
+
+        result = asyncio.run(
+            manager.orphan_cleanup(
+                {
+                    "symbol": "BTCUSDT",
+                    "cleanup_exchange": "gate",
+                },
+                [
+                    {
+                        "exchange": "gate",
+                        "symbol": "BTC/USDT:USDT",
+                        "side": "long",
+                        "coin_qty": 3.0,
+                    }
+                ],
+            )
+        )
+
+        self.assertEqual(result.get("mode"), "orphan-cleanup")
+        self.assertEqual(len(manager.rebalance_calls), 1)
+        self.assertEqual(manager.rebalance_calls[0]["exchange"], "gate")
+        self.assertAlmostEqual(float(manager.rebalance_calls[0]["qty_base"]), 3.0)
+        self.assertEqual(manager.market_calls, [])
+        self.assertEqual(manager.finalize_calls, 1)
+        self.assertEqual(result.get("warnings"), [])
+
+    def test_orphan_cleanup_panic_forces_final_market_when_residual_remains(self) -> None:
+        manager = _OrphanCleanupManager(
+            fetch_responses=[
+                [{"exchange": "gate", "symbol": "BTC/USDT:USDT", "side": "long", "coin_qty": 1.0}],
+                [],
+            ]
+        )
+
+        result = asyncio.run(
+            manager.orphan_cleanup(
+                {
+                    "symbol": "BTCUSDT",
+                    "cleanup_exchange": "gate",
+                    "panic_cleanup_mode": True,
+                },
+                [
+                    {
+                        "exchange": "gate",
+                        "symbol": "BTC/USDT:USDT",
+                        "side": "long",
+                        "coin_qty": 3.0,
+                    }
+                ],
+            )
+        )
+
+        self.assertEqual(result.get("mode"), "orphan-cleanup")
+        self.assertEqual([call["reason"] for call in manager.market_calls], ["orphan_cleanup_panic", "orphan_cleanup_final"])
+        self.assertAlmostEqual(float(manager.market_calls[0]["qty"]), 3.0)
+        self.assertAlmostEqual(float(manager.market_calls[1]["qty"]), 1.0)
+        self.assertAlmostEqual(float(result.get("remaining_qty") or 0.0), 0.0)
+        self.assertNotIn("orphan_cleanup_residual", result.get("risk_flags") or [])
+
+    def test_orphan_cleanup_marks_residual_risk_when_position_still_open(self) -> None:
+        manager = _OrphanCleanupManager(
+            fetch_responses=[
+                [{"exchange": "gate", "symbol": "BTC/USDT:USDT", "side": "long", "coin_qty": 1.0}],
+                [{"exchange": "gate", "symbol": "BTC/USDT:USDT", "side": "long", "coin_qty": 0.5}],
+            ]
+        )
+
+        result = asyncio.run(
+            manager.orphan_cleanup(
+                {
+                    "symbol": "BTCUSDT",
+                    "cleanup_exchange": "gate",
+                    "panic_cleanup_mode": True,
+                },
+                [
+                    {
+                        "exchange": "gate",
+                        "symbol": "BTC/USDT:USDT",
+                        "side": "long",
+                        "coin_qty": 3.0,
+                    }
+                ],
+            )
+        )
+
+        self.assertIn("orphan_cleanup_residual", result.get("risk_flags") or [])
+        self.assertTrue(any("orphan residual" in item for item in (result.get("warnings") or [])))
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 
@@ -62,14 +63,14 @@ def env_or_dotenv(name: str) -> str:
 
 def _normalize_primary_channel(value: str | None) -> str:
     channel = str(value or "").strip().lower()
-    if channel not in {"telegram", "pushbullet"}:
+    if channel not in {"telegram", "pushbullet", "ntfy"}:
         return "telegram"
     return channel
 
 
 def _normalize_fallback_channel(value: str | None, primary_channel: str) -> str:
     channel = str(value or "").strip().lower()
-    if channel not in {"none", "telegram", "pushbullet"}:
+    if channel not in {"none", "telegram", "pushbullet", "ntfy"}:
         return "none"
     if channel == primary_channel:
         return "none"
@@ -146,6 +147,8 @@ class NotificationRouter:
             return await self._send_telegram_text_status(text)
         if channel == "pushbullet":
             return await self._send_pushbullet_text_status(text, title=title)
+        if channel == "ntfy":
+            return await self._send_ntfy_text_status(text, title=title)
         return "skipped"
 
     async def _send_telegram_text_status(self, text: str) -> str:
@@ -196,4 +199,38 @@ class NotificationRouter:
             return "ok"
         except Exception as exc:  # pylint: disable=broad-except
             logger.warning("Pushbullet alert error: %s", exc)
+            return "error"
+
+    async def _send_ntfy_text_status(self, text: str, *, title: str | None = None) -> str:
+        base_url = env_or_dotenv("NTFY_BASE_URL") or "https://ntfy.sh"
+        topic = env_or_dotenv("NTFY_TOPIC")
+        token = env_or_dotenv("NTFY_TOKEN")
+        if not topic:
+            if "ntfy" not in self._missing_config_warned:
+                logger.info("ntfy send skipped: NTFY_TOPIC not set")
+                self._missing_config_warned.add("ntfy")
+            return "skipped"
+        base_url = base_url.rstrip("/")
+        url = f"{base_url}/{quote(topic, safe='')}"
+        headers = {
+            "Title": str(title or _derive_pushbullet_title(text))[:250],
+            "Priority": env_or_dotenv("NTFY_PRIORITY") or "4",
+            "Tags": env_or_dotenv("NTFY_TAGS") or "warning",
+            "Content-Type": "text/plain; charset=utf-8",
+        }
+        click_url = env_or_dotenv("NTFY_CLICK_URL")
+        if click_url:
+            headers["Click"] = click_url
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.post(url, data=str(text or "").encode("utf-8"), headers=headers) as resp:
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.warning("ntfy alert failed (%s): %s", resp.status, body)
+                        return "http_error"
+            return "ok"
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("ntfy alert error: %s", exc)
             return "error"

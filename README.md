@@ -1,5 +1,8 @@
 # FeeArb
 
+Пользовательские и эксплуатационные инструкции собраны в
+[`instructions/00_README_ИНСТРУКЦИИ.md`](instructions/00_README_ИНСТРУКЦИИ.md).
+
 Research tooling for cross-exchange funding-rate arbitrage. The latest architecture is fully asynchronous end-to-end: data ingestion, signal generation, execution, and telemetry all run on asyncio primitives, while a FastAPI dashboard streams progress (and fills) to the browser over WebSockets. Bybit and MEXC USDT perpetuals remain the default active venues, with additional adapters scaffolded for future expansion.
 
 ## Highlights

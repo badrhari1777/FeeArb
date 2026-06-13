@@ -1,0 +1,24 @@
+:18080 {
+    bind 127.0.0.1 ::1
+    basic_auth {
+        Sammy $2a$14$jOHwJ2.xhi8RwIxYXbZRtesNWdRAQHbPZOiEGuBYnUxbHCrf5xGcC
+    }
+
+    reverse_proxy 127.0.0.1:8000
+}
+
+:18081 {
+    bind 127.0.0.1 ::1
+
+    @authorized header X-FeeArb-Token {$FEEARB_REMOTE_ACCESS_TOKEN}
+
+    handle @authorized {
+        reverse_proxy 127.0.0.1:8000 {
+            header_up X-FeeArb-Public-Proxy tailscale-funnel
+        }
+    }
+
+    handle {
+        respond "Missing or invalid FeeArb remote access token." 401
+    }
+}

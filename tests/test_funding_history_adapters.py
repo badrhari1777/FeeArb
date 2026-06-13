@@ -50,6 +50,20 @@ class FundingHistoryAdaptersTestCase(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertAlmostEqual(float(rows[0].get("interval_hours") or 0.0), 8.0, places=6)
 
+    def test_bybit_history_overrides_stale_cached_declared_interval(self) -> None:
+        cached_rows = [
+            {"ts_ms": 1_700_007_200_000, "rate": "0.0001", "interval_hours": 4.0},
+            {"ts_ms": 1_700_003_600_000, "rate": "0.0002", "interval_hours": 4.0},
+            {"ts_ms": 1_700_000_000_000, "rate": "0.0003", "interval_hours": 4.0},
+        ]
+        with patch(
+            "exchanges.bybit.get_or_fetch_funding_history",
+            return_value=cached_rows,
+        ):
+            rows = BybitAdapter().funding_history("BTCUSDT", limit=3)
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(float(row.get("interval_hours") or 0.0) == 1.0 for row in rows))
+
     def test_okx_history_infers_interval(self) -> None:
         payload = {
             "code": "0",

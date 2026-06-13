@@ -34,6 +34,17 @@ class NotificationRouterTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, "ok")
         router._send_telegram_text_status.assert_awaited_once()  # type: ignore[attr-defined]
 
+    async def test_ntfy_primary_channel_is_supported(self) -> None:
+        router = NotificationRouter(primary_channel="ntfy", fallback_channel="telegram")
+        router._send_ntfy_text_status = AsyncMock(return_value="ok")  # type: ignore[attr-defined]
+        router._send_telegram_text_status = AsyncMock(return_value="ok")  # type: ignore[attr-defined]
+
+        status = await router.send_text_status("test message", title="FeeArb test")
+
+        self.assertEqual(status, "ok")
+        router._send_ntfy_text_status.assert_awaited_once()  # type: ignore[attr-defined]
+        router._send_telegram_text_status.assert_not_awaited()  # type: ignore[attr-defined]
+
 
 if __name__ == "__main__":
     unittest.main()

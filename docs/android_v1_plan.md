@@ -6,14 +6,22 @@ Purpose
 
 Scope
 - Primary screens:
+  - `Balances`
   - `Positions`
   - `Manual Trade`
-  - `Settings / Advanced`
+  - `Settings`
 - Explicitly out of scope for v1:
   - candidates / opportunities dashboards
   - full coin-analysis UI
   - exchange tests / raw WS tools
   - full configuration parity with desktop
+
+Current implementation note
+- The earlier combined `Dashboard` design has been split into dedicated `Balances` and `Positions` screens.
+- Bottom navigation is now `Balances / Positions / Manual / Settings`, and a cold start opens `Balances`.
+- `Balances` shows aggregate total/available/used values plus individual exchange cards; position controls remain isolated on `Positions`.
+- Position cards now use coin-based hedged sizing: the smaller long/short leg is the 100% basis. Quick `Add` and `Exit` support 25/50/75/100 presets plus a custom percentage, with server-side preflight and confirmation.
+- Auto Exit supports a configurable partial percentage and is one-shot by default. The backend recalculates the current smaller leg immediately before execution.
 
 Current Reusable Backend / UI Context
 - Existing phone-first web route: `/mobile`
@@ -34,11 +42,17 @@ Recommended Android Architecture
 - Thin client over the existing FastAPI backend.
 - Do not move exchange logic, credentials, or execution orchestration into Android.
 - Preferred app structure:
-  - bottom navigation: `Positions`, `Manual`, `Settings`
+  - bottom navigation: `Dashboard`, `Manual`, `Settings`
   - Jetpack Compose for native Android if a real app is built
 - If a faster first step is needed, the existing `/mobile` route can be used as a temporary bridge/reference.
 
-Screen 1: Positions
+Screen 1: Dashboard
+- Top section shows compact exchange balances:
+  - exchange
+  - total
+  - available
+  - used
+  - margin ratio/status
 - Main UI should be card-based, not a wide table.
 - Each symbol should have a collapsed and expanded state.
 
@@ -50,10 +64,9 @@ Collapsed card
 - `Live spread`
 - `Next funding`
 - `Liq distance %` as a risk indicator
-- inline auto-exit controls:
-  - toggle `Spread Exit`
-  - editable `Exit Spread %`
-  - `Save`
+- compact actions:
+  - auto-exit status/target when present
+  - `Manual`
   - `Expand`
 
 Expanded card
@@ -75,7 +88,7 @@ Expanded card
 - `Legs`
   - one row/card per leg with exchange, side, qty, entry, mark, pnl, leverage
 
-Positions screen controls
+Dashboard screen controls
 - Top filters:
   - `All`
   - `Risk`
@@ -107,53 +120,44 @@ Main fields
 - `Action`: Enter / Exit / Roll
 - `Symbol`
 - `Qty` or `Notional`
-- quick `Chunk qty` on the main form, close to `Qty` rather than buried in advanced settings
+- quick `Chunk qty` and `Chunk notional` on the main form, close to `Qty` / `Notional`
 - `Long exchange`
 - `Short exchange`
 - `Mode`
   - `Smart`
   - `Fast`
+- read-only `Spread Preview`, sourced from WS orderbook first and public market snapshots as fallback
 - Optional but acceptable on main form:
   - `Max slippage`
   - `Margin mode` if it is still changed often by the operator
 
 Main action flow
 1. Enter symbol / qty / exchanges / mode
-2. `Analyze`
-3. Show compact plan summary:
+2. Verify `Spread Preview` visually
+3. `Dry Run`
+4. Show compact plan summary:
    - spread
    - slippage estimate
    - recommended chunk
    - warnings
    - errors
-4. `Execute`
-5. Show execution status + log
+5. `Execute`
+6. Show execution status + log
 
 Advanced settings
 - Hide by default.
 - Read backend defaults first; allow editing only when needed.
 - Put in separate screen, dialog, or collapsible section.
 
-Advanced sections
-- `Execution`
-  - timeout
-  - max runtime
-  - reprice sec
-  - max slippage
-- `Chunking`
-  - chunk qty
-  - chunk notional
-  - force chunk qty
-- `Hedge`
-  - hedge order type
-  - hedge limit mode
-  - favorable / adverse bps
-- `Safety`
-  - orderbook check
-  - max limit deviation
-  - exit allow flip
-- `System`
-  - WS health / reconnect controls should be hidden deepest; not part of normal operator UX
+Visible settings in the Android v1 app should stay narrow:
+- backend base URL
+- max slippage
+- margin mode
+- orderbook check
+- exit allow flip
+- force chunk qty
+
+Timeouts, runtime/reprice controls, hedge offsets, max limit deviation, and WS health controls stay on the backend in this mobile build.
 
 Manual Trade: Expensive Leg / Auto Hint
 - The operator wanted to keep the existing `Expensive leg (manual)` behavior and especially the `Auto hint` rule.
@@ -183,32 +187,32 @@ Important execution note
   - suggested `short` -> `from`
 
 Recommended API follow-up
-- Android can work against existing APIs, but a slimmer mobile endpoint would be cleaner:
+- Android now works against slim mobile endpoints:
   - `GET /api/mobile/positions`
   - `GET /api/mobile/manual-defaults`
-- This is optional, not required for the first Android implementation.
+  - `POST /api/mobile/manual-spread`
 
 Current Implementation Status
 - Slim mobile backend endpoints now exist:
   - `GET /api/mobile/positions`
   - `GET /api/mobile/manual-defaults`
+  - `POST /api/mobile/manual-spread`
 - Native Android scaffold now exists in `android-app/`:
-  - Jetpack Compose app module with bottom navigation `Positions / Manual / Settings`
-  - `Positions` card list with filters/sorts, inline auto-exit save, expand/collapse details
-  - `Manual` screen wired to analyze/execute/stop against existing manual APIs
-  - `Settings` screen for base URL plus advanced trade parameters kept out of the main manual flow
+  - Jetpack Compose app module with bottom navigation `Dashboard / Manual / Settings`
+  - `Dashboard` balance list plus position card list with filters/sorts and expand/collapse details
+  - `Manual` screen wired to spread preview, dry-run, execute, and stop against existing manual APIs
+  - `Settings` screen for base URL plus a narrow set of mobile-critical trade safety parameters
 - Android module now builds locally with `.\gradlew.bat :app:assembleDebug`, producing `android-app/app/build/outputs/apk/debug/app-debug.apk`
-- Manual live submit is now gated by an explicit confirmation dialog after preflight, and the app shows clearer loading / empty / error states on `Positions` and `Manual`
+- Manual live submit is now gated by an explicit confirmation dialog after preflight, and the app shows clearer loading / empty / error states on `Dashboard` and `Manual`
 
 Implementation Priority
-1. `Positions` cards with inline auto-exit editing
+1. `Dashboard` balances and position cards
 2. simplified `Manual Trade`
-3. `Advanced` settings
-4. optional dedicated mobile endpoints
+3. narrow mobile `Settings`
+4. dedicated mobile endpoints
 
 Definition of Done for Android V1
-- Positions are readable and actionable on a phone without horizontal table scrolling.
-- Auto-exit can be edited per position directly from the positions screen.
-- Manual trade supports analyze -> execute -> watch log.
-- Rare tuning knobs are hidden by default but still reachable.
+- Balances and positions are readable on a phone without horizontal table scrolling.
+- Manual trade supports spread preview -> dry-run -> execute -> watch log.
+- Rare tuning knobs are hidden from Android and remain backend-managed.
 - `Auto hint` is available and relies on backend execution logic, not frontend guesswork.

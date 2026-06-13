@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Funding History | Funding Arbitrage Monitor</title>
+  {% set rp = request.scope.get('root_path', '') %}
+  <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
+  <script>
+    window.__ROOT_PATH__ = "{{ rp }}";
+    window.__FUNDING_HISTORY_INITIAL__ = {{ initial | tojson | safe }};
+  </script>
+  <script defer src="{{ rp }}/static/funding_history.js?v={{ static_version }}"></script>
+</head>
+<body class="page page--funding-history">
+  <header class="masthead">
+    <div>
+      <p class="back-link"><a href="/">Back to dashboard</a></p>
+      <h1>Funding history</h1>
+      <p class="subtitle">Single-symbol funding comparison across selected perpetual venues</p>
+    </div>
+    <div class="status-block">
+      <dl>
+        <div>
+          <dt>Symbol</dt>
+          <dd id="fh-header-symbol">{{ symbol | upper }}</dd>
+        </div>
+        <div>
+          <dt>Selected</dt>
+          <dd id="fh-header-selected">-</dd>
+        </div>
+        <div>
+          <dt>Last run</dt>
+          <dd id="fh-header-run">-</dd>
+        </div>
+      </dl>
+      <p class="hint">Funding is analyzed by exact settlement windows. Mixed 1h/4h/8h intervals are prorated by overlap.</p>
+    </div>
+  </header>
+
+  <main class="content">
+    <section class="panel">
+      <h2>Request</h2>
+      <form id="fh-form" class="analysis-form">
+        <label>
+          Symbol
+          <input type="text" id="fh-symbol" value="{{ symbol | upper }}" autocomplete="off" />
+        </label>
+        <label>
+          Funding points
+          <input type="number" id="fh-points" min="24" max="200" step="1" value="200" />
+        </label>
+        <button type="submit" class="button" id="fh-submit">Analyze</button>
+        <span class="settings-status" id="fh-status" aria-live="polite"></span>
+      </form>
+      <div class="exchange-check-grid" id="fh-exchanges"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Best windows</h2>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Window</th>
+              <th>Direction</th>
+              <th>Carry %</th>
+              <th>Per 1000 USDT</th>
+              <th>Annualized</th>
+              <th>Coverage</th>
+              <th>Verdict</th>
+            </tr>
+          </thead>
+          <tbody id="fh-best-body">
+            <tr><td colspan="7" class="muted">Run analysis to populate data.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Exchange funding chart</h2>
+      <svg id="fh-rate-chart" class="chart-svg chart-svg--large" viewBox="0 0 900 260" preserveAspectRatio="none" aria-label="Funding rate history chart"></svg>
+      <p class="hint" id="fh-chart-note">Y-axis is funding rate in percent per settlement event.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Exchange overview</h2>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Exchange</th>
+              <th>Symbol</th>
+              <th>Status</th>
+              <th>Latest funding %</th>
+              <th>Interval</th>
+              <th>Points</th>
+              <th>Latest time</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody id="fh-exchange-body">
+            <tr><td colspan="8" class="muted">No exchange data yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Pair calculations</h2>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Window</th>
+              <th>Direction</th>
+              <th>Left leg %</th>
+              <th>Right leg %</th>
+              <th>Net %</th>
+              <th>Per 1000</th>
+              <th>Annualized</th>
+              <th>Coverage</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="fh-pair-body">
+            <tr><td colspan="9" class="muted">No pair data yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Funding timeline</h2>
+      <div class="table-wrapper">
+        <table class="table table--sticky-first">
+          <thead id="fh-timeline-head">
+            <tr><th>Time (UTC)</th></tr>
+          </thead>
+          <tbody id="fh-timeline-body">
+            <tr><td class="muted">No timeline yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Method</h2>
+      <pre class="code-block code-block--wrap" id="fh-method">Funding carry = short funding received minus long funding paid. Each exchange event is treated as a time segment and prorated inside the selected window.</pre>
+    </section>
+  </main>
+</body>
+</html>

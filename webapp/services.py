@@ -29,6 +29,7 @@ from execution.manual import (
     estimate_fill,
     max_qty_for_slippage,
     suggest_expensive_leg,
+    spread_pct,
     venue_liquidity_tier,
 )
 from execution import (
@@ -41,9 +42,28 @@ from execution.accounts import _safe_float
 from execution.allocator import Allocator
 from execution.lifecycle import LifecycleController
 from execution.settings import ExecutionSettings
-from execution.storage import JsonStateStore
+from execution.storage import JsonStateStore, JsonlEventStore
+from execution.auto_arb_grid import (
+    build_grid_levels,
+    decide_grid_transition,
+    normalize_level_count,
+    recommend_level_count,
+)
 from execution.accounts import AccountMonitor, normalize_symbol
 from risk.config import default_risk_config, RiskConfig
+from risk.derisk_manager import (
+    build_exchange_health,
+    classify_residual_leg,
+    derisk_candidate_score,
+    derive_cluster_rules,
+    exchange_stress_state,
+    hedged_pair_key,
+    normalize_hedge_cluster_config,
+    panic_severity,
+    price_velocity_bps,
+    qty_mismatch_ratio,
+    standalone_key,
+)
 from risk.stop_manager import ProtectiveOrderManager
 from utils.notifications import NotificationRouter
 from utils import purge_expired
@@ -52,6 +72,7 @@ from utils.funding import (
     enrich_history_intervals,
     infer_funding_interval_hours,
     is_stale_next_funding_iso,
+    normalize_interval_hours,
     parse_timestamp_ms,
     project_next_funding_time_iso,
 )
@@ -104,8 +125,8 @@ from analysis_decisions import (
     evaluate_position_signal,
     normalize_reason_codes,
 )
-from exchanges import get_adapter_cached, normalize_exchange_name
-from config import BASE_DIR, STATE_DIR, EXCHANGE_COMMISSIONS
+from exchanges import ADAPTER_FACTORIES, get_adapter_cached, normalize_exchange_name
+from config import BASE_DIR, STATE_DIR, EXCHANGE_COMMISSIONS, SUPPORTED_EXCHANGES
 from .market_data import MarketDataBus
 from .manual_symbols import _normalize_input_symbol
 from uuid import uuid4
@@ -114,16 +135,34 @@ FUNDING_CACHE_TTL_SEC = 120
 POSITIONS_MARKET_CONCURRENCY = 3
 AUTO_EXIT_POLL_SEC = 2.0
 AUTO_EXIT_LOG_COOLDOWN_SEC = 30.0
+DERISK_LOG_COOLDOWN_SEC = 15.0
+DERISK_EVENT_LIMIT = 80
+DERISK_OUTCOME_HORIZONS_SEC = {
+    "1m": 60.0,
+    "5m": 300.0,
+    "15m": 900.0,
+}
 AUTO_EXIT_DEFAULTS = {
     "max_runtime_sec": 600,
     "cooldown_sec": 300,
     "require_live": True,
     "auto_clear_no_position_sec": 120,
+    "restore_spread_on_missing": True,
 }
 AUTO_EXIT_STATE_PATH = STATE_DIR / "auto_exit_rules.json"
+AUTO_EXIT_HISTORY_PATH = BASE_DIR / "logs" / "auto_exit_history.jsonl"
+AUTO_ARB_STATE_PATH = STATE_DIR / "auto_arb_rules.json"
+AUTO_ARB_HISTORY_PATH = BASE_DIR / "logs" / "auto_arb_history.jsonl"
+AUTO_ARB_LIVE_MAX_CHUNK_NOTIONAL_USD = 50.0
+AUTO_ARB_LIVE_MAX_TOTAL_NOTIONAL_USD = 100.0
+HEDGE_CLUSTER_STATE_PATH = STATE_DIR / "hedge_clusters.json"
+DERISK_HISTORY_PATH = BASE_DIR / "logs" / "derisk_history.jsonl"
+DERISK_OUTCOME_STATE_PATH = STATE_DIR / "derisk_outcome_state.json"
 AUTO_EXIT_MULTILEG_MARKER = "multileg"
 AUTO_EXIT_MULTILEG_PAIR_BUFFER_PCT = 0.02
 AUTO_EXIT_EXECUTABLE_MAX_SLIPPAGE_BPS = 8.0
+AUTO_EXIT_SIGNATURE_QTY_TOLERANCE_PCT = 0.10
+AUTO_EXIT_SIGNATURE_ENTRY_TOLERANCE_PCT = 0.005
 AUTO_EXIT_POLICY_BY_TIER = {
     1: {
         "chunk_notional_cap_usd": 350.0,
@@ -155,6 +194,9 @@ AUTO_EXIT_POLICY_SETTINGS_DEFAULTS = {
 MANUAL_EXEC_LOG_DIR = BASE_DIR / "logs" / "manual_exec"
 COIN_ANALYSIS_CORE_EXCHANGES: tuple[str, ...] = ("binance", "kucoin")
 COIN_ANALYSIS_CACHE_TTL_SEC = 90
+FUNDING_HISTORY_DEFAULT_EXCHANGES: tuple[str, ...] = ("binance", "kucoin")
+FUNDING_HISTORY_WINDOWS_HOURS: tuple[int, ...] = (4, 12, 24, 72)
+FUNDING_HISTORY_MAX_POINTS = 200
 COIN_ANALYSIS_SESSION_TTL_SEC = 30 * 60
 COIN_FOCUS_POLL_SEC = 5.0
 COIN_SHORTLIST_POLL_SEC = 180.0
@@ -292,6 +334,52 @@ def _position_matches_symbol(position: Mapping[str, Any], match_keys: set[str]) 
     return False
 
 
+def _position_pair_quantities(
+    positions: Iterable[Mapping[str, Any]],
+    *,
+    symbol: str,
+    long_exchange: str,
+    short_exchange: str,
+) -> dict[str, float]:
+    match_keys = _symbol_match_values(symbol)
+    long_exchange = normalize_exchange_name(long_exchange)
+    short_exchange = normalize_exchange_name(short_exchange)
+    long_qty = 0.0
+    short_qty = 0.0
+    for position in positions or []:
+        if not _position_matches_symbol(position, match_keys):
+            continue
+        exchange = normalize_exchange_name(str(position.get("exchange") or ""))
+        qty_raw = _safe_float(position.get("coin_qty"))
+        if qty_raw is None:
+            qty_raw = _safe_float(position.get("quantity"))
+        if qty_raw is None:
+            qty_raw = _safe_float(position.get("contracts"))
+        qty = abs(float(qty_raw or 0.0))
+        if qty <= 0:
+            continue
+        side = str(position.get("side") or "").strip().lower()
+        if side not in {"long", "short"}:
+            if float(qty_raw or 0.0) > 0:
+                side = "long"
+            elif float(qty_raw or 0.0) < 0:
+                side = "short"
+        if exchange == long_exchange and side == "long":
+            long_qty += qty
+        elif exchange == short_exchange and side == "short":
+            short_qty += qty
+    hedged_qty = min(long_qty, short_qty)
+    imbalance_qty = abs(long_qty - short_qty)
+    imbalance_pct = (imbalance_qty / hedged_qty * 100.0) if hedged_qty > 0 else 0.0
+    return {
+        "long_qty": float(long_qty),
+        "short_qty": float(short_qty),
+        "hedged_qty": float(hedged_qty),
+        "imbalance_qty": float(imbalance_qty),
+        "imbalance_pct": float(imbalance_pct),
+    }
+
+
 def _auto_exit_select_pair_from_legs(
     legs: Iterable[Mapping[str, Any]],
 ) -> dict[str, Any] | None:
@@ -371,6 +459,121 @@ def _is_auto_exit_multileg_rule(long_exchange: str | None, short_exchange: str |
     )
 
 
+def _auto_exit_normalized_signature_leg(leg: Mapping[str, Any]) -> dict[str, Any] | None:
+    exchange = normalize_exchange_name(str(leg.get("exchange") or ""))
+    side = str(leg.get("side") or "").lower()
+    if side not in {"long", "short"} or not exchange:
+        return None
+    qty = abs(_safe_float(leg.get("quantity")) or _safe_float(leg.get("qty")) or 0.0)
+    if qty <= 0:
+        return None
+    entry_price = _safe_float(leg.get("entry_price"))
+    mark_price = _safe_float(leg.get("mark_price"))
+    amount = abs(_safe_float(leg.get("amount")) or _safe_float(leg.get("notional")) or 0.0)
+    return {
+        "exchange": exchange,
+        "side": side,
+        "qty": float(qty),
+        "entry_price": float(entry_price) if entry_price is not None else None,
+        "mark_price": float(mark_price) if mark_price is not None else None,
+        "amount": float(amount) if amount > 0 else None,
+    }
+
+
+def _auto_exit_position_signature(
+    symbol: str,
+    legs: Iterable[Mapping[str, Any]],
+    *,
+    rule_long_exchange: str,
+    rule_short_exchange: str,
+    selected_pair: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    symbol_key = normalize_symbol(symbol)
+    long_exchange = normalize_exchange_name(rule_long_exchange)
+    short_exchange = normalize_exchange_name(rule_short_exchange)
+    is_multileg = _is_auto_exit_multileg_rule(long_exchange, short_exchange)
+    source_legs: list[Mapping[str, Any]] = []
+    if is_multileg:
+        source_legs = list(legs or [])
+    else:
+        selected = selected_pair or _auto_exit_select_pair_from_legs(legs)
+        if selected:
+            long_leg = dict(selected.get("long_leg") or {})
+            short_leg = dict(selected.get("short_leg") or {})
+            if (
+                normalize_exchange_name(str(long_leg.get("exchange") or "")) == long_exchange
+                and str(long_leg.get("side") or "").lower() == "long"
+            ):
+                source_legs.append(long_leg)
+            if (
+                normalize_exchange_name(str(short_leg.get("exchange") or "")) == short_exchange
+                and str(short_leg.get("side") or "").lower() == "short"
+            ):
+                source_legs.append(short_leg)
+    normalized = []
+    for leg in source_legs:
+        item = _auto_exit_normalized_signature_leg(leg)
+        if item:
+            normalized.append(item)
+    normalized.sort(key=lambda item: (str(item.get("exchange") or ""), str(item.get("side") or "")))
+    if len(normalized) < 2:
+        return None
+    leg_keys = [
+        f"{item['exchange']}:{item['side']}:{round(float(item.get('qty') or 0.0), 8)}:"
+        f"{round(float(item.get('entry_price') or 0.0), 8)}"
+        for item in normalized
+    ]
+    return {
+        "version": 1,
+        "symbol": symbol_key,
+        "mode": "multileg" if is_multileg else "pair",
+        "rule_long_exchange": long_exchange,
+        "rule_short_exchange": short_exchange,
+        "legs": normalized,
+        "fingerprint": "|".join(leg_keys),
+    }
+
+
+def _auto_exit_signature_match(
+    expected: Mapping[str, Any] | None,
+    current: Mapping[str, Any] | None,
+) -> tuple[bool, str]:
+    if not isinstance(expected, Mapping) or not expected.get("legs"):
+        return False, "unbound_position_signature"
+    if not isinstance(current, Mapping) or not current.get("legs"):
+        return False, "position_signature_unavailable"
+    if normalize_symbol(str(expected.get("symbol") or "")) != normalize_symbol(str(current.get("symbol") or "")):
+        return False, "position_signature_symbol_changed"
+    expected_legs = {
+        (normalize_exchange_name(str(item.get("exchange") or "")), str(item.get("side") or "").lower()): item
+        for item in list(expected.get("legs") or [])
+        if isinstance(item, Mapping)
+    }
+    current_legs = {
+        (normalize_exchange_name(str(item.get("exchange") or "")), str(item.get("side") or "").lower()): item
+        for item in list(current.get("legs") or [])
+        if isinstance(item, Mapping)
+    }
+    if set(expected_legs.keys()) != set(current_legs.keys()):
+        return False, "position_signature_legs_changed"
+    for key, expected_leg in expected_legs.items():
+        current_leg = current_legs.get(key) or {}
+        expected_qty = _safe_float(expected_leg.get("qty")) or 0.0
+        current_qty = _safe_float(current_leg.get("qty")) or 0.0
+        if expected_qty <= 0 or current_qty <= 0:
+            return False, "position_signature_qty_unavailable"
+        qty_delta = abs(current_qty - expected_qty) / max(abs(expected_qty), 1e-12)
+        if qty_delta > AUTO_EXIT_SIGNATURE_QTY_TOLERANCE_PCT:
+            return False, "position_signature_qty_changed"
+        expected_entry = _safe_float(expected_leg.get("entry_price"))
+        current_entry = _safe_float(current_leg.get("entry_price"))
+        if expected_entry is not None and current_entry is not None and expected_entry > 0 and current_entry > 0:
+            entry_delta = abs(current_entry - expected_entry) / max(abs(expected_entry), 1e-12)
+            if entry_delta > AUTO_EXIT_SIGNATURE_ENTRY_TOLERANCE_PCT:
+                return False, "position_signature_entry_changed"
+    return True, "position_signature_match"
+
+
 def _auto_exit_overall_spread_from_legs(
     legs: Iterable[Mapping[str, Any]],
     live_mid_by_exchange: Mapping[str, float] | None = None,
@@ -407,6 +610,43 @@ def _auto_exit_overall_spread_from_legs(
     if not long_avg or long_avg == 0 or short_avg is None:
         return None
     return (long_avg - short_avg) / long_avg * 100.0
+
+
+def _auto_exit_spread_trigger_status(
+    *,
+    is_multileg: bool,
+    target_pct: float,
+    overall_spread_pct: float | None,
+    pair_spread_pct: float | None,
+    pair_net_spread_pct: float | None,
+    edge_buffer_pct: float,
+) -> dict[str, Any]:
+    if is_multileg:
+        trigger_spread = overall_spread_pct
+        required_spread = float(target_pct)
+        live_ready = (
+            trigger_spread is not None
+            and pair_spread_pct is not None
+            and pair_net_spread_pct is not None
+        )
+    else:
+        trigger_spread = pair_spread_pct
+        required_spread = float(target_pct) + float(edge_buffer_pct)
+        live_ready = trigger_spread is not None and pair_net_spread_pct is not None
+    return {
+        "trigger_spread_pct": trigger_spread,
+        "required_spread_pct": required_spread,
+        "live_ready": bool(live_ready),
+        "target_reached": bool(
+            live_ready
+            and (
+                float(trigger_spread) >= float(required_spread)
+                if is_multileg
+                else float(pair_net_spread_pct) >= float(required_spread)
+            )
+        ),
+        "scope": "overall_basket" if is_multileg else "pair_executable",
+    }
 
 
 def _auto_exit_pair_fee_bps(long_exchange: str, short_exchange: str) -> float:
@@ -1434,7 +1674,9 @@ def _resolve_funding_interval_hours(
     history: list[dict[str, Any]],
     snapshot_interval: float | None,
 ) -> float | None:
-    return infer_funding_interval_hours(history, snapshot_interval=snapshot_interval)
+    timestamp_interval = _infer_history_timestamp_interval_hours(history)
+    inferred = infer_funding_interval_hours(history, snapshot_interval=snapshot_interval)
+    return _resolve_row_interval_hours(inferred, timestamp_interval, snapshot_interval)
 
 
 def _spread_series_from_candles(
@@ -1491,13 +1733,14 @@ def _funding_event_segments(
     rows = enrich_history_intervals(history or [], snapshot_interval=snapshot_interval)
     segments: list[dict[str, float]] = []
     for row in rows:
-        end_ts_ms = _funding_history_ts_ms(row.get("ts_ms") or row.get("timestamp"))
         interval_hours = _safe_float(row.get("interval_hours"))
-        rate = _safe_float(
-            row.get("rate")
-            or row.get("fundingRate")
-            or row.get("funding_rate")
+        raw_end_ts_ms = _funding_history_ts_ms(row.get("ts_ms") or row.get("timestamp"))
+        end_ts_ms = (
+            _funding_history_ts_ms(row.get("slot_ts_ms"))
+            or _funding_slot_ts_ms(raw_end_ts_ms, interval_hours or snapshot_interval)
+            or raw_end_ts_ms
         )
+        rate = _funding_rate_from_row(row)
         if not end_ts_ms or interval_hours is None or interval_hours <= 0 or rate is None:
             continue
         duration_ms = int(interval_hours * 3600.0 * 1000.0)
@@ -1513,6 +1756,134 @@ def _funding_event_segments(
         )
     segments.sort(key=lambda item: item.get("end_ts_ms") or 0.0)
     return segments
+
+
+def _funding_rate_from_row(row: Mapping[str, Any]) -> float | None:
+    for key in ("rate", "fundingRate", "funding_rate"):
+        if key in row:
+            value = _safe_float(row.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def _funding_slot_ts_ms(ts_ms: int | float | None, interval_hours: float | None = None) -> int | None:
+    if ts_ms is None:
+        return None
+    ts_val = int(ts_ms)
+    interval = normalize_interval_hours(interval_hours)
+    bucket_ms = int((interval or 1.0) * 3600.0 * 1000.0)
+    if bucket_ms <= 0:
+        bucket_ms = 3600 * 1000
+    return int(round(ts_val / float(bucket_ms)) * bucket_ms)
+
+
+def _funding_slot_iso(ts_ms: int | float | None) -> str | None:
+    if ts_ms is None:
+        return None
+    return datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=timezone.utc).isoformat()
+
+
+def _infer_history_timestamp_interval_hours(history: Sequence[Mapping[str, Any]]) -> float | None:
+    points: list[int] = []
+    for row in history or []:
+        if not isinstance(row, Mapping):
+            continue
+        ts_ms = _funding_history_ts_ms(
+            row.get("ts_ms")
+            or row.get("timestamp")
+            or row.get("timepoint")
+            or row.get("timePoint")
+            or row.get("fundingTime")
+        )
+        if ts_ms is not None:
+            points.append(int(ts_ms))
+    unique = sorted(set(points), reverse=True)
+    if len(unique) < 2:
+        return None
+    buckets: dict[float, int] = {}
+    for idx in range(len(unique) - 1):
+        diff_ms = abs(unique[idx] - unique[idx + 1])
+        interval = normalize_interval_hours(diff_ms / 1000.0 / 3600.0)
+        if interval is None:
+            continue
+        bucket = round(interval * 4.0) / 4.0
+        buckets[bucket] = buckets.get(bucket, 0) + 1
+    if not buckets:
+        return None
+    return max(buckets.items(), key=lambda item: (item[1], -item[0]))[0]
+
+
+def _resolve_row_interval_hours(
+    declared_interval: float | None,
+    timestamp_interval: float | None,
+    snapshot_interval: float | None,
+) -> float | None:
+    declared = normalize_interval_hours(declared_interval)
+    ts_interval = normalize_interval_hours(timestamp_interval)
+    snapshot = normalize_interval_hours(snapshot_interval)
+    if ts_interval is not None:
+        if declared is None:
+            return ts_interval
+        tolerance = max(0.1, min(declared, ts_interval) * 0.2)
+        if abs(declared - ts_interval) > tolerance:
+            return ts_interval
+        return declared
+    return declared if declared is not None else snapshot
+
+
+def _compact_funding_history_rows(
+    history: list[dict[str, Any]],
+    *,
+    snapshot_interval: float | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    enriched = enrich_history_intervals(history or [], snapshot_interval=snapshot_interval)
+    timestamp_interval = _infer_history_timestamp_interval_hours(enriched)
+    rows: list[dict[str, Any]] = []
+    for item in enriched:
+        ts_ms = _funding_history_ts_ms(
+            item.get("ts_ms")
+            or item.get("timestamp")
+            or item.get("timepoint")
+            or item.get("timePoint")
+            or item.get("fundingTime")
+        )
+        rate = _funding_rate_from_row(item)
+        if ts_ms is None or rate is None:
+            continue
+        interval_hours = _safe_float(
+            item.get("interval_hours")
+            or item.get("intervalHours")
+            or item.get("funding_interval_hours")
+        )
+        interval_hours = _resolve_row_interval_hours(
+            interval_hours,
+            timestamp_interval,
+            snapshot_interval,
+        )
+        slot_ts_ms = _funding_slot_ts_ms(ts_ms, interval_hours or snapshot_interval)
+        predicted = None
+        for predicted_key in ("predicted_rate", "predictedFundingRate", "predicted_funding_rate"):
+            if predicted_key in item:
+                predicted = _safe_float(item.get(predicted_key))
+                if predicted is not None:
+                    break
+        rows.append(
+            {
+                "ts_ms": int(ts_ms),
+                "time_utc": datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).isoformat(),
+                "slot_ts_ms": slot_ts_ms,
+                "slot_time_utc": _funding_slot_iso(slot_ts_ms),
+                "rate": float(rate),
+                "rate_bps": float(rate) * 10000.0,
+                "predicted_rate": predicted,
+                "predicted_bps": predicted * 10000.0 if predicted is not None else None,
+                "interval_hours": interval_hours,
+            }
+        )
+    rows.sort(key=lambda row: int(row.get("ts_ms") or 0), reverse=True)
+    return rows[: max(1, int(limit))]
 
 
 def _funding_carry_over_window_pct(
@@ -1544,6 +1915,280 @@ def _funding_carry_over_window_pct(
     if covered_ms <= 0:
         return None, 0.0
     return total_pct, min(100.0, covered_ms / max(1.0, float(window_end_ms - window_start_ms)) * 100.0)
+
+
+def _funding_history_window_label(hours: int | float) -> str:
+    hours_val = int(hours)
+    if hours_val == 24:
+        return "1d"
+    if hours_val == 72:
+        return "3d"
+    return f"{hours_val}h"
+
+
+def _funding_history_windows(windows_hours: Iterable[int | float] | None = None) -> list[dict[str, Any]]:
+    raw_values = list(windows_hours or FUNDING_HISTORY_WINDOWS_HOURS)
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for raw in raw_values:
+        hours = int(_safe_float(raw) or 0)
+        if hours <= 0 or hours > 24 * 14 or hours in seen:
+            continue
+        seen.add(hours)
+        out.append({"hours": hours, "label": _funding_history_window_label(hours)})
+    if not out:
+        for hours in FUNDING_HISTORY_WINDOWS_HOURS:
+            out.append({"hours": hours, "label": _funding_history_window_label(hours)})
+    return out
+
+
+def _funding_history_exchange_windows(
+    history: list[dict[str, Any]],
+    interval_hours: float | None,
+    windows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    segments = _funding_event_segments(history, interval_hours)
+    if not segments:
+        return []
+    latest_end_ms = int(_safe_float(segments[-1].get("end_ts_ms")) or 0)
+    out: list[dict[str, Any]] = []
+    for window in windows:
+        hours = int(window.get("hours") or 0)
+        if hours <= 0:
+            continue
+        start_ms = latest_end_ms - hours * 3600 * 1000
+        short_pct, short_cov = _funding_carry_over_window_pct(
+            segments,
+            start_ms,
+            latest_end_ms,
+            multiplier=1.0,
+        )
+        long_pct, long_cov = _funding_carry_over_window_pct(
+            segments,
+            start_ms,
+            latest_end_ms,
+            multiplier=-1.0,
+        )
+        out.append(
+            {
+                "label": window.get("label"),
+                "hours": hours,
+                "window_start_ms": start_ms,
+                "window_end_ms": latest_end_ms,
+                "short_carry_bps": short_pct * 10000.0 if short_pct is not None else None,
+                "long_carry_bps": long_pct * 10000.0 if long_pct is not None else None,
+                "coverage_pct": min(short_cov, long_cov),
+            }
+        )
+    return out
+
+
+def _build_funding_history_pair_analysis(
+    exchange_rows: list[Mapping[str, Any]],
+    windows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    usable = [
+        row
+        for row in exchange_rows
+        if row.get("status") in {"ok", "partial"} and row.get("funding_history")
+    ]
+    pair_rows: list[dict[str, Any]] = []
+    series_source: dict[str, Any] = {}
+    for i in range(len(usable)):
+        for j in range(i + 1, len(usable)):
+            left = usable[i]
+            right = usable[j]
+            left_exchange = str(left.get("exchange") or "")
+            right_exchange = str(right.get("exchange") or "")
+            left_history = list(left.get("funding_history") or [])
+            right_history = list(right.get("funding_history") or [])
+            left_interval = _safe_float(left.get("funding_interval_hours_resolved"))
+            right_interval = _safe_float(right.get("funding_interval_hours_resolved"))
+            left_segments = _funding_event_segments(left_history, left_interval)
+            right_segments = _funding_event_segments(right_history, right_interval)
+            if not left_segments or not right_segments:
+                continue
+            pair_end_ms = min(
+                int(_safe_float(left_segments[-1].get("end_ts_ms")) or 0),
+                int(_safe_float(right_segments[-1].get("end_ts_ms")) or 0),
+            )
+            if pair_end_ms <= 0:
+                continue
+            for direction in ("long_a_short_b", "long_b_short_a"):
+                left_mult = _funding_position_multiplier(direction, leg="left")
+                right_mult = _funding_position_multiplier(direction, leg="right")
+                if direction == "long_b_short_a":
+                    long_exchange = right_exchange
+                    short_exchange = left_exchange
+                else:
+                    long_exchange = left_exchange
+                    short_exchange = right_exchange
+                for window in windows:
+                    hours = int(window.get("hours") or 0)
+                    if hours <= 0:
+                        continue
+                    start_ms = pair_end_ms - hours * 3600 * 1000
+                    left_pct, left_cov = _funding_carry_over_window_pct(
+                        left_segments,
+                        start_ms,
+                        pair_end_ms,
+                        multiplier=left_mult,
+                    )
+                    right_pct, right_cov = _funding_carry_over_window_pct(
+                        right_segments,
+                        start_ms,
+                        pair_end_ms,
+                        multiplier=right_mult,
+                    )
+                    net_pct = None
+                    if left_pct is not None and right_pct is not None:
+                        net_pct = float(left_pct) + float(right_pct)
+                    coverage_pct = min(left_cov, right_cov)
+                    status = "ok"
+                    if net_pct is None:
+                        status = "insufficient_data"
+                    elif coverage_pct < 95.0:
+                        status = "partial"
+                    pair_rows.append(
+                        {
+                            "pair_key": f"{left_exchange}|{right_exchange}",
+                            "pair_label": f"{left_exchange} vs {right_exchange}",
+                            "left_exchange": left_exchange,
+                            "right_exchange": right_exchange,
+                            "direction": direction,
+                            "direction_label": _direction_label(direction, left_exchange, right_exchange),
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                            "window_label": window.get("label"),
+                            "window_hours": hours,
+                            "window_start_ms": start_ms,
+                            "window_end_ms": pair_end_ms,
+                            "left_leg_bps": left_pct * 10000.0 if left_pct is not None else None,
+                            "right_leg_bps": right_pct * 10000.0 if right_pct is not None else None,
+                            "net_bps": net_pct * 10000.0 if net_pct is not None else None,
+                            "net_pct": net_pct * 100.0 if net_pct is not None else None,
+                            "annualized_pct": (
+                                net_pct / float(hours) * 24.0 * 365.0 * 100.0
+                                if net_pct is not None and hours > 0
+                                else None
+                            ),
+                            "usd_per_1000_notional": net_pct * 1000.0 if net_pct is not None else None,
+                            "coverage_pct": coverage_pct,
+                            "status": status,
+                        }
+                    )
+                    if (
+                        net_pct is not None
+                        and (not series_source or float(net_pct) > float(series_source.get("net_pct") or -999.0))
+                        and hours == 24
+                    ):
+                        series_source = {
+                            "left_exchange": left_exchange,
+                            "right_exchange": right_exchange,
+                            "direction": direction,
+                            "net_pct": net_pct,
+                            "left_history": left_history,
+                            "right_history": right_history,
+                            "left_interval": left_interval,
+                            "right_interval": right_interval,
+                        }
+
+    best_by_window: dict[str, Any] = {}
+    for window in windows:
+        label = str(window.get("label") or "")
+        candidates = [
+            row
+            for row in pair_rows
+            if str(row.get("window_label") or "") == label and _safe_float(row.get("net_bps")) is not None
+        ]
+        complete = [row for row in candidates if float(_safe_float(row.get("coverage_pct")) or 0.0) >= 95.0]
+        pool = complete or candidates
+        if not pool:
+            continue
+        best = max(pool, key=lambda row: float(_safe_float(row.get("net_bps")) or -999999.0))
+        verdict = "favorable" if float(_safe_float(best.get("net_bps")) or 0.0) > 0 else "avoid"
+        if float(_safe_float(best.get("coverage_pct")) or 0.0) < 95.0:
+            verdict = "partial_data"
+        best_by_window[label] = {**best, "verdict": verdict}
+
+    spread_series: dict[str, Any] = {"points": [], "source": {}}
+    if series_source:
+        direction = str(series_source.get("direction") or "long_a_short_b")
+        points = _funding_net_hourly_series(
+            list(series_source.get("left_history") or []),
+            list(series_source.get("right_history") or []),
+            left_interval_hours=_safe_float(series_source.get("left_interval")),
+            right_interval_hours=_safe_float(series_source.get("right_interval")),
+            direction=direction,
+            max_points=96,
+        )
+        spread_series = {
+            "points": points,
+            "source": {
+                "left_exchange": series_source.get("left_exchange"),
+                "right_exchange": series_source.get("right_exchange"),
+                "direction": direction,
+            },
+        }
+
+    pair_rows.sort(
+        key=lambda row: (
+            int(row.get("window_hours") or 0),
+            -(float(_safe_float(row.get("net_bps")) or -999999.0)),
+            str(row.get("pair_label") or ""),
+        )
+    )
+    return pair_rows, best_by_window, spread_series
+
+
+def _build_funding_history_timeline(
+    exchange_rows: list[Mapping[str, Any]],
+    *,
+    max_hours: int,
+) -> list[dict[str, Any]]:
+    latest_ts_ms = 0
+    for row in exchange_rows:
+        for item in list(row.get("funding_history") or []):
+            ts_ms = _funding_history_ts_ms(
+                item.get("slot_ts_ms") or item.get("ts_ms") or item.get("timestamp")
+            )
+            if ts_ms:
+                latest_ts_ms = max(latest_ts_ms, int(ts_ms))
+    if latest_ts_ms <= 0:
+        return []
+    cutoff_ms = latest_ts_ms - max(1, int(max_hours)) * 3600 * 1000
+    by_time: dict[int, dict[str, Any]] = {}
+    for row in exchange_rows:
+        exchange = str(row.get("exchange") or "")
+        if not exchange:
+            continue
+        for item in list(row.get("funding_history") or []):
+            raw_ts_ms = _funding_history_ts_ms(item.get("ts_ms") or item.get("timestamp"))
+            slot_ts_ms = _funding_history_ts_ms(item.get("slot_ts_ms")) or _funding_slot_ts_ms(
+                raw_ts_ms,
+                _safe_float(item.get("interval_hours")),
+            )
+            if slot_ts_ms is None or slot_ts_ms < cutoff_ms:
+                continue
+            rate = _funding_rate_from_row(item)
+            if rate is None:
+                continue
+            slot = by_time.setdefault(
+                int(slot_ts_ms),
+                {
+                    "ts_ms": int(slot_ts_ms),
+                    "time_utc": _funding_slot_iso(slot_ts_ms),
+                    "exchanges": {},
+                },
+            )
+            slot["exchanges"][exchange] = {
+                "rate": float(rate),
+                "rate_bps": float(rate) * 10000.0,
+                "interval_hours": _safe_float(item.get("interval_hours")),
+                "raw_ts_ms": raw_ts_ms,
+                "raw_time_utc": _funding_slot_iso(raw_ts_ms),
+            }
+    return [by_time[key] for key in sorted(by_time.keys(), reverse=True)]
 
 
 def _funding_net_hourly_series(
@@ -2474,7 +3119,14 @@ class DataService:
         self._manual = ManualTradeManager(orderbook_provider=self._market_data)
         self._manual_runs: Dict[str, dict[str, Any]] = {}
         self._manual_run_ttl = 3600
+        self._auto_arb_store = JsonStateStore(AUTO_ARB_STATE_PATH)
+        self._auto_arb_history_store = JsonlEventStore(AUTO_ARB_HISTORY_PATH)
+        self._auto_arb: dict[str, Any] = self._load_auto_arb_config()
+        self._auto_arb_lock = asyncio.Lock()
+        self._auto_arb_task: Optional[asyncio.Task] = None
+        self._auto_arb_poll_sec = 3.0
         self._auto_exit_store = JsonStateStore(AUTO_EXIT_STATE_PATH)
+        self._auto_exit_history_store = JsonlEventStore(AUTO_EXIT_HISTORY_PATH)
         self._auto_exit: dict[str, Any] = self._load_auto_exit_config()
         self._auto_exit_lock = asyncio.Lock()
         self._auto_exit_task: Optional[asyncio.Task] = None
@@ -2486,7 +3138,25 @@ class DataService:
         self._auto_exit_events: list[dict[str, Any]] = []
         self._auto_exit_event_limit = 60
         self._auto_exit_last_log_ts: dict[str, float] = {}
+        self._auto_exit_completed_run_cleanup: set[str] = set()
         self._auto_exit_log_cooldown_sec = AUTO_EXIT_LOG_COOLDOWN_SEC
+        self._hedge_cluster_store = JsonStateStore(HEDGE_CLUSTER_STATE_PATH)
+        self._hedge_clusters: dict[str, Any] = self._load_hedge_cluster_config()
+        self._derisk_history_store = JsonlEventStore(DERISK_HISTORY_PATH)
+        self._derisk_outcome_store = JsonStateStore(DERISK_OUTCOME_STATE_PATH)
+        self._derisk_lock = asyncio.Lock()
+        self._derisk_task: Optional[asyncio.Task] = None
+        self._derisk_inflight = False
+        self._derisk_exchange_health: dict[str, Any] = {}
+        self._derisk_diagnostics: list[dict[str, Any]] = []
+        self._derisk_events: list[dict[str, Any]] = []
+        self._derisk_event_limit = DERISK_EVENT_LIMIT
+        self._derisk_last_log_ts: dict[str, float] = {}
+        self._derisk_log_cooldown_sec = DERISK_LOG_COOLDOWN_SEC
+        self._derisk_cluster_state: dict[str, Any] = {}
+        self._derisk_poll_sec = 5.0
+        self._derisk_active_cycle_id: str | None = None
+        self._derisk_outcome_state: dict[str, Any] = self._load_derisk_outcome_state()
         self._coin_analysis_cache: dict[tuple[str, int, int, tuple[str, ...]], tuple[float, dict[str, Any]]] = {}
         self._coin_focus_task: Optional[asyncio.Task] = None
         self._coin_focus_poll_sec = COIN_FOCUS_POLL_SEC
@@ -4875,6 +5545,208 @@ class DataService:
         self._coin_position_watcher_enabled = bool(enabled)
         return await self.get_coin_position_watcher_status()
 
+    async def send_test_notification(
+        self,
+        *,
+        message: str,
+        title: str = "FeeArb test notification",
+    ) -> dict[str, Any]:
+        self._apply_alert_settings()
+        status = await self._notifier.send_text_status(str(message or ""), title=str(title or "FeeArb test notification"))
+        protective = getattr(self._settings_manager.current, "protective", {}) or {}
+        return {
+            "status": status,
+            "primary_channel": str(protective.get("notification_primary_channel", "ntfy") or "ntfy"),
+            "fallback_channel": str(protective.get("notification_fallback_channel", "none") or "none"),
+            "title": str(title or "FeeArb test notification"),
+        }
+
+    async def analyze_funding_history(
+        self,
+        symbol: str,
+        *,
+        exchanges: Iterable[str] | None = None,
+        windows_hours: Iterable[int | float] | None = None,
+        funding_points: int = FUNDING_HISTORY_MAX_POINTS,
+    ) -> dict[str, Any]:
+        canonical = normalize_symbol(symbol)
+        if not canonical:
+            raise ValueError("Symbol must be provided for funding history analysis.")
+
+        supported = [
+            exchange
+            for exchange in SUPPORTED_EXCHANGES
+            if normalize_exchange_name(exchange) in ADAPTER_FACTORIES
+        ]
+        requested = list(exchanges or FUNDING_HISTORY_DEFAULT_EXCHANGES)
+        selected: list[str] = []
+        for item in requested:
+            exchange = normalize_exchange_name(str(item or "").strip())
+            if not exchange or exchange not in supported or exchange in selected:
+                continue
+            selected.append(exchange)
+        if not selected:
+            selected = [exchange for exchange in FUNDING_HISTORY_DEFAULT_EXCHANGES if exchange in supported]
+        if not selected:
+            raise ValueError("Enable at least one supported exchange.")
+
+        windows = _funding_history_windows(windows_hours)
+        max_window_hours = max(int(window.get("hours") or 0) for window in windows)
+        fetch_limit = max(24, min(int(funding_points or FUNDING_HISTORY_MAX_POINTS), FUNDING_HISTORY_MAX_POINTS))
+        fetch_limit = max(fetch_limit, min(FUNDING_HISTORY_MAX_POINTS, max_window_hours + 16))
+
+        tasks = [
+            self._analyze_funding_history_on_exchange(exchange, canonical, fetch_limit, windows)
+            for exchange in selected
+        ]
+        exchange_rows = [row for row in await asyncio.gather(*tasks) if row]
+        pair_windows, best_by_window, spread_series = _build_funding_history_pair_analysis(
+            exchange_rows,
+            windows,
+        )
+        timeline = _build_funding_history_timeline(exchange_rows, max_hours=max_window_hours)
+        chart_series: dict[str, Any] = {}
+        for row in exchange_rows:
+            exchange = str(row.get("exchange") or "")
+            if not exchange:
+                continue
+            history_asc = list(reversed(list(row.get("funding_history") or [])))
+            chart_series[exchange] = [
+                {
+                    "ts_ms": int(item.get("ts_ms") or 0),
+                    "rate_bps": _safe_float(item.get("rate_bps")),
+                    "interval_hours": _safe_float(item.get("interval_hours")),
+                }
+                for item in history_asc
+                if _safe_float(item.get("rate_bps")) is not None
+            ][-120:]
+
+        warnings: list[str] = []
+        if len([row for row in exchange_rows if row.get("funding_history")]) < 2:
+            warnings.append("pair_analysis_limited: fewer than two exchanges returned funding history")
+
+        return {
+            "symbol": canonical,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "supported_exchanges": supported,
+            "default_exchanges": list(FUNDING_HISTORY_DEFAULT_EXCHANGES),
+            "selected_exchanges": selected,
+            "funding_points": fetch_limit,
+            "windows": windows,
+            "warnings": warnings,
+            "exchanges": exchange_rows,
+            "best_by_window": best_by_window,
+            "pair_windows": pair_windows,
+            "timeline": timeline,
+            "charts": {
+                "exchange_rates": chart_series,
+                "best_pair_hourly": spread_series,
+            },
+            "method": {
+                "carry_formula": "long leg receives -funding_rate, short leg receives +funding_rate",
+                "interval_handling": "funding events are converted to time segments and prorated by overlap inside each analysis window",
+                "windows": [window.get("label") for window in windows],
+            },
+        }
+
+    async def _analyze_funding_history_on_exchange(
+        self,
+        exchange: str,
+        canonical_symbol: str,
+        funding_points: int,
+        windows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "exchange": exchange,
+            "symbol": canonical_symbol,
+        }
+        try:
+            adapter = get_adapter_cached(exchange)
+        except KeyError:
+            result["status"] = "error"
+            result["error"] = f"Adapter for {exchange} not registered."
+            return result
+
+        try:
+            exchange_symbol = adapter.map_symbol(canonical_symbol)
+        except Exception:  # pylint: disable=broad-except
+            exchange_symbol = None
+        if not exchange_symbol:
+            result["status"] = "unsupported"
+            result["error"] = "Symbol not supported on this exchange."
+            return result
+
+        result["exchange_symbol"] = exchange_symbol
+        warnings: list[str] = []
+        snapshot_dict: dict[str, Any] = {}
+        try:
+            snapshots = await adapter.fetch_market_snapshots_async([canonical_symbol])
+            if snapshots:
+                snapshot_dict = snapshots[0].to_dict()
+        except Exception as exc:  # pylint: disable=broad-except
+            warnings.append(f"snapshot_unavailable:{exc}")
+        result["snapshot"] = snapshot_dict
+
+        raw_history = await asyncio.to_thread(
+            _load_funding_history_cached,
+            exchange,
+            exchange_symbol,
+            canonical_symbol,
+            funding_points,
+            adapter,
+        )
+        interval_hours = _resolve_funding_interval_hours(
+            raw_history,
+            _safe_float(snapshot_dict.get("funding_interval_hours")),
+        )
+        funding_history = _compact_funding_history_rows(
+            raw_history,
+            snapshot_interval=interval_hours,
+            limit=funding_points,
+        )
+        interval_hours = _resolve_funding_interval_hours(
+            funding_history,
+            interval_hours,
+        )
+        await asyncio.to_thread(
+            self._persist_coin_funding_history,
+            canonical_symbol,
+            exchange,
+            funding_history,
+            interval_hours,
+        )
+
+        result["funding_history"] = funding_history
+        result["funding_interval_hours_resolved"] = interval_hours
+        result["latest_funding_rate"] = (
+            _safe_float(funding_history[0].get("rate")) if funding_history else _safe_float(snapshot_dict.get("funding_rate"))
+        )
+        result["latest_funding_bps"] = (
+            float(result["latest_funding_rate"]) * 10000.0
+            if result.get("latest_funding_rate") is not None
+            else None
+        )
+        result["windows"] = _funding_history_exchange_windows(funding_history, interval_hours, windows)
+        result["data_quality"] = {
+            "funding_points_received": len(funding_history),
+            "oldest_ts_ms": funding_history[-1].get("ts_ms") if funding_history else None,
+            "latest_ts_ms": funding_history[0].get("ts_ms") if funding_history else None,
+        }
+        if funding_history and interval_hours is None:
+            warnings.append("funding_interval_unresolved")
+        if funding_history and len(funding_history) < 2:
+            warnings.append("funding_history_short")
+        if not funding_history:
+            result["status"] = "error"
+            result["error"] = "Funding history unavailable for this symbol/exchange."
+        elif warnings:
+            result["status"] = "partial"
+        else:
+            result["status"] = "ok"
+        if warnings:
+            result["warnings"] = warnings
+        return result
+
     async def coin_paper_enter(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         canonical = normalize_symbol(str(payload.get("symbol") or ""))
         if not canonical:
@@ -5307,6 +6179,10 @@ class DataService:
             self._protective_task = asyncio.create_task(self._protective_scheduler())
         if self._auto_exit_task is None:
             self._auto_exit_task = asyncio.create_task(self._auto_exit_scheduler())
+        if self._auto_arb_task is None:
+            self._auto_arb_task = asyncio.create_task(self._auto_arb_scheduler())
+        if self._derisk_task is None:
+            self._derisk_task = asyncio.create_task(self._derisk_scheduler())
         if self._coin_focus_task is None:
             self._coin_focus_task = asyncio.create_task(self._coin_focus_scheduler())
         if self._coin_outcomes_task is None:
@@ -5353,6 +6229,20 @@ class DataService:
             except asyncio.CancelledError:
                 pass
             self._auto_exit_task = None
+        if self._auto_arb_task:
+            self._auto_arb_task.cancel()
+            try:
+                await self._auto_arb_task
+            except asyncio.CancelledError:
+                pass
+            self._auto_arb_task = None
+        if self._derisk_task:
+            self._derisk_task.cancel()
+            try:
+                await self._derisk_task
+            except asyncio.CancelledError:
+                pass
+            self._derisk_task = None
         if self._coin_focus_task:
             self._coin_focus_task.cancel()
             try:
@@ -5462,6 +6352,28 @@ class DataService:
                 pass
             self._positions_market_task = None
         self._positions_market_task = asyncio.create_task(self._positions_market_scheduler())
+
+    async def _derisk_scheduler(self) -> None:
+        try:
+            while True:
+                await self._auto_derisk_cycle()
+                await asyncio.sleep(max(2.0, float(self._derisk_poll_sec or 5.0)))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.exception("emergency de-risk loop failed: %s", exc)
+
+    async def _restart_derisk_scheduler(self) -> None:
+        if self._loop is None or self._loop.is_closed():
+            return
+        if self._derisk_task:
+            self._derisk_task.cancel()
+            try:
+                await self._derisk_task
+            except asyncio.CancelledError:
+                pass
+            self._derisk_task = None
+        self._derisk_task = asyncio.create_task(self._derisk_scheduler())
 
     async def _coin_focus_scheduler(self) -> None:
         try:
@@ -5879,6 +6791,7 @@ class DataService:
         await self._restart_scheduler()
         await self._restart_protective_scheduler()
         await self._restart_positions_market_scheduler()
+        await self._restart_derisk_scheduler()
         await self._restart_coin_focus_scheduler()
         await self._restart_coin_outcomes_scheduler()
         self._accounts.update_interval(self._account_interval)
@@ -5904,6 +6817,12 @@ class DataService:
             return await self._manual.exit(payload, positions)
         return await self._start_manual_run("exit", payload, positions)
 
+    async def manual_orphan_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        positions = self._accounts.snapshot().get("positions") or []
+        if payload.get("dry_run") or not payload.get("async_run"):
+            return await self._manual.orphan_cleanup(payload, positions)
+        return await self._start_manual_run("orphan_cleanup", payload, positions)
+
     async def manual_roll(self, payload: dict[str, Any]) -> dict[str, Any]:
         positions = self._accounts.snapshot().get("positions") or []
         if payload.get("dry_run"):
@@ -5913,6 +6832,843 @@ class DataService:
             return await self._manual.roll(payload, positions)
         return await self._start_manual_run("roll", payload, positions)
 
+    def _load_auto_arb_config(self) -> dict[str, Any]:
+        raw = self._auto_arb_store.load({"version": 1, "rules": {}})
+        if not isinstance(raw, Mapping):
+            raw = {}
+        rules = raw.get("rules")
+        return {
+            "version": 1,
+            "rules": dict(rules) if isinstance(rules, Mapping) else {},
+        }
+
+    def _save_auto_arb_config(self) -> None:
+        self._auto_arb_store.save(self._auto_arb)
+
+    def auto_arb_payload(self) -> dict[str, Any]:
+        rules = list((self._auto_arb.get("rules") or {}).values())
+        rules.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        return {
+            "version": 1,
+            "mode": "shadow_and_restricted_live",
+            "live_limits": {
+                "max_chunk_notional_usd": AUTO_ARB_LIVE_MAX_CHUNK_NOTIONAL_USD,
+                "max_total_notional_usd": AUTO_ARB_LIVE_MAX_TOTAL_NOTIONAL_USD,
+                "max_live_rules": 1,
+            },
+            "rules": rules,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def auto_arb_spreads(
+        self,
+        *,
+        symbol: str,
+        long_exchange: str,
+        short_exchange: str,
+    ) -> dict[str, Any]:
+        long_quote = await self._mobile_quote_for_exchange(long_exchange, symbol)
+        short_quote = await self._mobile_quote_for_exchange(short_exchange, symbol)
+        entry_spread = spread_pct(
+            _safe_float(long_quote.get("ask")),
+            _safe_float(short_quote.get("bid")),
+        )
+        exit_spread = spread_pct(
+            _safe_float(long_quote.get("bid")),
+            _safe_float(short_quote.get("ask")),
+        )
+        errors: list[str] = []
+        if entry_spread is None:
+            errors.append("Executable entry spread is unavailable.")
+        if exit_spread is None:
+            errors.append("Executable exit spread is unavailable.")
+        return {
+            "status": "ok" if not errors else "partial",
+            "symbol": symbol,
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
+            "entry_spread_pct": entry_spread,
+            "exit_spread_pct": exit_spread,
+            "long_quote": long_quote,
+            "short_quote": short_quote,
+            "errors": errors,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def analyze_auto_arb(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        symbol = normalize_symbol(str(payload.get("symbol") or "")).upper()
+        long_exchange = normalize_exchange_name(str(payload.get("long_exchange") or ""))
+        short_exchange = normalize_exchange_name(str(payload.get("short_exchange") or ""))
+        if not symbol or not long_exchange or not short_exchange:
+            raise ValueError("symbol, long_exchange, and short_exchange are required.")
+        if long_exchange == short_exchange:
+            raise ValueError("long_exchange and short_exchange must be different.")
+
+        range_start = _safe_float(payload.get("range_start_pct"))
+        range_end = _safe_float(payload.get("range_end_pct"))
+        if range_start is None or range_end is None:
+            raise ValueError("range_start_pct and range_end_pct are required.")
+        budget_mode = str(payload.get("budget_mode") or "qty").strip().lower()
+        if budget_mode not in {"qty", "notional"}:
+            raise ValueError("budget_mode must be qty or notional.")
+        max_qty = _safe_float(payload.get("max_qty"))
+        max_notional = _safe_float(payload.get("max_notional"))
+        if budget_mode == "qty" and (max_qty is None or max_qty <= 0):
+            raise ValueError("max_qty must be greater than zero.")
+        if budget_mode == "notional" and (max_notional is None or max_notional <= 0):
+            raise ValueError("max_notional must be greater than zero.")
+
+        max_slippage_bps = max(0.0, _safe_float(payload.get("max_slippage_bps")) or 8.0)
+        live_spreads = await self.auto_arb_spreads(
+            symbol=symbol,
+            long_exchange=long_exchange,
+            short_exchange=short_exchange,
+        )
+        reference_prices = [
+            _safe_float((live_spreads.get("long_quote") or {}).get("ask")),
+            _safe_float((live_spreads.get("short_quote") or {}).get("bid")),
+        ]
+        reference_prices = [value for value in reference_prices if value and value > 0]
+        reference_price = sum(reference_prices) / len(reference_prices) if reference_prices else None
+        total_qty = max_qty
+        if budget_mode == "notional":
+            if reference_price is None:
+                raise ValueError("Unable to convert the USDT budget because live prices are unavailable.")
+            total_qty = float(max_notional) / reference_price
+        if total_qty is None or total_qty <= 0:
+            raise ValueError("Unable to resolve total grid quantity.")
+
+        manual_base = {
+            "symbol": symbol,
+            "qty": float(total_qty),
+            "notional": None,
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
+            "max_slippage_bps": max_slippage_bps,
+            "use_orderbook_check": True,
+            "dry_run": True,
+            "async_run": False,
+            "margin_mode": "isolated",
+        }
+        plans: dict[str, Any] = {}
+        warnings: list[str] = []
+        for action in ("enter", "exit"):
+            try:
+                plans[action] = await self.manual_analyze(
+                    {
+                        **manual_base,
+                        "action": action,
+                        "mode": "smart-enter" if action == "enter" else "smart-exit",
+                    }
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                plans[action] = {"errors": [str(exc)]}
+                warnings.append(f"{action} dry run failed: {exc}")
+
+        safe_candidates: list[float] = []
+        min_chunk_candidates: list[float] = []
+        for plan in plans.values():
+            if not isinstance(plan, Mapping):
+                continue
+            recommended = _safe_float(
+                plan.get("recommended_chunk_qty") or plan.get("recommended_qty")
+            )
+            minimum = _safe_float(plan.get("min_chunk_qty"))
+            if recommended and recommended > 0:
+                safe_candidates.append(recommended)
+            if minimum and minimum > 0:
+                min_chunk_candidates.append(minimum)
+        liquidity_factor = _safe_float(payload.get("liquidity_safety_factor")) or 0.70
+        liquidity_factor = min(1.0, max(0.1, liquidity_factor))
+        requested_count = payload.get("level_count")
+        fallback_count = normalize_level_count(requested_count or 6)
+        safe_chunk = min(safe_candidates) * liquidity_factor if safe_candidates else total_qty / fallback_count
+        if min_chunk_candidates:
+            safe_chunk = max(safe_chunk, max(min_chunk_candidates))
+        safe_chunk = min(float(total_qty), safe_chunk)
+        level_count = (
+            normalize_level_count(requested_count)
+            if requested_count
+            else recommend_level_count(total_qty=total_qty, safe_chunk_qty=safe_chunk)
+        )
+        chunk_qty = float(total_qty) / level_count
+        exit_gap = _safe_float(payload.get("exit_gap_pct"))
+        if exit_gap is None or exit_gap <= 0:
+            exit_gap = max(0.25, max_slippage_bps * 4.0 / 100.0)
+        levels = build_grid_levels(
+            range_start_pct=range_start,
+            range_end_pct=range_end,
+            level_count=level_count,
+            exit_gap_pct=exit_gap,
+            max_qty=total_qty,
+        )
+        for level in levels:
+            qty = float(level.get("qty") or 0.0)
+            cumulative_qty = float(level.get("cumulative_qty") or 0.0)
+            level["chunk_notional_estimate"] = (
+                round(qty * reference_price, 8) if reference_price else None
+            )
+            level["cumulative_notional_estimate"] = (
+                round(cumulative_qty * reference_price, 8) if reference_price else None
+            )
+            level["entry_action"] = (
+                f"BUY {long_exchange} / SELL {short_exchange}"
+            )
+            level["exit_action"] = (
+                f"SELL {long_exchange} / BUY {short_exchange}"
+            )
+            level["entry_condition"] = (
+                f"entry spread <= {float(level['entry_spread_pct']):g}%"
+            )
+            level["exit_condition"] = (
+                f"exit spread >= {float(level['exit_spread_pct']):g}%"
+            )
+        grid_step = abs(float(range_start) - float(range_end)) / (level_count - 1)
+        if grid_step <= exit_gap:
+            warnings.append(
+                "Grid step is not wider than the exit gap; reduce level count or exit gap."
+            )
+        if not safe_candidates:
+            warnings.append("Dry run did not return a safe chunk; budget/count fallback was used.")
+
+        config = {
+            "symbol": symbol,
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
+            "direction": "negative_expansion",
+            "budget_mode": budget_mode,
+            "max_qty": float(total_qty),
+            "max_notional": float(max_notional) if max_notional else None,
+            "range_start_pct": float(range_start),
+            "range_end_pct": float(range_end),
+            "level_count": level_count,
+            "chunk_qty": chunk_qty,
+            "reference_price": reference_price,
+            "chunk_notional_estimate": (
+                chunk_qty * reference_price if reference_price else None
+            ),
+            "total_notional_estimate": (
+                float(total_qty) * reference_price if reference_price else None
+            ),
+            "exit_gap_pct": float(exit_gap),
+            "max_slippage_bps": max_slippage_bps,
+            "liquidity_safety_factor": liquidity_factor,
+            "confirm_samples": max(1, int(payload.get("confirm_samples") or 2)),
+            "max_levels_per_cycle": 1,
+            "levels": levels,
+        }
+        return {
+            "status": "ok" if not warnings else "warning",
+            "mode": "preview",
+            "config": config,
+            "live_spreads": live_spreads,
+            "safe_chunk_qty": safe_chunk,
+            "reference_price": reference_price,
+            "grid_step_pct": grid_step,
+            "warnings": warnings,
+            "dry_run": plans,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def upsert_auto_arb_rule(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        requested_id = str(payload.get("id") or "").strip()
+        if requested_id:
+            async with self._auto_arb_lock:
+                existing_rule = (self._auto_arb.get("rules") or {}).get(requested_id)
+                if isinstance(existing_rule, Mapping) and (
+                    existing_rule.get("mode") == "live"
+                    or existing_rule.get("active_execution_id")
+                ):
+                    raise ValueError(
+                        "Live grid reconfiguration is not available yet. "
+                        "Switch it to Shadow first; the real position will remain unchanged."
+                    )
+        analysis = await self.analyze_auto_arb(payload)
+        config = dict(analysis["config"])
+        rule_id = requested_id or uuid4().hex[:12]
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with self._auto_arb_lock:
+            existing = (self._auto_arb.get("rules") or {}).get(rule_id) or {}
+            generation = int(existing.get("generation") or 0) + 1
+            rule = {
+                **config,
+                "id": rule_id,
+                "version": 1,
+                "generation": generation,
+                "mode": "shadow",
+                "enabled": bool(payload.get("enabled", True)),
+                "status": "waiting_data",
+                "blocked_reason": None,
+                "shadow_level": int(existing.get("shadow_level") or 0),
+                "shadow_qty": float(existing.get("shadow_qty") or 0.0),
+                "live_level": int(existing.get("live_level") or 0),
+                "actual_hedged_qty": float(existing.get("actual_hedged_qty") or 0.0),
+                "active_execution_id": None,
+                "active_action": None,
+                "active_from_level": None,
+                "active_to_level": None,
+                "active_target_qty": None,
+                "pending_action": None,
+                "pending_samples": 0,
+                "last_decision": None,
+                "live_entry_spread_pct": None,
+                "live_exit_spread_pct": None,
+                "created_at": existing.get("created_at") or now_iso,
+                "updated_at": now_iso,
+            }
+            self._auto_arb.setdefault("rules", {})[rule_id] = rule
+            self._save_auto_arb_config()
+        self._auto_arb_history_store.append(
+            {
+                "event": "rule_upserted",
+                "rule_id": rule_id,
+                "generation": generation,
+                "config": config,
+                "ts": now_iso,
+            }
+        )
+        return {"rule": rule, "analysis": analysis}
+
+    async def set_auto_arb_rule_enabled(self, rule_id: str, enabled: bool) -> dict[str, Any]:
+        async with self._auto_arb_lock:
+            rule = (self._auto_arb.get("rules") or {}).get(rule_id)
+            if not isinstance(rule, dict):
+                raise ValueError("Auto-arbitrage rule not found.")
+            if not enabled and rule.get("active_execution_id"):
+                raise ValueError("Wait for the active grid execution to finish before pausing.")
+            if enabled and rule.get("mode") == "live":
+                raise ValueError(
+                    "Use 'Enable Live' again so positions and Live limits are revalidated."
+                )
+            rule["enabled"] = bool(enabled)
+            rule["status"] = "waiting_data" if enabled else "paused"
+            rule["pending_action"] = None
+            rule["pending_samples"] = 0
+            rule["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._save_auto_arb_config()
+            result = dict(rule)
+        self._auto_arb_history_store.append(
+            {
+                "event": "rule_resumed" if enabled else "rule_paused",
+                "rule_id": rule_id,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        return {"rule": result}
+
+    def _auto_arb_auto_exit_conflict(self, rule: Mapping[str, Any]) -> bool:
+        symbol = normalize_symbol(str(rule.get("symbol") or "")).upper()
+        long_exchange = normalize_exchange_name(str(rule.get("long_exchange") or ""))
+        short_exchange = normalize_exchange_name(str(rule.get("short_exchange") or ""))
+        for candidate in (self._auto_exit.get("rules") or {}).values():
+            if not isinstance(candidate, Mapping):
+                continue
+            if not bool(candidate.get("enabled") or candidate.get("v1_enabled")):
+                continue
+            if normalize_symbol(str(candidate.get("symbol") or "")).upper() != symbol:
+                continue
+            candidate_long = normalize_exchange_name(str(candidate.get("long_exchange") or ""))
+            candidate_short = normalize_exchange_name(str(candidate.get("short_exchange") or ""))
+            if candidate_long == long_exchange and candidate_short == short_exchange:
+                return True
+        return False
+
+    @staticmethod
+    def _auto_arb_level_for_qty(rule: Mapping[str, Any], hedged_qty: float) -> int | None:
+        qty = max(0.0, float(hedged_qty or 0.0))
+        total_qty = max(0.0, float(rule.get("max_qty") or 0.0))
+        tolerance = max(1e-8, total_qty * 1e-5)
+        if qty <= tolerance:
+            return 0
+        for level in rule.get("levels") or []:
+            cumulative = float(level.get("cumulative_qty") or 0.0)
+            if abs(qty - cumulative) <= tolerance:
+                return int(level.get("level") or 0)
+        return None
+
+    async def _auto_arb_refresh_quantities(self, rule: Mapping[str, Any]) -> dict[str, float]:
+        refresh = getattr(self._accounts, "refresh_now_for_protective", None)
+        if callable(refresh):
+            await asyncio.wait_for(refresh(force_env=True), timeout=45.0)
+        snapshot = self._accounts.snapshot() or {}
+        return _position_pair_quantities(
+            snapshot.get("positions") or [],
+            symbol=str(rule.get("symbol") or ""),
+            long_exchange=str(rule.get("long_exchange") or ""),
+            short_exchange=str(rule.get("short_exchange") or ""),
+        )
+
+    async def arm_auto_arb_live(self, rule_id: str, confirmation: str) -> dict[str, Any]:
+        expected_confirmation = f"LIVE {rule_id}"
+        if str(confirmation or "").strip() != expected_confirmation:
+            raise ValueError(f"Type '{expected_confirmation}' to enable restricted Live mode.")
+        async with self._auto_arb_lock:
+            rule = (self._auto_arb.get("rules") or {}).get(rule_id)
+            if not isinstance(rule, dict):
+                raise ValueError("Auto-arbitrage rule not found.")
+            if rule.get("active_execution_id"):
+                raise ValueError("The grid already has an active execution.")
+            for candidate in (self._auto_arb.get("rules") or {}).values():
+                if (
+                    isinstance(candidate, Mapping)
+                    and candidate.get("id") != rule_id
+                    and candidate.get("mode") == "live"
+                    and candidate.get("enabled")
+                ):
+                    raise ValueError("Only one restricted Live grid may be enabled.")
+            rule_copy = dict(rule)
+
+        chunk_notional = _safe_float(rule_copy.get("chunk_notional_estimate"))
+        total_notional = _safe_float(rule_copy.get("total_notional_estimate"))
+        if chunk_notional is None or total_notional is None:
+            raise ValueError("Live mode requires a current reference price and notional estimate.")
+        if chunk_notional > AUTO_ARB_LIVE_MAX_CHUNK_NOTIONAL_USD + 1e-9:
+            raise ValueError(
+                f"Chunk estimate {chunk_notional:.2f} USDT exceeds the restricted Live limit "
+                f"of {AUTO_ARB_LIVE_MAX_CHUNK_NOTIONAL_USD:.2f} USDT."
+            )
+        if total_notional > AUTO_ARB_LIVE_MAX_TOTAL_NOTIONAL_USD + 1e-9:
+            raise ValueError(
+                f"Total estimate {total_notional:.2f} USDT exceeds the restricted Live limit "
+                f"of {AUTO_ARB_LIVE_MAX_TOTAL_NOTIONAL_USD:.2f} USDT."
+            )
+        if self._auto_arb_auto_exit_conflict(rule_copy):
+            raise ValueError("Disable the matching Auto Exit rule before enabling Grid Live.")
+        if self._auto_exit_running_exec():
+            raise ValueError("Another manual or automatic execution is currently running.")
+
+        try:
+            quantities = await self._auto_arb_refresh_quantities(rule_copy)
+        except Exception as exc:  # pylint: disable=broad-except
+            raise ValueError(f"Unable to refresh positions before Live activation: {exc}") from exc
+        live_level = self._auto_arb_level_for_qty(
+            rule_copy,
+            float(quantities.get("hedged_qty") or 0.0),
+        )
+        if live_level is None:
+            raise ValueError(
+                "The existing hedged quantity does not match a grid level. "
+                "Flatten it or configure a grid that matches the real position."
+            )
+        imbalance_qty = float(quantities.get("imbalance_qty") or 0.0)
+        tolerance = max(1e-8, float(rule_copy.get("max_qty") or 0.0) * 1e-5)
+        if imbalance_qty > tolerance:
+            raise ValueError(
+                "Long and short quantities are imbalanced; Live Grid cannot take ownership."
+            )
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with self._auto_arb_lock:
+            rule = (self._auto_arb.get("rules") or {}).get(rule_id)
+            if not isinstance(rule, dict):
+                raise ValueError("Auto-arbitrage rule not found.")
+            rule["mode"] = "live"
+            rule["enabled"] = True
+            rule["live_level"] = int(live_level)
+            rule["actual_hedged_qty"] = float(quantities.get("hedged_qty") or 0.0)
+            rule["status"] = "waiting_entry" if live_level == 0 else "monitoring"
+            rule["blocked_reason"] = None
+            rule["pending_action"] = None
+            rule["pending_samples"] = 0
+            rule["updated_at"] = now_iso
+            self._save_auto_arb_config()
+            result = dict(rule)
+        self._auto_arb_history_store.append(
+            {
+                "event": "live_armed",
+                "rule_id": rule_id,
+                "generation": result.get("generation"),
+                "live_level": live_level,
+                "actual_hedged_qty": quantities.get("hedged_qty"),
+                "ts": now_iso,
+            }
+        )
+        return {"rule": result, "live_limits": self.auto_arb_payload()["live_limits"]}
+
+    async def set_auto_arb_shadow(self, rule_id: str) -> dict[str, Any]:
+        async with self._auto_arb_lock:
+            rule = (self._auto_arb.get("rules") or {}).get(rule_id)
+            if not isinstance(rule, dict):
+                raise ValueError("Auto-arbitrage rule not found.")
+            if rule.get("active_execution_id"):
+                raise ValueError("Wait for the active grid execution before switching to Shadow.")
+            rule["mode"] = "shadow"
+            rule["enabled"] = False
+            rule["status"] = "paused"
+            rule["pending_action"] = None
+            rule["pending_samples"] = 0
+            rule["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._save_auto_arb_config()
+            result = dict(rule)
+        self._auto_arb_history_store.append(
+            {
+                "event": "switched_to_shadow",
+                "rule_id": rule_id,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        return {"rule": result}
+
+    async def delete_auto_arb_rule(self, rule_id: str) -> dict[str, Any]:
+        async with self._auto_arb_lock:
+            rule = (self._auto_arb.get("rules") or {}).get(rule_id)
+            if rule is None:
+                raise ValueError("Auto-arbitrage rule not found.")
+            if rule.get("active_execution_id"):
+                raise ValueError("Wait for the active grid execution before deleting the rule.")
+            (self._auto_arb.get("rules") or {}).pop(rule_id, None)
+            self._save_auto_arb_config()
+        self._auto_arb_history_store.append(
+            {
+                "event": "rule_deleted",
+                "rule_id": rule_id,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        return {"status": "deleted", "id": rule_id}
+
+    def auto_arb_history(self, rule_id: str, limit: int = 100) -> dict[str, Any]:
+        path = self._auto_arb_history_store.path
+        rows: list[dict[str, Any]] = []
+        if path.exists():
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                lines = []
+            for line in reversed(lines):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(row.get("rule_id") or "") != rule_id:
+                    continue
+                rows.append(row)
+                if len(rows) >= max(1, min(int(limit), 500)):
+                    break
+        return {"rule_id": rule_id, "events": list(reversed(rows))}
+
+    async def _reconcile_auto_arb_execution(self, rule_id: str) -> bool:
+        async with self._auto_arb_lock:
+            rule = (self._auto_arb.get("rules") or {}).get(rule_id)
+            if not isinstance(rule, dict):
+                return False
+            exec_id = str(rule.get("active_execution_id") or "")
+            if not exec_id:
+                return True
+            rule_copy = dict(rule)
+        run = self._manual_runs.get(exec_id)
+        if not isinstance(run, Mapping):
+            async with self._auto_arb_lock:
+                current = (self._auto_arb.get("rules") or {}).get(rule_id)
+                if isinstance(current, dict):
+                    current["enabled"] = False
+                    current["status"] = "error"
+                    current["blocked_reason"] = "active_execution_state_missing"
+                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    self._save_auto_arb_config()
+            return False
+        status = str(run.get("status") or "")
+        if status == "running":
+            return False
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        event: dict[str, Any] = {
+            "event": "live_execution_reconciled",
+            "rule_id": rule_id,
+            "execution_id": exec_id,
+            "execution_status": status,
+            "action": rule_copy.get("active_action"),
+            "from_level": rule_copy.get("active_from_level"),
+            "to_level": rule_copy.get("active_to_level"),
+            "ts": now_iso,
+        }
+        success = status == "completed" and not (
+            isinstance(run.get("result"), Mapping) and run["result"].get("errors")
+        )
+        quantities: dict[str, float] | None = None
+        reconcile_error = None
+        if success:
+            try:
+                quantities = await self._auto_arb_refresh_quantities(rule_copy)
+            except Exception as exc:  # pylint: disable=broad-except
+                reconcile_error = str(exc)
+                success = False
+
+        async with self._auto_arb_lock:
+            current = (self._auto_arb.get("rules") or {}).get(rule_id)
+            if not isinstance(current, dict):
+                return False
+            current["active_execution_id"] = None
+            current["active_action"] = None
+            current["active_from_level"] = None
+            current["active_to_level"] = None
+            expected_qty = _safe_float(current.get("active_target_qty"))
+            current["active_target_qty"] = None
+            if success and quantities is not None:
+                hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+                imbalance_qty = float(quantities.get("imbalance_qty") or 0.0)
+                tolerance = max(1e-8, float(current.get("max_qty") or 0.0) * 1e-5)
+                matched_level = self._auto_arb_level_for_qty(current, hedged_qty)
+                target_level = int(rule_copy.get("active_to_level") or 0)
+                target_matches = matched_level == target_level
+                qty_matches = expected_qty is None or abs(hedged_qty - expected_qty) <= tolerance
+                if target_matches and qty_matches and imbalance_qty <= tolerance:
+                    current["live_level"] = target_level
+                    current["actual_hedged_qty"] = hedged_qty
+                    current["status"] = "waiting_entry" if target_level == 0 else "monitoring"
+                    current["blocked_reason"] = None
+                    event["event"] = f"live_{rule_copy.get('active_action')}"
+                    event["live_level"] = target_level
+                    event["actual_hedged_qty"] = hedged_qty
+                else:
+                    current["enabled"] = False
+                    current["status"] = "paused_reconcile_mismatch"
+                    current["blocked_reason"] = "actual_position_does_not_match_target_level"
+                    current["actual_hedged_qty"] = hedged_qty
+                    event["event"] = "live_reconcile_mismatch"
+                    event["matched_level"] = matched_level
+                    event["actual_hedged_qty"] = hedged_qty
+                    event["imbalance_qty"] = imbalance_qty
+                    success = False
+            else:
+                current["enabled"] = False
+                current["status"] = "error"
+                current["blocked_reason"] = (
+                    f"position_refresh_failed: {reconcile_error}"
+                    if reconcile_error
+                    else f"execution_{status or 'unknown'}"
+                )
+                event["event"] = "live_execution_failed"
+                event["error"] = reconcile_error or run.get("error")
+                event["result"] = run.get("result")
+            current["updated_at"] = now_iso
+            self._save_auto_arb_config()
+        self._auto_arb_history_store.append(event)
+        return success
+
+    async def _start_auto_arb_live_transition(
+        self,
+        rule_id: str,
+        action: str,
+        from_level: int,
+        to_level: int,
+    ) -> None:
+        async with self._auto_arb_lock:
+            rule = (self._auto_arb.get("rules") or {}).get(rule_id)
+            if not isinstance(rule, dict) or not rule.get("enabled") or rule.get("mode") != "live":
+                return
+            rule_copy = dict(rule)
+        running = self._auto_exit_running_exec()
+        if running:
+            async with self._auto_arb_lock:
+                current = (self._auto_arb.get("rules") or {}).get(rule_id)
+                if isinstance(current, dict):
+                    current["status"] = "blocked_conflict"
+                    current["blocked_reason"] = (
+                        f"execution_running:{running.get('execution_id')}"
+                    )
+                    current["pending_action"] = None
+                    current["pending_samples"] = 0
+                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    self._save_auto_arb_config()
+            return
+        if self._auto_arb_auto_exit_conflict(rule_copy):
+            async with self._auto_arb_lock:
+                current = (self._auto_arb.get("rules") or {}).get(rule_id)
+                if isinstance(current, dict):
+                    current["status"] = "blocked_conflict"
+                    current["blocked_reason"] = "matching_auto_exit_rule_enabled"
+                    current["pending_action"] = None
+                    current["pending_samples"] = 0
+                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    self._save_auto_arb_config()
+            return
+
+        levels = rule_copy.get("levels") or []
+        level_index = to_level - 1 if action == "enter" else from_level - 1
+        if level_index < 0 or level_index >= len(levels):
+            raise ValueError("Grid transition level is outside the configured range.")
+        qty = float(levels[level_index].get("qty") or 0.0)
+        target_qty = (
+            float(levels[to_level - 1].get("cumulative_qty") or 0.0)
+            if to_level > 0
+            else 0.0
+        )
+        payload = {
+            "symbol": rule_copy.get("symbol"),
+            "qty": qty,
+            "notional": None,
+            "mode": "smart-enter" if action == "enter" else "smart-exit",
+            "max_slippage_bps": float(rule_copy.get("max_slippage_bps") or 8.0),
+            "timeout_sec": 15,
+            "max_runtime_sec": 600,
+            "reprice_sec": 5.0,
+            "chunk_qty": qty,
+            "chunk_notional": None,
+            "force_chunk_qty": True,
+            "use_orderbook_check": True,
+            "fallback_to_market": False,
+            "async_run": True,
+            "dry_run": False,
+            "long_exchange": rule_copy.get("long_exchange"),
+            "short_exchange": rule_copy.get("short_exchange"),
+            "margin_mode": "isolated",
+            "auto_arb_agent": True,
+            "auto_arb_rule_id": rule_id,
+            "auto_arb_rule_generation": int(rule_copy.get("generation") or 0),
+        }
+        result = (
+            await self.manual_enter(payload)
+            if action == "enter"
+            else await self.manual_exit(payload)
+        )
+        exec_id = str((result or {}).get("execution_id") or "")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with self._auto_arb_lock:
+            current = (self._auto_arb.get("rules") or {}).get(rule_id)
+            if not isinstance(current, dict):
+                return
+            current["pending_action"] = None
+            current["pending_samples"] = 0
+            if exec_id:
+                current["active_execution_id"] = exec_id
+                current["active_action"] = action
+                current["active_from_level"] = from_level
+                current["active_to_level"] = to_level
+                current["active_target_qty"] = target_qty
+                current["status"] = f"executing_{action}"
+                current["blocked_reason"] = None
+            else:
+                current["enabled"] = False
+                current["status"] = "error"
+                current["blocked_reason"] = "manual_execution_did_not_return_execution_id"
+            current["updated_at"] = now_iso
+            self._save_auto_arb_config()
+        self._auto_arb_history_store.append(
+            {
+                "event": f"live_{action}_started" if exec_id else "live_start_failed",
+                "rule_id": rule_id,
+                "execution_id": exec_id or None,
+                "from_level": from_level,
+                "to_level": to_level,
+                "qty": qty,
+                "result": result,
+                "ts": now_iso,
+            }
+        )
+
+    async def _auto_arb_cycle(self) -> None:
+        async with self._auto_arb_lock:
+            rules = [
+                dict(rule)
+                for rule in (self._auto_arb.get("rules") or {}).values()
+                if isinstance(rule, dict) and rule.get("enabled")
+            ]
+        for rule in rules:
+            rule_id = str(rule.get("id") or "")
+            if rule.get("mode") == "live" and rule.get("active_execution_id"):
+                await self._reconcile_auto_arb_execution(rule_id)
+                continue
+            live_spreads = await self.auto_arb_spreads(
+                symbol=str(rule.get("symbol") or ""),
+                long_exchange=str(rule.get("long_exchange") or ""),
+                short_exchange=str(rule.get("short_exchange") or ""),
+            )
+            entry_spread = _safe_float(live_spreads.get("entry_spread_pct"))
+            exit_spread = _safe_float(live_spreads.get("exit_spread_pct"))
+            now_iso = datetime.now(timezone.utc).isoformat()
+            transition_event = None
+            live_transition = None
+            async with self._auto_arb_lock:
+                current = (self._auto_arb.get("rules") or {}).get(rule_id)
+                if not isinstance(current, dict) or not current.get("enabled"):
+                    continue
+                current["live_entry_spread_pct"] = entry_spread
+                current["live_exit_spread_pct"] = exit_spread
+                current["last_quote_at"] = now_iso
+                if entry_spread is None or exit_spread is None:
+                    current["status"] = "waiting_data"
+                    current["blocked_reason"] = "entry_or_exit_spread_unavailable"
+                    current["pending_action"] = None
+                    current["pending_samples"] = 0
+                else:
+                    mode = str(current.get("mode") or "shadow")
+                    current_level = (
+                        int(current.get("live_level") or 0)
+                        if mode == "live"
+                        else int(current.get("shadow_level") or 0)
+                    )
+                    decision = decide_grid_transition(
+                        entry_spread_pct=entry_spread,
+                        exit_spread_pct=exit_spread,
+                        levels=current.get("levels") or [],
+                        current_level=current_level,
+                        max_levels_per_cycle=current.get("max_levels_per_cycle") or 1,
+                    )
+                    action = decision["action"]
+                    current["last_decision"] = decision
+                    current["blocked_reason"] = None
+                    if action == "none":
+                        current["pending_action"] = None
+                        current["pending_samples"] = 0
+                        current["status"] = "waiting_entry" if not current_level else "monitoring"
+                    else:
+                        if current.get("pending_action") == action:
+                            current["pending_samples"] = int(current.get("pending_samples") or 0) + 1
+                        else:
+                            current["pending_action"] = action
+                            current["pending_samples"] = 1
+                        current["status"] = f"confirming_{action}"
+                        required = max(1, int(current.get("confirm_samples") or 2))
+                        if int(current["pending_samples"]) >= required:
+                            previous_level = current_level
+                            new_level = int(decision["target_level"])
+                            if mode == "live":
+                                current["status"] = f"queued_{action}"
+                                live_transition = (rule_id, action, previous_level, new_level)
+                            else:
+                                current["shadow_level"] = new_level
+                                levels = current.get("levels") or []
+                                current["shadow_qty"] = (
+                                    float(levels[new_level - 1].get("cumulative_qty") or 0.0)
+                                    if new_level > 0 and new_level <= len(levels)
+                                    else 0.0
+                                )
+                                current["status"] = f"shadow_{action}"
+                                current["pending_action"] = None
+                                current["pending_samples"] = 0
+                                transition_event = {
+                                    "event": f"shadow_{action}",
+                                    "rule_id": current.get("id"),
+                                    "generation": current.get("generation"),
+                                    "symbol": current.get("symbol"),
+                                    "long_exchange": current.get("long_exchange"),
+                                    "short_exchange": current.get("short_exchange"),
+                                    "from_level": previous_level,
+                                    "to_level": new_level,
+                                    "shadow_qty": current.get("shadow_qty"),
+                                    "entry_spread_pct": entry_spread,
+                                    "exit_spread_pct": exit_spread,
+                                    "ts": now_iso,
+                                }
+                current["updated_at"] = now_iso
+                self._save_auto_arb_config()
+            if transition_event:
+                self._auto_arb_history_store.append(transition_event)
+            if live_transition:
+                await self._start_auto_arb_live_transition(*live_transition)
+
+    async def _auto_arb_scheduler(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(max(1.0, float(self._auto_arb_poll_sec)))
+                try:
+                    await self._auto_arb_cycle()
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception("Auto-arbitrage shadow cycle failed")
+        except asyncio.CancelledError:
+            raise
+
     async def manual_analyze(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload)
         payload.setdefault(
@@ -5920,6 +7676,82 @@ class DataService:
             self._manual_pair_constraints(payload, action=payload.get("action") or "enter"),
         )
         return await self._manual.analyze(payload)
+
+    async def position_action(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        symbol = normalize_symbol(str(payload.get("symbol") or "")).upper()
+        long_exchange = normalize_exchange_name(str(payload.get("long_exchange") or ""))
+        short_exchange = normalize_exchange_name(str(payload.get("short_exchange") or ""))
+        action = str(payload.get("action") or "").strip().lower()
+        percent = _safe_float(payload.get("percent"))
+        dry_run = bool(payload.get("dry_run", True))
+        async_run = bool(payload.get("async_run", True))
+        if not symbol or not long_exchange or not short_exchange:
+            raise ValueError("symbol, long_exchange, and short_exchange are required.")
+        if action not in {"add", "exit"}:
+            raise ValueError("action must be 'add' or 'exit'.")
+        if percent is None or percent <= 0 or percent > 100:
+            raise ValueError("percent must be greater than 0 and no more than 100.")
+
+        refresh = getattr(self._accounts, "refresh_now_for_protective", None)
+        if callable(refresh):
+            try:
+                await asyncio.wait_for(refresh(force_env=True), timeout=45.0)
+            except Exception as exc:  # pylint: disable=broad-except
+                raise ValueError(f"Unable to refresh positions before action: {exc}") from exc
+        account_snapshot = self._accounts.snapshot() or {}
+        quantities = _position_pair_quantities(
+            account_snapshot.get("positions") or [],
+            symbol=symbol,
+            long_exchange=long_exchange,
+            short_exchange=short_exchange,
+        )
+        hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+        if hedged_qty <= 0:
+            raise ValueError(
+                f"No hedged pair found for {symbol}: "
+                f"{long_exchange} long={quantities.get('long_qty', 0.0):g}, "
+                f"{short_exchange} short={quantities.get('short_qty', 0.0):g}."
+            )
+        action_qty = hedged_qty * float(percent) / 100.0
+        context = {
+            "symbol": symbol,
+            "action": action,
+            "percent": float(percent),
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
+            **quantities,
+            "action_qty": float(action_qty),
+            "quantity_basis": "min_long_short_coin_qty",
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        manual_payload = {
+            "symbol": symbol,
+            "qty": float(action_qty),
+            "notional": None,
+            "mode": "smart-enter" if action == "add" else "smart-exit",
+            "max_slippage_bps": 8.0,
+            "timeout_sec": 15,
+            "max_runtime_sec": 600,
+            "reprice_sec": 5.0,
+            "chunk_qty": None,
+            "chunk_notional": None,
+            "force_chunk_qty": False,
+            "use_orderbook_check": True,
+            "fallback_to_market": False,
+            "async_run": bool(async_run and not dry_run),
+            "dry_run": dry_run,
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
+            "margin_mode": "isolated",
+        }
+        result = (
+            await self.manual_enter(manual_payload)
+            if action == "add"
+            else await self.manual_exit(manual_payload)
+        )
+        output = dict(result or {})
+        output["position_action"] = context
+        return output
 
     def _manual_pair_constraints(self, payload: Mapping[str, Any], *, action: str) -> list[str]:
         exchanges: list[str] = []
@@ -7201,6 +9033,8 @@ class DataService:
             "created_at": run.get("created_at"),
             "updated_at": run.get("updated_at"),
             "stop_requested": bool(run.get("stop_requested")),
+            "stop_force_finalize": bool(run.get("stop_force_finalize")),
+            "stop_reason": run.get("stop_reason") or None,
             "logs": list(run.get("logs") or []),
             "result": run.get("result"),
             "error": run.get("error"),
@@ -7227,7 +9061,13 @@ class DataService:
         except Exception as exc:  # pylint: disable=broad-except
             return {"error": f"log_read_failed: {exc}"}
 
-    async def manual_exec_stop(self, exec_id: str) -> dict[str, Any]:
+    async def manual_exec_stop(
+        self,
+        exec_id: str,
+        *,
+        force_finalize: bool = False,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
         self._prune_manual_runs()
         run = self._manual_runs.get(exec_id)
         if not run:
@@ -7237,8 +9077,11 @@ class DataService:
                 "execution_id": exec_id,
                 "status": run.get("status"),
                 "stop_requested": bool(run.get("stop_requested")),
+                "stop_force_finalize": bool(run.get("stop_force_finalize")),
             }
         run["stop_requested"] = True
+        run["stop_force_finalize"] = bool(force_finalize)
+        run["stop_reason"] = str(reason or "")
         run["updated_at"] = datetime.now(timezone.utc).isoformat()
         run["updated_at_ts"] = time.time()
         logs = run.get("logs")
@@ -7248,7 +9091,10 @@ class DataService:
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "event": "stop",
                     "message": "User stop requested",
-                    "data": {},
+                    "data": {
+                        "force_finalize": bool(force_finalize),
+                        "reason": str(reason or ""),
+                    },
                 }
             )
             if len(logs) > 200:
@@ -7257,6 +9103,7 @@ class DataService:
             "execution_id": exec_id,
             "status": run.get("status"),
             "stop_requested": True,
+            "stop_force_finalize": bool(force_finalize),
         }
 
     async def _start_manual_run(
@@ -7287,7 +9134,25 @@ class DataService:
             "result": None,
             "error": None,
             "stop_requested": False,
+            "stop_force_finalize": False,
+            "stop_reason": "",
             "log_path": str(log_path) if log_path else None,
+            "auto_exit_agent": bool((payload or {}).get("auto_exit_agent")),
+            "payload_symbol": normalize_symbol(str((payload or {}).get("symbol") or "")),
+            "auto_exit_rule_key": str((payload or {}).get("auto_exit_rule_key") or ""),
+            "auto_exit_rule_generation": max(
+                0,
+                int((payload or {}).get("auto_exit_rule_generation") or 0),
+            ),
+            "auto_exit_trigger_mode": str((payload or {}).get("auto_exit_trigger_mode") or ""),
+            "auto_exit_exit_percent": _safe_float((payload or {}).get("auto_exit_exit_percent")),
+            "auto_exit_hedged_qty": _safe_float((payload or {}).get("auto_exit_hedged_qty")),
+            "auto_arb_agent": bool((payload or {}).get("auto_arb_agent")),
+            "auto_arb_rule_id": str((payload or {}).get("auto_arb_rule_id") or ""),
+            "auto_arb_rule_generation": max(
+                0,
+                int((payload or {}).get("auto_arb_rule_generation") or 0),
+            ),
         }
         self._manual_runs[exec_id] = run
 
@@ -7317,8 +9182,14 @@ class DataService:
             run["updated_at_ts"] = time.time()
             _append_log(entry)
 
-        def _stop_cb() -> bool:
-            return bool(run.get("stop_requested"))
+        def _stop_cb() -> dict[str, Any] | bool:
+            if not run.get("stop_requested"):
+                return False
+            return {
+                "requested": True,
+                "force_finalize": bool(run.get("stop_force_finalize")),
+                "reason": run.get("stop_reason") or None,
+            }
 
         async def _runner() -> None:
             try:
@@ -7326,6 +9197,10 @@ class DataService:
                     result = await self._manual.enter(payload, log_cb=_log_cb, stop_cb=_stop_cb)
                 elif action == "exit":
                     result = await self._manual.exit(payload, positions or [], log_cb=_log_cb, stop_cb=_stop_cb)
+                elif action == "orphan_cleanup":
+                    result = await self._manual.orphan_cleanup(
+                        payload, positions or [], log_cb=_log_cb, stop_cb=_stop_cb
+                    )
                 elif action == "roll":
                     result = await self._manual.roll(payload, positions or [], log_cb=_log_cb, stop_cb=_stop_cb)
                 else:
@@ -7373,6 +9248,8 @@ class DataService:
         ]
         for key in expired:
             self._manual_runs.pop(key, None)
+        if expired:
+            self._auto_exit_completed_run_cleanup.intersection_update(self._manual_runs.keys())
 
     def latest_snapshot(self) -> Optional[DataSnapshot]:
         return self._snapshot
@@ -7453,6 +9330,8 @@ class DataService:
             "exchange_status": list(self._exchange_status.values()),
             "settings": settings_payload,
             "auto_exit": self.auto_exit_payload(),
+            "auto_arb": self.auto_arb_payload(),
+            "emergency_derisk": self.derisk_payload(),
             "coin_analysis": {
                 "focus_poll_sec": self._coin_focus_poll_sec,
                 "shortlist_poll_sec": self._coin_shortlist_poll_sec,
@@ -7474,7 +9353,11 @@ class DataService:
         }
 
     def mobile_positions_payload(self) -> dict[str, Any]:
-        positions = self._accounts.snapshot().get("positions") or []
+        accounts_snapshot = self._accounts.snapshot()
+        positions = accounts_snapshot.get("positions") or []
+        balances = self._mobile_compact_balances(
+            self._sanitize_balances(accounts_snapshot.get("balances") or [])
+        )
         market_lookup, market_ts_lookup = self._positions_market_snapshot_lookup()
         rows, grouped = self._positions_by_symbol(
             positions,
@@ -7606,6 +9489,8 @@ class DataService:
                 "spread_enabled": spread_enabled,
                 "v1_enabled": v1_enabled,
                 "target_spread_pct": _safe_float((rule or {}).get("target_spread_pct")),
+                "exit_percent": _safe_float((rule or {}).get("exit_percent")) or 100.0,
+                "exit_once": bool((rule or {}).get("exit_once", True)),
                 "live_spread_pct": live_spread,
                 "live_spread_source": "auto_exit" if rule_key and rule_key in live_spreads else "summary_mark",
                 "status": status,
@@ -7638,6 +9523,21 @@ class DataService:
                 default=0.0,
             )
             pair_amount = _pair_amount_usdt(longs, shorts)
+            selected_long_exchange = normalize_exchange_name(
+                str((selected_pair or {}).get("long_exchange") or row.get("long_exchange") or "")
+            )
+            selected_short_exchange = normalize_exchange_name(
+                str((selected_pair or {}).get("short_exchange") or row.get("short_exchange") or "")
+            )
+            long_quantity = float((selected_pair or {}).get("long_qty") or 0.0)
+            short_quantity = float((selected_pair or {}).get("short_qty") or 0.0)
+            hedged_quantity = float((selected_pair or {}).get("qty") or 0.0)
+            imbalance_quantity = abs(long_quantity - short_quantity)
+            imbalance_pct = (
+                imbalance_quantity / hedged_quantity * 100.0
+                if hedged_quantity > 0
+                else None
+            )
             long_leverage = _weighted_avg(longs, "leverage")
             short_leverage = _weighted_avg(shorts, "leverage")
             cards.append(
@@ -7645,8 +9545,8 @@ class DataService:
                     "symbol": symbol,
                     "pair_label": _pair_label(row, selected_pair),
                     "is_multi_leg": bool(selected_pair and str(selected_pair.get("mode") or "") != "single_pair"),
-                    "long_exchange": normalize_exchange_name(str(row.get("long_exchange") or "")) or None,
-                    "short_exchange": normalize_exchange_name(str(row.get("short_exchange") or "")) or None,
+                    "long_exchange": selected_long_exchange or None,
+                    "short_exchange": selected_short_exchange or None,
                     "net_pnl": _safe_float(row.get("unrealized_pnl")),
                     "expected_funding": _safe_float(row.get("expected_funding")),
                     "live_spread_pct": _safe_float(auto_exit_state.get("live_spread_pct")),
@@ -7668,6 +9568,11 @@ class DataService:
                     "auto_exit": auto_exit_state,
                     "position_summary": {
                         "quantity": quantity_abs if quantity_abs > 0 else None,
+                        "long_quantity": long_quantity if long_quantity > 0 else None,
+                        "short_quantity": short_quantity if short_quantity > 0 else None,
+                        "hedged_quantity": hedged_quantity if hedged_quantity > 0 else None,
+                        "imbalance_quantity": imbalance_quantity,
+                        "imbalance_pct": imbalance_pct,
                         "amount_usdt": pair_amount,
                         "gross_amount_usdt": sum(abs(_safe_float(leg.get("amount")) or 0.0) for leg in legs) or None,
                         "pair_entry_spread_pct": _safe_float(row.get("entry_price")),
@@ -7707,6 +9612,8 @@ class DataService:
         return {
             "status": self._status if self._status != "idle" else ("ready" if self._snapshot else "idle"),
             "last_updated": self._last_refreshed.isoformat() if self._last_refreshed else None,
+            "account_last_updated": accounts_snapshot.get("last_updated"),
+            "balances": balances,
             "cards": cards,
             "filters": {
                 "all": len(cards),
@@ -7715,6 +9622,214 @@ class DataService:
                 "auto_exit_on": sum(1 for card in cards if bool((card.get("flags") or {}).get("auto_exit_on"))),
             },
         }
+
+    @staticmethod
+    def _mobile_compact_balances(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        compact: list[dict[str, Any]] = []
+        for row in rows:
+            exchange = normalize_exchange_name(str(row.get("exchange") or ""))
+            if not exchange:
+                continue
+            total = _safe_float(row.get("total"))
+            available = _safe_float(row.get("available"))
+            used = _safe_float(row.get("used"))
+            margin_ratio = _safe_float(row.get("margin_ratio"))
+            equity = _safe_float(row.get("equity"))
+            if total is None and equity is not None:
+                total = equity
+            if used is None and total is not None and available is not None:
+                used = max(0.0, float(total) - float(available))
+            if margin_ratio is None and total and used is not None and total > 0:
+                margin_ratio = float(used) / float(total)
+            if margin_ratio is None:
+                status = "unknown"
+            elif margin_ratio >= 0.8:
+                status = "stress"
+            elif margin_ratio >= 0.6:
+                status = "watch"
+            else:
+                status = "ok"
+            compact.append(
+                {
+                    "exchange": exchange,
+                    "asset": row.get("asset") or row.get("currency") or "USDT",
+                    "total": total,
+                    "available": available,
+                    "used": used,
+                    "margin_ratio": margin_ratio,
+                    "status": status,
+                    "updated_at": row.get("updated_at") or row.get("timestamp"),
+                }
+            )
+        compact.sort(key=lambda item: str(item.get("exchange") or ""))
+        return compact
+
+    async def mobile_manual_spread(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        symbol = normalize_symbol(str(payload.get("symbol") or "")).upper()
+        action = str(payload.get("action") or "enter").lower()
+        long_exchange = normalize_exchange_name(str(payload.get("long_exchange") or ""))
+        short_exchange = normalize_exchange_name(str(payload.get("short_exchange") or ""))
+        from_exchange = normalize_exchange_name(str(payload.get("from_exchange") or ""))
+        to_exchange = normalize_exchange_name(str(payload.get("to_exchange") or ""))
+        side = str(payload.get("side") or "long").lower()
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        buy_exchange = ""
+        sell_exchange = ""
+        if not symbol:
+            errors.append("symbol is required")
+        if action == "roll":
+            if side == "long":
+                buy_exchange = to_exchange
+                sell_exchange = from_exchange
+            elif side == "short":
+                buy_exchange = from_exchange
+                sell_exchange = to_exchange
+            else:
+                errors.append("side must be long or short")
+            if not from_exchange or not to_exchange:
+                errors.append("from_exchange and to_exchange are required")
+        elif action == "exit":
+            buy_exchange = short_exchange
+            sell_exchange = long_exchange
+            if not long_exchange or not short_exchange:
+                errors.append("long_exchange and short_exchange are required")
+        else:
+            action = "enter"
+            buy_exchange = long_exchange
+            sell_exchange = short_exchange
+            if not long_exchange or not short_exchange:
+                errors.append("long_exchange and short_exchange are required")
+
+        if buy_exchange and sell_exchange and buy_exchange == sell_exchange:
+            warnings.append("buy and sell exchanges are the same")
+        if errors:
+            return {
+                "status": "error",
+                "symbol": symbol,
+                "action": action,
+                "errors": errors,
+                "warnings": warnings,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        buy_quote = await self._mobile_quote_for_exchange(buy_exchange, symbol)
+        sell_quote = await self._mobile_quote_for_exchange(sell_exchange, symbol)
+        buy_price = _safe_float(buy_quote.get("ask"))
+        sell_price = _safe_float(sell_quote.get("bid"))
+        if buy_price is None:
+            errors.append(f"{buy_exchange}: ask unavailable")
+        if sell_price is None:
+            errors.append(f"{sell_exchange}: bid unavailable")
+        spread_val = spread_pct(buy_price, sell_price)
+        if spread_val is None and not errors:
+            errors.append("spread unavailable")
+        status = "ok" if not errors else "partial"
+        return {
+            "status": status,
+            "symbol": symbol,
+            "action": action,
+            "side": side if action == "roll" else None,
+            "buy_exchange": buy_exchange,
+            "sell_exchange": sell_exchange,
+            "buy_price": buy_price,
+            "sell_price": sell_price,
+            "spread_pct": spread_val,
+            "quotes": {
+                buy_exchange: buy_quote,
+                sell_exchange: sell_quote,
+            },
+            "errors": errors,
+            "warnings": warnings,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def _mobile_quote_for_exchange(self, exchange: str, symbol: str) -> dict[str, Any]:
+        exchange = normalize_exchange_name(exchange)
+        symbol = normalize_symbol(symbol)
+        quote: dict[str, Any] = {
+            "exchange": exchange,
+            "symbol": symbol,
+            "bid": None,
+            "ask": None,
+            "mid": None,
+            "mark_price": None,
+            "source": None,
+            "updated_at": None,
+            "age_sec": None,
+        }
+        if not exchange or not symbol:
+            return quote
+
+        try:
+            book = await self._market_data.get_orderbook(exchange, symbol, depth=1, max_age_sec=15.0)
+        except Exception:  # pylint: disable=broad-except
+            book = None
+        if book:
+            bids = book.get("bids") or []
+            asks = book.get("asks") or []
+            bid = _safe_float((bids[0] if bids else [None])[0])
+            ask = _safe_float((asks[0] if asks else [None])[0])
+            if bid is not None or ask is not None:
+                ts = _safe_float(book.get("timestamp"))
+                quote.update(
+                    {
+                        "bid": bid,
+                        "ask": ask,
+                        "mid": ((bid + ask) / 2.0) if bid and ask else None,
+                        "source": "websocket",
+                        "updated_at": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None,
+                        "age_sec": round(time.time() - ts, 3) if ts else None,
+                    }
+                )
+                return quote
+
+        cached = self._positions_market_cache.get((exchange, symbol))
+        cached_ts = self._positions_market_cache_ts.get((exchange, symbol))
+        if cached and (cached.bid is not None or cached.ask is not None or cached.mark_price is not None):
+            bid = _safe_float(cached.bid)
+            ask = _safe_float(cached.ask)
+            quote.update(
+                {
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": ((bid + ask) / 2.0) if bid and ask else _safe_float(cached.mark_price),
+                    "mark_price": _safe_float(cached.mark_price),
+                    "source": "positions_market_cache",
+                    "updated_at": cached_ts.isoformat() if cached_ts else None,
+                    "age_sec": round((datetime.now(timezone.utc) - cached_ts).total_seconds(), 3) if cached_ts else None,
+                }
+            )
+            return quote
+
+        try:
+            adapter = get_adapter_cached(exchange)
+            snapshots = await adapter.fetch_market_snapshots_async([symbol])
+        except Exception as exc:  # pylint: disable=broad-except
+            quote["error"] = str(exc)
+            return quote
+        for snapshot in snapshots or []:
+            if not isinstance(snapshot, MarketSnapshot):
+                continue
+            if normalize_symbol(snapshot.symbol) != symbol:
+                continue
+            bid = _safe_float(snapshot.bid)
+            ask = _safe_float(snapshot.ask)
+            quote.update(
+                {
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": ((bid + ask) / 2.0) if bid and ask else _safe_float(snapshot.mark_price),
+                    "mark_price": _safe_float(snapshot.mark_price),
+                    "source": "public_rest",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "age_sec": 0.0,
+                }
+            )
+            return quote
+        quote["error"] = "snapshot unavailable"
+        return quote
 
     def mobile_manual_defaults_payload(self) -> dict[str, Any]:
         settings_payload = self._settings_manager.as_dict()
@@ -7936,6 +10051,10 @@ class DataService:
         payload["positions_market"] = self._positions_market_state(positions)
         payload["margin_diagnostics"] = self._margin_diagnostics(positions, balances)
         payload["margin_logic_log"] = list(self._margin_logic_log)
+        payload["exchange_health"] = json.loads(json.dumps(self._derisk_exchange_health))
+        payload["hedge_clusters"] = self._active_hedge_clusters()
+        payload["derisk_diagnostics"] = list(self._derisk_diagnostics)
+        payload["derisk_events"] = list(self._derisk_events)
         self._account_state_cache_key = self._account_state_cache_token(payload)
         self._account_state_cache = payload
         return payload
@@ -8666,6 +10785,10 @@ class DataService:
             )
             summary = self._summarize_symbol(symbol, legs)
             if summary:
+                selected_pair = _auto_exit_select_pair_from_legs(legs)
+                if selected_pair:
+                    summary["selected_long_exchange"] = selected_pair.get("long_exchange")
+                    summary["selected_short_exchange"] = selected_pair.get("short_exchange")
                 rows.append(summary)
         if return_grouped:
             return rows, grouped_simple
@@ -8945,6 +11068,15 @@ class DataService:
             funding_spread = short_funding - long_funding
 
         net_quantity = sum(leg.get("quantity") or 0.0 for leg in legs)
+        long_quantity = sum(abs(_safe_float(leg.get("quantity")) or 0.0) for leg in long_legs)
+        short_quantity = sum(abs(_safe_float(leg.get("quantity")) or 0.0) for leg in short_legs)
+        hedged_quantity = min(long_quantity, short_quantity)
+        imbalance_quantity = abs(long_quantity - short_quantity)
+        imbalance_pct = (
+            imbalance_quantity / hedged_quantity * 100.0
+            if hedged_quantity > 0
+            else None
+        )
         pnl_total = sum(leg.get("unrealized_pnl") or 0.0 for leg in legs)
 
         soonest_next = None
@@ -8982,6 +11114,11 @@ class DataService:
             "short_entry_avg": short_entry,
             "long_mark_avg": long_mark,
             "short_mark_avg": short_mark,
+            "long_quantity": long_quantity,
+            "short_quantity": short_quantity,
+            "hedged_quantity": hedged_quantity,
+            "imbalance_quantity": imbalance_quantity,
+            "imbalance_pct": imbalance_pct,
             "long_legs_count": len(long_legs),
             "short_legs_count": len(short_legs),
             "long_exchange": long_exchange,
@@ -9154,7 +11291,7 @@ class DataService:
     def _apply_alert_settings(self) -> None:
         protective = getattr(self._settings_manager.current, "protective", {}) or {}
         send_margin = bool(protective.get("send_margin_alerts", True))
-        notification_primary_channel = str(protective.get("notification_primary_channel", "telegram") or "telegram")
+        notification_primary_channel = str(protective.get("notification_primary_channel", "ntfy") or "ntfy")
         notification_fallback_channel = str(protective.get("notification_fallback_channel", "none") or "none")
         telegram_chat_id = str(protective.get("telegram_alert_chat_id", "") or "")
         warning_buffer = _safe_float(protective.get("warning_buffer_pct"))
@@ -9215,6 +11352,152 @@ class DataService:
             protective.get("send_missing_stop_alerts", self._send_missing_stop_alerts)
         )
 
+    def _load_hedge_cluster_config(self) -> dict[str, Any]:
+        payload = self._hedge_cluster_store.load({"rules": {}})
+        return normalize_hedge_cluster_config(payload)
+
+    def hedge_cluster_payload(self) -> dict[str, Any]:
+        return json.loads(json.dumps(self._hedge_clusters))
+
+    async def update_hedge_cluster_rule(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        symbol = normalize_symbol(payload.get("symbol"))
+        if not symbol:
+            raise ValueError("symbol is required.")
+        kind = str(payload.get("kind") or payload.get("strategy_type") or "hedged_pair").strip().lower()
+        async with self._derisk_lock:
+            rules = dict(self._hedge_clusters.get("rules") or {})
+            if kind == "standalone":
+                exchange = normalize_exchange_name(str(payload.get("exchange") or ""))
+                side = str(payload.get("side") or "").strip().lower() or None
+                if not exchange:
+                    raise ValueError("exchange is required for standalone rules.")
+                key = standalone_key(symbol, exchange, side)
+                enabled = bool(payload.get("enabled", True))
+                if not enabled:
+                    rules.pop(key, None)
+                else:
+                    rules[key] = {
+                        "kind": "standalone",
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "side": side,
+                        "enabled": True,
+                        "source": str(payload.get("source") or "manual"),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+            else:
+                long_exchange = normalize_exchange_name(str(payload.get("long_exchange") or ""))
+                short_exchange = normalize_exchange_name(str(payload.get("short_exchange") or ""))
+                if not long_exchange or not short_exchange:
+                    raise ValueError("long_exchange and short_exchange are required for hedged_pair rules.")
+                key = hedged_pair_key(symbol, long_exchange, short_exchange)
+                enabled = bool(payload.get("enabled", True))
+                if not enabled:
+                    rules.pop(key, None)
+                else:
+                    qty_tolerance_pct = _safe_float(payload.get("qty_tolerance_pct"))
+                    if qty_tolerance_pct is None or qty_tolerance_pct < 0:
+                        qty_tolerance_pct = 0.1
+                    rules[key] = {
+                        "kind": "hedged_pair",
+                        "symbol": symbol,
+                        "long_exchange": long_exchange,
+                        "short_exchange": short_exchange,
+                        "enabled": True,
+                        "qty_tolerance_pct": float(qty_tolerance_pct),
+                        "rehedge_allowed": bool(payload.get("rehedge_allowed", False)),
+                        "source": str(payload.get("source") or "manual"),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+            self._hedge_clusters = normalize_hedge_cluster_config({"rules": rules})
+            self._hedge_cluster_store.save(self._hedge_clusters)
+        return {"hedge_clusters": self.hedge_cluster_payload()}
+
+    def _active_hedge_clusters(self) -> dict[str, Any]:
+        explicit = self.hedge_cluster_payload()
+        auto_exit_rules = (self._auto_exit or {}).get("rules") or {}
+        return derive_cluster_rules(explicit, auto_exit_rules)
+
+    def _load_derisk_outcome_state(self) -> dict[str, Any]:
+        payload = self._derisk_outcome_store.load({"tracked": {}})
+        tracked: dict[str, Any] = {}
+        incoming = (payload or {}).get("tracked") if isinstance(payload, Mapping) else None
+        if isinstance(incoming, Mapping):
+            for cycle_id, raw in incoming.items():
+                if not isinstance(raw, Mapping):
+                    continue
+                cid = str(raw.get("cycle_id") or cycle_id or "").strip()
+                symbol = normalize_symbol(str(raw.get("symbol") or ""))
+                if not cid or not symbol:
+                    continue
+                horizons_in = raw.get("horizons")
+                horizons: dict[str, Any] = {}
+                if isinstance(horizons_in, Mapping):
+                    for name, meta in horizons_in.items():
+                        if not isinstance(meta, Mapping):
+                            continue
+                        target_ts = _safe_float(meta.get("target_ts"))
+                        if target_ts is None or target_ts <= 0:
+                            continue
+                        horizons[str(name)] = {
+                            "target_ts": float(target_ts),
+                            "emitted": bool(meta.get("emitted", False)),
+                        }
+                if not horizons:
+                    continue
+                tracked[cid] = {
+                    "cycle_id": cid,
+                    "symbol": symbol,
+                    "key": str(raw.get("key") or "").strip() or None,
+                    "action_type": str(raw.get("action_type") or "").strip() or None,
+                    "created_ts": float(_safe_float(raw.get("created_ts")) or 0.0),
+                    "baseline": dict(raw.get("baseline") or {}),
+                    "horizons": horizons,
+                }
+        return {"tracked": tracked}
+
+    def _save_derisk_outcome_state(self) -> None:
+        self._derisk_outcome_store.save(self._derisk_outcome_state)
+
+    def _derisk_settings(self) -> dict[str, Any]:
+        protective = getattr(self._settings_manager.current, "protective", {}) or {}
+        poll_sec = _safe_float(protective.get("derisk_poll_sec"))
+        if poll_sec is not None and poll_sec > 0:
+            self._derisk_poll_sec = float(poll_sec)
+        def _num(name: str, default: float) -> float:
+            value = _safe_float(protective.get(name))
+            return float(default if value is None else value)
+        return {
+            "enabled": bool(protective.get("auto_derisk_enabled", False)),
+            "shadow_mode": bool(protective.get("auto_derisk_shadow_mode", True)),
+            "orphan_cleanup_enabled": bool(protective.get("orphan_cleanup_enabled", True)),
+            "target_buffer_pct": _num("derisk_target_buffer_pct", 0.30),
+            "warning_buffer_pct": _num("derisk_warning_buffer_pct", 0.20),
+            "panic_buffer_pct": _num("derisk_panic_buffer_pct", 0.15),
+            "recovery_buffer_pct": _num("derisk_recovery_buffer_pct", 0.35),
+            "min_free_balance_abs": _num("derisk_min_free_balance_abs", 500.0),
+            "stale_positions_max_sec": int(protective.get("derisk_stale_positions_max_sec", 180) or 180),
+            "failure_block_count": int(protective.get("derisk_failure_block_count", 2) or 2),
+            "confirm_cycles": int(protective.get("derisk_confirm_cycles", 2) or 2),
+            "cooldown_sec": int(protective.get("derisk_cooldown_sec", 120) or 120),
+            "velocity_trigger_bps": _num("derisk_velocity_trigger_bps", 120.0),
+            "qty_tolerance_pct": _num("derisk_qty_tolerance_pct", 0.10),
+            "max_single_action_notional_usd": _num("derisk_max_single_action_notional_usd", 500.0),
+            "market_cleanup_only_in_emergency": bool(
+                protective.get("derisk_market_cleanup_only_in_emergency", True)
+            ),
+            "dust_notional_usd": _num("derisk_dust_notional_usd", 10.0),
+        }
+
+    def derisk_payload(self) -> dict[str, Any]:
+        return {
+            "settings": self._derisk_settings(),
+            "exchange_health": json.loads(json.dumps(self._derisk_exchange_health)),
+            "clusters": self._active_hedge_clusters(),
+            "diagnostics": list(self._derisk_diagnostics),
+            "events": list(self._derisk_events),
+        }
+
     def _load_auto_exit_config(self) -> dict[str, Any]:
         payload = self._auto_exit_store.load({"defaults": dict(AUTO_EXIT_DEFAULTS), "rules": {}})
         return self._normalize_auto_exit_config(payload)
@@ -9238,6 +11521,10 @@ class DataService:
                         pass
                 if "require_live" in incoming_defaults:
                     defaults["require_live"] = bool(incoming_defaults.get("require_live"))
+                if "restore_spread_on_missing" in incoming_defaults:
+                    defaults["restore_spread_on_missing"] = bool(
+                        incoming_defaults.get("restore_spread_on_missing")
+                    )
                 if incoming_defaults.get("auto_clear_no_position_sec") is not None:
                     try:
                         defaults["auto_clear_no_position_sec"] = max(0, int(incoming_defaults.get("auto_clear_no_position_sec")))
@@ -9254,6 +11541,9 @@ class DataService:
                     target = _safe_float(rule.get("target_spread_pct"))
                     spread_enabled = bool(rule.get("enabled", target is not None))
                     v1_enabled = bool(rule.get("v1_enabled", False))
+                    exit_percent = _safe_float(rule.get("exit_percent"))
+                    if exit_percent is None or exit_percent <= 0 or exit_percent > 100:
+                        exit_percent = 100.0
                     if not symbol or not long_ex or not short_ex or (target is None and not v1_enabled):
                         continue
                     rule_key = f"{symbol}|{long_ex}|{short_ex}"
@@ -9264,12 +11554,22 @@ class DataService:
                         "target_spread_pct": float(target) if target is not None else None,
                         "enabled": spread_enabled,
                         "v1_enabled": v1_enabled,
+                        "exit_percent": float(exit_percent),
+                        "exit_once": bool(rule.get("exit_once", True)),
                         "persist_on_missing": bool(rule.get("persist_on_missing", True)),
                         "last_triggered_ts": float(rule.get("last_triggered_ts") or 0.0),
                         "last_v1_triggered_ts": float(rule.get("last_v1_triggered_ts") or 0.0),
                         "updated_at": rule.get("updated_at"),
                         "missing_since_ts": float(rule.get("missing_since_ts") or 0.0),
                         "v1_pending_exit_cycles": max(0, int(rule.get("v1_pending_exit_cycles") or 0)),
+                        "position_signature": (
+                            dict(rule.get("position_signature"))
+                            if isinstance(rule.get("position_signature"), Mapping)
+                            else None
+                        ),
+                        "bound_at": rule.get("bound_at"),
+                        "signature_status": str(rule.get("signature_status") or ""),
+                        "rule_generation": max(1, int(rule.get("rule_generation") or 1)),
                     }
         return {"defaults": defaults, "rules": rules}
 
@@ -9285,6 +11585,35 @@ class DataService:
         payload["events"] = list(self._auto_exit_events)
         return payload
 
+    def _current_auto_exit_position_signature(
+        self,
+        symbol: str,
+        long_exchange: str,
+        short_exchange: str,
+    ) -> dict[str, Any] | None:
+        try:
+            positions = self._accounts.snapshot().get("positions") or []
+            market_lookup, market_ts_lookup = self._positions_market_snapshot_lookup()
+            _, grouped = self._positions_by_symbol(
+                positions,
+                return_grouped=True,
+                market_lookup=market_lookup,
+                market_ts_lookup=market_ts_lookup,
+            )
+            symbol_key = normalize_symbol(symbol)
+            legs = grouped.get(symbol_key) or []
+            selected = _auto_exit_select_pair_from_legs(legs)
+            return _auto_exit_position_signature(
+                symbol_key,
+                legs,
+                rule_long_exchange=long_exchange,
+                rule_short_exchange=short_exchange,
+                selected_pair=selected,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.debug("auto-exit signature build failed: %s", exc)
+            return None
+
     async def update_auto_exit_defaults(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         async with self._auto_exit_lock:
             defaults = self._auto_exit.get("defaults", {})
@@ -9292,17 +11621,81 @@ class DataService:
             cooldown = payload.get("cooldown_sec")
             require_live = payload.get("require_live")
             auto_clear = payload.get("auto_clear_no_position_sec")
+            restore_spread = payload.get("restore_spread_on_missing")
             if runtime is not None:
                 defaults["max_runtime_sec"] = max(30, int(runtime))
             if cooldown is not None:
                 defaults["cooldown_sec"] = max(0, int(cooldown))
             if require_live is not None:
                 defaults["require_live"] = bool(require_live)
+            if restore_spread is not None:
+                defaults["restore_spread_on_missing"] = bool(restore_spread)
             if auto_clear is not None:
                 defaults["auto_clear_no_position_sec"] = max(0, int(auto_clear))
             self._auto_exit["defaults"] = defaults
             self._auto_exit_store.save(self._auto_exit)
         return {"auto_exit": self.auto_exit_payload()}
+
+    async def clear_auto_exit_spread_cache(
+        self,
+        symbol: str | None = None,
+        *,
+        clear_v1: bool = False,
+    ) -> dict[str, Any]:
+        symbol_key = normalize_symbol(symbol or "") if symbol else ""
+        removed = 0
+        disabled = 0
+        cleared_v1 = 0
+        async with self._auto_exit_lock:
+            rules = self._auto_exit.get("rules", {})
+            if not isinstance(rules, dict):
+                rules = {}
+                self._auto_exit["rules"] = rules
+            for key in list(rules.keys()):
+                rule = rules.get(key)
+                if not isinstance(rule, dict):
+                    continue
+                rule_symbol = normalize_symbol(str(rule.get("symbol") or ""))
+                if symbol_key and rule_symbol != symbol_key:
+                    continue
+                if clear_v1:
+                    rules.pop(key, None)
+                    removed += 1
+                    if bool(rule.get("v1_enabled", False)):
+                        cleared_v1 += 1
+                    continue
+                if not bool(rule.get("enabled", False)) and rule.get("target_spread_pct") is None:
+                    continue
+                if bool(rule.get("v1_enabled", False)):
+                    rule["enabled"] = False
+                    rule["target_spread_pct"] = None
+                    rule["persist_on_missing"] = False
+                    rule["missing_since_ts"] = 0.0
+                    rule["position_signature"] = None
+                    rule["signature_status"] = "spread_cache_cleared"
+                    rule["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    disabled += 1
+                else:
+                    rules.pop(key, None)
+                    removed += 1
+            if removed or disabled:
+                self._auto_exit_store.save(self._auto_exit)
+        self._auto_exit_event(
+            "spread_cache_clear",
+            {
+                "symbol": symbol_key or None,
+                "removed": removed,
+                "disabled": disabled,
+                "cleared_v1": cleared_v1,
+                "clear_v1": bool(clear_v1),
+            },
+        )
+        return {
+            "removed": removed,
+            "disabled": disabled,
+            "cleared_v1": cleared_v1,
+            "auto_exit": self.auto_exit_payload(),
+        }
 
     async def update_auto_exit_rule(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         symbol = str(payload.get("symbol") or "").upper().strip()
@@ -9318,7 +11711,16 @@ class DataService:
             if spread_enabled_in is None and "enabled" in payload:
                 spread_enabled_in = payload.get("enabled")
             v1_enabled_in = payload.get("v1_enabled")
+            exit_percent_in = _safe_float(payload.get("exit_percent"))
+            exit_once_in = payload.get("exit_once")
             persist_on_missing_in = payload.get("persist_on_missing")
+            defaults = self._auto_exit.get("defaults", {}) or {}
+            default_persist_on_missing = bool(
+                defaults.get(
+                    "restore_spread_on_missing",
+                    AUTO_EXIT_DEFAULTS["restore_spread_on_missing"],
+                )
+            )
             spread_enabled = (
                 bool(prev.get("enabled", False))
                 if spread_enabled_in is None
@@ -9329,13 +11731,27 @@ class DataService:
                 if v1_enabled_in is None
                 else bool(v1_enabled_in)
             )
+            exit_percent = (
+                _safe_float(prev.get("exit_percent")) or 100.0
+                if exit_percent_in is None
+                else float(exit_percent_in)
+            )
+            if exit_percent <= 0 or exit_percent > 100:
+                raise ValueError("exit_percent must be greater than 0 and no more than 100.")
+            exit_once = (
+                bool(prev.get("exit_once", True))
+                if exit_once_in is None
+                else bool(exit_once_in)
+            )
             persist_on_missing = (
-                bool(prev.get("persist_on_missing", True))
+                bool(prev.get("persist_on_missing", default_persist_on_missing))
                 if persist_on_missing_in is None
                 else bool(persist_on_missing_in)
             )
             target = _safe_float(payload.get("target_spread_pct"))
-            if target is None:
+            if not spread_enabled:
+                target = None
+            elif target is None:
                 target = _safe_float(prev.get("target_spread_pct"))
             if not spread_enabled and not v1_enabled:
                 rules.pop(key, None)
@@ -9343,6 +11759,13 @@ class DataService:
                 if spread_enabled and target is None:
                     raise ValueError("target_spread_pct is required when enabled.")
                 now_iso = datetime.now(timezone.utc).isoformat()
+                position_signature = self._current_auto_exit_position_signature(
+                    symbol,
+                    long_exchange,
+                    short_exchange,
+                )
+                signature_status = "bound" if position_signature else "binding_position_missing"
+                rule_generation = max(1, int(prev.get("rule_generation") or 0) + 1)
                 rules[key] = {
                     "symbol": symbol,
                     "long_exchange": long_exchange,
@@ -9350,16 +11773,1226 @@ class DataService:
                     "target_spread_pct": float(target) if target is not None else None,
                     "enabled": bool(spread_enabled),
                     "v1_enabled": bool(v1_enabled),
+                    "exit_percent": float(exit_percent),
+                    "exit_once": bool(exit_once),
                     "persist_on_missing": bool(persist_on_missing),
                     "last_triggered_ts": float(prev.get("last_triggered_ts") or 0.0),
                     "last_v1_triggered_ts": float(prev.get("last_v1_triggered_ts") or 0.0),
                     "updated_at": now_iso,
                     "missing_since_ts": 0.0,
                     "v1_pending_exit_cycles": max(0, int(prev.get("v1_pending_exit_cycles") or 0)),
+                    "position_signature": position_signature,
+                    "bound_at": now_iso if position_signature else None,
+                    "signature_status": signature_status,
+                    "rule_generation": rule_generation,
                 }
             self._auto_exit["rules"] = rules
             self._auto_exit_store.save(self._auto_exit)
+            stored_rule = dict(rules.get(key) or {})
+        self._auto_exit_event(
+            "rule_update",
+            {
+                "key": key,
+                "symbol": symbol,
+                "long_exchange": long_exchange,
+                "short_exchange": short_exchange,
+                "spread_enabled": bool(stored_rule.get("enabled", False)),
+                "v1_enabled": bool(stored_rule.get("v1_enabled", False)),
+                "target_spread_pct": stored_rule.get("target_spread_pct"),
+                "exit_percent": stored_rule.get("exit_percent"),
+                "exit_once": stored_rule.get("exit_once"),
+                "rule_generation": stored_rule.get("rule_generation"),
+                "signature_status": stored_rule.get("signature_status"),
+                "removed": not bool(stored_rule),
+            },
+        )
         return {"auto_exit": self.auto_exit_payload()}
+
+    def _derisk_event(self, event: str, payload: Mapping[str, Any]) -> None:
+        entry = {
+            "event": event,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        if self._derisk_active_cycle_id:
+            entry["cycle_id"] = self._derisk_active_cycle_id
+        entry.update(dict(payload or {}))
+        self._derisk_events.append(entry)
+        if len(self._derisk_events) > self._derisk_event_limit:
+            self._derisk_events = self._derisk_events[-self._derisk_event_limit :]
+        self._append_derisk_history(
+            {
+                "record_type": "event",
+                **dict(entry),
+            }
+        )
+
+    def _append_derisk_history(self, payload: Mapping[str, Any]) -> None:
+        try:
+            self._derisk_history_store.append(dict(payload or {}))
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("failed to append de-risk history: %s", exc)
+
+    @staticmethod
+    def _compact_derisk_result(result: Mapping[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(result, Mapping):
+            return None
+        return {
+            "status": result.get("status"),
+            "execution_id": result.get("execution_id"),
+            "mode": result.get("mode"),
+            "action": result.get("action"),
+            "remaining_qty": result.get("remaining_qty"),
+            "error_count": len(list(result.get("errors") or [])),
+            "warning_count": len(list(result.get("warnings") or [])),
+            "risk_flags": list(result.get("risk_flags") or []),
+        }
+
+    @staticmethod
+    def _compact_derisk_health_rows(exchange_health: Mapping[str, Any]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for exchange in sorted(str(key) for key in (exchange_health or {}).keys()):
+            item = dict((exchange_health or {}).get(exchange) or {})
+            rows.append(
+                {
+                    "exchange": exchange,
+                    "health": item.get("health"),
+                    "last_status": item.get("last_status"),
+                    "last_error_kind": item.get("last_error_kind"),
+                    "consecutive_failures": int(item.get("consecutive_failures") or 0),
+                    "stale_sec": _safe_float(item.get("stale_sec")),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _compact_derisk_balance_rows(
+        balances: list[Mapping[str, Any]],
+        exchange_stress: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for item in balances or []:
+            exchange = normalize_exchange_name(str(item.get("exchange") or ""))
+            if not exchange:
+                continue
+            stress = dict((exchange_stress or {}).get(exchange) or {})
+            rows.append(
+                {
+                    "exchange": exchange,
+                    "asset": item.get("asset"),
+                    "total": _safe_float(item.get("total")),
+                    "available": _safe_float(item.get("available")),
+                    "used": _safe_float(item.get("used")),
+                    "buffer_pct": _safe_float(item.get("buffer_pct")),
+                    "stress_status": stress.get("status"),
+                    "stress_score": _safe_float(stress.get("stress_score")),
+                    "target_free_usd": _safe_float(stress.get("target_free_usd")),
+                    "deficit_usd": _safe_float(stress.get("deficit_usd")),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _compact_derisk_diagnostic_row(row: Mapping[str, Any]) -> dict[str, Any]:
+        payload = dict(row or {})
+        result = {
+            "kind": payload.get("kind"),
+            "key": payload.get("key"),
+            "symbol": payload.get("symbol"),
+            "status": payload.get("status"),
+            "reason": payload.get("reason"),
+            "long_exchange": payload.get("long_exchange"),
+            "short_exchange": payload.get("short_exchange"),
+            "orphan_exchange": payload.get("orphan_exchange"),
+            "orphan_position_side": payload.get("orphan_position_side"),
+            "orphan_qty": _safe_float(payload.get("orphan_qty")),
+            "stress_exchange": payload.get("stress_exchange"),
+            "stress_status": payload.get("stress_status"),
+            "stress_score": _safe_float(payload.get("stress_score")),
+            "cluster_notional_usd": _safe_float(payload.get("cluster_notional_usd")),
+            "cluster_unrealized_pnl_usd": _safe_float(payload.get("cluster_unrealized_pnl_usd")),
+            "funding_to_next_usd": _safe_float(payload.get("funding_to_next_usd")),
+            "minutes_to_event": _safe_float(payload.get("minutes_to_event")),
+            "action_qty": _safe_float(payload.get("action_qty")),
+            "action_mode": payload.get("action_mode"),
+            "candidate_score": _safe_float(payload.get("candidate_score")),
+            "residual_status": payload.get("residual_status"),
+            "qty_mismatch_ratio": _safe_float(payload.get("qty_mismatch_ratio")),
+            "missing_cycles": int(payload.get("missing_cycles") or 0),
+            "confirm_cycles": int(payload.get("confirm_cycles") or 0),
+            "health_blocked": bool(payload.get("health_blocked", False)),
+            "long_health": payload.get("long_health"),
+            "short_health": payload.get("short_health"),
+            "long_error_kind": payload.get("long_error_kind"),
+            "short_error_kind": payload.get("short_error_kind"),
+            "cluster_conflict": bool(payload.get("cluster_conflict", False)),
+            "cluster_conflict_reason": payload.get("cluster_conflict_reason"),
+            "unexpected_leg_count": int(payload.get("unexpected_leg_count") or 0),
+            "duplicate_visible_leg_count": int(payload.get("duplicate_visible_leg_count") or 0),
+            "updated_at": payload.get("updated_at"),
+        }
+        overlap_conflicts = list(payload.get("overlap_conflicts") or [])
+        if overlap_conflicts:
+            result["overlap_conflicts"] = overlap_conflicts
+        unexpected_legs = list(payload.get("unexpected_legs") or [])
+        if unexpected_legs:
+            result["unexpected_legs"] = unexpected_legs
+        return result
+
+    def _persist_derisk_cycle_history(
+        self,
+        *,
+        cycle_id: str,
+        settings: Mapping[str, Any],
+        balances: list[Mapping[str, Any]],
+        exchange_stress: Mapping[str, Any],
+        diagnostics: list[Mapping[str, Any]],
+        cycle_action: Mapping[str, Any] | None,
+        running_execution: Mapping[str, Any] | None,
+    ) -> None:
+        status_counts: dict[str, int] = {}
+        compact_rows: list[dict[str, Any]] = []
+        for row in diagnostics or []:
+            status = str(row.get("status") or "")
+            if status:
+                status_counts[status] = status_counts.get(status, 0) + 1
+            kind = str(row.get("kind") or "")
+            if (
+                kind in {"candidate", "orphan_candidate"}
+                or status not in {"", "healthy", "ranked"}
+                or str(row.get("stress_status") or "") in {"stress", "panic"}
+                or str(row.get("action_mode") or "") not in {"", "none"}
+            ):
+                compact_rows.append(self._compact_derisk_diagnostic_row(row))
+        history_row = {
+            "record_type": "cycle",
+            "cycle_id": cycle_id,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "settings": {
+                "enabled": bool(settings.get("enabled")),
+                "shadow_mode": bool(settings.get("shadow_mode")),
+                "orphan_cleanup_enabled": bool(settings.get("orphan_cleanup_enabled", True)),
+                "target_buffer_pct": _safe_float(settings.get("target_buffer_pct")),
+                "warning_buffer_pct": _safe_float(settings.get("warning_buffer_pct")),
+                "panic_buffer_pct": _safe_float(settings.get("panic_buffer_pct")),
+                "recovery_buffer_pct": _safe_float(settings.get("recovery_buffer_pct")),
+                "confirm_cycles": int(settings.get("confirm_cycles") or 0),
+                "cooldown_sec": int(settings.get("cooldown_sec") or 0),
+                "qty_tolerance_pct": _safe_float(settings.get("qty_tolerance_pct")),
+                "max_single_action_notional_usd": _safe_float(settings.get("max_single_action_notional_usd")),
+                "dust_notional_usd": _safe_float(settings.get("dust_notional_usd")),
+            },
+            "status_counts": status_counts,
+            "exchange_health": self._compact_derisk_health_rows(self._derisk_exchange_health),
+            "balances": self._compact_derisk_balance_rows(balances, exchange_stress),
+            "running_execution": dict(running_execution or {}) or None,
+            "cycle_action": dict(cycle_action or {}) or None,
+            "rows": compact_rows,
+        }
+        self._append_derisk_history(history_row)
+
+    @staticmethod
+    def _compact_balance_lookup_rows(
+        balances: list[Mapping[str, Any]],
+        exchange_health: Mapping[str, Any],
+        exchanges: list[str],
+    ) -> list[dict[str, Any]]:
+        wanted = {normalize_exchange_name(name) for name in exchanges if str(name).strip()}
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in balances or []:
+            exchange = normalize_exchange_name(str(item.get("exchange") or ""))
+            if not exchange or exchange not in wanted or exchange in seen:
+                continue
+            health = dict((exchange_health or {}).get(exchange) or {})
+            rows.append(
+                {
+                    "exchange": exchange,
+                    "available": _safe_float(item.get("available")),
+                    "used": _safe_float(item.get("used")),
+                    "total": _safe_float(item.get("total")),
+                    "buffer_pct": _safe_float(item.get("buffer_pct")),
+                    "health": health.get("health"),
+                    "last_error_kind": health.get("last_error_kind"),
+                }
+            )
+            seen.add(exchange)
+        return rows
+
+    def _build_derisk_outcome_snapshot(
+        self,
+        *,
+        diagnostics: list[Mapping[str, Any]],
+        balances: list[Mapping[str, Any]],
+        cycle_action: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        key = str(cycle_action.get("key") or "").strip()
+        symbol = normalize_symbol(str(cycle_action.get("symbol") or ""))
+        cluster = next(
+            (
+                dict(row)
+                for row in diagnostics
+                if str(row.get("kind") or "") == "cluster"
+                and (
+                    (key and str(row.get("key") or "") == key)
+                    or (not key and normalize_symbol(str(row.get("symbol") or "")) == symbol)
+                )
+            ),
+            {},
+        )
+        candidate = next(
+            (
+                dict(row)
+                for row in diagnostics
+                if str(row.get("kind") or "") in {"candidate", "orphan_candidate"}
+                and (
+                    (key and str(row.get("key") or "") == key)
+                    or (not key and normalize_symbol(str(row.get("symbol") or "")) == symbol)
+                )
+            ),
+            {},
+        )
+        exchanges = [
+            str(cluster.get("stress_exchange") or ""),
+            str(cluster.get("orphan_exchange") or ""),
+            str(cluster.get("long_exchange") or ""),
+            str(cluster.get("short_exchange") or ""),
+        ]
+        return {
+            "symbol": symbol,
+            "key": key or None,
+            "action_type": str(cycle_action.get("type") or ""),
+            "cluster_status": cluster.get("status"),
+            "cluster_reason": cluster.get("reason"),
+            "stress_exchange": cluster.get("stress_exchange"),
+            "stress_status": cluster.get("stress_status"),
+            "stress_score": _safe_float(cluster.get("stress_score")),
+            "orphan_exchange": cluster.get("orphan_exchange"),
+            "orphan_position_side": cluster.get("orphan_position_side"),
+            "orphan_qty": _safe_float(cluster.get("orphan_qty")),
+            "candidate_score": _safe_float(candidate.get("candidate_score") or cluster.get("candidate_score")),
+            "action_qty": _safe_float(cycle_action.get("action_qty") or cluster.get("action_qty")),
+            "action_mode": cluster.get("action_mode"),
+            "cluster_notional_usd": _safe_float(cluster.get("cluster_notional_usd")),
+            "cluster_unrealized_pnl_usd": _safe_float(cluster.get("cluster_unrealized_pnl_usd")),
+            "funding_to_next_usd": _safe_float(cluster.get("funding_to_next_usd")),
+            "minutes_to_event": _safe_float(cluster.get("minutes_to_event")),
+            "unexpected_leg_count": int(cluster.get("unexpected_leg_count") or 0),
+            "cluster_conflict": bool(cluster.get("cluster_conflict", False)),
+            "balances": self._compact_balance_lookup_rows(
+                balances,
+                self._derisk_exchange_health,
+                exchanges,
+            ),
+        }
+
+    @staticmethod
+    def _derisk_outcome_label(
+        initial: Mapping[str, Any],
+        current: Mapping[str, Any],
+    ) -> tuple[str, list[str]]:
+        reasons: list[str] = []
+        action_type = str(initial.get("action_type") or "")
+        if action_type == "orphan_trigger":
+            initial_orphan = _safe_float(initial.get("orphan_qty")) or 0.0
+            current_orphan = _safe_float(current.get("orphan_qty"))
+            current_status = str(current.get("cluster_status") or "")
+            if (current_orphan or 0.0) <= 0 and current_status not in {"confirmed_orphan", "suspected_orphan"}:
+                reasons.append("orphan_resolved")
+                return "improved", reasons
+            if initial_orphan > 0 and current_orphan is not None and current_orphan < initial_orphan:
+                reasons.append("orphan_qty_reduced")
+                return "improved", reasons
+            if current_status == "confirmed_orphan":
+                reasons.append("orphan_still_confirmed")
+                return "worsened", reasons
+            reasons.append("orphan_not_resolved")
+            return "unchanged", reasons
+
+        initial_stress = str(initial.get("stress_status") or "ok")
+        current_stress = str(current.get("stress_status") or "ok")
+        stress_rank = {"ok": 0, "stress": 1, "panic": 2}
+        initial_buffer = None
+        current_buffer = None
+        initial_exchange = normalize_exchange_name(str(initial.get("stress_exchange") or ""))
+        current_exchange = normalize_exchange_name(str(current.get("stress_exchange") or initial_exchange))
+        for item in list(initial.get("balances") or []):
+            if normalize_exchange_name(str(item.get("exchange") or "")) == initial_exchange:
+                initial_buffer = _safe_float(item.get("buffer_pct"))
+                break
+        for item in list(current.get("balances") or []):
+            if normalize_exchange_name(str(item.get("exchange") or "")) == current_exchange:
+                current_buffer = _safe_float(item.get("buffer_pct"))
+                break
+        if stress_rank.get(current_stress, 3) < stress_rank.get(initial_stress, 3):
+            reasons.append("stress_status_improved")
+            return "improved", reasons
+        if stress_rank.get(current_stress, 3) > stress_rank.get(initial_stress, 3):
+            reasons.append("stress_status_worsened")
+            return "worsened", reasons
+        if initial_buffer is not None and current_buffer is not None:
+            if current_buffer >= initial_buffer + 1.0:
+                reasons.append("buffer_pct_recovered")
+                return "improved", reasons
+            if current_buffer <= initial_buffer - 1.0:
+                reasons.append("buffer_pct_deteriorated")
+                return "worsened", reasons
+        reasons.append("stress_state_stable")
+        return "unchanged", reasons
+
+    def _register_derisk_outcome_tracking(
+        self,
+        *,
+        cycle_id: str,
+        now_ts: float,
+        cycle_action: Mapping[str, Any] | None,
+        diagnostics: list[Mapping[str, Any]],
+        balances: list[Mapping[str, Any]],
+    ) -> None:
+        action = dict(cycle_action or {})
+        action_type = str(action.get("type") or "")
+        if action_type not in {"trigger", "orphan_trigger"}:
+            return
+        if not (normalize_symbol(str(action.get("symbol") or ""))):
+            return
+        baseline = self._build_derisk_outcome_snapshot(
+            diagnostics=diagnostics,
+            balances=balances,
+            cycle_action=action,
+        )
+        horizons = {
+            name: {"target_ts": float(now_ts) + float(delay), "emitted": False}
+            for name, delay in DERISK_OUTCOME_HORIZONS_SEC.items()
+        }
+        minutes_to_event = _safe_float(baseline.get("minutes_to_event"))
+        if minutes_to_event is not None and minutes_to_event > 0:
+            funding_target_ts = float(now_ts) + float(minutes_to_event) * 60.0
+            if funding_target_ts > float(now_ts) + 5.0:
+                horizons["to_next_funding"] = {"target_ts": funding_target_ts, "emitted": False}
+        tracked = dict(self._derisk_outcome_state.get("tracked") or {})
+        tracked[str(cycle_id)] = {
+            "cycle_id": str(cycle_id),
+            "symbol": baseline.get("symbol"),
+            "key": baseline.get("key"),
+            "action_type": action_type,
+            "created_ts": float(now_ts),
+            "baseline": baseline,
+            "horizons": horizons,
+        }
+        self._derisk_outcome_state["tracked"] = tracked
+        self._save_derisk_outcome_state()
+
+    def _evaluate_pending_derisk_outcomes(
+        self,
+        *,
+        now_ts: float,
+        diagnostics: list[Mapping[str, Any]],
+        balances: list[Mapping[str, Any]],
+    ) -> None:
+        tracked = dict(self._derisk_outcome_state.get("tracked") or {})
+        if not tracked:
+            return
+        updated: dict[str, Any] = {}
+        for cycle_id, item in tracked.items():
+            row = dict(item or {})
+            baseline = dict(row.get("baseline") or {})
+            symbol = normalize_symbol(str(row.get("symbol") or baseline.get("symbol") or ""))
+            if not symbol:
+                continue
+            action_view = {
+                "type": row.get("action_type"),
+                "symbol": symbol,
+                "key": row.get("key"),
+                "action_qty": baseline.get("action_qty"),
+            }
+            current = self._build_derisk_outcome_snapshot(
+                diagnostics=diagnostics,
+                balances=balances,
+                cycle_action=action_view,
+            )
+            horizons_out: dict[str, Any] = {}
+            changed = False
+            for horizon_name, meta in dict(row.get("horizons") or {}).items():
+                target_ts = float(_safe_float(meta.get("target_ts")) or 0.0)
+                emitted = bool(meta.get("emitted", False))
+                if emitted or target_ts <= 0:
+                    if emitted:
+                        horizons_out[str(horizon_name)] = {"target_ts": target_ts, "emitted": True}
+                    continue
+                if float(now_ts) >= target_ts:
+                    label, reasons = self._derisk_outcome_label(baseline, current)
+                    self._append_derisk_history(
+                        {
+                            "record_type": "outcome",
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "cycle_id": str(cycle_id),
+                            "source_action_type": row.get("action_type"),
+                            "symbol": symbol,
+                            "key": row.get("key"),
+                            "horizon": str(horizon_name),
+                            "target_ts": target_ts,
+                            "age_sec": max(0.0, float(now_ts) - float(_safe_float(row.get("created_ts")) or 0.0)),
+                            "heuristic_outcome": {
+                                "label": label,
+                                "reasons": reasons,
+                            },
+                            "initial": baseline,
+                            "current": current,
+                        }
+                    )
+                    horizons_out[str(horizon_name)] = {"target_ts": target_ts, "emitted": True}
+                    changed = True
+                else:
+                    horizons_out[str(horizon_name)] = {"target_ts": target_ts, "emitted": False}
+            if any(not bool(meta.get("emitted", False)) for meta in horizons_out.values()):
+                row["horizons"] = horizons_out
+                updated[str(cycle_id)] = row
+            elif not changed:
+                row["horizons"] = horizons_out
+                updated[str(cycle_id)] = row
+        if updated != tracked:
+            self._derisk_outcome_state["tracked"] = updated
+            self._save_derisk_outcome_state()
+
+    def _derisk_log_event(
+        self,
+        key: str,
+        event: str,
+        payload: Mapping[str, Any],
+        now_ts: float,
+    ) -> None:
+        log_key = f"{key}|{event}"
+        last_ts = float(self._derisk_last_log_ts.get(log_key) or 0.0)
+        if (now_ts - last_ts) < float(self._derisk_log_cooldown_sec):
+            return
+        self._derisk_last_log_ts[log_key] = now_ts
+        self._derisk_event(event, payload)
+
+    async def _auto_derisk_cycle(self) -> None:
+        if self._derisk_inflight:
+            return
+        self._derisk_inflight = True
+        cycle_id = uuid4().hex
+        self._derisk_active_cycle_id = cycle_id
+        try:
+            settings = self._derisk_settings()
+            accounts_snapshot = self._accounts.snapshot() or {}
+            positions = list(accounts_snapshot.get("positions") or [])
+            balances = self._sanitize_balances(accounts_snapshot.get("balances") or [])
+            status_entries = list(accounts_snapshot.get("status") or [])
+            now_ts = time.time()
+            self._derisk_exchange_health = build_exchange_health(
+                status_entries,
+                previous=self._derisk_exchange_health,
+                now_ts=now_ts,
+                stale_after_sec=int(settings.get("stale_positions_max_sec", 180)),
+                failure_block_count=int(settings.get("failure_block_count", 2)),
+            )
+            clusters_payload = self._active_hedge_clusters()
+            cluster_rules = dict(clusters_payload.get("rules") or {})
+            diagnostics: list[dict[str, Any]] = []
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            if positions:
+                _rows, grouped = self._positions_by_symbol(
+                    positions,
+                    return_grouped=True,
+                    market_lookup={},
+                    market_ts_lookup={},
+                )
+            balances_by_exchange = {
+                normalize_exchange_name(str(item.get("exchange") or "")): dict(item)
+                for item in balances
+                if str(item.get("exchange") or "").strip()
+            }
+            exchange_stress = {
+                exchange: exchange_stress_state(
+                    balance,
+                    target_buffer_pct=float(settings.get("target_buffer_pct", 0.30)),
+                    warning_buffer_pct=float(settings.get("warning_buffer_pct", 0.20)),
+                    panic_buffer_pct=float(settings.get("panic_buffer_pct", 0.15)),
+                    min_free_balance_abs=float(settings.get("min_free_balance_abs", 500.0)),
+                )
+                for exchange, balance in balances_by_exchange.items()
+            }
+            orphan_targets: list[dict[str, Any]] = []
+            candidates: list[dict[str, Any]] = []
+            confirm_cycles = max(1, int(settings.get("confirm_cycles", 2)))
+            qty_tolerance_default = float(settings.get("qty_tolerance_pct", 0.10))
+            cycle_action: dict[str, Any] | None = None
+            expected_cluster_legs: dict[tuple[str, str, str], list[str]] = {}
+
+            def _position_side(value: Any, qty_hint: float | None = None) -> str:
+                side_raw = str(value or "").strip().lower()
+                if side_raw in {"long", "buy"}:
+                    return "long"
+                if side_raw in {"short", "sell"}:
+                    return "short"
+                if qty_hint is not None:
+                    if qty_hint < 0:
+                        return "short"
+                    if qty_hint > 0:
+                        return "long"
+                return ""
+
+            def _leg_qty(leg: Mapping[str, Any]) -> float:
+                qty = _safe_float(leg.get("coin_qty"))
+                if qty is None:
+                    qty = _safe_float(leg.get("quantity"))
+                if qty is None:
+                    qty = _safe_float(leg.get("contracts"))
+                if qty is None:
+                    qty = _safe_float(leg.get("amount"))
+                return abs(float(qty or 0.0))
+
+            def _aggregate_symbol_legs(
+                raw_legs: list[dict[str, Any]],
+                *,
+                symbol_name: str,
+                long_ex: str,
+                short_ex: str,
+            ) -> tuple[dict[tuple[str, str], dict[str, Any]], list[dict[str, Any]], int]:
+                expected = {(long_ex, "long"), (short_ex, "short")}
+                aggregates: dict[tuple[str, str], dict[str, Any]] = {}
+                unexpected: list[dict[str, Any]] = []
+                duplicate_count = 0
+                for raw_leg in raw_legs:
+                    exchange = normalize_exchange_name(str(raw_leg.get("exchange") or ""))
+                    qty_hint = _safe_float(raw_leg.get("coin_qty"))
+                    if qty_hint is None:
+                        qty_hint = _safe_float(raw_leg.get("quantity"))
+                    if qty_hint is None:
+                        qty_hint = _safe_float(raw_leg.get("contracts"))
+                    if qty_hint is None:
+                        qty_hint = _safe_float(raw_leg.get("amount"))
+                    side = _position_side(raw_leg.get("side"), qty_hint)
+                    if not exchange or not side:
+                        continue
+                    key = (exchange, side)
+                    qty_abs = abs(float(qty_hint or 0.0))
+                    if key not in expected:
+                        if qty_abs > 0:
+                            unexpected.append(
+                                {
+                                    "exchange": exchange,
+                                    "side": side,
+                                    "qty": qty_abs,
+                                    "symbol": symbol_name,
+                                }
+                            )
+                        continue
+                    current = aggregates.get(key)
+                    if current is None:
+                        current = dict(raw_leg)
+                        current["exchange"] = exchange
+                        current["side"] = side
+                        current["_aggregate_count"] = 1
+                        current["coin_qty"] = qty_abs
+                        current["quantity"] = qty_abs
+                        current["contracts"] = qty_abs
+                        current["amount"] = _safe_float(raw_leg.get("amount")) or 0.0
+                        current["notional"] = _safe_float(raw_leg.get("notional"))
+                        current["unrealized_pnl"] = _safe_float(raw_leg.get("unrealized_pnl")) or 0.0
+                        current["margin_used"] = _safe_float(raw_leg.get("margin_used"))
+                        aggregates[key] = current
+                        continue
+                    duplicate_count += 1
+                    current["_aggregate_count"] = int(current.get("_aggregate_count") or 1) + 1
+                    current["coin_qty"] = float(current.get("coin_qty") or 0.0) + qty_abs
+                    current["quantity"] = float(current.get("quantity") or 0.0) + qty_abs
+                    current["contracts"] = float(current.get("contracts") or 0.0) + qty_abs
+                    current["amount"] = (
+                        float(current.get("amount") or 0.0)
+                        + float(_safe_float(raw_leg.get("amount")) or 0.0)
+                    )
+                    current_notional = _safe_float(current.get("notional"))
+                    add_notional = _safe_float(raw_leg.get("notional"))
+                    if current_notional is not None or add_notional is not None:
+                        current["notional"] = float(current_notional or 0.0) + float(add_notional or 0.0)
+                    current["unrealized_pnl"] = (
+                        float(current.get("unrealized_pnl") or 0.0)
+                        + float(_safe_float(raw_leg.get("unrealized_pnl")) or 0.0)
+                    )
+                    current_margin = _safe_float(current.get("margin_used"))
+                    add_margin = _safe_float(raw_leg.get("margin_used"))
+                    if current_margin is not None or add_margin is not None:
+                        current["margin_used"] = float(current_margin or 0.0) + float(add_margin or 0.0)
+                return aggregates, unexpected, duplicate_count
+
+            for cluster_key, cluster in cluster_rules.items():
+                if not isinstance(cluster, Mapping):
+                    continue
+                if not bool(cluster.get("enabled", True)):
+                    continue
+                if str(cluster.get("kind") or "") != "hedged_pair":
+                    continue
+                symbol = normalize_symbol(cluster.get("symbol"))
+                long_exchange = normalize_exchange_name(str(cluster.get("long_exchange") or ""))
+                short_exchange = normalize_exchange_name(str(cluster.get("short_exchange") or ""))
+                if not symbol or not long_exchange or not short_exchange:
+                    continue
+                for expected_leg in (
+                    (symbol, long_exchange, "long"),
+                    (symbol, short_exchange, "short"),
+                ):
+                    expected_cluster_legs.setdefault(expected_leg, []).append(str(cluster_key))
+
+            for cluster_key, cluster in cluster_rules.items():
+                if not isinstance(cluster, Mapping):
+                    continue
+                if not bool(cluster.get("enabled", True)):
+                    continue
+                if str(cluster.get("kind") or "") != "hedged_pair":
+                    continue
+                symbol = normalize_symbol(cluster.get("symbol"))
+                long_exchange = normalize_exchange_name(str(cluster.get("long_exchange") or ""))
+                short_exchange = normalize_exchange_name(str(cluster.get("short_exchange") or ""))
+                if not symbol or not long_exchange or not short_exchange:
+                    continue
+                symbol_legs = list(grouped.get(symbol) or [])
+                aggregated_legs, unexpected_legs, duplicate_visible_leg_count = _aggregate_symbol_legs(
+                    symbol_legs,
+                    symbol_name=symbol,
+                    long_ex=long_exchange,
+                    short_ex=short_exchange,
+                )
+                long_leg = dict(aggregated_legs.get((long_exchange, "long")) or {}) or None
+                short_leg = dict(aggregated_legs.get((short_exchange, "short")) or {}) or None
+                long_health = dict(self._derisk_exchange_health.get(long_exchange) or {})
+                short_health = dict(self._derisk_exchange_health.get(short_exchange) or {})
+                state = dict(self._derisk_cluster_state.get(cluster_key) or {})
+                missing_cycles = int(state.get("missing_cycles") or 0)
+                health_block = (
+                    str(long_health.get("health") or "") != "healthy"
+                    or str(short_health.get("health") or "") != "healthy"
+                )
+                overlap_conflicts = sorted(
+                    {
+                        key
+                        for key in (
+                            expected_cluster_legs.get((symbol, long_exchange, "long")) or []
+                        ) + (
+                            expected_cluster_legs.get((symbol, short_exchange, "short")) or []
+                        )
+                        if str(key) != str(cluster_key)
+                    }
+                )
+                cluster_conflict = bool(unexpected_legs) or bool(overlap_conflicts)
+                status = "healthy"
+                reason = "ok"
+                mismatch_ratio = None
+                orphan_confirmed = False
+                if cluster_conflict:
+                    status = "blocked_by_cluster_conflict"
+                    reason = "extra_visible_legs" if unexpected_legs else "overlapping_cluster_leg"
+                    missing_cycles = 0
+                elif not long_leg and not short_leg:
+                    status = "missing_all_legs"
+                    reason = "no_visible_positions"
+                    if health_block:
+                        status = "blocked_by_exchange_health"
+                        reason = "exchange_health_untrusted"
+                elif not long_leg or not short_leg:
+                    if health_block:
+                        status = "blocked_by_exchange_health"
+                        reason = "exchange_health_untrusted"
+                        missing_cycles = 0
+                    else:
+                        missing_cycles += 1
+                        orphan_confirmed = missing_cycles >= confirm_cycles
+                        status = "confirmed_orphan" if orphan_confirmed else "suspected_orphan"
+                        reason = "single_leg_visible"
+                else:
+                    missing_cycles = 0
+                    mismatch_ratio = qty_mismatch_ratio(
+                        long_leg.get("coin_qty") or long_leg.get("quantity"),
+                        short_leg.get("coin_qty") or short_leg.get("quantity"),
+                    )
+                    tolerance = _safe_float(cluster.get("qty_tolerance_pct"))
+                    if tolerance is None or tolerance < 0:
+                        tolerance = qty_tolerance_default
+                    if mismatch_ratio is not None and mismatch_ratio > float(tolerance):
+                        if health_block:
+                            status = "blocked_by_exchange_health"
+                            reason = "qty_mismatch_but_unhealthy"
+                        else:
+                            missing_cycles += 1
+                            orphan_confirmed = missing_cycles >= confirm_cycles
+                            status = "confirmed_orphan" if orphan_confirmed else "suspected_orphan"
+                            reason = "qty_mismatch"
+                state["missing_cycles"] = missing_cycles
+                state["last_status"] = status
+                state["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._derisk_cluster_state[cluster_key] = state
+
+                cluster_notional = None
+                cluster_pnl = None
+                funding_to_next_usd = None
+                minutes_to_event = None
+                interval_minutes = None
+                orphan_exchange = None
+                orphan_position_side = None
+                orphan_qty = None
+                stress_exchange = None
+                stress_status = "ok"
+                stress_score = None
+                action_qty = None
+                candidate_score = None
+                residual_status = None
+                action_mode = "none"
+
+                if long_leg and short_leg:
+                    cluster_notional = sum(
+                        abs(_safe_float(leg.get("amount")) or _safe_float(leg.get("notional")) or 0.0)
+                        for leg in (long_leg, short_leg)
+                    ) / 2.0
+                    cluster_pnl = sum(_safe_float(leg.get("unrealized_pnl")) or 0.0 for leg in (long_leg, short_leg))
+                    context = _auto_exit_v1_position_context([long_leg, short_leg])
+                    funding_to_next_usd = _safe_float(context.get("funding_to_next_usd"))
+                    minutes_to_event = _safe_float(context.get("minutes_to_event"))
+                    interval_minutes = _safe_float(context.get("effective_interval_minutes"))
+                    long_stress = dict(exchange_stress.get(long_exchange) or {})
+                    short_stress = dict(exchange_stress.get(short_exchange) or {})
+                    long_score = float(long_stress.get("stress_score") or 0.0)
+                    short_score = float(short_stress.get("stress_score") or 0.0)
+                    if long_score > 0 or short_score > 0:
+                        stress_exchange = long_exchange if long_score >= short_score else short_exchange
+                        chosen_stress = long_stress if stress_exchange == long_exchange else short_stress
+                        stressed_leg = long_leg if stress_exchange == long_exchange else short_leg
+                        stress_status = str(chosen_stress.get("status") or "ok")
+                        stress_score = _safe_float(chosen_stress.get("stress_score"))
+                        margin_relief_full = (
+                            abs(_safe_float(stressed_leg.get("margin_used")) or 0.0)
+                            or (abs(_safe_float(stressed_leg.get("notional")) or 0.0) / max(float(_safe_float(stressed_leg.get("leverage")) or 3.0), 1.0))
+                        )
+                        deficit_usd = _safe_float(chosen_stress.get("deficit_usd")) or 0.0
+                        if margin_relief_full > 0 and deficit_usd > 0:
+                            action_fraction = min(1.0, float(deficit_usd) / float(margin_relief_full))
+                            pair_qty = min(
+                                abs(_safe_float(long_leg.get("coin_qty")) or _safe_float(long_leg.get("quantity")) or 0.0),
+                                abs(_safe_float(short_leg.get("coin_qty")) or _safe_float(short_leg.get("quantity")) or 0.0),
+                            )
+                            action_qty = pair_qty * action_fraction if pair_qty > 0 else None
+                            if cluster_notional and pair_qty and pair_qty > 0:
+                                max_notional = float(settings.get("max_single_action_notional_usd", 500.0))
+                                scaled = min(float(cluster_notional) * action_fraction, max_notional)
+                                action_qty = pair_qty * (scaled / float(cluster_notional)) if cluster_notional > 0 else action_qty
+                            candidate_score = derisk_candidate_score(
+                                margin_relief_usd=min(float(margin_relief_full), float(deficit_usd)),
+                                close_cost_usd=max(0.0, -(float(cluster_pnl or 0.0))),
+                                funding_to_next_usd=funding_to_next_usd,
+                                minutes_to_funding=minutes_to_event,
+                                interval_minutes=interval_minutes,
+                                pressure_credit_usd=5.0 if stress_status == "panic" else 0.0,
+                            )
+                            residual_qty = max(0.0, pair_qty - float(action_qty or 0.0))
+                            residual_notional = (
+                                float(cluster_notional) * (residual_qty / pair_qty)
+                                if cluster_notional and pair_qty > 0
+                                else None
+                            )
+                            residual_status = classify_residual_leg(
+                                qty=residual_qty,
+                                notional_usd=residual_notional,
+                                dust_notional_usd=float(settings.get("dust_notional_usd", 10.0)),
+                            )
+                            action_mode = "partial"
+                            max_notional = float(settings.get("max_single_action_notional_usd", 500.0))
+                            if residual_status in {
+                                "dust_suspect",
+                                "precision_blocked",
+                                "below_min_qty",
+                                "below_min_notional",
+                            }:
+                                allow_full_cleanup = (
+                                    str(stress_status) == "panic"
+                                    or (cluster_notional is not None and float(cluster_notional) <= max_notional)
+                                )
+                                if allow_full_cleanup and pair_qty > 0:
+                                    action_qty = pair_qty
+                                    residual_status = "flat"
+                                    action_mode = "full_cleanup"
+                            candidates.append(
+                                {
+                                    "key": cluster_key,
+                                    "symbol": symbol,
+                                    "long_exchange": long_exchange,
+                                    "short_exchange": short_exchange,
+                                    "stress_exchange": stress_exchange,
+                                    "stress_status": stress_status,
+                                    "cluster_notional_usd": cluster_notional,
+                                    "cluster_unrealized_pnl_usd": cluster_pnl,
+                                    "funding_to_next_usd": funding_to_next_usd,
+                                    "minutes_to_event": minutes_to_event,
+                                    "interval_minutes": interval_minutes,
+                                    "action_qty": action_qty,
+                                    "action_mode": action_mode,
+                                    "candidate_score": candidate_score,
+                                    "residual_status": residual_status,
+                                    "stress_score": stress_score,
+                                }
+                            )
+                if status in {"suspected_orphan", "confirmed_orphan"}:
+                    if long_leg and not short_leg:
+                        orphan_exchange = long_exchange
+                        orphan_position_side = "long"
+                        orphan_qty = abs(
+                            _safe_float(long_leg.get("coin_qty"))
+                            or _safe_float(long_leg.get("quantity"))
+                            or 0.0
+                        )
+                    elif short_leg and not long_leg:
+                        orphan_exchange = short_exchange
+                        orphan_position_side = "short"
+                        orphan_qty = abs(
+                            _safe_float(short_leg.get("coin_qty"))
+                            or _safe_float(short_leg.get("quantity"))
+                            or 0.0
+                        )
+                    elif long_leg and short_leg and mismatch_ratio is not None:
+                        long_qty = abs(
+                            _safe_float(long_leg.get("coin_qty"))
+                            or _safe_float(long_leg.get("quantity"))
+                            or 0.0
+                        )
+                        short_qty = abs(
+                            _safe_float(short_leg.get("coin_qty"))
+                            or _safe_float(short_leg.get("quantity"))
+                            or 0.0
+                        )
+                        if long_qty > short_qty:
+                            orphan_exchange = long_exchange
+                            orphan_position_side = "long"
+                            orphan_qty = max(0.0, long_qty - short_qty)
+                        elif short_qty > long_qty:
+                            orphan_exchange = short_exchange
+                            orphan_position_side = "short"
+                            orphan_qty = max(0.0, short_qty - long_qty)
+                    if (
+                        status == "confirmed_orphan"
+                        and bool(settings.get("orphan_cleanup_enabled", True))
+                        and orphan_exchange
+                        and orphan_position_side
+                        and orphan_qty
+                        and float(orphan_qty) > 0
+                    ):
+                        orphan_targets.append(
+                            {
+                                "key": cluster_key,
+                                "symbol": symbol,
+                                "orphan_exchange": orphan_exchange,
+                                "orphan_position_side": orphan_position_side,
+                                "orphan_qty": float(orphan_qty),
+                                "reason": reason,
+                                "long_exchange": long_exchange,
+                                "short_exchange": short_exchange,
+                            }
+                        )
+
+                diagnostics.append(
+                    {
+                        "key": cluster_key,
+                        "kind": "cluster",
+                        "symbol": symbol,
+                        "source": cluster.get("source"),
+                        "long_exchange": long_exchange,
+                        "short_exchange": short_exchange,
+                        "status": status,
+                        "reason": reason,
+                        "health_blocked": health_block,
+                        "long_health": long_health.get("health"),
+                        "short_health": short_health.get("health"),
+                        "long_error_kind": long_health.get("last_error_kind"),
+                        "short_error_kind": short_health.get("last_error_kind"),
+                        "missing_cycles": missing_cycles,
+                        "confirm_cycles": confirm_cycles,
+                        "qty_mismatch_ratio": mismatch_ratio,
+                        "cluster_conflict": cluster_conflict,
+                        "cluster_conflict_reason": reason if status == "blocked_by_cluster_conflict" else None,
+                        "overlap_conflicts": overlap_conflicts,
+                        "unexpected_legs": unexpected_legs,
+                        "unexpected_leg_count": len(unexpected_legs),
+                        "duplicate_visible_leg_count": duplicate_visible_leg_count,
+                        "cluster_notional_usd": cluster_notional,
+                        "cluster_unrealized_pnl_usd": cluster_pnl,
+                        "funding_to_next_usd": funding_to_next_usd,
+                        "minutes_to_event": minutes_to_event,
+                        "orphan_exchange": orphan_exchange,
+                        "orphan_position_side": orphan_position_side,
+                        "orphan_qty": orphan_qty,
+                        "stress_exchange": stress_exchange,
+                        "stress_status": stress_status,
+                        "stress_score": stress_score,
+                        "action_qty": action_qty,
+                        "action_mode": action_mode,
+                        "candidate_score": candidate_score,
+                        "residual_status": residual_status,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+
+                if status in {
+                    "suspected_orphan",
+                    "confirmed_orphan",
+                    "blocked_by_exchange_health",
+                    "blocked_by_cluster_conflict",
+                }:
+                    self._derisk_log_event(
+                        cluster_key,
+                        "cluster_status",
+                        {
+                            "symbol": symbol,
+                            "status": status,
+                            "reason": reason,
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                            "orphan_exchange": orphan_exchange,
+                            "orphan_position_side": orphan_position_side,
+                            "orphan_qty": orphan_qty,
+                            "cluster_conflict": cluster_conflict,
+                            "overlap_conflicts": overlap_conflicts,
+                            "unexpected_leg_count": len(unexpected_legs),
+                            "long_health": long_health.get("health"),
+                            "short_health": short_health.get("health"),
+                        },
+                        now_ts,
+                    )
+
+            orphan_targets.sort(
+                key=lambda item: (
+                    -float(item.get("orphan_qty") or 0.0),
+                    str(item.get("symbol") or ""),
+                )
+            )
+            for item in orphan_targets:
+                diagnostics.append(
+                    {
+                        **dict(item),
+                        "kind": "orphan_candidate",
+                        "status": "ranked",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+            candidates.sort(
+                key=lambda item: (
+                    {"panic": 0, "stress": 1, "ok": 2}.get(str(item.get("stress_status") or "ok"), 3),
+                    float(item.get("candidate_score")) if item.get("candidate_score") is not None else float("inf"),
+                )
+            )
+            for item in candidates:
+                diagnostics.append(
+                    {
+                        **dict(item),
+                        "kind": "candidate",
+                        "status": "ranked",
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+
+            if (
+                orphan_targets
+                and bool(settings.get("enabled"))
+                and not bool(settings.get("shadow_mode"))
+                and bool(settings.get("orphan_cleanup_enabled", True))
+            ):
+                top_orphan = orphan_targets[0]
+                running = self._auto_exit_running_exec()
+                if running:
+                    await self.manual_exec_stop(
+                        str(running.get("execution_id") or ""),
+                        force_finalize=True,
+                        reason="orphan_cleanup_priority",
+                    )
+                    self._derisk_log_event(
+                        str(top_orphan.get("key") or "global"),
+                        "preempt_requested",
+                        {
+                            "symbol": top_orphan.get("symbol"),
+                            "execution_id": running.get("execution_id"),
+                            "reason": "orphan_cleanup_priority",
+                            "orphan_exchange": top_orphan.get("orphan_exchange"),
+                            "orphan_qty": top_orphan.get("orphan_qty"),
+                        },
+                        now_ts,
+                    )
+                    cycle_action = {
+                        "type": "preempt_requested",
+                        "priority": "orphan",
+                        "reason": "orphan_cleanup_priority",
+                        "execution_id": running.get("execution_id"),
+                        "symbol": top_orphan.get("symbol"),
+                        "orphan_exchange": top_orphan.get("orphan_exchange"),
+                        "orphan_qty": top_orphan.get("orphan_qty"),
+                    }
+                else:
+                    top_state = dict(self._derisk_cluster_state.get(str(top_orphan.get("key") or "")) or {})
+                    last_action_ts = float(top_state.get("last_action_ts") or 0.0)
+                    cooldown_sec = int(settings.get("cooldown_sec", 120))
+                    if (now_ts - last_action_ts) >= cooldown_sec:
+                        top_state["last_action_ts"] = now_ts
+                        self._derisk_cluster_state[str(top_orphan.get("key") or "")] = top_state
+                        payload = {
+                            "symbol": top_orphan.get("symbol"),
+                            "qty": float(top_orphan.get("orphan_qty") or 0.0),
+                            "cleanup_exchange": top_orphan.get("orphan_exchange"),
+                            "cleanup_position_side": top_orphan.get("orphan_position_side"),
+                            "panic_cleanup_mode": True,
+                            "max_slippage_bps": 18.0,
+                            "async_run": True,
+                            "dry_run": False,
+                            "auto_exit_agent": False,
+                            "risk_emergency_agent": True,
+                            "margin_mode": "isolated",
+                        }
+                        result = await self.manual_orphan_cleanup(payload)
+                        self._derisk_event(
+                            "orphan_trigger",
+                            {
+                                "symbol": top_orphan.get("symbol"),
+                                "key": top_orphan.get("key"),
+                                "orphan_exchange": top_orphan.get("orphan_exchange"),
+                                "orphan_position_side": top_orphan.get("orphan_position_side"),
+                                "orphan_qty": top_orphan.get("orphan_qty"),
+                                "reason": top_orphan.get("reason"),
+                                "result": result,
+                            },
+                        )
+                        cycle_action = {
+                            "type": "orphan_trigger",
+                            "symbol": top_orphan.get("symbol"),
+                            "key": top_orphan.get("key"),
+                            "orphan_exchange": top_orphan.get("orphan_exchange"),
+                            "orphan_position_side": top_orphan.get("orphan_position_side"),
+                            "orphan_qty": top_orphan.get("orphan_qty"),
+                            "result": self._compact_derisk_result(result),
+                        }
+            elif candidates:
+                top = candidates[0]
+                should_execute = (
+                    bool(settings.get("enabled"))
+                    and not bool(settings.get("shadow_mode"))
+                    and str(top.get("stress_status") or "") in {"stress", "panic"}
+                    and top.get("action_qty")
+                    and top.get("candidate_score") is not None
+                )
+                if should_execute:
+                    running = self._auto_exit_running_exec()
+                    if running:
+                        await self.manual_exec_stop(
+                            str(running.get("execution_id") or ""),
+                            force_finalize=True,
+                            reason="emergency_derisk_priority",
+                        )
+                        self._derisk_log_event(
+                            str(top.get("key") or "global"),
+                            "preempt_requested",
+                            {
+                                "symbol": top.get("symbol"),
+                                "execution_id": running.get("execution_id"),
+                                "reason": "emergency_derisk_priority",
+                            },
+                            now_ts,
+                        )
+                        cycle_action = {
+                            "type": "preempt_requested",
+                            "priority": "stress",
+                            "reason": "emergency_derisk_priority",
+                            "execution_id": running.get("execution_id"),
+                            "symbol": top.get("symbol"),
+                            "stress_exchange": top.get("stress_exchange"),
+                            "stress_status": top.get("stress_status"),
+                            "action_qty": top.get("action_qty"),
+                        }
+                    else:
+                        top_state = dict(self._derisk_cluster_state.get(str(top.get("key") or "")) or {})
+                        last_action_ts = float(top_state.get("last_action_ts") or 0.0)
+                        cooldown_sec = int(settings.get("cooldown_sec", 120))
+                        if (now_ts - last_action_ts) >= cooldown_sec:
+                            top_state["last_action_ts"] = now_ts
+                            self._derisk_cluster_state[str(top.get("key") or "")] = top_state
+                            payload = {
+                                "symbol": top.get("symbol"),
+                                "qty": float(top.get("action_qty") or 0.0),
+                                "notional": None,
+                                "mode": "smart-exit",
+                                "max_slippage_bps": 12 if str(top.get("stress_status")) == "panic" else 8,
+                                "spread_min_pct": -100.0,
+                                "spread_max_pct": 100.0,
+                                "timeout_sec": 0,
+                                "max_runtime_sec": 90 if str(top.get("stress_status")) == "panic" else 180,
+                                "reprice_sec": 2,
+                                "chunk_qty": None,
+                                "chunk_notional": float(settings.get("max_single_action_notional_usd", 500.0)),
+                                "force_chunk_qty": False,
+                                "limit_offset_bps": 0.0,
+                                "limit_offset_ticks": 0,
+                                "use_orderbook_check": False,
+                                "fallback_to_market": (
+                                    str(top.get("stress_status")) == "panic"
+                                    and bool(settings.get("market_cleanup_only_in_emergency", True))
+                                ),
+                                "hedge_order_type": "limit",
+                                "hedge_limit_mode": "aggressive" if str(top.get("stress_status")) == "panic" else "passive",
+                                "hedge_favorable_bps": 1.0,
+                                "hedge_adverse_bps": 6.0 if str(top.get("stress_status")) == "panic" else 4.0,
+                                "hedge_reprice_min_sec": 3.0,
+                                "max_limit_deviation_bps": 25.0,
+                                "async_run": True,
+                                "dry_run": False,
+                                "auto_exit_agent": False,
+                                "risk_emergency_agent": True,
+                                "long_exchange": top.get("long_exchange"),
+                                "short_exchange": top.get("short_exchange"),
+                                "margin_mode": "isolated",
+                            }
+                            result = await self.manual_exit(payload)
+                            self._derisk_event(
+                                "trigger",
+                                {
+                                    "symbol": top.get("symbol"),
+                                    "key": top.get("key"),
+                                    "stress_exchange": top.get("stress_exchange"),
+                                    "stress_status": top.get("stress_status"),
+                                    "action_qty": top.get("action_qty"),
+                                    "candidate_score": top.get("candidate_score"),
+                                    "result": result,
+                                },
+                            )
+                            cycle_action = {
+                                "type": "trigger",
+                                "symbol": top.get("symbol"),
+                                "key": top.get("key"),
+                                "stress_exchange": top.get("stress_exchange"),
+                                "stress_status": top.get("stress_status"),
+                                "action_qty": top.get("action_qty"),
+                                "candidate_score": top.get("candidate_score"),
+                                "result": self._compact_derisk_result(result),
+                            }
+
+            self._derisk_diagnostics = diagnostics
+            self._evaluate_pending_derisk_outcomes(
+                now_ts=now_ts,
+                diagnostics=diagnostics,
+                balances=balances,
+            )
+            self._persist_derisk_cycle_history(
+                cycle_id=cycle_id,
+                settings=settings,
+                balances=balances,
+                exchange_stress=exchange_stress,
+                diagnostics=diagnostics,
+                cycle_action=cycle_action,
+                running_execution=self._auto_exit_running_exec(),
+            )
+            self._register_derisk_outcome_tracking(
+                cycle_id=cycle_id,
+                now_ts=now_ts,
+                cycle_action=cycle_action,
+                diagnostics=diagnostics,
+                balances=balances,
+            )
+        finally:
+            if self._derisk_active_cycle_id == cycle_id:
+                self._derisk_active_cycle_id = None
+            self._derisk_inflight = False
 
     def _auto_exit_has_running(self) -> bool:
         return self._auto_exit_running_exec() is not None
@@ -9372,6 +13005,128 @@ class DataService:
                     "action": run.get("action"),
                 }
         return None
+
+    async def _cleanup_completed_auto_exit_spread_rules(self) -> None:
+        for exec_id, run in list(self._manual_runs.items()):
+            if exec_id in self._auto_exit_completed_run_cleanup:
+                continue
+            if run.get("action") != "exit" or not bool(run.get("auto_exit_agent")):
+                continue
+            status = str(run.get("status") or "")
+            if status == "running":
+                continue
+            self._auto_exit_completed_run_cleanup.add(exec_id)
+            if status != "completed":
+                continue
+            symbol = normalize_symbol(str(run.get("payload_symbol") or ""))
+            if not symbol:
+                continue
+            result = run.get("result")
+            if isinstance(result, Mapping) and result.get("errors"):
+                continue
+            result_remaining_qty = (
+                _safe_float(result.get("remaining_qty"))
+                if isinstance(result, Mapping)
+                else None
+            )
+            requested_qty = _safe_float(run.get("auto_exit_hedged_qty"))
+            exit_percent = _safe_float(run.get("auto_exit_exit_percent"))
+            if requested_qty is not None and exit_percent is not None:
+                requested_qty = requested_qty * min(100.0, max(0.0, exit_percent)) / 100.0
+            completion_tolerance = max(
+                1e-9,
+                (float(requested_qty) * 1e-6) if requested_qty is not None else 1e-9,
+            )
+            one_shot_fulfilled = (
+                result_remaining_qty is not None
+                and float(result_remaining_qty) <= completion_tolerance
+            )
+            rule_key = str(run.get("auto_exit_rule_key") or "")
+            run_generation = max(0, int(run.get("auto_exit_rule_generation") or 0))
+            if not rule_key:
+                self._auto_exit_event(
+                    "rule_preserved_after_exit",
+                    {
+                        "symbol": symbol,
+                        "execution_id": exec_id,
+                        "reason": "run_rule_identity_missing",
+                    },
+                )
+                continue
+
+            positions = self._accounts.snapshot().get("positions") or []
+            market_lookup, market_ts_lookup = self._positions_market_snapshot_lookup()
+            _, grouped = self._positions_by_symbol(
+                positions,
+                return_grouped=True,
+                market_lookup=market_lookup,
+                market_ts_lookup=market_ts_lookup,
+            )
+            residual_legs = grouped.get(symbol) or []
+            now_iso = datetime.now(timezone.utc).isoformat()
+            event_payload: dict[str, Any] = {
+                "symbol": symbol,
+                "execution_id": exec_id,
+                "rule_key": rule_key,
+                "run_generation": run_generation,
+                "residual_leg_count": len(residual_legs),
+                "remaining_qty": result_remaining_qty,
+                "one_shot_fulfilled": one_shot_fulfilled,
+            }
+            async with self._auto_exit_lock:
+                stored_rules = self._auto_exit.get("rules", {})
+                stored = stored_rules.get(rule_key) if isinstance(stored_rules, dict) else None
+                if not isinstance(stored, dict):
+                    event_payload["reason"] = "rule_missing"
+                else:
+                    current_generation = max(1, int(stored.get("rule_generation") or 1))
+                    event_payload["current_generation"] = current_generation
+                    if run_generation and current_generation != run_generation:
+                        event_payload["reason"] = "rule_changed_after_run_started"
+                    elif residual_legs:
+                        current_signature = _auto_exit_position_signature(
+                            symbol,
+                            residual_legs,
+                            rule_long_exchange=str(stored.get("long_exchange") or ""),
+                            rule_short_exchange=str(stored.get("short_exchange") or ""),
+                            selected_pair=_auto_exit_select_pair_from_legs(residual_legs),
+                        )
+                        if current_signature:
+                            stored["position_signature"] = current_signature
+                            stored["bound_at"] = now_iso
+                            stored["signature_status"] = "rebound_after_partial_auto_exit"
+                            event_payload["reason"] = "residual_pair_rebound"
+                        else:
+                            stored["signature_status"] = "residual_position_after_auto_exit"
+                            event_payload["reason"] = "residual_position_preserved"
+                        stored["missing_since_ts"] = 0.0
+                        stored["updated_at"] = now_iso
+                        if bool(stored.get("exit_once", True)) and one_shot_fulfilled:
+                            stored["enabled"] = False
+                            stored["v1_enabled"] = False
+                            stored["signature_status"] = "one_shot_completed"
+                            event_payload["reason"] = "one_shot_completed_residual_pair"
+                        elif result_remaining_qty is not None and result_remaining_qty > completion_tolerance:
+                            event_payload["reason"] = "partial_exit_remaining"
+                        self._auto_exit_store.save(self._auto_exit)
+                    else:
+                        if bool(stored.get("exit_once", True)) and one_shot_fulfilled:
+                            stored["enabled"] = False
+                            stored["v1_enabled"] = False
+                            stored["signature_status"] = "one_shot_completed"
+                            event_payload["reason"] = "one_shot_completed_no_position"
+                        else:
+                            stored["signature_status"] = "awaiting_position_restore_after_auto_exit"
+                            event_payload["reason"] = (
+                                "partial_exit_remaining"
+                                if result_remaining_qty is not None
+                                and result_remaining_qty > completion_tolerance
+                                else "no_position_rule_preserved"
+                            )
+                        stored["missing_since_ts"] = time.time()
+                        stored["updated_at"] = now_iso
+                        self._auto_exit_store.save(self._auto_exit)
+            self._auto_exit_event("rule_preserved_after_exit", event_payload)
 
     async def _auto_exit_scheduler(self) -> None:
         while True:
@@ -9388,11 +13143,10 @@ class DataService:
             return
         self._auto_exit_inflight = True
         try:
+            await self._cleanup_completed_auto_exit_spread_rules()
             async with self._auto_exit_lock:
                 config = json.loads(json.dumps(self._auto_exit))
             positions = self._accounts.snapshot().get("positions") or []
-            if not positions:
-                return
             market_lookup, market_ts_lookup = self._positions_market_snapshot_lookup()
             _, grouped = self._positions_by_symbol(
                 positions,
@@ -9406,6 +13160,12 @@ class DataService:
             cooldown_sec = int(defaults.get("cooldown_sec", AUTO_EXIT_DEFAULTS["cooldown_sec"]))
             require_live = bool(defaults.get("require_live", AUTO_EXIT_DEFAULTS["require_live"]))
             auto_clear_sec = int(defaults.get("auto_clear_no_position_sec", AUTO_EXIT_DEFAULTS["auto_clear_no_position_sec"]))
+            restore_spread_on_missing = bool(
+                defaults.get(
+                    "restore_spread_on_missing",
+                    AUTO_EXIT_DEFAULTS["restore_spread_on_missing"],
+                )
+            )
             now_ts = time.time()
 
             live_spreads: dict[str, float] = {}
@@ -9566,6 +13326,8 @@ class DataService:
                         "short_legs": int((selected_pair or {}).get("short_legs") or 0),
                         "status": status,
                         "reason": reason,
+                        "signature_status": rule_state.get("signature_status"),
+                        "bound_at": rule_state.get("bound_at"),
                         "target_spread_pct": float(target_pct) if target_pct is not None else None,
                         "gross_spread_pct": float(trigger_spread) if trigger_spread is not None else None,
                         "overall_spread_pct": float(overall_spread) if overall_spread is not None else None,
@@ -9628,6 +13390,8 @@ class DataService:
                         "selection_mode": str((selected_pair or {}).get("mode") or ""),
                         "status": status,
                         "reason": reason or decision_payload.get("reason"),
+                        "signature_status": rule_state.get("signature_status"),
+                        "bound_at": rule_state.get("bound_at"),
                         "decision": decision_payload.get("decision"),
                         "effective_interval_minutes": _safe_float(context_payload.get("effective_interval_minutes")),
                         "minutes_to_event": _safe_float(context_payload.get("minutes_to_event")),
@@ -9703,7 +13467,7 @@ class DataService:
                 pair_metrics: Mapping[str, Any] | None = None,
             ) -> bool:
                 missing_since = float(rule_state.get("missing_since_ts") or 0.0)
-                persist_on_missing = bool(rule_state.get("persist_on_missing", True))
+                persist_on_missing = bool(rule_state.get("persist_on_missing", True)) and restore_spread_on_missing
                 if missing_since <= 0:
                     missing_since = now_ts
                     merge_rule_updates(rule_key, {"missing_since_ts": missing_since})
@@ -9891,8 +13655,12 @@ class DataService:
                         selected_pair=selected,
                     )
                     continue
-                qty = float(selected.get("qty") or 0.0)
-                if qty <= 0:
+                hedged_qty = float(selected.get("qty") or 0.0)
+                exit_percent = _safe_float(rule.get("exit_percent")) or 100.0
+                if exit_percent <= 0 or exit_percent > 100:
+                    exit_percent = 100.0
+                qty = hedged_qty * float(exit_percent) / 100.0
+                if hedged_qty <= 0 or qty <= 0:
                     mark_missing(
                         key,
                         rule,
@@ -9902,6 +13670,8 @@ class DataService:
                             "long_exchange": selected_long_exchange,
                             "short_exchange": selected_short_exchange,
                             "reason": "zero_qty",
+                            "hedged_qty": hedged_qty,
+                            "exit_percent": exit_percent,
                         },
                         spread_enabled=spread_rule_enabled and not spread_on_cooldown,
                         v1_enabled=v1_monitor_enabled and (not v1_rule_enabled or not v1_on_cooldown),
@@ -9909,6 +13679,59 @@ class DataService:
                     )
                     continue
                 clear_missing(key, rule)
+                current_signature = _auto_exit_position_signature(
+                    symbol_key,
+                    legs,
+                    rule_long_exchange=long_exchange,
+                    rule_short_exchange=short_exchange,
+                    selected_pair=selected,
+                )
+                signature_ok, signature_reason = _auto_exit_signature_match(
+                    rule.get("position_signature"),
+                    current_signature,
+                )
+                if not signature_ok:
+                    merge_rule_updates(
+                        key,
+                        {
+                            "signature_status": signature_reason,
+                            "missing_since_ts": 0.0,
+                        },
+                    )
+                    self._auto_exit_log_event(
+                        key,
+                        "skip",
+                        {
+                            "symbol": symbol,
+                            "long_exchange": selected_long_exchange,
+                            "short_exchange": selected_short_exchange,
+                            "rule_long_exchange": long_exchange,
+                            "rule_short_exchange": short_exchange,
+                            "reason": signature_reason,
+                            "trigger_mode": "signature_guard",
+                        },
+                        now_ts,
+                    )
+                    if spread_rule_enabled and not spread_on_cooldown:
+                        append_diagnostic(
+                            key,
+                            {**dict(rule), "signature_status": signature_reason},
+                            status="skip",
+                            reason=signature_reason,
+                            selected_pair=selected,
+                        )
+                    if v1_monitor_enabled and (not v1_rule_enabled or not v1_on_cooldown):
+                        append_v1_diagnostic(
+                            key,
+                            {**dict(rule), "signature_status": signature_reason},
+                            status="skip",
+                            reason=signature_reason,
+                            selected_pair=selected,
+                            pending_exit_cycles=int(rule.get("v1_pending_exit_cycles") or 0),
+                        )
+                    continue
+                if str(rule.get("signature_status") or "") != "position_signature_match":
+                    merge_rule_updates(key, {"signature_status": "position_signature_match"})
                 pair_exit_metrics = await resolve_pair_exit_metrics(
                     symbol_key,
                     selected_long_exchange,
@@ -9923,14 +13746,20 @@ class DataService:
                 edge_buffer_bps = _safe_float((pair_exit_metrics or {}).get("edge_buffer_bps")) or 0.0
                 fee_bps = _safe_float((pair_exit_metrics or {}).get("fee_bps")) or 0.0
                 edge_buffer_pct = _safe_float((pair_exit_metrics or {}).get("edge_buffer_pct")) or 0.0
-                required_net_spread_pct = (
-                    float(target) + edge_buffer_pct if target is not None else None
-                )
                 overall_spread = None
-                trigger_spread = selected_pair_spread
-                spread_scope = "pair_executable"
                 if rule_is_multileg:
                     overall_spread = await resolve_overall_spread(symbol_key, legs)
+                spread_trigger = _auto_exit_spread_trigger_status(
+                    is_multileg=rule_is_multileg,
+                    target_pct=float(target) if target is not None else 0.0,
+                    overall_spread_pct=overall_spread,
+                    pair_spread_pct=selected_pair_spread,
+                    pair_net_spread_pct=selected_pair_net_spread,
+                    edge_buffer_pct=edge_buffer_pct,
+                )
+                trigger_spread = _safe_float(spread_trigger.get("trigger_spread_pct"))
+                required_net_spread_pct = _safe_float(spread_trigger.get("required_spread_pct"))
+                spread_scope = str(spread_trigger.get("scope") or "pair_executable")
                 position_context: dict[str, Any] | None = None
                 funding_to_next_bps = None
                 close_now_bps = None
@@ -9972,7 +13801,7 @@ class DataService:
                     )
                 standard_triggered = False
                 if spread_rule_enabled and not spread_on_cooldown:
-                    if trigger_spread is None and require_live:
+                    if not bool(spread_trigger.get("live_ready")) and require_live:
                         self._auto_exit_log_event(
                             key,
                             "skip",
@@ -10021,7 +13850,7 @@ class DataService:
                             target_pct=float(target),
                             required_net_spread_pct=required_net_spread_pct,
                         )
-                    elif selected_pair_net_spread is None or selected_pair_net_spread < required_net_spread_pct:
+                    elif not bool(spread_trigger.get("target_reached")):
                         self._auto_exit_log_event(
                             key,
                             "wait",
@@ -10098,6 +13927,8 @@ class DataService:
                                     "target_pct": float(target),
                                     "pair_exit_target_pct": float(payload_spread_min),
                                     "qty": qty,
+                                    "hedged_qty": hedged_qty,
+                                    "exit_percent": exit_percent,
                                     "trigger_mode": "spread",
                                 },
                             )
@@ -10141,6 +13972,14 @@ class DataService:
                                 "async_run": True,
                                 "dry_run": False,
                                 "auto_exit_agent": True,
+                                "auto_exit_rule_key": key,
+                                "auto_exit_rule_generation": max(
+                                    1,
+                                    int(rule.get("rule_generation") or 1),
+                                ),
+                                "auto_exit_trigger_mode": "spread",
+                                "auto_exit_exit_percent": float(exit_percent),
+                                "auto_exit_hedged_qty": float(hedged_qty),
                                 "auto_exit_dynamic_chunk": True,
                                 "auto_exit_market_cleanup_notional_max": _safe_float(
                                     pair_policy.get("market_cleanup_notional_cap_usd")
@@ -10304,6 +14143,8 @@ class DataService:
                             "chunk_qty": pair_chunk_qty,
                             "chunk_notional_usd": pair_chunk_notional,
                             "qty": qty,
+                            "hedged_qty": hedged_qty,
+                            "exit_percent": exit_percent,
                             "trigger_mode": "v1",
                             "v1_reason": trigger_reason,
                             "v1_wait_score_bps": _safe_float(v1_decision.get("wait_score_bps")),
@@ -10355,6 +14196,14 @@ class DataService:
                         "async_run": True,
                         "dry_run": False,
                         "auto_exit_agent": True,
+                        "auto_exit_rule_key": key,
+                        "auto_exit_rule_generation": max(
+                            1,
+                            int(rule.get("rule_generation") or 1),
+                        ),
+                        "auto_exit_trigger_mode": "v1",
+                        "auto_exit_exit_percent": float(exit_percent),
+                        "auto_exit_hedged_qty": float(hedged_qty),
                         "auto_exit_dynamic_chunk": True,
                         "auto_exit_market_cleanup_notional_max": _safe_float(
                             pair_policy.get("market_cleanup_notional_cap_usd")
@@ -10463,6 +14312,10 @@ class DataService:
         self._auto_exit_events.append(entry)
         if len(self._auto_exit_events) > self._auto_exit_event_limit:
             self._auto_exit_events = self._auto_exit_events[-self._auto_exit_event_limit :]
+        try:
+            self._auto_exit_history_store.append(entry)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("failed to append auto-exit history: %s", exc)
 
     def _auto_exit_log_event(
         self,

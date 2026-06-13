@@ -34,3 +34,23 @@ class JsonStateStore:
         with self._lock:
             tmp_path.write_text(payload, encoding="utf-8")
             tmp_path.replace(self._path)
+
+
+class JsonlEventStore:
+    """Append-only JSONL persistence helper."""
+
+    def __init__(self, path: Path | str) -> None:
+        self._path = Path(path)
+        self._lock = threading.Lock()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def append(self, data: Any) -> None:
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        with self._lock:
+            with self._path.open("a", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.write("\n")

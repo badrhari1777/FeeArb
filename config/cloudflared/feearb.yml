@@ -1,0 +1,8 @@
+tunnel: b848b4d9-bb7c-47ff-858b-ef025d2d469f
+credentials-file: C:\Windows\System32\config\systemprofile\.cloudflared\b848b4d9-bb7c-47ff-858b-ef025d2d469f.json
+protocol: http2
+
+ingress:
+  - hostname: app.feearb.ru
+    service: http://127.0.0.1:8000
+  - service: http_status:404

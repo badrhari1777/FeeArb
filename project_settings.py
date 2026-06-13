@@ -111,8 +111,8 @@ class AppSettings:
             "auto_take_enabled": True,
             "send_margin_alerts": True,
             "send_missing_stop_alerts": True,
-            "notification_primary_channel": "telegram",
-            "notification_fallback_channel": "none",
+            "notification_primary_channel": "ntfy",
+            "notification_fallback_channel": "telegram",
             "auto_margin_enabled": True,
             "auto_margin_reduce_enabled": True,
             "enforce_isolated_margin": True,
@@ -142,6 +142,24 @@ class AppSettings:
             "margin_reduce_pct": 0.10,
             "margin_adjust_cooldown_sec": 300,
             "position_check_interval_sec": 60,
+            "auto_derisk_enabled": False,
+            "auto_derisk_shadow_mode": True,
+            "orphan_cleanup_enabled": True,
+            "derisk_poll_sec": 5,
+            "derisk_target_buffer_pct": 0.30,
+            "derisk_warning_buffer_pct": 0.20,
+            "derisk_panic_buffer_pct": 0.15,
+            "derisk_recovery_buffer_pct": 0.35,
+            "derisk_min_free_balance_abs": 500.0,
+            "derisk_stale_positions_max_sec": 180,
+            "derisk_failure_block_count": 2,
+            "derisk_confirm_cycles": 2,
+            "derisk_cooldown_sec": 120,
+            "derisk_velocity_trigger_bps": 120.0,
+            "derisk_qty_tolerance_pct": 0.10,
+            "derisk_max_single_action_notional_usd": 500.0,
+            "derisk_market_cleanup_only_in_emergency": True,
+            "derisk_dust_notional_usd": 10.0,
         }
     )
     manual: Dict[str, object] = field(
@@ -275,8 +293,8 @@ class AppSettings:
             "auto_take_enabled": True,
             "send_margin_alerts": True,
             "send_missing_stop_alerts": True,
-            "notification_primary_channel": "telegram",
-            "notification_fallback_channel": "none",
+            "notification_primary_channel": "ntfy",
+            "notification_fallback_channel": "telegram",
             "auto_margin_enabled": True,
             "auto_margin_reduce_enabled": True,
             "enforce_isolated_margin": True,
@@ -306,6 +324,24 @@ class AppSettings:
             "margin_reduce_pct": 0.10,
             "margin_adjust_cooldown_sec": 300,
             "position_check_interval_sec": 60,
+            "auto_derisk_enabled": False,
+            "auto_derisk_shadow_mode": True,
+            "orphan_cleanup_enabled": True,
+            "derisk_poll_sec": 5,
+            "derisk_target_buffer_pct": 0.30,
+            "derisk_warning_buffer_pct": 0.20,
+            "derisk_panic_buffer_pct": 0.15,
+            "derisk_recovery_buffer_pct": 0.35,
+            "derisk_min_free_balance_abs": 500.0,
+            "derisk_stale_positions_max_sec": 180,
+            "derisk_failure_block_count": 2,
+            "derisk_confirm_cycles": 2,
+            "derisk_cooldown_sec": 120,
+            "derisk_velocity_trigger_bps": 120.0,
+            "derisk_qty_tolerance_pct": 0.10,
+            "derisk_max_single_action_notional_usd": 500.0,
+            "derisk_market_cleanup_only_in_emergency": True,
+            "derisk_dust_notional_usd": 10.0,
         }
         merged = dict(defaults)
         if isinstance(self.protective, dict):
@@ -415,12 +451,24 @@ class AppSettings:
                 raise ValueError("stop_requote_threshold_pct must be >= 0.")
             if float(protective.get("target_leverage", 3.0) or 0.0) <= 0:
                 raise ValueError("target_leverage must be > 0.")
+            if float(protective.get("derisk_target_buffer_pct", 0.30) or 0.0) < 0:
+                raise ValueError("derisk_target_buffer_pct must be >= 0.")
+            if float(protective.get("derisk_warning_buffer_pct", 0.20) or 0.0) < 0:
+                raise ValueError("derisk_warning_buffer_pct must be >= 0.")
+            if float(protective.get("derisk_panic_buffer_pct", 0.15) or 0.0) < 0:
+                raise ValueError("derisk_panic_buffer_pct must be >= 0.")
+            if float(protective.get("derisk_recovery_buffer_pct", 0.35) or 0.0) < 0:
+                raise ValueError("derisk_recovery_buffer_pct must be >= 0.")
+            if int(protective.get("derisk_confirm_cycles", 2) or 0) < 1:
+                raise ValueError("derisk_confirm_cycles must be >= 1.")
+            if int(protective.get("derisk_failure_block_count", 2) or 0) < 1:
+                raise ValueError("derisk_failure_block_count must be >= 1.")
             primary_channel = str(protective.get("notification_primary_channel", "telegram") or "").strip().lower()
-            if primary_channel not in {"telegram", "pushbullet"}:
-                raise ValueError("notification_primary_channel must be telegram or pushbullet.")
+            if primary_channel not in {"telegram", "pushbullet", "ntfy"}:
+                raise ValueError("notification_primary_channel must be telegram, pushbullet, or ntfy.")
             fallback_channel = str(protective.get("notification_fallback_channel", "none") or "").strip().lower()
-            if fallback_channel not in {"none", "telegram", "pushbullet"}:
-                raise ValueError("notification_fallback_channel must be none, telegram, or pushbullet.")
+            if fallback_channel not in {"none", "telegram", "pushbullet", "ntfy"}:
+                raise ValueError("notification_fallback_channel must be none, telegram, pushbullet, or ntfy.")
         except Exception as exc:
             raise ValueError(f"Invalid protective settings: {exc}") from exc
         try:

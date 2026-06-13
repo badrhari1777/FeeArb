@@ -13,6 +13,7 @@ from webapp.services import (
     _auto_exit_v1_window,
     _auto_exit_overall_spread_from_legs,
     _auto_exit_select_pair_from_legs,
+    _auto_exit_spread_trigger_status,
     _is_auto_exit_multileg_rule,
 )
 
@@ -128,6 +129,54 @@ class AutoExitMultilegSelectTestCase(unittest.TestCase):
         self.assertIsNotNone(spread)
         assert spread is not None
         self.assertAlmostEqual(spread, 2.0, places=6)
+
+    def test_multileg_trigger_uses_overall_basket_not_selected_pair(self) -> None:
+        status = _auto_exit_spread_trigger_status(
+            is_multileg=True,
+            target_pct=-3.5,
+            overall_spread_pct=-4.504368604168459,
+            pair_spread_pct=-0.5248427315778031,
+            pair_net_spread_pct=-0.6748427315778032,
+            edge_buffer_pct=0.08,
+        )
+        self.assertEqual(status["scope"], "overall_basket")
+        self.assertAlmostEqual(float(status["trigger_spread_pct"]), -4.504368604168459)
+        self.assertAlmostEqual(float(status["required_spread_pct"]), -3.5)
+        self.assertTrue(status["live_ready"])
+        self.assertFalse(status["target_reached"])
+
+    def test_multileg_trigger_requires_live_selected_pair_books(self) -> None:
+        status = _auto_exit_spread_trigger_status(
+            is_multileg=True,
+            target_pct=-3.5,
+            overall_spread_pct=-3.4,
+            pair_spread_pct=None,
+            pair_net_spread_pct=None,
+            edge_buffer_pct=0.08,
+        )
+        self.assertFalse(status["live_ready"])
+        self.assertFalse(status["target_reached"])
+
+    def test_single_pair_trigger_still_uses_net_spread_and_buffer(self) -> None:
+        waiting = _auto_exit_spread_trigger_status(
+            is_multileg=False,
+            target_pct=0.4,
+            overall_spread_pct=None,
+            pair_spread_pct=0.55,
+            pair_net_spread_pct=0.47,
+            edge_buffer_pct=0.08,
+        )
+        ready = _auto_exit_spread_trigger_status(
+            is_multileg=False,
+            target_pct=0.4,
+            overall_spread_pct=None,
+            pair_spread_pct=0.57,
+            pair_net_spread_pct=0.49,
+            edge_buffer_pct=0.08,
+        )
+        self.assertFalse(waiting["target_reached"])
+        self.assertTrue(ready["target_reached"])
+        self.assertAlmostEqual(float(ready["required_spread_pct"]), 0.48)
 
     def test_pair_policy_uses_worst_tier(self) -> None:
         policy = _auto_exit_policy_for_pair("binance", "okx")

@@ -4,6 +4,7 @@ import android.content.Context
 
 private const val PREFS_NAME = "feearb_mobile_prefs"
 private const val KEY_BASE_URL = "base_url"
+private const val KEY_REMOTE_ACCESS_TOKEN = "remote_access_token"
 private const val KEY_ADV_MAX_SLIPPAGE = "adv_max_slippage"
 private const val KEY_ADV_TIMEOUT = "adv_timeout"
 private const val KEY_ADV_RUNTIME = "adv_runtime"
@@ -30,6 +31,12 @@ class SettingsStore(context: Context) {
 
     fun saveBaseUrl(value: String) {
         prefs.edit().putString(KEY_BASE_URL, value).apply()
+    }
+
+    fun loadRemoteAccessToken(): String = prefs.getString(KEY_REMOTE_ACCESS_TOKEN, "").orEmpty()
+
+    fun saveRemoteAccessToken(value: String) {
+        prefs.edit().putString(KEY_REMOTE_ACCESS_TOKEN, value).apply()
     }
 
     fun loadAdvancedSettings(defaults: ManualDefaultsDto?): AdvancedSettingsUiState {

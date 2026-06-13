@@ -15,7 +15,11 @@ from pydantic import BaseModel, Field
 from project_settings import MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS, SettingsManager
 from utils import setup_logging
 
-from .services import DataService
+from .services import (
+    DataService,
+    FUNDING_HISTORY_DEFAULT_EXCHANGES,
+    FUNDING_HISTORY_WINDOWS_HOURS,
+)
 from .manual_stream import ManualSpreadStream
 from .manual_trade_stream import ManualTradeStream
 from .ws_trade_raw import WsTradeRawStream
@@ -27,11 +31,16 @@ from .ws_trade_bitget_trade_raw import WsTradeBitgetTradeRawStream
 from .ws_trade_bingx_raw import WsTradeBingxRawStream
 from .ws_trade_gate_raw import WsTradeGateRawStream
 from .ws_trade_kucoin_raw import WsTradeKucoinRawStream
+from .remote_access import (
+    has_valid_remote_token,
+    is_cloudflare_request,
+    is_public_proxy_request,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-04-22-01"
+STATIC_VERSION = "v2026-06-11-01"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -40,6 +49,17 @@ templates = Jinja2Templates(directory=BASE_DIR / "templates")
 settings_manager = SettingsManager()
 service = DataService(settings_manager=settings_manager)
 logger = logging.getLogger(__name__)
+
+
+@app.middleware("http")
+async def require_cloudflare_remote_token(request: Request, call_next):
+    is_remote = is_cloudflare_request(request.headers) or is_public_proxy_request(request.headers)
+    if is_remote and not has_valid_remote_token(request.headers):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Missing or invalid FeeArb remote access token."},
+        )
+    return await call_next(request)
 
 class SettingsPayload(BaseModel):
     sources: Dict[str, bool]
@@ -123,6 +143,48 @@ class ManualAnalyzePayload(ManualBasePayload):
     action: str = "enter"
 
 
+class MobileManualSpreadPayload(BaseModel):
+    symbol: str
+    action: str = "enter"
+    long_exchange: Optional[str] = None
+    short_exchange: Optional[str] = None
+    from_exchange: Optional[str] = None
+    to_exchange: Optional[str] = None
+    side: Optional[str] = "long"
+
+
+class PositionActionPayload(BaseModel):
+    symbol: str
+    long_exchange: str
+    short_exchange: str
+    action: str
+    percent: float = Field(default=100.0, gt=0, le=100)
+    dry_run: bool = True
+    async_run: bool = True
+
+
+class AutoArbRulePayload(BaseModel):
+    id: Optional[str] = None
+    symbol: str
+    long_exchange: str
+    short_exchange: str
+    budget_mode: str = "qty"
+    max_qty: Optional[float] = Field(default=None, gt=0)
+    max_notional: Optional[float] = Field(default=None, gt=0)
+    range_start_pct: float
+    range_end_pct: float
+    level_count: Optional[int] = Field(default=None, ge=2, le=20)
+    exit_gap_pct: Optional[float] = Field(default=None, gt=0)
+    max_slippage_bps: float = Field(default=8.0, ge=0)
+    liquidity_safety_factor: float = Field(default=0.70, gt=0, le=1)
+    confirm_samples: int = Field(default=2, ge=1, le=10)
+    enabled: bool = True
+
+
+class AutoArbLivePayload(BaseModel):
+    confirmation: str
+
+
 class ManualTestPayload(BaseModel):
     exchange: str
     symbol: str
@@ -177,10 +239,24 @@ class ManualTestCoinAnalysisPayload(BaseModel):
     include_series: bool = False
 
 
+class FundingHistoryAnalyzePayload(BaseModel):
+    symbol: str
+    exchanges: Optional[list[str]] = None
+    windows_hours: Optional[list[int]] = None
+    funding_points: Optional[int] = Field(default=200, ge=24, le=200)
+
+
+class NotificationTestPayload(BaseModel):
+    title: Optional[str] = "FeeArb test notification"
+    message: Optional[str] = "FeeArb notification test from backend."
+
+
 class AutoExitDefaultsPayload(BaseModel):
     max_runtime_sec: Optional[int] = None
     cooldown_sec: Optional[int] = None
     require_live: Optional[bool] = None
+    auto_clear_no_position_sec: Optional[int] = None
+    restore_spread_on_missing: Optional[bool] = None
 
 
 class AutoExitRulePayload(BaseModel):
@@ -191,6 +267,25 @@ class AutoExitRulePayload(BaseModel):
     spread_enabled: Optional[bool] = None
     v1_enabled: Optional[bool] = None
     target_spread_pct: Optional[float] = None
+    exit_percent: Optional[float] = Field(default=None, gt=0, le=100)
+    exit_once: Optional[bool] = None
+
+
+class AutoExitClearSpreadPayload(BaseModel):
+    symbol: Optional[str] = None
+    clear_v1: Optional[bool] = False
+
+
+class HedgeClusterRulePayload(BaseModel):
+    symbol: str
+    kind: Optional[str] = "hedged_pair"
+    long_exchange: Optional[str] = None
+    short_exchange: Optional[str] = None
+    exchange: Optional[str] = None
+    side: Optional[str] = None
+    enabled: Optional[bool] = True
+    qty_tolerance_pct: Optional[float] = None
+    rehedge_allowed: Optional[bool] = None
 
 
 class CoinPaperEnterPayload(BaseModel):
@@ -270,6 +365,30 @@ async def coin_analysis_page(
         },
     )
 
+@app.get("/funding-history", response_class=HTMLResponse)
+async def funding_history_page(
+    request: Request,
+    symbol: str = "BTCUSDT",
+) -> HTMLResponse:
+    initial = {
+        "symbol": symbol,
+        "supported_exchanges": list(settings_manager.as_dict().get("analysis_exchanges", {}).keys()),
+        "default_exchanges": list(FUNDING_HISTORY_DEFAULT_EXCHANGES),
+        "windows": [
+            {"hours": int(hours), "label": "1d" if int(hours) == 24 else "3d" if int(hours) == 72 else f"{int(hours)}h"}
+            for hours in FUNDING_HISTORY_WINDOWS_HOURS
+        ],
+    }
+    return templates.TemplateResponse(
+        "funding_history.html",
+        {
+            "request": request,
+            "symbol": symbol,
+            "initial": initial,
+            "static_version": STATIC_VERSION,
+        },
+    )
+
 @app.get("/manual", response_class=HTMLResponse)
 async def manual_page(request: Request) -> HTMLResponse:
     settings = settings_manager.as_dict()
@@ -278,6 +397,27 @@ async def manual_page(request: Request) -> HTMLResponse:
         {
             "request": request,
             "settings": settings,
+            "static_version": STATIC_VERSION,
+        },
+    )
+
+
+@app.get("/auto-arbitrage", response_class=HTMLResponse)
+async def auto_arbitrage_page(request: Request) -> HTMLResponse:
+    settings = settings_manager.as_dict()
+    exchanges = [
+        name
+        for name, enabled in (settings.get("analysis_exchanges") or {}).items()
+        if enabled
+    ]
+    return templates.TemplateResponse(
+        "auto_arbitrage.html",
+        {
+            "request": request,
+            "initial": {
+                "exchanges": exchanges,
+                "rules": service.auto_arb_payload().get("rules", []),
+            },
             "static_version": STATIC_VERSION,
         },
     )
@@ -328,6 +468,29 @@ async def snapshot_api() -> JSONResponse:
 async def coin_sessions_api() -> JSONResponse:
     sessions = await service.list_active_coin_symbol_sessions()
     return JSONResponse({"sessions": sessions})
+
+
+@app.post("/api/funding-history/analyze")
+async def funding_history_analyze_api(payload: FundingHistoryAnalyzePayload) -> JSONResponse:
+    try:
+        result = await service.analyze_funding_history(
+            payload.symbol,
+            exchanges=payload.exchanges,
+            windows_hours=payload.windows_hours,
+            funding_points=payload.funding_points or 200,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/notifications/test")
+async def notification_test_api(payload: NotificationTestPayload) -> JSONResponse:
+    status = await service.send_test_notification(
+        message=payload.message or "FeeArb notification test from backend.",
+        title=payload.title or "FeeArb test notification",
+    )
+    return JSONResponse(jsonable_encoder(status))
 
 
 @app.post("/api/coin/sessions/start")
@@ -803,9 +966,104 @@ async def mobile_manual_defaults() -> JSONResponse:
     return JSONResponse(jsonable_encoder(service.mobile_manual_defaults_payload()))
 
 
+@app.post("/api/mobile/manual-spread")
+async def mobile_manual_spread(payload: MobileManualSpreadPayload) -> JSONResponse:
+    return JSONResponse(jsonable_encoder(await service.mobile_manual_spread(payload.dict(exclude_none=True))))
+
+
+@app.post("/api/position/action")
+async def position_action(payload: PositionActionPayload) -> JSONResponse:
+    try:
+        result = await service.position_action(payload.dict())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception("position action failed: %s", exc)
+        result = {"errors": [str(exc)]}
+    return JSONResponse(jsonable_encoder(result))
+
+
 @app.get("/api/auto-exit")
 async def get_auto_exit() -> JSONResponse:
     return JSONResponse(service.auto_exit_payload())
+
+
+@app.get("/api/auto-arb")
+async def get_auto_arb() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(service.auto_arb_payload()))
+
+
+@app.post("/api/auto-arb/analyze")
+async def auto_arb_analyze(payload: AutoArbRulePayload) -> JSONResponse:
+    try:
+        result = await service.analyze_auto_arb(payload.dict(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/auto-arb/rules")
+async def auto_arb_upsert(payload: AutoArbRulePayload) -> JSONResponse:
+    try:
+        result = await service.upsert_auto_arb_rule(payload.dict(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/auto-arb/rules/{rule_id}/pause")
+async def auto_arb_pause(rule_id: str) -> JSONResponse:
+    try:
+        result = await service.set_auto_arb_rule_enabled(rule_id, False)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/auto-arb/rules/{rule_id}/resume")
+async def auto_arb_resume(rule_id: str) -> JSONResponse:
+    try:
+        result = await service.set_auto_arb_rule_enabled(rule_id, True)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/auto-arb/rules/{rule_id}/arm-live")
+async def auto_arb_arm_live(rule_id: str, payload: AutoArbLivePayload) -> JSONResponse:
+    try:
+        result = await service.arm_auto_arb_live(rule_id, payload.confirmation)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/auto-arb/rules/{rule_id}/shadow")
+async def auto_arb_shadow(rule_id: str) -> JSONResponse:
+    try:
+        result = await service.set_auto_arb_shadow(rule_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.delete("/api/auto-arb/rules/{rule_id}")
+async def auto_arb_delete(rule_id: str) -> JSONResponse:
+    try:
+        result = await service.delete_auto_arb_rule(rule_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.get("/api/auto-arb/rules/{rule_id}/history")
+async def auto_arb_history(rule_id: str, limit: int = 100) -> JSONResponse:
+    return JSONResponse(jsonable_encoder(service.auto_arb_history(rule_id, limit=limit)))
+
+
+@app.get("/api/hedge-clusters")
+async def get_hedge_clusters() -> JSONResponse:
+    return JSONResponse(service.hedge_cluster_payload())
 
 @app.websocket("/ws/manual")
 async def manual_stream(websocket: WebSocket) -> None:
@@ -939,6 +1197,21 @@ async def update_auto_exit_defaults(payload: AutoExitDefaultsPayload) -> JSONRes
 async def update_auto_exit_rule(payload: AutoExitRulePayload) -> JSONResponse:
     try:
         result = await service.update_auto_exit_rule(payload.dict(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(result)
+
+
+@app.post("/api/auto-exit/clear-spread-cache")
+async def clear_auto_exit_spread_cache(payload: AutoExitClearSpreadPayload) -> JSONResponse:
+    result = await service.clear_auto_exit_spread_cache(payload.symbol, clear_v1=bool(payload.clear_v1))
+    return JSONResponse(result)
+
+
+@app.post("/api/hedge-clusters/rule")
+async def update_hedge_cluster_rule(payload: HedgeClusterRulePayload) -> JSONResponse:
+    try:
+        result = await service.update_hedge_cluster_rule(payload.dict(exclude_none=True))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JSONResponse(result)

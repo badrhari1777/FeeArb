@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Auto Arbitrage Grid | FeeArb</title>
+  {% set rp = request.scope.get('root_path', '') %}
+  <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
+  <script>
+    window.__ROOT_PATH__ = "{{ rp }}";
+    window.__AUTO_ARB_INITIAL__ = {{ initial | tojson | safe }};
+  </script>
+  <script defer src="{{ rp }}/static/auto_arbitrage.js?v={{ static_version }}"></script>
+</head>
+<body class="page page--auto-arb">
+  <header class="masthead">
+    <div>
+      <p class="back-link"><a href="/">Назад на Dashboard</a></p>
+      <h1>Автоарбитражная сетка</h1>
+      <p class="subtitle">Расчёт сетки, Shadow-наблюдение и ограниченный Live для теста малым объёмом</p>
+    </div>
+    <div class="status-block">
+      <dl>
+        <div><dt>Режим</dt><dd>Shadow / Restricted Live</dd></div>
+        <div><dt>Стратегий</dt><dd id="aa-rule-count">0</dd></div>
+        <div><dt>Обновлено</dt><dd id="aa-updated">-</dd></div>
+      </dl>
+      <p class="hint">Live: не более 50 USDT на чанк и 100 USDT общей позиции на одну ногу.</p>
+    </div>
+  </header>
+
+  <main class="content">
+    <section class="panel">
+      <h2>Новая сетка</h2>
+      <form id="aa-form" class="analysis-form auto-arb-form">
+        <label>
+          Монета
+          <input id="aa-symbol" type="text" value="BTCUSDT" autocomplete="off" required />
+        </label>
+        <label>
+          Long биржа
+          <select id="aa-long" required></select>
+        </label>
+        <label>
+          Short биржа
+          <select id="aa-short" required></select>
+        </label>
+        <label>
+          Бюджет
+          <select id="aa-budget-mode">
+            <option value="qty">В монетах</option>
+            <option value="notional">В USDT</option>
+          </select>
+        </label>
+        <label id="aa-qty-wrap">
+          Максимум монет
+          <input id="aa-max-qty" type="number" min="0" step="any" value="10000" />
+        </label>
+        <label id="aa-notional-wrap" hidden>
+          Максимум USDT
+          <input id="aa-max-notional" type="number" min="0" step="any" value="1000" />
+        </label>
+        <label>
+          Первый вход, %
+          <input id="aa-range-start" type="number" step="any" value="-2" required />
+        </label>
+        <label>
+          Последний вход, %
+          <input id="aa-range-end" type="number" step="any" value="-10" required />
+        </label>
+        <label>
+          Уровней
+          <input id="aa-level-count" type="number" min="2" max="20" step="1" placeholder="Авто" />
+        </label>
+        <label>
+          Exit gap, %
+          <input id="aa-exit-gap" type="number" min="0" step="any" placeholder="Авто" />
+        </label>
+        <label>
+          Max slippage, bps
+          <input id="aa-slippage" type="number" min="0" step="any" value="8" />
+        </label>
+        <label>
+          Подтверждений
+          <input id="aa-confirm-samples" type="number" min="1" max="10" step="1" value="2" />
+        </label>
+        <button class="button" type="submit" id="aa-analyze">Рассчитать таблицу + Dry Run</button>
+        <button class="button button--ghost" type="button" id="aa-save" disabled>Запустить Shadow</button>
+        <span class="settings-status" id="aa-status" aria-live="polite"></span>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Предпросмотр</h2>
+      <div id="aa-summary" class="auto-arb-summary muted">Сначала запустите анализ.</div>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Уровень</th>
+              <th>Условие входа</th>
+              <th>Операция входа</th>
+              <th>Условие выхода</th>
+              <th>Операция выхода</th>
+              <th>Чанк</th>
+              <th>Чанк, USDT</th>
+              <th>Общий объём</th>
+              <th>Итого, USDT</th>
+              <th>Статус</th>
+            </tr>
+          </thead>
+          <tbody id="aa-levels">
+            <tr><td colspan="10" class="muted">Нет рассчитанных уровней.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="aa-warnings" class="auto-arb-warnings"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Grid-стратегии</h2>
+      <div id="aa-rules" class="auto-arb-rule-grid">
+        <p class="muted">Стратегий пока нет.</p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

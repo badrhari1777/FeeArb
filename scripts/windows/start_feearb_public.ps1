@@ -6,6 +6,10 @@ $uvicornLauncher = Join-Path $repoRoot "scripts\windows\run_feearb_uvicorn.py"
 $tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
 $caddyExe = "C:\Tools\caddy\caddy.exe"
 $caddyfile = "C:\Tools\caddy\Caddyfile"
+$caddyfileSource = Join-Path $repoRoot "config\caddy\Caddyfile"
+$remoteTokenPath = Join-Path $repoRoot "state\remote_access_token.txt"
+$cloudflaredExe = "C:\Program Files (x86)\cloudflared\cloudflared.exe"
+$cloudflaredConfig = Join-Path $repoRoot "config\cloudflared\feearb.yml"
 $feeArbApiUrl = "http://127.0.0.1:8000/api/settings"
 
 function Test-ListeningPort {
@@ -40,7 +44,15 @@ function Get-FeeArbUvicornProcesses {
 }
 
 function Start-CaddyIfNeeded {
+    if (!(Test-Path $caddyfileSource)) { throw "Missing canonical Caddyfile at $caddyfileSource" }
+    if (!(Test-Path $remoteTokenPath)) { throw "Missing remote access token at $remoteTokenPath" }
+    $env:FEEARB_REMOTE_ACCESS_TOKEN = (Get-Content -LiteralPath $remoteTokenPath -Raw).Trim()
+    if (-not $env:FEEARB_REMOTE_ACCESS_TOKEN) { throw "Remote access token is empty" }
+    Copy-Item -LiteralPath $caddyfileSource -Destination $caddyfile -Force
+
     if (Test-ListeningPort -Port 18080) {
+        & $caddyExe reload --config $caddyfile --adapter caddyfile | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "Caddy reload failed" }
         return
     }
     if (!(Test-Path $caddyExe)) { throw "Missing caddy.exe at $caddyExe" }
@@ -100,10 +112,39 @@ function Ensure-Funnel {
 
     # Idempotent: if already configured, this should be a no-op.
     & $tailscaleExe funnel --yes --bg --https=443 127.0.0.1:18080 | Out-Null
+    & $tailscaleExe funnel --yes --bg --https=10000 127.0.0.1:18081 | Out-Null
+}
+
+function Ensure-CloudflareService {
+    if (!(Test-Path $cloudflaredConfig)) {
+        return
+    }
+    if (!(Test-Path $cloudflaredExe)) {
+        throw "Missing cloudflared.exe at $cloudflaredExe"
+    }
+
+    $service = Get-Service -Name "cloudflared" -ErrorAction SilentlyContinue
+    if (-not $service) {
+        throw "Cloudflare Tunnel service is not installed"
+    }
+    $service.Refresh()
+    if ($service.Status -eq "StopPending") {
+        $service.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+        $service.Refresh()
+    }
+    if ($service.Status -eq "StartPending") {
+        $service.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+        return
+    }
+    if ($service.Status -eq "Stopped") {
+        Start-Service -Name "cloudflared"
+        $service.WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
+    }
 }
 
 Start-CaddyIfNeeded
 Start-FeeArbIfNeeded
 Ensure-Funnel
+Ensure-CloudflareService
 
-Write-Output "OK: FeeArb on 127.0.0.1:8000; Caddy on 127.0.0.1:18080; Funnel enforced"
+Write-Output "OK: FeeArb on 127.0.0.1:8000; Caddy on 127.0.0.1:18080; Tailscale Funnel and Cloudflare Tunnel enforced"

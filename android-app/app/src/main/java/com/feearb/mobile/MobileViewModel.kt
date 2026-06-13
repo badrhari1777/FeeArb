@@ -71,6 +71,7 @@ data class ManualFormUiState(
 @Immutable
 data class MobileUiState(
     val baseUrl: String = "http://10.0.2.2:8000/",
+    val remoteAccessToken: String = "",
     val statusText: String = "",
     val positionsLoading: Boolean = false,
     val positionsErrorText: String? = null,
@@ -84,24 +85,35 @@ data class MobileUiState(
     val manualForm: ManualFormUiState = ManualFormUiState(),
     val advancedSettings: AdvancedSettingsUiState = AdvancedSettingsUiState(),
     val manualPlanText: String = "No plan yet.",
+    val manualSpreadLoading: Boolean = false,
+    val manualSpreadText: String = "Spread not loaded.",
+    val manualSpread: MobileManualSpreadResponse? = null,
     val manualStatusText: String = "",
     val executionId: String? = null,
     val executionStatus: String? = null,
     val executionLogText: String = "No execution logs yet.",
     val executeConfirmationText: String? = null,
+    val positionActionLoading: Boolean = false,
+    val positionActionConfirmationText: String? = null,
 )
 
 class MobileViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsStore = SettingsStore(application.applicationContext)
     private val gson = GsonBuilder().setPrettyPrinting().create()
-    private var api: FeeArbApi = FeeArbApiFactory.create(settingsStore.loadBaseUrl())
+    private var api: FeeArbApi = FeeArbApiFactory.create(
+        settingsStore.loadBaseUrl(),
+        settingsStore.loadRemoteAccessToken(),
+    )
     private var pollingJob: Job? = null
+    private var spreadJob: Job? = null
     private var pendingExecuteRequest: ManualRequest? = null
     private var pendingExecuteAction: String? = null
+    private var pendingPositionAction: PositionActionRequest? = null
 
     var uiState by mutableStateOf(
         MobileUiState(
             baseUrl = settingsStore.loadBaseUrl(),
+            remoteAccessToken = settingsStore.loadRemoteAccessToken(),
             statusText = "Connecting...",
         )
     )
@@ -121,7 +133,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             uiState = uiState.copy(
                 positionsLoading = true,
                 positionsErrorText = null,
-                statusText = "Refreshing positions...",
+                statusText = "Refreshing account data...",
             )
             runCatching { api.getMobilePositions() }
                 .onSuccess { payload ->
@@ -129,14 +141,14 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                         positionsLoading = false,
                         positionsErrorText = null,
                         positionsResponse = payload,
-                        statusText = "Positions updated.",
+                        statusText = "Account data updated.",
                     )
                 }
                 .onFailure { error ->
                     uiState = uiState.copy(
                         positionsLoading = false,
                         positionsErrorText = error.message ?: "unknown error",
-                        statusText = "Positions refresh failed: ${error.message}",
+                        statusText = "Account refresh failed: ${error.message}",
                     )
                 }
         }
@@ -163,6 +175,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                         advancedSettings = settingsStore.loadAdvancedSettings(payload.defaults),
                         statusText = "Manual defaults loaded.",
                     )
+                    scheduleManualSpreadRefresh()
                 }
                 .onFailure { error ->
                     uiState = uiState.copy(
@@ -178,11 +191,21 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         uiState = uiState.copy(baseUrl = value)
     }
 
-    fun applyBaseUrl() {
+    fun updateRemoteAccessToken(value: String) {
+        uiState = uiState.copy(remoteAccessToken = value)
+    }
+
+    fun applyConnectionSettings() {
         val normalized = uiState.baseUrl.trim().ifBlank { "http://10.0.2.2:8000/" }
+        val remoteAccessToken = uiState.remoteAccessToken.trim()
         settingsStore.saveBaseUrl(normalized)
-        api = FeeArbApiFactory.create(normalized)
-        uiState = uiState.copy(baseUrl = normalized, statusText = "Base URL updated.")
+        settingsStore.saveRemoteAccessToken(remoteAccessToken)
+        api = FeeArbApiFactory.create(normalized, remoteAccessToken)
+        uiState = uiState.copy(
+            baseUrl = normalized,
+            remoteAccessToken = remoteAccessToken,
+            statusText = "Connection settings updated.",
+        )
         refreshAll()
     }
 
@@ -196,6 +219,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
 
     fun updateManualForm(transform: (ManualFormUiState) -> ManualFormUiState) {
         uiState = uiState.copy(manualForm = transform(uiState.manualForm))
+        scheduleManualSpreadRefresh()
     }
 
     fun updateAdvancedSettings(transform: (AdvancedSettingsUiState) -> AdvancedSettingsUiState) {
@@ -214,15 +238,21 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                 toExchange = card.long_exchange.orEmpty(),
             )
         )
+        scheduleManualSpreadRefresh()
     }
 
-    fun saveAutoExit(card: PositionCardDto, enabled: Boolean, targetSpreadPct: String) {
+    fun saveAutoExit(card: PositionCardDto, enabled: Boolean, targetSpreadPct: String, exitPercentText: String) {
         val longExchange = card.long_exchange ?: return
         val shortExchange = card.short_exchange ?: return
         viewModelScope.launch {
             val target = targetSpreadPct.toDoubleOrNull()
+            val exitPercent = exitPercentText.toDoubleOrNull()
             if (enabled && target == null) {
                 uiState = uiState.copy(statusText = "Auto-exit target spread is required.")
+                return@launch
+            }
+            if (exitPercent == null || exitPercent <= 0.0 || exitPercent > 100.0) {
+                uiState = uiState.copy(statusText = "Auto-exit percent must be from 1 to 100.")
                 return@launch
             }
             runCatching {
@@ -232,7 +262,10 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                         long_exchange = longExchange,
                         short_exchange = shortExchange,
                         enabled = enabled,
+                        spread_enabled = enabled,
                         target_spread_pct = if (enabled) target else null,
+                        exit_percent = exitPercent,
+                        exit_once = true,
                     )
                 )
             }.onSuccess {
@@ -244,12 +277,104 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun startPositionAction(card: PositionCardDto, action: String, percentText: String) {
+        val longExchange = card.long_exchange
+        val shortExchange = card.short_exchange
+        val percent = percentText.toDoubleOrNull()
+        if (longExchange.isNullOrBlank() || shortExchange.isNullOrBlank()) {
+            uiState = uiState.copy(statusText = "Exchange pair is unavailable for this position.")
+            return
+        }
+        if (percent == null || percent <= 0.0 || percent > 100.0) {
+            uiState = uiState.copy(statusText = "Position percent must be from 1 to 100.")
+            return
+        }
+        val preflight = PositionActionRequest(
+            symbol = card.symbol,
+            long_exchange = longExchange,
+            short_exchange = shortExchange,
+            action = action,
+            percent = percent,
+            dry_run = true,
+            async_run = false,
+        )
+        viewModelScope.launch {
+            pendingPositionAction = null
+            uiState = uiState.copy(positionActionLoading = true, statusText = "Running position preflight...")
+            runCatching { api.positionAction(preflight) }
+                .onSuccess { result ->
+                    uiState = uiState.copy(positionActionLoading = false)
+                    if (result.hasErrors()) {
+                        uiState = uiState.copy(statusText = "Position preflight failed: ${formatErrors(result)}")
+                        return@onSuccess
+                    }
+                    pendingPositionAction = preflight.copy(dry_run = false, async_run = true)
+                    uiState = uiState.copy(
+                        positionActionConfirmationText = buildPositionActionConfirmation(result),
+                        statusText = "Position preflight passed. Confirm execution.",
+                    )
+                }
+                .onFailure { error ->
+                    uiState = uiState.copy(
+                        positionActionLoading = false,
+                        statusText = "Position preflight failed: ${error.message}",
+                    )
+                }
+        }
+    }
+
+    fun confirmPositionAction() {
+        val request = pendingPositionAction ?: return
+        viewModelScope.launch {
+            uiState = uiState.copy(
+                positionActionLoading = true,
+                positionActionConfirmationText = null,
+                statusText = "Submitting position action...",
+            )
+            runCatching { api.positionAction(request) }
+                .onSuccess { result ->
+                    pendingPositionAction = null
+                    val executionId = result.get("execution_id")?.asString
+                    uiState = uiState.copy(
+                        positionActionLoading = false,
+                        executionId = executionId,
+                        executionStatus = if (executionId.isNullOrBlank()) null else "running",
+                        statusText = if (executionId.isNullOrBlank()) {
+                            "Position action completed."
+                        } else {
+                            "Position action started: $executionId"
+                        },
+                    )
+                    if (!executionId.isNullOrBlank()) {
+                        startPollingExecution(executionId)
+                    }
+                    refreshPositions()
+                }
+                .onFailure { error ->
+                    pendingPositionAction = null
+                    uiState = uiState.copy(
+                        positionActionLoading = false,
+                        statusText = "Position action failed: ${error.message}",
+                    )
+                }
+        }
+    }
+
+    fun cancelPositionAction() {
+        pendingPositionAction = null
+        uiState = uiState.copy(
+            positionActionConfirmationText = null,
+            statusText = "Position action canceled.",
+        )
+    }
+
     fun analyzeManual() {
-        val request = buildManualRequest(dryRun = true, includeAction = true) ?: return
+        val request = buildManualRequest(dryRun = true, includeAction = false) ?: return
+        val endpoint = endpointForAction(uiState.manualForm.action)
         viewModelScope.launch {
             clearPendingExecute()
             uiState = uiState.copy(manualLoading = true, manualStatusText = "Analyzing...")
-            runCatching { api.manualAnalyze(request) }
+            runCatching { endpoint(request) }
                 .onSuccess { payload ->
                     val hintedChunk = request.chunk_qty ?: payload.optDoubleOrNull("recommended_chunk_qty") ?: payload.optDoubleOrNull("min_chunk_qty")
                     if (uiState.advancedSettings.chunkQty.isBlank() && hintedChunk != null) {
@@ -262,6 +387,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                         manualPlanText = formatPlan(payload),
                         manualStatusText = if (payload.hasErrors()) "Analyze completed with errors." else "Analyze completed.",
                     )
+                    refreshManualSpread()
                 }
                 .onFailure { error ->
                     uiState = uiState.copy(
@@ -371,6 +497,28 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun refreshManualSpread() {
+        val request = buildManualSpreadRequest() ?: return
+        spreadJob?.cancel()
+        spreadJob = viewModelScope.launch {
+            uiState = uiState.copy(manualSpreadLoading = true, manualSpreadText = "Loading spread...")
+            runCatching { api.getManualSpread(request) }
+                .onSuccess { payload ->
+                    uiState = uiState.copy(
+                        manualSpreadLoading = false,
+                        manualSpread = payload,
+                        manualSpreadText = formatSpread(payload),
+                    )
+                }
+                .onFailure { error ->
+                    uiState = uiState.copy(
+                        manualSpreadLoading = false,
+                        manualSpreadText = "Spread failed: ${error.message ?: "unknown error"}",
+                    )
+                }
+        }
+    }
+
     fun visibleCards(): List<PositionCardDto> {
         val filtered = uiState.positionsResponse.cards.filter { card ->
             when (uiState.positionFilter) {
@@ -417,6 +565,29 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                     }
                 delay(2_000)
             }
+        }
+    }
+
+    private fun scheduleManualSpreadRefresh() {
+        spreadJob?.cancel()
+        val request = buildManualSpreadRequest(updateStatus = false) ?: return
+        spreadJob = viewModelScope.launch {
+            delay(700)
+            uiState = uiState.copy(manualSpreadLoading = true, manualSpreadText = "Loading spread...")
+            runCatching { api.getManualSpread(request) }
+                .onSuccess { payload ->
+                    uiState = uiState.copy(
+                        manualSpreadLoading = false,
+                        manualSpread = payload,
+                        manualSpreadText = formatSpread(payload),
+                    )
+                }
+                .onFailure { error ->
+                    uiState = uiState.copy(
+                        manualSpreadLoading = false,
+                        manualSpreadText = "Spread failed: ${error.message ?: "unknown error"}",
+                    )
+                }
         }
     }
 
@@ -485,6 +656,39 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         )
     }
 
+    private fun buildManualSpreadRequest(updateStatus: Boolean = true): MobileManualSpreadRequest? {
+        val form = uiState.manualForm
+        val symbol = form.symbol.trim().uppercase()
+        if (symbol.isBlank()) {
+            if (updateStatus) uiState = uiState.copy(manualSpreadText = "Enter a symbol to load spread.")
+            return null
+        }
+        return if (form.action == "roll") {
+            if (form.fromExchange.isBlank() || form.toExchange.isBlank()) {
+                if (updateStatus) uiState = uiState.copy(manualSpreadText = "Select roll exchanges to load spread.")
+                return null
+            }
+            MobileManualSpreadRequest(
+                symbol = symbol,
+                action = "roll",
+                from_exchange = form.fromExchange,
+                to_exchange = form.toExchange,
+                side = form.side,
+            )
+        } else {
+            if (form.longExchange.isBlank() || form.shortExchange.isBlank()) {
+                if (updateStatus) uiState = uiState.copy(manualSpreadText = "Select exchanges to load spread.")
+                return null
+            }
+            MobileManualSpreadRequest(
+                symbol = symbol,
+                action = form.action,
+                long_exchange = form.longExchange,
+                short_exchange = form.shortExchange,
+            )
+        }
+    }
+
     private fun clearPendingExecute() {
         pendingExecuteRequest = null
         pendingExecuteAction = null
@@ -501,6 +705,63 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         payload.optDoubleOrNull("min_chunk_qty")?.let { lines += "Min chunk qty: ${formatCompact(it)}" }
         payload.optDoubleOrNull("recommended_chunk_qty")?.let { lines += "Recommended chunk qty: ${formatCompact(it)}" }
         return if (lines.isNotEmpty()) lines.joinToString("\n") else gson.toJson(payload)
+    }
+
+    private fun formatErrors(payload: JsonObject): String {
+        val errors = payload.getAsJsonArray("errors") ?: return "unknown error"
+        return errors.joinToString("; ") { it.asString }
+    }
+
+    private fun buildPositionActionConfirmation(payload: JsonObject): String {
+        val meta = payload.getAsJsonObject("position_action") ?: return gson.toJson(payload)
+        val action = meta.get("action")?.asString.orEmpty()
+        val verb = if (action == "add") "Add" else "Exit"
+        val symbol = meta.get("symbol")?.asString.orEmpty()
+        val percent = meta.optDoubleOrNull("percent")
+        val actionQty = meta.optDoubleOrNull("action_qty")
+        val hedgedQty = meta.optDoubleOrNull("hedged_qty")
+        val longQty = meta.optDoubleOrNull("long_qty")
+        val shortQty = meta.optDoubleOrNull("short_qty")
+        val imbalance = meta.optDoubleOrNull("imbalance_qty")
+        return buildString {
+            append("$verb ${formatCompact(actionQty)} $symbol")
+            append("\n${formatCompact(percent)}% of hedged ${formatCompact(hedgedQty)} coins")
+            append("\nLong ${formatCompact(longQty)} | Short ${formatCompact(shortQty)}")
+            append("\nImbalance ${formatCompact(imbalance)} coins")
+        }
+    }
+
+    private fun formatSpread(payload: MobileManualSpreadResponse): String {
+        val lines = mutableListOf<String>()
+        val spread = payload.spread_pct
+        val buy = payload.buy_exchange?.uppercase().orEmpty()
+        val sell = payload.sell_exchange?.uppercase().orEmpty()
+        if (spread != null) {
+            lines += "Spread: ${formatCompact(spread)}%"
+        }
+        if (buy.isNotBlank() || sell.isNotBlank()) {
+            lines += "Buy/Sell: ${buy.ifBlank { "-" }} @ ${formatCompact(payload.buy_price)} / ${sell.ifBlank { "-" }} @ ${formatCompact(payload.sell_price)}"
+        }
+        val sources = payload.quotes.values.mapNotNull { quote ->
+            val exchange = quote.exchange?.uppercase()
+            val source = quote.source
+            if (exchange.isNullOrBlank() || source.isNullOrBlank()) null else "$exchange:$source"
+        }.joinToString(", ")
+        if (sources.isNotBlank()) {
+            lines += "Source: $sources"
+        }
+        if (payload.warnings.isNotEmpty()) {
+            lines += "Warnings: ${payload.warnings.joinToString("; ")}"
+        }
+        if (payload.errors.isNotEmpty()) {
+            lines += "Errors: ${payload.errors.joinToString("; ")}"
+        }
+        return lines.ifEmpty { listOf("Spread unavailable.") }.joinToString("\n")
+    }
+
+    private fun formatCompact(value: Double?): String {
+        if (value == null) return "-"
+        return formatCompact(value)
     }
 
     private fun formatLogs(logs: List<ManualExecLogEntry>): String {

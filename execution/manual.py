@@ -81,6 +81,28 @@ def _precision_to_step(value: Any) -> float | None:
     return numeric
 
 
+def _market_filter_value(market: Mapping[str, Any] | None, filter_type: str, *keys: str) -> float | None:
+    if not isinstance(market, Mapping):
+        return None
+    info = market.get("info") or {}
+    if not isinstance(info, Mapping):
+        return None
+    filters = info.get("filters")
+    if not isinstance(filters, list):
+        return None
+    wanted = str(filter_type or "").upper()
+    for item in filters:
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("filterType") or "").upper() != wanted:
+            continue
+        for key in keys:
+            value = _safe_float(item.get(key))
+            if value is not None and value > 0:
+                return value
+    return None
+
+
 def _round_to_step(value: float, step: float | None, *, mode: str = "down") -> float:
     if step is None or step <= 0:
         return float(value)
@@ -612,6 +634,19 @@ def _normalize_submit_values(
     return qty_base, adjusted_price, None
 
 
+def _ccxt_precision_value(client: Any, kind: str, symbol: str, value: float | None) -> float | None:
+    if value is None:
+        return None
+    method_name = "price_to_precision" if kind == "price" else "amount_to_precision"
+    method = getattr(client, method_name, None)
+    if not callable(method):
+        return float(value)
+    try:
+        return float(method(symbol, value))
+    except Exception:  # pylint: disable=broad-except
+        return float(value)
+
+
 def _resolve_timeout(payload: Mapping[str, Any], default: int) -> int:
     raw = _safe_float(payload.get("timeout_sec"))
     if raw is None:
@@ -995,12 +1030,25 @@ class ManualTradeManager:
             self._ws_orders.set_health_configs(overrides)
 
     def _stop_requested(self) -> bool:
+        return bool(self._stop_signal().get("requested"))
+
+    def _stop_signal(self) -> dict[str, Any]:
         if not self._stop_check:
-            return False
+            return {"requested": False, "force_finalize": False, "reason": None}
         try:
-            return bool(self._stop_check())
+            value = self._stop_check()
+            if isinstance(value, Mapping):
+                return {
+                    "requested": bool(value.get("requested", True)),
+                    "force_finalize": bool(value.get("force_finalize")),
+                    "reason": value.get("reason"),
+                }
+            return {"requested": bool(value), "force_finalize": False, "reason": None}
         except Exception:
-            return False
+            return {"requested": False, "force_finalize": False, "reason": None}
+
+    def _stop_force_finalize(self) -> bool:
+        return bool(self._stop_signal().get("force_finalize"))
 
     def _auto_exit_market_fallback_allowed(
         self,
@@ -1492,6 +1540,24 @@ class ManualTradeManager:
     ) -> dict[str, Any]:
         return await self._handle_pair(payload, action="exit", positions=positions, log_cb=log_cb, stop_cb=stop_cb)
 
+    async def orphan_cleanup(
+        self,
+        payload: Mapping[str, Any],
+        positions: Iterable[Mapping[str, Any]],
+        *,
+        log_cb: Optional[callable] = None,
+        stop_cb: Optional[callable] = None,
+    ) -> dict[str, Any]:
+        orphan_payload = dict(payload)
+        orphan_payload["orphan_cleanup_mode"] = True
+        return await self._handle_pair(
+            orphan_payload,
+            action="exit",
+            positions=positions,
+            log_cb=log_cb,
+            stop_cb=stop_cb,
+        )
+
     async def roll(
         self,
         payload: Mapping[str, Any],
@@ -1524,8 +1590,17 @@ class ManualTradeManager:
                 self._emit_log(log_cb, "payload", "manual payload", dict(payload))
             self._stop_check = stop_cb
             symbol = str(payload.get("symbol") or "").upper().strip()
-            exit_allow_flip = bool(payload.get("exit_allow_flip")) if action == "exit" else False
             positions_for_plan = list(positions or [])
+            if action == "exit" and bool(payload.get("orphan_cleanup_mode")):
+                try:
+                    return await self._execute_orphan_cleanup(
+                        payload,
+                        positions_for_plan,
+                        log_cb=log_cb,
+                    )
+                finally:
+                    self._stop_check = None
+            exit_allow_flip = bool(payload.get("exit_allow_flip")) if action == "exit" else False
             exchanges_hint: list[str] = []
             if action == "roll":
                 exchanges_hint = [
@@ -4791,7 +4866,7 @@ class ManualTradeManager:
                         )
                         actions.append(result)
                         self._emit_log(log_cb, "result", "final reconcile result", result)
-            if not stopped_by_user:
+            if not stopped_by_user or self._stop_force_finalize():
                 await self._finalize_exit_dust(
                     symbol=symbol,
                     legs=[primary_leg, hedge_leg],
@@ -5226,7 +5301,7 @@ class ManualTradeManager:
                     end_positions = retry_positions
                     end_errors = []
             emit_positions_snapshot("end", end_positions, end_errors)
-            if stopped_by_user:
+            if stopped_by_user and not self._stop_force_finalize():
                 self._emit_log(log_cb, "warn", "stop requested; skipping final reconcile", {"remaining": remaining})
                 return {
                     "dry_run": False,
@@ -5240,6 +5315,13 @@ class ManualTradeManager:
                     "remaining_qty": remaining,
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                 }
+            if stopped_by_user and self._stop_force_finalize():
+                self._emit_log(
+                    log_cb,
+                    "warn",
+                    "stop requested; forcing final reconcile",
+                    {"remaining": remaining},
+                )
             if len(legs) >= 2:
                 deltas: dict[str, float] = {}
                 for leg in legs:
@@ -6737,7 +6819,7 @@ class ManualTradeManager:
         if remaining > 0 and max_runtime_sec is not None:
             warnings.append(f"Remaining qty {remaining:g} not entered ({mode_label} runtime ended).")
 
-        if not stopped_by_user:
+        if not stopped_by_user or self._stop_force_finalize():
             await _final_reconcile_positions("final")
         return {
             "dry_run": False,
@@ -7141,7 +7223,7 @@ class ManualTradeManager:
                     end_positions = retry_positions
                     end_errors = []
             emit_positions_snapshot("end", end_positions, end_errors)
-            if stopped_by_user:
+            if stopped_by_user and not self._stop_force_finalize():
                 self._emit_log(log_cb, "warn", "stop requested; skipping final reconcile", {"remaining": remaining})
                 return {
                     "dry_run": False,
@@ -7156,6 +7238,13 @@ class ManualTradeManager:
                     "remaining_qty": remaining,
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                 }
+            if stopped_by_user and self._stop_force_finalize():
+                self._emit_log(
+                    log_cb,
+                    "warn",
+                    "stop requested; forcing final reconcile",
+                    {"remaining": remaining},
+                )
             if len(legs) >= 2:
                 deltas: dict[str, float] = {}
                 for leg in legs:
@@ -7675,6 +7764,270 @@ class ManualTradeManager:
             "actions": actions,
         }
 
+    async def _execute_orphan_cleanup(
+        self,
+        payload: Mapping[str, Any],
+        positions: Iterable[Mapping[str, Any]],
+        *,
+        log_cb: Optional[callable] = None,
+    ) -> dict[str, Any]:
+        symbol = normalize_symbol(str(payload.get("symbol") or ""))
+        cleanup_exchange = normalize_exchange_name(
+            str(payload.get("cleanup_exchange") or payload.get("exchange") or "")
+        )
+        requested_qty = _safe_float(payload.get("qty"))
+        requested_position_side = str(
+            payload.get("cleanup_position_side") or payload.get("position_side") or ""
+        ).strip().lower()
+        panic_cleanup = bool(payload.get("panic_cleanup_mode"))
+        margin_mode = str(payload.get("margin_mode") or "isolated").strip().lower() or "isolated"
+        warnings: list[str] = []
+        errors: list[str] = []
+        actions: list[dict[str, Any]] = []
+        if not symbol:
+            errors.append("symbol is required")
+        if not cleanup_exchange:
+            errors.append("cleanup_exchange is required")
+        if errors:
+            return {
+                "dry_run": False,
+                "action": "exit",
+                "symbol": symbol,
+                "qty": requested_qty,
+                "mode": "orphan-cleanup",
+                "actions": actions,
+                "errors": errors,
+                "warnings": warnings,
+                "risk_flags": self._collect_risk_flags(actions, warnings),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        def _pos_qty(entry: Mapping[str, Any]) -> float:
+            qty = _safe_float(entry.get("coin_qty"))
+            if qty is None:
+                qty = _safe_float(entry.get("contracts"))
+            if qty is None:
+                qty = _safe_float(entry.get("amount"))
+            return abs(float(qty or 0.0))
+
+        matching: list[dict[str, Any]] = []
+        for raw in positions or []:
+            position = dict(raw)
+            exchange = normalize_exchange_name(str(position.get("exchange") or ""))
+            if exchange != cleanup_exchange:
+                continue
+            pos_symbol = str(position.get("symbol") or position.get("symbol_normalized") or "")
+            if not _symbol_matches(symbol, pos_symbol):
+                continue
+            qty_hint = _safe_float(position.get("coin_qty"))
+            if qty_hint is None:
+                qty_hint = _safe_float(position.get("contracts")) or _safe_float(position.get("amount"))
+            position_side = _normalize_position_side(position.get("side"), qty_hint)
+            if requested_position_side in ("long", "short") and position_side != requested_position_side:
+                continue
+            position["_normalized_side"] = position_side
+            matching.append(position)
+        if not matching:
+            return {
+                "dry_run": False,
+                "action": "exit",
+                "symbol": symbol,
+                "qty": requested_qty,
+                "mode": "orphan-cleanup",
+                "actions": actions,
+                "errors": [f"{cleanup_exchange}: orphan position not found"],
+                "warnings": warnings,
+                "risk_flags": self._collect_risk_flags(actions, warnings),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        side_set = {str(item.get("_normalized_side") or "") for item in matching if item.get("_normalized_side")}
+        if len(side_set) > 1:
+            return {
+                "dry_run": False,
+                "action": "exit",
+                "symbol": symbol,
+                "qty": requested_qty,
+                "mode": "orphan-cleanup",
+                "actions": actions,
+                "errors": [f"{cleanup_exchange}: multiple orphan sides visible"],
+                "warnings": warnings,
+                "risk_flags": self._collect_risk_flags(actions, warnings),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        position_side = next(iter(side_set), requested_position_side or "")
+        current_qty = sum(_pos_qty(item) for item in matching)
+        if current_qty <= 0:
+            return {
+                "dry_run": False,
+                "action": "exit",
+                "symbol": symbol,
+                "qty": requested_qty,
+                "mode": "orphan-cleanup",
+                "actions": actions,
+                "errors": [f"{cleanup_exchange}: orphan qty unavailable"],
+                "warnings": warnings,
+                "risk_flags": self._collect_risk_flags(actions, warnings),
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        cleanup_qty = current_qty
+        if requested_qty is not None and requested_qty > 0:
+            cleanup_qty = min(cleanup_qty, float(requested_qty))
+        close_side = "sell" if position_side == "long" else "buy"
+        leg = {
+            "exchange": cleanup_exchange,
+            "side": close_side,
+            "label": "orphan",
+            "reduce_only": True,
+            "margin_mode": margin_mode,
+        }
+        snapshot = await self._snapshot_legs(
+            symbol,
+            [leg],
+            max_slippage_bps=_safe_float(payload.get("max_slippage_bps")) or 0.0,
+        )
+        constraints = (snapshot.get("constraints") or {}).get(cleanup_exchange) or {}
+        self._emit_log(
+            log_cb,
+            "start",
+            "orphan cleanup",
+            {
+                "symbol": symbol,
+                "exchange": cleanup_exchange,
+                "position_side": position_side,
+                "close_side": close_side,
+                "qty": cleanup_qty,
+                "panic_cleanup_mode": panic_cleanup,
+            },
+        )
+
+        if panic_cleanup:
+            market_result = await self._place_market(
+                leg,
+                symbol,
+                cleanup_qty,
+                payload,
+                reason="orphan_cleanup_panic",
+                require_ws=False,
+                log_cb=log_cb,
+            )
+            actions.append(market_result)
+            if market_result.get("status") == "error":
+                errors.append(str(market_result.get("error") or "orphan_cleanup_market_error"))
+        else:
+            rebalance = await self.agent_rebalance(
+                exchange=cleanup_exchange,
+                symbol=symbol,
+                side=close_side,
+                qty_base=cleanup_qty,
+                margin_mode=margin_mode,
+                limit_timeout_sec=int(_safe_float(payload.get("orphan_limit_timeout_sec")) or 6),
+                limit_offset_bps=_safe_float(payload.get("orphan_limit_offset_bps")) or 1.0,
+                max_slippage_bps=_safe_float(payload.get("max_slippage_bps")) or 8.0,
+                log_cb=log_cb,
+            )
+            actions.append(
+                {
+                    "exchange": cleanup_exchange,
+                    "status": "error" if rebalance.get("status") == "error" else "submitted",
+                    "filled_qty": rebalance.get("filled_qty"),
+                    "remaining_qty": rebalance.get("remaining_qty"),
+                    "detail": rebalance,
+                    "market_reason": "orphan_cleanup",
+                }
+            )
+            if rebalance.get("status") == "error":
+                errors.extend([str(item) for item in (rebalance.get("errors") or []) if item])
+            elif rebalance.get("status") == "partial":
+                warnings.append("orphan_cleanup_partial")
+
+        await self._finalize_exit_dust(
+            symbol=symbol,
+            legs=[leg],
+            start_qty_by_exchange={cleanup_exchange: current_qty},
+            requested_exit_qty=cleanup_qty,
+            constraints={cleanup_exchange: constraints},
+            payload=payload,
+            actions=actions,
+            warnings=warnings,
+            log_cb=log_cb,
+        )
+
+        end_positions, end_errors = await self._fetch_positions_for_symbol(
+            exchanges=[cleanup_exchange],
+            symbol=symbol,
+            allow_ws=False,
+            contract_sizes=self._contract_sizes_from_constraints({cleanup_exchange: constraints}),
+        )
+        if end_errors:
+            warnings.extend(end_errors)
+        remaining_qty = self._sum_position_qty(
+            end_positions,
+            exchange=cleanup_exchange,
+            side=position_side,
+            symbol=symbol,
+        )
+        if panic_cleanup and remaining_qty > 0:
+            self._emit_log(
+                log_cb,
+                "submit",
+                f"orphan forced final market {cleanup_exchange} qty={remaining_qty:g}",
+                {"symbol": symbol, "exchange": cleanup_exchange},
+            )
+            final_result = await self._place_market(
+                leg,
+                symbol,
+                remaining_qty,
+                payload,
+                reason="orphan_cleanup_final",
+                require_ws=False,
+                log_cb=log_cb,
+            )
+            actions.append(final_result)
+            if final_result.get("status") == "error":
+                errors.append(str(final_result.get("error") or "orphan_cleanup_final_error"))
+            end_positions, end_errors = await self._fetch_positions_for_symbol(
+                exchanges=[cleanup_exchange],
+                symbol=symbol,
+                allow_ws=False,
+                contract_sizes=self._contract_sizes_from_constraints({cleanup_exchange: constraints}),
+            )
+            if end_errors:
+                warnings.extend(end_errors)
+            remaining_qty = self._sum_position_qty(
+                end_positions,
+                exchange=cleanup_exchange,
+                side=position_side,
+                symbol=symbol,
+            )
+
+        if remaining_qty > 0:
+            warnings.append(f"{cleanup_exchange}: orphan residual {remaining_qty:g}")
+            actions.append(
+                {
+                    "exchange": cleanup_exchange,
+                    "status": "error",
+                    "error": f"orphan residual {remaining_qty:g}",
+                    "risk_state": "orphan_cleanup_residual",
+                }
+            )
+
+        return {
+            "dry_run": False,
+            "action": "exit",
+            "symbol": symbol,
+            "qty": cleanup_qty,
+            "mode": "orphan-cleanup",
+            "actions": actions,
+            "errors": errors + self._collect_action_errors(actions),
+            "warnings": warnings,
+            "risk_flags": self._collect_risk_flags(actions, warnings),
+            "remaining_qty": remaining_qty,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
     async def _submit_order(
         self,
         leg: Mapping[str, Any],
@@ -7810,6 +8163,11 @@ class ManualTradeManager:
         order_qty = float(qty)
         if contract_size and contract_size > 0:
             order_qty = order_qty / contract_size
+        order_qty = _ccxt_precision_value(client, "amount", ccxt_symbol, order_qty) or order_qty
+        if order_type == "limit" and price is not None:
+            precise_price = _ccxt_precision_value(client, "price", ccxt_symbol, price)
+            if precise_price is not None and precise_price > 0:
+                price = precise_price
         if reduce_only:
             reduce_only_error = await self._precheck_reduce_only_qty(
                 client,
@@ -8053,6 +8411,57 @@ class ManualTradeManager:
                 except Exception as retry_exc:  # pylint: disable=broad-except
                     message = str(retry_exc)
             error_type = _classify_submit_error(message)
+            if (
+                error_type == "tick_size"
+                and order_type == "limit"
+                and price is not None
+                and price_step
+                and price_step > 0
+            ):
+                retry_mode = "down" if str(leg.get("side") or "").lower() == "buy" else "up"
+                retry_price = _round_to_step(float(price), float(price_step), mode=retry_mode)
+                precise_retry_price = _ccxt_precision_value(client, "price", ccxt_symbol, retry_price)
+                if precise_retry_price is not None and precise_retry_price > 0:
+                    retry_price = precise_retry_price
+                if retry_price and retry_price > 0 and abs(float(retry_price) - float(price)) <= max(float(price_step), 1e-12):
+                    try:
+                        order = await client.create_order(
+                            ccxt_symbol,
+                            order_type,
+                            leg["side"],
+                            order_qty,
+                            retry_price,
+                            params,
+                        )
+                        filled = _to_base_qty(_safe_float(order.get("filled")), contract_size)
+                        self._emit_log(
+                            log_cb,
+                            "order",
+                            "order submitted after tick-size retry",
+                            {
+                                "exchange": exchange,
+                                "order_id": order.get("id"),
+                                "status": order.get("status"),
+                                "filled_qty": filled,
+                                "avg_price": order.get("average"),
+                                "original_price": price,
+                                "retry_price": retry_price,
+                            },
+                        )
+                        return {
+                            "exchange": exchange,
+                            "status": "submitted",
+                            "order_id": order.get("id"),
+                            "filled_qty": filled,
+                            "avg_price": order.get("average"),
+                            "qty_base": float(qty),
+                            "qty_contracts": order_qty if contract_size else None,
+                            "contract_size": contract_size,
+                            "ts": _now_iso(),
+                        }
+                    except Exception as retry_exc:  # pylint: disable=broad-except
+                        message = str(retry_exc)
+                        error_type = _classify_submit_error(message)
             self._emit_log(
                 log_cb,
                 "error",
@@ -9302,6 +9711,31 @@ class ManualTradeManager:
         precision = market.get("precision") or {}
         amount_step = _precision_to_step(precision.get("amount"))
         price_step = _precision_to_step(precision.get("price"))
+        filter_amount_step = _market_filter_value(market, "LOT_SIZE", "stepSize", "qtyStep")
+        filter_market_amount_step = _market_filter_value(market, "MARKET_LOT_SIZE", "stepSize", "qtyStep")
+        filter_price_step = _market_filter_value(market, "PRICE_FILTER", "tickSize")
+        filter_min_qty = _market_filter_value(market, "LOT_SIZE", "minQty", "minQtySize")
+        filter_min_notional = _market_filter_value(
+            market,
+            "MIN_NOTIONAL",
+            "notional",
+            "minNotional",
+        ) or _market_filter_value(
+            market,
+            "NOTIONAL",
+            "minNotional",
+            "notional",
+        )
+        if filter_amount_step is not None:
+            amount_step = filter_amount_step
+        elif filter_market_amount_step is not None:
+            amount_step = filter_market_amount_step
+        if filter_price_step is not None:
+            price_step = filter_price_step
+        if raw_min_qty is None and filter_min_qty is not None:
+            raw_min_qty = filter_min_qty
+        if min_notional is None and filter_min_notional is not None:
+            min_notional = filter_min_notional
         contract_size = _safe_float(market.get("contractSize"))
         min_qty = raw_min_qty
         if contract_size and contract_size > 0:

@@ -163,25 +163,34 @@ class BitgetAdapter(ExchangeAdapter):
     def funding_history(self, symbol: str, limit: int = 200) -> list[dict]:
         """Return cached funding history with ~2m refresh."""
         contract = self.map_symbol(symbol) or symbol
+        v2_symbol = _history_symbol(symbol, contract)
 
         def _fetch() -> list[dict]:
-            url = f"{self.base_url}/api/mix/v2/market/history-fundRate?" + urlencode(
-                {"symbol": contract, "pageSize": limit}
+            url = f"{self.base_url}/api/v2/mix/market/history-fund-rate?" + urlencode(
+                {
+                    "symbol": v2_symbol,
+                    "productType": _product_type_for_history(v2_symbol),
+                    "pageSize": limit,
+                }
             )
             try:
                 payload = _get_json(url)
             except Exception as exc:  # pylint: disable=broad-except
-                logger.debug("Bitget funding history fetch failed for %s: %s", contract, exc)
+                logger.debug("Bitget funding history fetch failed for %s: %s", v2_symbol, exc)
                 payload = {}
             out: list[dict] = []
             if payload.get("code") == "00000":
                 items = payload.get("data") or []
                 for item in items:
-                    ts_ms = parse_timestamp_ms(item.get("timePoint"))
+                    ts_ms = parse_timestamp_ms(
+                        item.get("fundingTime")
+                        or item.get("timePoint")
+                        or item.get("fundingRateTimestamp")
+                    )
                     out.append(
                         {
                             "ts_ms": ts_ms or 0,
-                            "rate": _to_float(item.get("fundRate")),
+                            "rate": _to_float(item.get("fundingRate") or item.get("fundRate")),
                             "interval_hours": None,
                             "mark_price": None,
                         }
@@ -238,9 +247,9 @@ class BitgetAdapter(ExchangeAdapter):
             limit=limit,
         )
         usable = any(item.get("rate") is not None for item in history)
-        if usable:
+        if usable and len(history) >= min(3, max(1, int(limit))):
             return history
-        # Cache contained only nulls; try live fetch once more.
+        # Cache contained only nulls or an old single-point fallback; try live fetch once more.
         fresh = _fetch()
         return fresh or history
 
@@ -268,3 +277,21 @@ def _to_datetime(value: object) -> datetime | None:
     if millis <= 0:
         return None
     return datetime.fromtimestamp(millis / 1000, tz=timezone.utc)
+
+
+def _history_symbol(symbol: str, contract: str) -> str:
+    raw = str(symbol or contract or "").upper().replace("/", "").replace(":", "").strip()
+    if raw.endswith("_UMCBL") or raw.endswith("_DMCBL"):
+        raw = raw.rsplit("_", 1)[0]
+    if raw.endswith("USDTUSDT"):
+        raw = raw[:-4]
+    return raw
+
+
+def _product_type_for_history(symbol: str) -> str:
+    normalized = str(symbol or "").upper()
+    if normalized.endswith("USDC"):
+        return "USDC-FUTURES"
+    if normalized.endswith("USD") and not normalized.endswith("USDT"):
+        return "COIN-FUTURES"
+    return "USDT-FUTURES"
