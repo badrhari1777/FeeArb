@@ -81,7 +81,8 @@
       max_slippage_bps: numberValue(el.slippage),
       confirm_samples: numberValue(el.confirmSamples),
       liquidity_safety_factor: 0.70,
-      enabled: true
+      enabled: true,
+      live: true
     };
     if (payload.budget_mode === 'notional') {
       payload.max_notional = numberValue(el.maxNotional);
@@ -158,10 +159,10 @@
       var currentLevel = mode === 'live' ? (rule.live_level || 0) : (rule.shadow_level || 0);
       var currentQty = mode === 'live' ? (rule.actual_hedged_qty || 0) : (rule.shadow_qty || 0);
       var modeAction = mode === 'live'
-        ? '<button class="button button--ghost" data-action="shadow" data-id="' + escapeHtml(rule.id) + '">В Shadow</button>'
+        ? ''
         : '<button class="button" data-action="arm-live" data-id="' + escapeHtml(rule.id) + '">Включить Live</button>';
-      var toggleAction = enabled ? 'pause' : (mode === 'live' ? 'arm-live' : 'resume');
-      var toggleLabel = enabled ? 'Пауза' : (mode === 'live' ? 'Проверить и включить' : 'Продолжить');
+      var toggleAction = enabled ? 'pause' : 'arm-live';
+      var toggleLabel = enabled ? 'Пауза' : 'Проверить и включить';
       return '<article class="auto-arb-rule-card">' +
         '<div class="auto-arb-rule-head">' +
           '<div><strong>' + escapeHtml(rule.symbol) + '</strong>' +
@@ -173,7 +174,7 @@
         '<div class="auto-arb-metrics">' +
           '<div><span>Уровень</span><strong>' + escapeHtml(currentLevel) + ' / ' +
           escapeHtml(rule.level_count || 0) + '</strong></div>' +
-          '<div><span>Фактический/Shadow qty</span><strong>' + fmt(currentQty, 8) + '</strong></div>' +
+          '<div><span>Фактический qty</span><strong>' + fmt(currentQty, 8) + '</strong></div>' +
           '<div><span>Entry spread</span><strong>' + fmt(rule.live_entry_spread_pct, 4) + '%</strong></div>' +
           '<div><span>Exit spread</span><strong>' + fmt(rule.live_exit_spread_pct, 4) + '%</strong></div>' +
           '<div><span>Диапазон</span><strong>' + fmt(rule.range_start_pct, 2) + '% ... ' +
@@ -230,7 +231,7 @@
     setBusy('Выполняется Dry Run...');
     request('POST', '/api/auto-arb/analyze', formPayload()).then(function (data) {
       renderAnalysis(data);
-      setBusy('Анализ готов. Проверьте уровни перед запуском Shadow.');
+      setBusy('Анализ готов. Проверьте уровни перед запуском Live.');
     }).catch(function (error) {
       setBusy(error.message);
     });
@@ -241,9 +242,9 @@
       return;
     }
     el.save.disabled = true;
-    setBusy('Сохраняется Shadow-стратегия...');
+    setBusy('Сохраняется и проверяется Live-стратегия...');
     request('POST', '/api/auto-arb/rules', formPayload()).then(function () {
-      setBusy('Shadow-стратегия запущена.');
+      setBusy('Live-сетка включена.');
       refreshRules();
     }).catch(function (error) {
       setBusy(error.message);
@@ -258,7 +259,7 @@
     }
     var id = button.getAttribute('data-id');
     var action = button.getAttribute('data-action');
-    if (action === 'delete' && !window.confirm('Удалить Shadow-стратегию?')) {
+    if (action === 'delete' && !window.confirm('Удалить Grid-стратегию?')) {
       return;
     }
     if (action === 'arm-live') {

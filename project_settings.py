@@ -52,17 +52,17 @@ MAX_REFRESH_SECONDS: Final[int] = 24 * 60 * 60  # one day
 def _default_manual_auto_exit_policy() -> Dict[str, Dict[str, float]]:
     return {
         "tier1": {
-            "chunk_notional_cap_usd": 350.0,
+            "chunk_notional_cap_usd": 750.0,
             "market_cleanup_notional_cap_usd": 1500.0,
             "edge_buffer_bps": 2.0,
         },
         "tier2": {
-            "chunk_notional_cap_usd": 250.0,
+            "chunk_notional_cap_usd": 500.0,
             "market_cleanup_notional_cap_usd": 800.0,
             "edge_buffer_bps": 4.0,
         },
         "lower_tier": {
-            "chunk_notional_cap_usd": 150.0,
+            "chunk_notional_cap_usd": 250.0,
             "market_cleanup_notional_cap_usd": 0.0,
             "edge_buffer_bps": 8.0,
         },
@@ -404,11 +404,24 @@ class AppSettings:
         auto_exit_policy = manual.get("auto_exit_policy")
         merged_auto_exit_policy = _default_manual_auto_exit_policy()
         if isinstance(auto_exit_policy, Mapping):
+            legacy_chunk_caps = {
+                "tier1": 350.0,
+                "tier2": 250.0,
+                "lower_tier": 150.0,
+            }
             for tier_key, defaults in merged_auto_exit_policy.items():
                 incoming_section = auto_exit_policy.get(tier_key)
                 if isinstance(incoming_section, Mapping):
                     merged_auto_exit_policy[tier_key] = dict(defaults)
                     merged_auto_exit_policy[tier_key].update(incoming_section)
+                    incoming_cap = incoming_section.get("chunk_notional_cap_usd")
+                    if (
+                        incoming_cap is not None
+                        and float(incoming_cap) == legacy_chunk_caps.get(tier_key)
+                    ):
+                        merged_auto_exit_policy[tier_key]["chunk_notional_cap_usd"] = defaults[
+                            "chunk_notional_cap_usd"
+                        ]
         manual["auto_exit_policy"] = merged_auto_exit_policy
         self.manual = manual
         return self

@@ -17,11 +17,11 @@
     <div>
       <p class="back-link"><a href="/">Назад на Dashboard</a></p>
       <h1>Автоарбитражная сетка</h1>
-      <p class="subtitle">Расчёт сетки, Shadow-наблюдение и ограниченный Live для теста малым объёмом</p>
+      <p class="subtitle">Расчёт и запуск Grid сразу в ограниченном Live для теста малым объёмом</p>
     </div>
     <div class="status-block">
       <dl>
-        <div><dt>Режим</dt><dd>Shadow / Restricted Live</dd></div>
+        <div><dt>Режим</dt><dd>Restricted Live</dd></div>
         <div><dt>Стратегий</dt><dd id="aa-rule-count">0</dd></div>
         <div><dt>Обновлено</dt><dd id="aa-updated">-</dd></div>
       </dl>
@@ -85,7 +85,7 @@
           <input id="aa-confirm-samples" type="number" min="1" max="10" step="1" value="2" />
         </label>
         <button class="button" type="submit" id="aa-analyze">Рассчитать таблицу + Dry Run</button>
-        <button class="button button--ghost" type="button" id="aa-save" disabled>Запустить Shadow</button>
+        <button class="button button--ghost" type="button" id="aa-save" disabled>Запустить Live Grid</button>
         <span class="settings-status" id="aa-status" aria-live="polite"></span>
       </form>
     </section>

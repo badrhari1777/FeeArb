@@ -200,6 +200,79 @@ a {
   margin-top: 6px;
 }
 
+.strategy-form {
+  display: grid;
+  gap: 14px;
+}
+
+.strategy-form > label,
+.strategy-step label {
+  display: grid;
+  gap: 6px;
+}
+
+.strategy-steps,
+.strategy-list {
+  display: grid;
+  gap: 14px;
+}
+
+.strategy-step,
+.strategy-card,
+.agent-now {
+  border: 1px solid #1f2a38;
+  border-radius: 10px;
+  padding: 14px;
+  background: var(--panel-alt, rgba(255, 255, 255, 0.02));
+}
+
+.strategy-step {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.strategy-step-title,
+.strategy-advanced {
+  grid-column: 1 / -1;
+}
+
+.strategy-step-title,
+.panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.strategy-advanced {
+  border-top: 1px solid #1f2a38;
+  padding-top: 10px;
+}
+
+.strategy-advanced[open] {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(140px, 1fr));
+  gap: 10px;
+}
+
+.strategy-advanced summary {
+  grid-column: 1 / -1;
+  cursor: pointer;
+}
+
+.strategy-current-step {
+  outline: 1px solid #5da9ff;
+  outline-offset: -1px;
+}
+
+@media (max-width: 850px) {
+  .strategy-step,
+  .strategy-advanced[open] {
+    grid-template-columns: 1fr;
+  }
+}
+
 .panel-muted {
   margin-top: 12px;
 }

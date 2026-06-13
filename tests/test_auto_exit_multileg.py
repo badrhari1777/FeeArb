@@ -181,7 +181,7 @@ class AutoExitMultilegSelectTestCase(unittest.TestCase):
     def test_pair_policy_uses_worst_tier(self) -> None:
         policy = _auto_exit_policy_for_pair("binance", "okx")
         self.assertEqual(policy["worst_tier"], 2)
-        self.assertAlmostEqual(float(policy["chunk_notional_cap_usd"]), 250.0)
+        self.assertAlmostEqual(float(policy["chunk_notional_cap_usd"]), 500.0)
         self.assertAlmostEqual(float(policy["market_cleanup_notional_cap_usd"]), 800.0)
         self.assertAlmostEqual(float(policy["edge_buffer_bps"]), 4.0)
 

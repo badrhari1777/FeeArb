@@ -115,7 +115,7 @@
       </dl>
       <button id="refresh-button" class="button" type="button">Manual refresh</button>
       <a class="button" href="/manual">Manual trading</a>
-      <a class="button" href="/auto-arbitrage">Auto arbitrage</a>
+      <a class="button" href="/strategies">Strategies</a>
       <a class="button" href="/funding-history">Funding history</a>
       <a class="button" href="/mobile">Mobile UI</a>
       <p class="hint">UI refresh: {{ refresh_interval }} s | Parser: {{ parser_interval }} s | Exchange poll: {{ exchange_interval }} s | Account refresh: {{ account_interval }} s | Positions market: {{ positions_market_interval }} s</p>
@@ -758,6 +758,16 @@
       </div>
     </section>
 
+    <section class="panel" id="live-strategies-panel">
+      <div class="panel-heading">
+        <h2>Live Auto Strategies</h2>
+        <a class="button button--ghost" href="/strategies">Open Strategies</a>
+      </div>
+      <div id="live-strategies-list" class="auto-arb-rule-grid">
+        <p class="muted">No live entry or exit strategies.</p>
+      </div>
+    </section>
+
     <section class="panel" id="symbol-positions-panel">
       <h2>Symbol Positions</h2>
       <table class="data-table data-table--wide data-table--symbol-positions">
@@ -1108,14 +1118,14 @@
 
     <section class="panel" id="auto-exit-agent-panel">
       <div class="panel-header">
-        <h2>Auto Exit Agent</h2>
+        <h2>Auto Agent</h2>
         <div class="panel-actions">
           <button type="button" class="button button--ghost" id="auto-exit-agent-copy">Copy</button>
           <button type="button" class="button button--ghost" id="auto-exit-agent-open-log">Open log</button>
           <button type="button" class="button button--danger" id="auto-exit-agent-stop">Stop</button>
         </div>
       </div>
-      <div class="muted" id="auto-exit-agent-status">No auto-exit execution yet.</div>
+      <div class="muted" id="auto-exit-agent-status">No auto-agent execution yet.</div>
       <div class="muted" id="auto-exit-agent-meta"></div>
       <div class="value-neg" id="auto-exit-agent-errors"></div>
       <div class="log-box" id="auto-exit-agent-log-box">

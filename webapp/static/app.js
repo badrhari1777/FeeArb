@@ -134,6 +134,15 @@
     rules: []
   };
 
+  var defaultAutoStrategies = {
+    mode: 'live',
+    defaults: { completion_tolerance_pct: 1 },
+    strategies: [],
+    queue: [],
+    running: null,
+    events: []
+  };
+
   var defaultState = {
     status: 'idle',
     refresh_interval: defaultSettings.table_refresh_seconds,
@@ -151,7 +160,8 @@
     execution: clone(defaultExecution),
     accounts: clone(defaultAccounts),
     auto_exit: clone(defaultAutoExit),
-    auto_arb: clone(defaultAutoArb)
+    auto_arb: clone(defaultAutoArb),
+    auto_strategies: clone(defaultAutoStrategies)
   };
 
   var globalState = normalizeState(window.__INITIAL_STATE__);
@@ -169,6 +179,7 @@
   };
   var staleAutoExitExecIds = {};
   var autoExitExecTimer = null;
+  var autoAgentContext = null;
 
   var elements = {
     generatedAt: document.getElementById('generated-at'),
@@ -264,6 +275,7 @@
     symbolPositionsMeta: document.getElementById('symbol-positions-meta'),
     symbolPositionsDiffs: document.getElementById('symbol-positions-diffs'),
     gridStrategiesList: document.getElementById('grid-strategies-list'),
+    liveStrategiesList: document.getElementById('live-strategies-list'),
     marginDiagnosticsBody: document.getElementById('margin-diagnostics-body'),
     marginDiagnosticsEmpty: document.getElementById('margin-diagnostics-empty'),
     marginLogicLog: document.getElementById('margin-logic-log'),
@@ -610,6 +622,9 @@
     state.accounts = normalizeAccounts(source ? source.accounts : null);
     state.auto_exit = normalizeAutoExit(source ? source.auto_exit : null);
     state.auto_arb = source && source.auto_arb ? clone(source.auto_arb) : clone(defaultAutoArb);
+    state.auto_strategies = source && source.auto_strategies
+      ? clone(source.auto_strategies)
+      : clone(defaultAutoStrategies);
     return state;
   }
 
@@ -1584,6 +1599,14 @@
             escapeHtml(row.symbol || '') + '" data-long="' + escapeHtml(ruleLong) + '" data-short="' + escapeHtml(ruleShort) + '" />';
           autoExitToggle = spreadCheckbox + ' ' + v1Checkbox + ' ' + percentSelect + ' <span class="muted">once</span>' +
             (isMultileg ? ' <span class="muted">multi-leg</span>' : '');
+          var linkedExitStrategies = ((globalState.auto_strategies || {}).strategies || []).filter(function (strategy) {
+            return strategy.enabled && strategy.type === 'exit_ladder' &&
+              String(strategy.symbol || '').toUpperCase() === String(row.symbol || '').toUpperCase();
+          });
+          if (linkedExitStrategies.length) {
+            autoExitToggle += ' <a class="cell-note" href="/strategies">ladder: ' +
+              escapeHtml(linkedExitStrategies.length) + '</a>';
+          }
           autoExitTarget = input;
           positionAction = '<div class="position-action-controls" data-symbol="' + escapeHtml(row.symbol || '') +
             '" data-long="' + escapeHtml((isMultileg ? (row.selected_long_exchange || '') : longEx) || '') +
@@ -1954,8 +1977,12 @@
     autoExitExecState.lastFetched = 0;
   }
 
-  function syncAutoExitExecId(autoExit) {
-    var execId = latestAutoExitExecId(autoExit);
+  function syncAutoExitExecId(autoExit, autoStrategies) {
+    var running = autoStrategies && autoStrategies.running ? autoStrategies.running : null;
+    autoAgentContext = running;
+    var execId = running && running.execution_id
+      ? running.execution_id
+      : latestAutoExitExecId(autoExit);
     if (!execId) {
       if (autoExitExecState.execId !== null) {
         resetAutoExitExecState(true);
@@ -1974,7 +2001,7 @@
       return;
     }
     if (!autoExitExecState.execId) {
-      elements.autoExitAgentStatus.textContent = 'No auto-exit execution yet.';
+      elements.autoExitAgentStatus.textContent = 'No auto-agent execution yet.';
       elements.autoExitAgentLog.innerHTML = '';
       elements.autoExitAgentLogEmpty.style.display = '';
       if (elements.autoExitAgentMeta) {
@@ -1991,9 +2018,33 @@
     }
     elements.autoExitAgentStatus.textContent = statusText;
     if (elements.autoExitAgentMeta) {
-      elements.autoExitAgentMeta.textContent = autoExitExecState.logPath
-        ? ('Log file: ' + autoExitExecState.logPath)
-        : '';
+      var meta = [];
+      if (autoAgentContext) {
+        meta.push('Action: ' + (autoAgentContext.action || '-'));
+        if (autoAgentContext.strategy_id) {
+          meta.push('Strategy: ' + autoAgentContext.strategy_id);
+        } else if (autoAgentContext.auto_exit_agent) {
+          meta.push('Source: Spread / V1');
+        } else if (autoAgentContext.auto_arb_agent) {
+          meta.push('Source: Grid');
+        }
+        if (autoAgentContext.step_id) {
+          meta.push('Step: ' + autoAgentContext.step_id);
+        }
+        if (autoAgentContext.message || autoAgentContext.stage) {
+          meta.push('Now: ' + (autoAgentContext.message || autoAgentContext.stage));
+        }
+        if (autoAgentContext.created_at) {
+          var started = Date.parse(autoAgentContext.created_at);
+          if (!isNaN(started)) {
+            meta.push('Elapsed: ' + Math.max(0, Math.round((Date.now() - started) / 1000)) + ' s');
+          }
+        }
+      }
+      if (autoExitExecState.logPath) {
+        meta.push('Log: ' + autoExitExecState.logPath);
+      }
+      elements.autoExitAgentMeta.textContent = meta.join(' | ');
     }
     if (elements.autoExitAgentErrors) {
       var errorLines = [];
@@ -2194,6 +2245,55 @@
     }).join('');
   }
 
+  function renderLiveStrategies(autoStrategies) {
+    if (!elements.liveStrategiesList) {
+      return;
+    }
+    var strategies = autoStrategies && Array.isArray(autoStrategies.strategies)
+      ? autoStrategies.strategies
+      : [];
+    if (!strategies.length) {
+      elements.liveStrategiesList.innerHTML = '<p class="muted">No live entry or exit strategies.</p>';
+      return;
+    }
+    elements.liveStrategiesList.innerHTML = strategies.map(function (strategy) {
+      var steps = Array.isArray(strategy.steps) ? strategy.steps : [];
+      var current = null;
+      var i;
+      for (i = 0; i < steps.length; i += 1) {
+        if (['completed', 'completed_with_dust', 'cancelled'].indexOf(steps[i].status) === -1) {
+          current = steps[i];
+          break;
+        }
+      }
+      var typeLabel = strategy.type === 'exit_ladder' ? 'AUTO EXIT' : 'AUTO ENTER';
+      var trigger = current
+        ? ('spread ' + (strategy.action === 'exit' ? '≥ ' : '≤ ') +
+          formatNumber(current.spread_target_pct, 3) + '%' +
+          (current.funding_min_pct !== null && current.funding_min_pct !== undefined
+            ? ', funding ≥ ' + formatNumber(current.funding_min_pct, 4) + '%'
+            : ''))
+        : 'all steps completed';
+      return '<article class="auto-arb-rule-card">' +
+        '<div class="auto-arb-rule-head"><div><strong>' + escapeHtml(strategy.symbol || '-') +
+        '</strong><div class="cell-note">' + escapeHtml(strategy.long_exchange || '-') +
+        ' long / ' + escapeHtml(strategy.short_exchange || '-') + ' short</div></div>' +
+        '<span class="status-pill status-pill--' + (strategy.enabled ? 'ready' : 'idle') + '">' +
+        typeLabel + '</span></div>' +
+        '<div class="auto-arb-metrics">' +
+        '<div><span>Current step</span><strong>' +
+        escapeHtml(current ? ((current.index || 0) + 1) + ' / ' + steps.length : steps.length + ' / ' + steps.length) +
+        '</strong></div><div><span>Status</span><strong>' +
+        escapeHtml(current ? (current.status || 'waiting') : 'completed') +
+        '</strong></div><div><span>Target / filled</span><strong>' +
+        formatTrimmedNumber(current && current.target_qty, 8) + ' / ' +
+        formatTrimmedNumber(current && current.filled_qty, 8) +
+        '</strong></div><div><span>Remaining</span><strong>' +
+        formatTrimmedNumber(current && current.remaining_qty, 8) +
+        '</strong></div></div><div class="cell-note">' + escapeHtml(trigger) + '</div></article>';
+    }).join('');
+  }
+
   function renderAccounts(accounts) {
     var data = accounts || defaultAccounts;
     renderAccountStatus(data.status || []);
@@ -2274,10 +2374,11 @@
     renderExecution(globalState.execution);
     renderAccounts(globalState.accounts);
     renderGridStrategies(globalState.auto_arb || {});
+    renderLiveStrategies(globalState.auto_strategies || {});
     renderAutoExitLog(globalState.auto_exit || {});
     renderAutoExitDiagnostics(globalState.auto_exit || {});
     renderAutoExitV1Diagnostics(globalState.auto_exit || {});
-    syncAutoExitExecId(globalState.auto_exit || {});
+    syncAutoExitExecId(globalState.auto_exit || {}, globalState.auto_strategies || {});
     renderAutoExitAgent();
     renderMessages(collectMessages(globalState));
     toggleEmptyState(!globalState.snapshot);

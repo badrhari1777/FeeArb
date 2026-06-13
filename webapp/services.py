@@ -49,6 +49,15 @@ from execution.auto_arb_grid import (
     normalize_level_count,
     recommend_level_count,
 )
+from execution.auto_strategies import (
+    StrategyCandidate,
+    action_priority,
+    choose_candidate,
+    current_step,
+    reconcile_step_progress,
+    trigger_edge,
+    trigger_matches,
+)
 from execution.accounts import AccountMonitor, normalize_symbol
 from risk.config import default_risk_config, RiskConfig
 from risk.derisk_manager import (
@@ -143,7 +152,7 @@ DERISK_OUTCOME_HORIZONS_SEC = {
     "15m": 900.0,
 }
 AUTO_EXIT_DEFAULTS = {
-    "max_runtime_sec": 600,
+    "max_runtime_sec": 120,
     "cooldown_sec": 300,
     "require_live": True,
     "auto_clear_no_position_sec": 120,
@@ -153,6 +162,14 @@ AUTO_EXIT_STATE_PATH = STATE_DIR / "auto_exit_rules.json"
 AUTO_EXIT_HISTORY_PATH = BASE_DIR / "logs" / "auto_exit_history.jsonl"
 AUTO_ARB_STATE_PATH = STATE_DIR / "auto_arb_rules.json"
 AUTO_ARB_HISTORY_PATH = BASE_DIR / "logs" / "auto_arb_history.jsonl"
+AUTO_STRATEGY_STATE_PATH = STATE_DIR / "auto_strategies.json"
+AUTO_STRATEGY_HISTORY_PATH = BASE_DIR / "logs" / "auto_strategy_history.jsonl"
+AUTO_STRATEGY_DEFAULTS = {
+    "completion_tolerance_pct": 1.0,
+    "max_runtime_sec": 120,
+    "poll_sec": 2.0,
+    "balance_retry_sec": 60,
+}
 AUTO_ARB_LIVE_MAX_CHUNK_NOTIONAL_USD = 50.0
 AUTO_ARB_LIVE_MAX_TOTAL_NOTIONAL_USD = 100.0
 HEDGE_CLUSTER_STATE_PATH = STATE_DIR / "hedge_clusters.json"
@@ -165,18 +182,18 @@ AUTO_EXIT_SIGNATURE_QTY_TOLERANCE_PCT = 0.10
 AUTO_EXIT_SIGNATURE_ENTRY_TOLERANCE_PCT = 0.005
 AUTO_EXIT_POLICY_BY_TIER = {
     1: {
-        "chunk_notional_cap_usd": 350.0,
+        "chunk_notional_cap_usd": 750.0,
         "market_cleanup_notional_cap_usd": 1500.0,
         "edge_buffer_bps": 2.0,
     },
     2: {
-        "chunk_notional_cap_usd": 250.0,
+        "chunk_notional_cap_usd": 500.0,
         "market_cleanup_notional_cap_usd": 800.0,
         "edge_buffer_bps": 4.0,
     },
 }
 AUTO_EXIT_DEFAULT_POLICY = {
-    "chunk_notional_cap_usd": 150.0,
+    "chunk_notional_cap_usd": 250.0,
     "market_cleanup_notional_cap_usd": 0.0,
     "edge_buffer_bps": 8.0,
 }
@@ -3125,6 +3142,18 @@ class DataService:
         self._auto_arb_lock = asyncio.Lock()
         self._auto_arb_task: Optional[asyncio.Task] = None
         self._auto_arb_poll_sec = 3.0
+        self._auto_strategy_store = JsonStateStore(AUTO_STRATEGY_STATE_PATH)
+        self._auto_strategy_history_store = JsonlEventStore(AUTO_STRATEGY_HISTORY_PATH)
+        self._auto_strategies: dict[str, Any] = self._load_auto_strategy_config()
+        self._auto_strategy_lock = asyncio.Lock()
+        self._auto_strategy_task: Optional[asyncio.Task] = None
+        self._auto_strategy_poll_sec = float(
+            (self._auto_strategies.get("defaults") or {}).get("poll_sec")
+            or AUTO_STRATEGY_DEFAULTS["poll_sec"]
+        )
+        self._auto_strategy_queue: list[dict[str, Any]] = []
+        self._auto_strategy_events: list[dict[str, Any]] = []
+        self._auto_strategy_event_limit = 100
         self._auto_exit_store = JsonStateStore(AUTO_EXIT_STATE_PATH)
         self._auto_exit_history_store = JsonlEventStore(AUTO_EXIT_HISTORY_PATH)
         self._auto_exit: dict[str, Any] = self._load_auto_exit_config()
@@ -6179,8 +6208,6 @@ class DataService:
             self._protective_task = asyncio.create_task(self._protective_scheduler())
         if self._auto_exit_task is None:
             self._auto_exit_task = asyncio.create_task(self._auto_exit_scheduler())
-        if self._auto_arb_task is None:
-            self._auto_arb_task = asyncio.create_task(self._auto_arb_scheduler())
         if self._derisk_task is None:
             self._derisk_task = asyncio.create_task(self._derisk_scheduler())
         if self._coin_focus_task is None:
@@ -6236,6 +6263,13 @@ class DataService:
             except asyncio.CancelledError:
                 pass
             self._auto_arb_task = None
+        if self._auto_strategy_task:
+            self._auto_strategy_task.cancel()
+            try:
+                await self._auto_strategy_task
+            except asyncio.CancelledError:
+                pass
+            self._auto_strategy_task = None
         if self._derisk_task:
             self._derisk_task.cancel()
             try:
@@ -6831,6 +6865,683 @@ class DataService:
         if payload.get("dry_run") or not payload.get("async_run"):
             return await self._manual.roll(payload, positions)
         return await self._start_manual_run("roll", payload, positions)
+
+    def _load_auto_strategy_config(self) -> dict[str, Any]:
+        raw = self._auto_strategy_store.load(
+            {"version": 1, "defaults": dict(AUTO_STRATEGY_DEFAULTS), "strategies": {}}
+        )
+        if not isinstance(raw, Mapping):
+            raw = {}
+        defaults = dict(AUTO_STRATEGY_DEFAULTS)
+        if isinstance(raw.get("defaults"), Mapping):
+            defaults.update(raw["defaults"])
+        strategies = raw.get("strategies")
+        return {
+            "version": 1,
+            "defaults": defaults,
+            "strategies": dict(strategies) if isinstance(strategies, Mapping) else {},
+        }
+
+    def _save_auto_strategy_config(self) -> None:
+        self._auto_strategy_store.save(self._auto_strategies)
+
+    def _auto_strategy_event(self, event: str, payload: Mapping[str, Any]) -> None:
+        row = {
+            "event": event,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            **dict(payload),
+        }
+        self._auto_strategy_events.append(row)
+        if len(self._auto_strategy_events) > self._auto_strategy_event_limit:
+            self._auto_strategy_events = self._auto_strategy_events[-self._auto_strategy_event_limit :]
+        self._auto_strategy_history_store.append(row)
+
+    def auto_strategy_payload(self) -> dict[str, Any]:
+        strategies = [
+            dict(item)
+            for item in (self._auto_strategies.get("strategies") or {}).values()
+            if isinstance(item, Mapping)
+        ]
+        strategies.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        running = self._auto_exit_running_exec()
+        running_detail = None
+        if running:
+            run = self._manual_runs.get(str(running.get("execution_id") or "")) or {}
+            running_detail = {
+                **running,
+                "strategy_id": run.get("auto_strategy_id"),
+                "step_id": run.get("auto_strategy_step_id"),
+                "auto_exit_agent": bool(run.get("auto_exit_agent")),
+                "auto_arb_agent": bool(run.get("auto_arb_agent")),
+                "created_at": run.get("created_at"),
+                "updated_at": run.get("updated_at"),
+                "stage": ((run.get("logs") or [{}])[-1] or {}).get("event"),
+                "message": ((run.get("logs") or [{}])[-1] or {}).get("message"),
+            }
+        return {
+            "version": 1,
+            "mode": "live",
+            "defaults": dict(self._auto_strategies.get("defaults") or {}),
+            "strategies": strategies,
+            "queue": list(self._auto_strategy_queue),
+            "running": running_detail,
+            "events": list(self._auto_strategy_events),
+            "legacy": {
+                "spread_v1": self.auto_exit_payload(),
+                "grid": self.auto_arb_payload(),
+            },
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def analyze_auto_strategy(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        strategy_type = str(payload.get("type") or "").strip().lower()
+        if strategy_type not in {"enter_ladder", "exit_ladder"}:
+            raise ValueError("Strategy type must be enter_ladder or exit_ladder.")
+        symbol = normalize_symbol(str(payload.get("symbol") or "")).upper()
+        long_exchange = normalize_exchange_name(str(payload.get("long_exchange") or ""))
+        short_exchange = normalize_exchange_name(str(payload.get("short_exchange") or ""))
+        raw_steps = payload.get("steps")
+        if not symbol or not long_exchange or not short_exchange:
+            raise ValueError("Symbol, long exchange and short exchange are required.")
+        if not isinstance(raw_steps, list) or not raw_steps:
+            raise ValueError("At least one strategy step is required.")
+        action = "enter" if strategy_type == "enter_ladder" else "exit"
+        hedged_qty = 0.0
+        if action == "exit":
+            hedged_qty = float(
+                _position_pair_quantities(
+                    self._accounts.snapshot().get("positions") or [],
+                    symbol=symbol,
+                    long_exchange=long_exchange,
+                    short_exchange=short_exchange,
+                ).get("hedged_qty")
+                or 0.0
+            )
+        plans: list[dict[str, Any]] = []
+        for index, raw in enumerate(raw_steps):
+            if not isinstance(raw, Mapping):
+                raise ValueError(f"Step {index + 1} is invalid.")
+            qty = _safe_float(raw.get("qty"))
+            notional = _safe_float(raw.get("notional_usd"))
+            percent = _safe_float(raw.get("percent"))
+            if action == "exit" and percent and percent > 0:
+                qty = hedged_qty * min(100.0, percent) / 100.0
+                notional = None
+            if not ((qty and qty > 0) or (notional and notional > 0)):
+                raise ValueError(f"Step {index + 1}: unable to resolve qty or USDT notional.")
+            plan = await self.manual_analyze(
+                {
+                    "action": action,
+                    "mode": "smart-enter" if action == "enter" else "smart-exit",
+                    "symbol": symbol,
+                    "qty": qty,
+                    "notional": notional,
+                    "long_exchange": long_exchange,
+                    "short_exchange": short_exchange,
+                    "max_slippage_bps": _safe_float(raw.get("max_slippage_bps")) or 8.0,
+                    "use_orderbook_check": True,
+                    "dry_run": True,
+                    "async_run": False,
+                    "margin_mode": "isolated",
+                }
+            )
+            plans.append(
+                {
+                    "step": index + 1,
+                    "requested_qty": qty,
+                    "requested_notional_usd": notional,
+                    "plan": plan,
+                }
+            )
+        return {
+            "type": strategy_type,
+            "action": action,
+            "symbol": symbol,
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
+            "hedged_qty": hedged_qty if action == "exit" else None,
+            "steps": plans,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    async def upsert_auto_strategy(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        strategy_type = str(payload.get("type") or "").strip().lower()
+        if strategy_type not in {"enter_ladder", "exit_ladder"}:
+            raise ValueError("Strategy type must be enter_ladder or exit_ladder.")
+        symbol = normalize_symbol(str(payload.get("symbol") or "")).upper()
+        long_exchange = normalize_exchange_name(str(payload.get("long_exchange") or ""))
+        short_exchange = normalize_exchange_name(str(payload.get("short_exchange") or ""))
+        if not symbol or not long_exchange or not short_exchange:
+            raise ValueError("Symbol, long exchange and short exchange are required.")
+        if long_exchange == short_exchange:
+            raise ValueError("Long and short exchanges must differ.")
+        raw_steps = payload.get("steps")
+        if not isinstance(raw_steps, list) or not raw_steps:
+            raise ValueError("At least one strategy step is required.")
+        action = "enter" if strategy_type == "enter_ladder" else "exit"
+        now_iso = datetime.now(timezone.utc).isoformat()
+        strategy_id = str(payload.get("id") or uuid4().hex[:12])
+        async with self._auto_strategy_lock:
+            existing = (self._auto_strategies.get("strategies") or {}).get(strategy_id)
+            if isinstance(existing, Mapping):
+                active = current_step(existing)
+                if active and active.get("active_execution_id"):
+                    raise ValueError("Wait for the active strategy execution before editing.")
+            generation = max(1, int((existing or {}).get("generation") or 0) + 1)
+            steps: list[dict[str, Any]] = []
+            for index, raw in enumerate(raw_steps):
+                if not isinstance(raw, Mapping):
+                    raise ValueError(f"Step {index + 1} is invalid.")
+                spread_target = _safe_float(raw.get("spread_target_pct"))
+                if spread_target is None:
+                    raise ValueError(f"Step {index + 1}: spread target is required.")
+                qty = _safe_float(raw.get("qty"))
+                notional = _safe_float(raw.get("notional_usd"))
+                percent = _safe_float(raw.get("percent"))
+                if action == "enter" and not ((qty and qty > 0) or (notional and notional > 0)):
+                    raise ValueError(f"Step {index + 1}: enter qty or USDT notional is required.")
+                if action == "exit" and not (
+                    (qty and qty > 0)
+                    or (notional and notional > 0)
+                    or (percent and 0 < percent <= 100)
+                ):
+                    raise ValueError(f"Step {index + 1}: exit qty, USDT or percent is required.")
+                step_id = str(raw.get("id") or f"{strategy_id}-{index + 1}")
+                steps.append(
+                    {
+                        "id": step_id,
+                        "index": index,
+                        "action": action,
+                        "spread_target_pct": float(spread_target),
+                        "funding_min_pct": _safe_float(raw.get("funding_min_pct")),
+                        "qty": float(qty) if qty and qty > 0 else None,
+                        "notional_usd": float(notional) if notional and notional > 0 else None,
+                        "percent": float(percent) if percent and percent > 0 else None,
+                        "chunk_notional_usd": _safe_float(raw.get("chunk_notional_usd")),
+                        "max_slippage_bps": _safe_float(raw.get("max_slippage_bps")) or 8.0,
+                        "max_runtime_sec": int(
+                            _safe_float(raw.get("max_runtime_sec"))
+                            or (self._auto_strategies.get("defaults") or {}).get("max_runtime_sec")
+                            or 120
+                        ),
+                        "target_qty": None,
+                        "filled_qty": 0.0,
+                        "remaining_qty": None,
+                        "baseline_hedged_qty": None,
+                        "status": "waiting",
+                        "active_execution_id": None,
+                        "last_trigger": None,
+                        "last_result": None,
+                        "waiting_since_ts": time.time(),
+                    }
+                )
+            strategy = {
+                "id": strategy_id,
+                "generation": generation,
+                "type": strategy_type,
+                "action": action,
+                "name": str(payload.get("name") or f"{action.upper()} {symbol}"),
+                "symbol": symbol,
+                "long_exchange": long_exchange,
+                "short_exchange": short_exchange,
+                "enabled": bool(payload.get("enabled", True)),
+                "status": "waiting",
+                "steps": steps,
+                "created_at": (existing or {}).get("created_at") or now_iso,
+                "updated_at": now_iso,
+            }
+            self._auto_strategies.setdefault("strategies", {})[strategy_id] = strategy
+            self._save_auto_strategy_config()
+        self._auto_strategy_event(
+            "strategy_saved",
+            {"strategy_id": strategy_id, "type": strategy_type, "symbol": symbol},
+        )
+        return self.auto_strategy_payload()
+
+    async def set_auto_strategy_enabled(self, strategy_id: str, enabled: bool) -> dict[str, Any]:
+        async with self._auto_strategy_lock:
+            strategy = (self._auto_strategies.get("strategies") or {}).get(strategy_id)
+            if not isinstance(strategy, dict):
+                raise ValueError("Strategy not found.")
+            step = current_step(strategy)
+            if not enabled and step and step.get("active_execution_id"):
+                raise ValueError("Stop the active execution before pausing the strategy.")
+            strategy["enabled"] = bool(enabled)
+            strategy["status"] = "waiting" if enabled else "paused"
+            strategy["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._save_auto_strategy_config()
+        self._auto_strategy_event(
+            "strategy_enabled" if enabled else "strategy_paused",
+            {"strategy_id": strategy_id},
+        )
+        return self.auto_strategy_payload()
+
+    async def delete_auto_strategy(self, strategy_id: str) -> dict[str, Any]:
+        async with self._auto_strategy_lock:
+            strategy = (self._auto_strategies.get("strategies") or {}).get(strategy_id)
+            if not isinstance(strategy, Mapping):
+                raise ValueError("Strategy not found.")
+            step = current_step(strategy)
+            if step and step.get("active_execution_id"):
+                raise ValueError("Stop the active execution before deleting the strategy.")
+            self._auto_strategies.setdefault("strategies", {}).pop(strategy_id, None)
+            self._save_auto_strategy_config()
+        self._auto_strategy_event("strategy_deleted", {"strategy_id": strategy_id})
+        return self.auto_strategy_payload()
+
+    async def _auto_strategy_funding_delta_pct(
+        self,
+        *,
+        symbol: str,
+        long_exchange: str,
+        short_exchange: str,
+    ) -> float | None:
+        rates: dict[str, float | None] = {}
+        for exchange in (long_exchange, short_exchange):
+            cached = self._positions_market_cache.get((exchange, symbol))
+            rate = _safe_float(getattr(cached, "funding_rate", None)) if cached else None
+            if rate is None:
+                try:
+                    adapter = get_adapter_cached(exchange)
+                    snapshots = await adapter.fetch_market_snapshots_async([symbol])
+                except Exception:  # pylint: disable=broad-except
+                    snapshots = []
+                for snapshot in snapshots or []:
+                    if isinstance(snapshot, MarketSnapshot) and normalize_symbol(snapshot.symbol) == symbol:
+                        rate = _safe_float(snapshot.funding_rate)
+                        break
+            rates[exchange] = rate
+        long_rate = rates.get(long_exchange)
+        short_rate = rates.get(short_exchange)
+        if long_rate is None or short_rate is None:
+            return None
+        return (float(short_rate) - float(long_rate)) * 100.0
+
+    def _auto_strategy_pair_quantities(self, strategy: Mapping[str, Any]) -> dict[str, float]:
+        return _position_pair_quantities(
+            self._accounts.snapshot().get("positions") or [],
+            symbol=str(strategy.get("symbol") or ""),
+            long_exchange=str(strategy.get("long_exchange") or ""),
+            short_exchange=str(strategy.get("short_exchange") or ""),
+        )
+
+    def _auto_strategy_step_ref(
+        self,
+        strategy: dict[str, Any],
+        step_id: str,
+    ) -> dict[str, Any] | None:
+        for step in strategy.get("steps") or []:
+            if isinstance(step, dict) and str(step.get("id") or "") == step_id:
+                return step
+        return None
+
+    async def _reconcile_auto_strategy_execution(
+        self,
+        strategy_id: str,
+        step_id: str,
+        execution_id: str,
+    ) -> None:
+        run = self._manual_runs.get(execution_id)
+        if not isinstance(run, Mapping) or str(run.get("status") or "") == "running":
+            return
+        try:
+            await self._accounts.refresh_now(force_env=True)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        async with self._auto_strategy_lock:
+            strategy = (self._auto_strategies.get("strategies") or {}).get(strategy_id)
+            if not isinstance(strategy, dict):
+                return
+            step = self._auto_strategy_step_ref(strategy, step_id)
+            if not isinstance(step, dict) or str(step.get("active_execution_id") or "") != execution_id:
+                return
+            quantities = self._auto_strategy_pair_quantities(strategy)
+            current_qty = float(quantities.get("hedged_qty") or 0.0)
+            baseline_qty = float(step.get("baseline_hedged_qty") or 0.0)
+            action = str(strategy.get("action") or "")
+            observed_filled = (
+                max(0.0, current_qty - baseline_qty)
+                if action == "enter"
+                else max(0.0, baseline_qty - current_qty)
+            )
+            tolerance_pct = float(
+                (self._auto_strategies.get("defaults") or {}).get("completion_tolerance_pct")
+                or 1.0
+            )
+            reconciled = reconcile_step_progress(
+                step,
+                observed_filled_qty=observed_filled,
+                tolerance_pct=tolerance_pct,
+            )
+            step.update(reconciled)
+            step["active_execution_id"] = None
+            step["last_result"] = {
+                "execution_id": execution_id,
+                "status": run.get("status"),
+                "error": run.get("error"),
+                "result": run.get("result"),
+                "observed_hedged_qty": current_qty,
+                "observed_filled_qty": observed_filled,
+            }
+            step["updated_at"] = datetime.now(timezone.utc).isoformat()
+            step["next_eligible_ts"] = time.time() + 2.0
+            if str(step.get("status")) in {"completed", "completed_with_dust"}:
+                next_step = current_step(strategy)
+                strategy["status"] = "completed" if next_step is None else "waiting"
+            else:
+                errors = []
+                result = run.get("result")
+                if isinstance(result, Mapping):
+                    errors = [str(item) for item in (result.get("errors") or [])]
+                if errors and not observed_filled:
+                    joined = " ".join(errors).lower()
+                    step["status"] = "blocked_balance" if "balance" in joined else "waiting"
+                    retry_sec = (
+                        int((self._auto_strategies.get("defaults") or {}).get("balance_retry_sec") or 60)
+                        if step["status"] == "blocked_balance"
+                        else 2
+                    )
+                    step["next_eligible_ts"] = time.time() + retry_sec
+                strategy["status"] = str(step.get("status") or "waiting")
+            strategy["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._save_auto_strategy_config()
+            event_payload = {
+                "strategy_id": strategy_id,
+                "step_id": step_id,
+                "execution_id": execution_id,
+                "status": step.get("status"),
+                "target_qty": step.get("target_qty"),
+                "filled_qty": step.get("filled_qty"),
+                "remaining_qty": step.get("remaining_qty"),
+                "completion_tolerance_qty": step.get("completion_tolerance_qty"),
+            }
+        self._auto_strategy_event("step_reconciled", event_payload)
+
+    async def _start_auto_strategy_step(
+        self,
+        strategy_id: str,
+        step_id: str,
+        trigger: Mapping[str, Any],
+    ) -> None:
+        if self._auto_exit_running_exec():
+            return
+        try:
+            await self._accounts.refresh_now(force_env=True)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        async with self._auto_strategy_lock:
+            strategy = (self._auto_strategies.get("strategies") or {}).get(strategy_id)
+            if not isinstance(strategy, dict) or not strategy.get("enabled"):
+                return
+            step = self._auto_strategy_step_ref(strategy, step_id)
+            if not isinstance(step, dict) or step.get("active_execution_id"):
+                return
+            quantities = self._auto_strategy_pair_quantities(strategy)
+            hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+            reference_price = max(
+                [
+                    value
+                    for value in (
+                        _safe_float(trigger.get("long_mid")),
+                        _safe_float(trigger.get("short_mid")),
+                    )
+                    if value and value > 0
+                ],
+                default=None,
+            )
+            target_qty = _safe_float(step.get("target_qty"))
+            if target_qty is None:
+                requested_qty = _safe_float(step.get("qty"))
+                requested_notional = _safe_float(step.get("notional_usd"))
+                requested_percent = _safe_float(step.get("percent"))
+                if requested_qty and requested_qty > 0:
+                    target_qty = requested_qty
+                elif requested_notional and reference_price:
+                    target_qty = requested_notional / reference_price
+                elif str(strategy.get("action")) == "exit" and requested_percent:
+                    target_qty = hedged_qty * min(100.0, requested_percent) / 100.0
+                if not target_qty or target_qty <= 0:
+                    step["status"] = "blocked_minimum"
+                    step["last_result"] = {"errors": ["Unable to resolve target quantity."]}
+                    strategy["status"] = "blocked_minimum"
+                    self._save_auto_strategy_config()
+                    return
+                if str(strategy.get("action")) == "exit":
+                    target_qty = min(float(target_qty), hedged_qty)
+                step["target_qty"] = float(target_qty)
+                step["remaining_qty"] = float(target_qty)
+                step["baseline_hedged_qty"] = hedged_qty
+            remaining_qty = max(
+                0.0,
+                _safe_float(step.get("remaining_qty"))
+                if step.get("remaining_qty") is not None
+                else float(target_qty),
+            )
+            if str(strategy.get("action")) == "exit":
+                remaining_qty = min(remaining_qty, hedged_qty)
+            if remaining_qty <= 0:
+                step.update(
+                    reconcile_step_progress(
+                        step,
+                        observed_filled_qty=float(step.get("target_qty") or 0.0),
+                        tolerance_pct=float(
+                            (self._auto_strategies.get("defaults") or {}).get(
+                                "completion_tolerance_pct", 1.0
+                            )
+                        ),
+                    )
+                )
+                self._save_auto_strategy_config()
+                return
+            worst_tier = max(
+                venue_liquidity_tier(str(strategy.get("long_exchange") or "")),
+                venue_liquidity_tier(str(strategy.get("short_exchange") or "")),
+            )
+            default_chunk_notional = 750.0 if worst_tier <= 1 else 500.0 if worst_tier == 2 else 250.0
+            action = str(strategy.get("action") or "")
+            spread_target = float(step.get("spread_target_pct"))
+            run_payload = {
+                "symbol": strategy.get("symbol"),
+                "qty": remaining_qty,
+                "notional": None,
+                "mode": "smart-enter" if action == "enter" else "smart-exit",
+                "max_slippage_bps": float(step.get("max_slippage_bps") or 8.0),
+                "spread_min_pct": -100.0 if action == "enter" else spread_target,
+                "spread_max_pct": spread_target if action == "enter" else 100.0,
+                "timeout_sec": 0,
+                "max_runtime_sec": int(step.get("max_runtime_sec") or 120),
+                "reprice_sec": 5,
+                "chunk_qty": None,
+                "chunk_notional": _safe_float(step.get("chunk_notional_usd"))
+                or default_chunk_notional,
+                "force_chunk_qty": False,
+                "use_orderbook_check": True,
+                "fallback_to_market": False,
+                "hedge_order_type": "limit",
+                "hedge_limit_mode": "passive",
+                "async_run": True,
+                "dry_run": False,
+                "long_exchange": strategy.get("long_exchange"),
+                "short_exchange": strategy.get("short_exchange"),
+                "margin_mode": "isolated",
+                "auto_strategy_agent": True,
+                "auto_strategy_id": strategy_id,
+                "auto_strategy_step_id": step_id,
+                "auto_strategy_generation": int(strategy.get("generation") or 1),
+            }
+            step["status"] = "queued"
+            step["last_trigger"] = dict(trigger)
+            strategy["status"] = "queued"
+            self._save_auto_strategy_config()
+        result = (
+            await self.manual_enter(run_payload)
+            if action == "enter"
+            else await self.manual_exit(run_payload)
+        )
+        execution_id = str((result or {}).get("execution_id") or "")
+        async with self._auto_strategy_lock:
+            strategy = (self._auto_strategies.get("strategies") or {}).get(strategy_id)
+            if not isinstance(strategy, dict):
+                return
+            step = self._auto_strategy_step_ref(strategy, step_id)
+            if not isinstance(step, dict):
+                return
+            if execution_id:
+                step["active_execution_id"] = execution_id
+                step["status"] = "executing"
+                strategy["status"] = "executing"
+            else:
+                step["status"] = "blocked_conflict"
+                step["last_result"] = dict(result or {})
+                step["next_eligible_ts"] = time.time() + 2.0
+                strategy["status"] = "blocked_conflict"
+            strategy["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._save_auto_strategy_config()
+        self._auto_strategy_event(
+            "step_started" if execution_id else "step_start_blocked",
+            {
+                "strategy_id": strategy_id,
+                "step_id": step_id,
+                "execution_id": execution_id or None,
+                "qty": remaining_qty,
+                "trigger": dict(trigger),
+                "result": result,
+            },
+        )
+
+    async def _auto_strategy_cycle(self) -> None:
+        async with self._auto_strategy_lock:
+            snapshots = [
+                dict(strategy)
+                for strategy in (self._auto_strategies.get("strategies") or {}).values()
+                if isinstance(strategy, Mapping) and strategy.get("enabled")
+            ]
+        for strategy in snapshots:
+            step = current_step(strategy)
+            if not step:
+                continue
+            execution_id = str(step.get("active_execution_id") or "")
+            if execution_id:
+                await self._reconcile_auto_strategy_execution(
+                    str(strategy.get("id") or ""),
+                    str(step.get("id") or ""),
+                    execution_id,
+                )
+        if self._auto_exit_running_exec():
+            self._auto_strategy_queue = []
+            return
+
+        candidates: list[StrategyCandidate] = []
+        candidate_data: dict[tuple[str, str], dict[str, Any]] = {}
+        for strategy in snapshots:
+            strategy_id = str(strategy.get("id") or "")
+            step = current_step(strategy)
+            if not step or step.get("active_execution_id"):
+                continue
+            if time.time() < float(step.get("next_eligible_ts") or 0.0):
+                continue
+            spreads = await self.auto_arb_spreads(
+                symbol=str(strategy.get("symbol") or ""),
+                long_exchange=str(strategy.get("long_exchange") or ""),
+                short_exchange=str(strategy.get("short_exchange") or ""),
+            )
+            action = str(strategy.get("action") or "")
+            spread_value = _safe_float(
+                spreads.get("entry_spread_pct") if action == "enter" else spreads.get("exit_spread_pct")
+            )
+            funding_delta = await self._auto_strategy_funding_delta_pct(
+                symbol=str(strategy.get("symbol") or ""),
+                long_exchange=str(strategy.get("long_exchange") or ""),
+                short_exchange=str(strategy.get("short_exchange") or ""),
+            )
+            target = _safe_float(step.get("spread_target_pct"))
+            matched, reason = trigger_matches(
+                action=action,
+                spread_pct=spread_value,
+                spread_target_pct=target,
+                funding_delta_pct=funding_delta,
+                funding_min_pct=_safe_float(step.get("funding_min_pct")),
+            )
+            trigger = {
+                "matched": matched,
+                "reason": reason,
+                "spread_pct": spread_value,
+                "spread_target_pct": target,
+                "funding_delta_pct": funding_delta,
+                "funding_min_pct": _safe_float(step.get("funding_min_pct")),
+                "long_mid": _safe_float((spreads.get("long_quote") or {}).get("mid")),
+                "short_mid": _safe_float((spreads.get("short_quote") or {}).get("mid")),
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            }
+            async with self._auto_strategy_lock:
+                current = (self._auto_strategies.get("strategies") or {}).get(strategy_id)
+                if isinstance(current, dict):
+                    current_step_ref = self._auto_strategy_step_ref(
+                        current, str(step.get("id") or "")
+                    )
+                    if current_step_ref:
+                        current_step_ref["last_trigger"] = trigger
+                        if not matched and current_step_ref.get("status") not in {
+                            "partial",
+                            "blocked_balance",
+                        }:
+                            current_step_ref["status"] = "waiting"
+                        current["status"] = str(current_step_ref.get("status") or "waiting")
+                        current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                        self._save_auto_strategy_config()
+            if not matched or spread_value is None or target is None:
+                continue
+            candidate = StrategyCandidate(
+                strategy_id=strategy_id,
+                step_id=str(step.get("id") or ""),
+                action=action,
+                priority=action_priority(action, str(strategy.get("type") or "")),
+                edge=trigger_edge(
+                    action=action,
+                    spread_pct=float(spread_value),
+                    spread_target_pct=float(target),
+                ),
+                waiting_since_ts=float(step.get("waiting_since_ts") or time.time()),
+            )
+            candidates.append(candidate)
+            candidate_data[(candidate.strategy_id, candidate.step_id)] = trigger
+        ordered = sorted(
+            candidates,
+            key=lambda item: (
+                item.priority,
+                -item.edge,
+                item.waiting_since_ts,
+                item.strategy_id,
+                item.step_id,
+            ),
+        )
+        self._auto_strategy_queue = [
+            {
+                "strategy_id": item.strategy_id,
+                "step_id": item.step_id,
+                "action": item.action,
+                "priority": item.priority,
+                "edge": item.edge,
+            }
+            for item in ordered
+        ]
+        selected = choose_candidate(candidates)
+        if selected:
+            await self._start_auto_strategy_step(
+                selected.strategy_id,
+                selected.step_id,
+                candidate_data[(selected.strategy_id, selected.step_id)],
+            )
+
+    async def _auto_strategy_scheduler(self) -> None:
+        while True:
+            try:
+                await self._auto_strategy_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("auto-strategy loop failed: %s", exc)
+            await asyncio.sleep(max(1.0, self._auto_strategy_poll_sec))
 
     def _load_auto_arb_config(self) -> dict[str, Any]:
         raw = self._auto_arb_store.load({"version": 1, "rules": {}})
@@ -9113,6 +9824,14 @@ class DataService:
         positions: Optional[list[dict[str, Any]]],
     ) -> dict[str, Any]:
         self._prune_manual_runs()
+        running = self._auto_exit_running_exec()
+        if running:
+            return {
+                "error": "execution_busy",
+                "status": "blocked",
+                "running_execution_id": running.get("execution_id"),
+                "running_action": running.get("action"),
+            }
         exec_id = uuid4().hex[:12]
         now = datetime.now(timezone.utc).isoformat()
         now_ts = time.time()
@@ -9147,11 +9866,19 @@ class DataService:
             "auto_exit_trigger_mode": str((payload or {}).get("auto_exit_trigger_mode") or ""),
             "auto_exit_exit_percent": _safe_float((payload or {}).get("auto_exit_exit_percent")),
             "auto_exit_hedged_qty": _safe_float((payload or {}).get("auto_exit_hedged_qty")),
+            "auto_exit_requested_qty": _safe_float((payload or {}).get("auto_exit_requested_qty")),
             "auto_arb_agent": bool((payload or {}).get("auto_arb_agent")),
             "auto_arb_rule_id": str((payload or {}).get("auto_arb_rule_id") or ""),
             "auto_arb_rule_generation": max(
                 0,
                 int((payload or {}).get("auto_arb_rule_generation") or 0),
+            ),
+            "auto_strategy_agent": bool((payload or {}).get("auto_strategy_agent")),
+            "auto_strategy_id": str((payload or {}).get("auto_strategy_id") or ""),
+            "auto_strategy_step_id": str((payload or {}).get("auto_strategy_step_id") or ""),
+            "auto_strategy_generation": max(
+                0,
+                int((payload or {}).get("auto_strategy_generation") or 0),
             ),
         }
         self._manual_runs[exec_id] = run
@@ -9331,6 +10058,7 @@ class DataService:
             "settings": settings_payload,
             "auto_exit": self.auto_exit_payload(),
             "auto_arb": self.auto_arb_payload(),
+            "auto_strategies": self.auto_strategy_payload(),
             "emergency_derisk": self.derisk_payload(),
             "coin_analysis": {
                 "focus_poll_sec": self._coin_focus_poll_sec,
@@ -11511,7 +12239,12 @@ class DataService:
             if isinstance(incoming_defaults, Mapping):
                 if incoming_defaults.get("max_runtime_sec") is not None:
                     try:
-                        defaults["max_runtime_sec"] = int(incoming_defaults.get("max_runtime_sec"))
+                        incoming_runtime = int(incoming_defaults.get("max_runtime_sec"))
+                        defaults["max_runtime_sec"] = (
+                            AUTO_EXIT_DEFAULTS["max_runtime_sec"]
+                            if incoming_runtime == 600
+                            else incoming_runtime
+                        )
                     except Exception:
                         pass
                 if incoming_defaults.get("cooldown_sec") is not None:
@@ -11570,6 +12303,10 @@ class DataService:
                         "bound_at": rule.get("bound_at"),
                         "signature_status": str(rule.get("signature_status") or ""),
                         "rule_generation": max(1, int(rule.get("rule_generation") or 1)),
+                        "spread_target_qty": _safe_float(rule.get("spread_target_qty")),
+                        "spread_remaining_qty": _safe_float(rule.get("spread_remaining_qty")),
+                        "v1_target_qty": _safe_float(rule.get("v1_target_qty")),
+                        "v1_remaining_qty": _safe_float(rule.get("v1_remaining_qty")),
                     }
         return {"defaults": defaults, "rules": rules}
 
@@ -11785,6 +12522,10 @@ class DataService:
                     "bound_at": now_iso if position_signature else None,
                     "signature_status": signature_status,
                     "rule_generation": rule_generation,
+                    "spread_target_qty": None,
+                    "spread_remaining_qty": None,
+                    "v1_target_qty": None,
+                    "v1_remaining_qty": None,
                 }
             self._auto_exit["rules"] = rules
             self._auto_exit_store.save(self._auto_exit)
@@ -13029,13 +13770,15 @@ class DataService:
                 if isinstance(result, Mapping)
                 else None
             )
-            requested_qty = _safe_float(run.get("auto_exit_hedged_qty"))
-            exit_percent = _safe_float(run.get("auto_exit_exit_percent"))
-            if requested_qty is not None and exit_percent is not None:
-                requested_qty = requested_qty * min(100.0, max(0.0, exit_percent)) / 100.0
+            requested_qty = _safe_float(run.get("auto_exit_requested_qty"))
+            if requested_qty is None:
+                requested_qty = _safe_float(run.get("auto_exit_hedged_qty"))
+                exit_percent = _safe_float(run.get("auto_exit_exit_percent"))
+                if requested_qty is not None and exit_percent is not None:
+                    requested_qty = requested_qty * min(100.0, max(0.0, exit_percent)) / 100.0
             completion_tolerance = max(
                 1e-9,
-                (float(requested_qty) * 1e-6) if requested_qty is not None else 1e-9,
+                (float(requested_qty) * 0.01) if requested_qty is not None else 1e-9,
             )
             one_shot_fulfilled = (
                 result_remaining_qty is not None
@@ -13083,7 +13826,31 @@ class DataService:
                     event_payload["current_generation"] = current_generation
                     if run_generation and current_generation != run_generation:
                         event_payload["reason"] = "rule_changed_after_run_started"
-                    elif residual_legs:
+                    else:
+                        trigger_mode = str(run.get("auto_exit_trigger_mode") or "spread")
+                        target_field = "v1_target_qty" if trigger_mode == "v1" else "spread_target_qty"
+                        remaining_field = "v1_remaining_qty" if trigger_mode == "v1" else "spread_remaining_qty"
+                        fixed_target_qty = _safe_float(stored.get(target_field)) or requested_qty
+                        completion_tolerance = max(
+                            1e-9,
+                            float(fixed_target_qty or 0.0) * 0.01,
+                        )
+                        one_shot_fulfilled = (
+                            result_remaining_qty is not None
+                            and float(result_remaining_qty) <= completion_tolerance
+                        )
+                        event_payload["fixed_target_qty"] = fixed_target_qty
+                        event_payload["completion_tolerance_qty"] = completion_tolerance
+                        event_payload["dust_completed"] = bool(
+                            one_shot_fulfilled
+                            and result_remaining_qty is not None
+                            and float(result_remaining_qty) > 0
+                        )
+                        stored[target_field] = fixed_target_qty
+                        stored[remaining_field] = (
+                            0.0 if one_shot_fulfilled else result_remaining_qty
+                        )
+                    if not (run_generation and current_generation != run_generation) and residual_legs:
                         current_signature = _auto_exit_position_signature(
                             symbol,
                             residual_legs,
@@ -13109,7 +13876,7 @@ class DataService:
                         elif result_remaining_qty is not None and result_remaining_qty > completion_tolerance:
                             event_payload["reason"] = "partial_exit_remaining"
                         self._auto_exit_store.save(self._auto_exit)
-                    else:
+                    elif not (run_generation and current_generation != run_generation):
                         if bool(stored.get("exit_once", True)) and one_shot_fulfilled:
                             stored["enabled"] = False
                             stored["v1_enabled"] = False
@@ -13132,10 +13899,12 @@ class DataService:
         while True:
             try:
                 await self._auto_exit_cycle()
+                await self._auto_strategy_cycle()
+                await self._auto_arb_cycle()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pylint: disable=broad-except
-                logger.exception("auto-exit loop failed: %s", exc)
+                logger.exception("auto-agent loop failed: %s", exc)
             await asyncio.sleep(self._auto_exit_poll_sec)
 
     async def _auto_exit_cycle(self) -> None:
@@ -13660,6 +14429,14 @@ class DataService:
                 if exit_percent <= 0 or exit_percent > 100:
                     exit_percent = 100.0
                 qty = hedged_qty * float(exit_percent) / 100.0
+                spread_qty = min(
+                    hedged_qty,
+                    _safe_float(rule.get("spread_remaining_qty")) or qty,
+                )
+                v1_qty = min(
+                    hedged_qty,
+                    _safe_float(rule.get("v1_remaining_qty")) or qty,
+                )
                 if hedged_qty <= 0 or qty <= 0:
                     mark_missing(
                         key,
@@ -13926,7 +14703,7 @@ class DataService:
                                     "pair_exit_metrics": pair_exit_metrics,
                                     "target_pct": float(target),
                                     "pair_exit_target_pct": float(payload_spread_min),
-                                    "qty": qty,
+                                    "qty": spread_qty,
                                     "hedged_qty": hedged_qty,
                                     "exit_percent": exit_percent,
                                     "trigger_mode": "spread",
@@ -13945,7 +14722,7 @@ class DataService:
                             )
                             payload = {
                                 "symbol": symbol,
-                                "qty": qty,
+                                "qty": spread_qty,
                                 "notional": None,
                                 "mode": "smart-exit",
                                 "max_slippage_bps": 8,
@@ -13980,6 +14757,7 @@ class DataService:
                                 "auto_exit_trigger_mode": "spread",
                                 "auto_exit_exit_percent": float(exit_percent),
                                 "auto_exit_hedged_qty": float(hedged_qty),
+                                "auto_exit_requested_qty": float(spread_qty),
                                 "auto_exit_dynamic_chunk": True,
                                 "auto_exit_market_cleanup_notional_max": _safe_float(
                                     pair_policy.get("market_cleanup_notional_cap_usd")
@@ -14016,6 +14794,9 @@ class DataService:
                                 stored_rules = self._auto_exit.get("rules", {})
                                 stored = stored_rules.get(key)
                                 if stored is not None:
+                                    if _safe_float(stored.get("spread_target_qty")) is None:
+                                        stored["spread_target_qty"] = float(qty)
+                                    stored["spread_remaining_qty"] = float(spread_qty)
                                     stored["last_triggered_ts"] = now_ts
                                     stored["updated_at"] = datetime.now(timezone.utc).isoformat()
                                     self._auto_exit_store.save(self._auto_exit)
@@ -14142,7 +14923,7 @@ class DataService:
                             "net_spread_pct": selected_pair_net_spread,
                             "chunk_qty": pair_chunk_qty,
                             "chunk_notional_usd": pair_chunk_notional,
-                            "qty": qty,
+                            "qty": v1_qty,
                             "hedged_qty": hedged_qty,
                             "exit_percent": exit_percent,
                             "trigger_mode": "v1",
@@ -14169,7 +14950,7 @@ class DataService:
                     )
                     payload = {
                         "symbol": symbol,
-                        "qty": qty,
+                        "qty": v1_qty,
                         "notional": None,
                         "mode": "smart-exit",
                         "max_slippage_bps": 8,
@@ -14204,6 +14985,7 @@ class DataService:
                         "auto_exit_trigger_mode": "v1",
                         "auto_exit_exit_percent": float(exit_percent),
                         "auto_exit_hedged_qty": float(hedged_qty),
+                        "auto_exit_requested_qty": float(v1_qty),
                         "auto_exit_dynamic_chunk": True,
                         "auto_exit_market_cleanup_notional_max": _safe_float(
                             pair_policy.get("market_cleanup_notional_cap_usd")
@@ -14231,6 +15013,9 @@ class DataService:
                         stored_rules = self._auto_exit.get("rules", {})
                         stored = stored_rules.get(key)
                         if stored is not None:
+                            if _safe_float(stored.get("v1_target_qty")) is None:
+                                stored["v1_target_qty"] = float(qty)
+                            stored["v1_remaining_qty"] = float(v1_qty)
                             stored["last_v1_triggered_ts"] = now_ts
                             stored["updated_at"] = datetime.now(timezone.utc).isoformat()
                             stored["v1_pending_exit_cycles"] = 0

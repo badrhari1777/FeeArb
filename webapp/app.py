@@ -40,7 +40,7 @@ from .remote_access import (
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-06-11-01"
+STATIC_VERSION = "v2026-06-13-02"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -179,10 +179,22 @@ class AutoArbRulePayload(BaseModel):
     liquidity_safety_factor: float = Field(default=0.70, gt=0, le=1)
     confirm_samples: int = Field(default=2, ge=1, le=10)
     enabled: bool = True
+    live: bool = False
 
 
 class AutoArbLivePayload(BaseModel):
     confirmation: str
+
+
+class AutoStrategyPayload(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    type: str
+    symbol: str
+    long_exchange: str
+    short_exchange: str
+    enabled: bool = True
+    steps: list[Dict[str, object]]
 
 
 class ManualTestPayload(BaseModel):
@@ -417,6 +429,27 @@ async def auto_arbitrage_page(request: Request) -> HTMLResponse:
             "initial": {
                 "exchanges": exchanges,
                 "rules": service.auto_arb_payload().get("rules", []),
+            },
+            "static_version": STATIC_VERSION,
+        },
+    )
+
+
+@app.get("/strategies", response_class=HTMLResponse)
+async def strategies_page(request: Request) -> HTMLResponse:
+    settings = settings_manager.as_dict()
+    exchanges = [
+        name
+        for name, enabled in (settings.get("analysis_exchanges") or {}).items()
+        if enabled
+    ]
+    return templates.TemplateResponse(
+        "strategies.html",
+        {
+            "request": request,
+            "initial": {
+                "exchanges": exchanges,
+                "payload": service.auto_strategy_payload(),
             },
             "static_version": STATIC_VERSION,
         },
@@ -993,6 +1026,56 @@ async def get_auto_arb() -> JSONResponse:
     return JSONResponse(jsonable_encoder(service.auto_arb_payload()))
 
 
+@app.get("/api/strategies")
+async def get_auto_strategies() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(service.auto_strategy_payload()))
+
+
+@app.post("/api/strategies/preflight")
+async def preflight_auto_strategy(payload: AutoStrategyPayload) -> JSONResponse:
+    try:
+        result = await service.analyze_auto_strategy(payload.dict(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/strategies")
+async def upsert_auto_strategy(payload: AutoStrategyPayload) -> JSONResponse:
+    try:
+        result = await service.upsert_auto_strategy(payload.dict(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/strategies/{strategy_id}/pause")
+async def pause_auto_strategy(strategy_id: str) -> JSONResponse:
+    try:
+        result = await service.set_auto_strategy_enabled(strategy_id, False)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/strategies/{strategy_id}/resume")
+async def resume_auto_strategy(strategy_id: str) -> JSONResponse:
+    try:
+        result = await service.set_auto_strategy_enabled(strategy_id, True)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.delete("/api/strategies/{strategy_id}")
+async def delete_auto_strategy(strategy_id: str) -> JSONResponse:
+    try:
+        result = await service.delete_auto_strategy(strategy_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
 @app.post("/api/auto-arb/analyze")
 async def auto_arb_analyze(payload: AutoArbRulePayload) -> JSONResponse:
     try:
@@ -1004,9 +1087,22 @@ async def auto_arb_analyze(payload: AutoArbRulePayload) -> JSONResponse:
 
 @app.post("/api/auto-arb/rules")
 async def auto_arb_upsert(payload: AutoArbRulePayload) -> JSONResponse:
+    created_rule_id = ""
     try:
         result = await service.upsert_auto_arb_rule(payload.dict(exclude_none=True))
+        if payload.live:
+            rule_id = str((result.get("rule") or {}).get("id") or "")
+            if not payload.id:
+                created_rule_id = rule_id
+            armed = await service.arm_auto_arb_live(rule_id, f"LIVE {rule_id}")
+            result["rule"] = armed["rule"]
+            result["live"] = True
     except ValueError as exc:
+        if created_rule_id:
+            try:
+                await service.delete_auto_arb_rule(created_rule_id)
+            except ValueError:
+                pass
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JSONResponse(jsonable_encoder(result))
 

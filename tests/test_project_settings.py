@@ -28,11 +28,14 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self._service_path_patchers = [
             patch("webapp.services.AUTO_ARB_STATE_PATH", state_dir / "auto_arb_rules.json"),
             patch("webapp.services.AUTO_ARB_HISTORY_PATH", log_dir / "auto_arb_history.jsonl"),
+            patch("webapp.services.AUTO_STRATEGY_STATE_PATH", state_dir / "auto_strategies.json"),
+            patch("webapp.services.AUTO_STRATEGY_HISTORY_PATH", log_dir / "auto_strategy_history.jsonl"),
             patch("webapp.services.AUTO_EXIT_STATE_PATH", state_dir / "auto_exit_rules.json"),
             patch("webapp.services.AUTO_EXIT_HISTORY_PATH", log_dir / "auto_exit_history.jsonl"),
             patch("webapp.services.HEDGE_CLUSTER_STATE_PATH", state_dir / "hedge_clusters.json"),
             patch("webapp.services.DERISK_HISTORY_PATH", log_dir / "derisk_history.jsonl"),
             patch("webapp.services.DERISK_OUTCOME_STATE_PATH", state_dir / "derisk_outcome_state.json"),
+            patch("execution.wallet.WalletService.DEFAULT_STATE_PATH", state_dir / "wallet_state.json"),
         ]
         for patcher in self._service_path_patchers:
             patcher.start()
@@ -120,6 +123,24 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(float(tier1.get("edge_buffer_bps", 0.0)), 1.5)
         self.assertIn("tier2", policy)
         self.assertIn("lower_tier", policy)
+
+    def test_legacy_auto_exit_chunk_caps_migrate_to_live_defaults(self) -> None:
+        self.manager.update(
+            {
+                "manual": {
+                    "auto_exit_policy": {
+                        "tier1": {"chunk_notional_cap_usd": 350.0},
+                        "tier2": {"chunk_notional_cap_usd": 250.0},
+                        "lower_tier": {"chunk_notional_cap_usd": 150.0},
+                    }
+                }
+            }
+        )
+
+        policy = self.manager.current.manual["auto_exit_policy"]
+        self.assertEqual(policy["tier1"]["chunk_notional_cap_usd"], 750.0)
+        self.assertEqual(policy["tier2"]["chunk_notional_cap_usd"], 500.0)
+        self.assertEqual(policy["lower_tier"]["chunk_notional_cap_usd"], 250.0)
 
     async def test_protective_sync_skipped_when_disabled(self) -> None:
         """Protective sync should short-circuit when both toggles are off."""
