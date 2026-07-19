@@ -24,9 +24,9 @@ Current implementation note
 - Auto Exit supports a configurable partial percentage and is one-shot by default. The backend recalculates the current smaller leg immediately before execution.
 
 Current Reusable Backend / UI Context
-- Existing phone-first web route: `/mobile`
-  - `webapp/templates/mobile.html`
-  - `webapp/static/mobile.js`
+- The former phone-first web route `/mobile` was retired after the native
+  Android app became the supported mobile surface. Android-specific
+  `/api/mobile/*` contracts remain active.
 - Existing manual trading backend:
   - `/api/manual/analyze`
   - `/api/manual/enter`
@@ -44,7 +44,7 @@ Recommended Android Architecture
 - Preferred app structure:
   - bottom navigation: `Dashboard`, `Manual`, `Settings`
   - Jetpack Compose for native Android if a real app is built
-- If a faster first step is needed, the existing `/mobile` route can be used as a temporary bridge/reference.
+- The native Android client is the only supported mobile interface.
 
 Screen 1: Dashboard
 - Top section shows compact exchange balances:

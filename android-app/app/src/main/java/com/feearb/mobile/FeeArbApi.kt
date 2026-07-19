@@ -24,6 +24,15 @@ interface FeeArbApi {
     @POST("api/auto-exit/rule")
     suspend fun updateAutoExitRule(@Body payload: AutoExitRuleRequest): JsonObject
 
+    @GET("api/auto-arb")
+    suspend fun getAutoArb(): JsonObject
+
+    @POST("api/auto-arb/analyze")
+    suspend fun analyzeAutoArb(@Body payload: AutoArbRuleRequest): JsonObject
+
+    @POST("api/auto-arb/rules")
+    suspend fun upsertAutoArbRule(@Body payload: AutoArbRuleRequest): JsonObject
+
     @POST("api/position/action")
     suspend fun positionAction(@Body payload: PositionActionRequest): JsonObject
 

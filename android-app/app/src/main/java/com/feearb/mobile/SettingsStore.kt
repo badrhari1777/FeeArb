@@ -8,6 +8,8 @@ private const val KEY_REMOTE_ACCESS_TOKEN = "remote_access_token"
 private const val KEY_ADV_MAX_SLIPPAGE = "adv_max_slippage"
 private const val KEY_ADV_TIMEOUT = "adv_timeout"
 private const val KEY_ADV_RUNTIME = "adv_runtime"
+private const val KEY_ADV_RUNTIME_MINUTES = "adv_runtime_minutes"
+private const val KEY_ADV_UNTIL_FILLED = "adv_until_filled"
 private const val KEY_ADV_REPRICE = "adv_reprice"
 private const val KEY_ADV_CHUNK_QTY = "adv_chunk_qty"
 private const val KEY_ADV_CHUNK_NOTIONAL = "adv_chunk_notional"
@@ -40,10 +42,18 @@ class SettingsStore(context: Context) {
     }
 
     fun loadAdvancedSettings(defaults: ManualDefaultsDto?): AdvancedSettingsUiState {
+        val defaultRuntimeMinutes = defaults?.max_runtime_sec
+            ?.let { seconds -> ((seconds.coerceAtLeast(1) + 59) / 60).toString() }
+            .orEmpty()
+        val savedRuntimeMinutes = prefs.getString(KEY_ADV_RUNTIME_MINUTES, null)
+        val migratedRuntimeMinutes = prefs.getString(KEY_ADV_RUNTIME, null)
+            ?.toIntOrNull()
+            ?.let { seconds -> ((seconds.coerceAtLeast(1) + 59) / 60).toString() }
         return AdvancedSettingsUiState(
             maxSlippageBps = prefs.getString(KEY_ADV_MAX_SLIPPAGE, defaults?.max_slippage_bps?.toString().orEmpty()).orEmpty(),
             timeoutSec = prefs.getString(KEY_ADV_TIMEOUT, defaults?.timeout_sec?.toString().orEmpty()).orEmpty(),
-            maxRuntimeSec = prefs.getString(KEY_ADV_RUNTIME, defaults?.max_runtime_sec?.toString().orEmpty()).orEmpty(),
+            maxRuntimeMinutes = savedRuntimeMinutes ?: migratedRuntimeMinutes ?: defaultRuntimeMinutes,
+            untilFilled = prefs.getBoolean(KEY_ADV_UNTIL_FILLED, false),
             repriceSec = prefs.getString(KEY_ADV_REPRICE, defaults?.reprice_sec?.toString().orEmpty()).orEmpty(),
             chunkQty = prefs.getString(KEY_ADV_CHUNK_QTY, defaults?.chunk_qty?.toString().orEmpty()).orEmpty(),
             chunkNotional = prefs.getString(KEY_ADV_CHUNK_NOTIONAL, defaults?.chunk_notional?.toString().orEmpty()).orEmpty(),
@@ -66,7 +76,8 @@ class SettingsStore(context: Context) {
         prefs.edit()
             .putString(KEY_ADV_MAX_SLIPPAGE, state.maxSlippageBps)
             .putString(KEY_ADV_TIMEOUT, state.timeoutSec)
-            .putString(KEY_ADV_RUNTIME, state.maxRuntimeSec)
+            .putString(KEY_ADV_RUNTIME_MINUTES, state.maxRuntimeMinutes)
+            .putBoolean(KEY_ADV_UNTIL_FILLED, state.untilFilled)
             .putString(KEY_ADV_REPRICE, state.repriceSec)
             .putString(KEY_ADV_CHUNK_QTY, state.chunkQty)
             .putString(KEY_ADV_CHUNK_NOTIONAL, state.chunkNotional)

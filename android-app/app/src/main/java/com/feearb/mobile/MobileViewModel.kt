@@ -11,6 +11,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonArray
+import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -34,7 +35,8 @@ enum class PositionSort(val label: String) {
 data class AdvancedSettingsUiState(
     val maxSlippageBps: String = "",
     val timeoutSec: String = "",
-    val maxRuntimeSec: String = "",
+    val maxRuntimeMinutes: String = "",
+    val untilFilled: Boolean = false,
     val repriceSec: String = "",
     val chunkQty: String = "",
     val chunkNotional: String = "",
@@ -66,6 +68,20 @@ data class ManualFormUiState(
     val mode: String = "smart",
     val rollMode: String = "smart-roll",
     val expensiveLeg: String? = null,
+    val triggerSpreadPct: String = "",
+    val rollTriggerOperator: String = "lte",
+)
+
+@Immutable
+data class GridFormUiState(
+    val symbol: String = "",
+    val longExchange: String = "",
+    val shortExchange: String = "",
+    val setupMode: String = "entry_range",
+    val maxNotional: String = "",
+    val rangeStartPct: String = "",
+    val rangeEndPct: String = "",
+    val levelCount: String = "12",
 )
 
 @Immutable
@@ -95,6 +111,12 @@ data class MobileUiState(
     val executeConfirmationText: String? = null,
     val positionActionLoading: Boolean = false,
     val positionActionConfirmationText: String? = null,
+    val gridForm: GridFormUiState = GridFormUiState(),
+    val gridLoading: Boolean = false,
+    val gridStatusText: String = "",
+    val gridPlanText: String = "No grid preview yet.",
+    val gridRulesText: String = "Grid status not loaded.",
+    val gridConfirmationText: String? = null,
 )
 
 class MobileViewModel(application: Application) : AndroidViewModel(application) {
@@ -109,6 +131,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
     private var pendingExecuteRequest: ManualRequest? = null
     private var pendingExecuteAction: String? = null
     private var pendingPositionAction: PositionActionRequest? = null
+    private var pendingGridRequest: AutoArbRuleRequest? = null
 
     var uiState by mutableStateOf(
         MobileUiState(
@@ -126,9 +149,10 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
     fun refreshAll() {
         refreshPositions()
         loadManualDefaults()
+        refreshGridStatus()
     }
 
-    fun refreshPositions() {
+    fun refreshPositions(statusAfterRefresh: String? = null) {
         viewModelScope.launch {
             uiState = uiState.copy(
                 positionsLoading = true,
@@ -141,7 +165,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                         positionsLoading = false,
                         positionsErrorText = null,
                         positionsResponse = payload,
-                        statusText = "Account data updated.",
+                        statusText = statusAfterRefresh ?: "Account data updated.",
                     )
                 }
                 .onFailure { error ->
@@ -167,11 +191,17 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                         fromExchange = currentForm.fromExchange.ifBlank { exchanges.getOrNull(1) ?: exchanges.getOrNull(0).orEmpty() },
                         toExchange = currentForm.toExchange.ifBlank { exchanges.getOrNull(0).orEmpty() },
                     )
+                    val currentGrid = uiState.gridForm
+                    val nextGrid = currentGrid.copy(
+                        longExchange = currentGrid.longExchange.ifBlank { nextForm.longExchange },
+                        shortExchange = currentGrid.shortExchange.ifBlank { nextForm.shortExchange },
+                    )
                     uiState = uiState.copy(
                         manualDefaultsLoading = false,
                         manualDefaultsErrorText = null,
                         manualDefaults = payload,
                         manualForm = nextForm,
+                        gridForm = nextGrid,
                         advancedSettings = settingsStore.loadAdvancedSettings(payload.defaults),
                         statusText = "Manual defaults loaded.",
                     )
@@ -228,6 +258,10 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         uiState = uiState.copy(advancedSettings = next)
     }
 
+    fun updateGridForm(transform: (GridFormUiState) -> GridFormUiState) {
+        uiState = uiState.copy(gridForm = transform(uiState.gridForm))
+    }
+
     fun prefillManualFromPosition(card: PositionCardDto) {
         uiState = uiState.copy(
             manualForm = uiState.manualForm.copy(
@@ -239,6 +273,122 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             )
         )
         scheduleManualSpreadRefresh()
+    }
+
+    fun prefillGridFromPosition(card: PositionCardDto) {
+        val longExchange = card.long_exchange.orEmpty()
+        val shortExchange = card.short_exchange.orEmpty()
+        uiState = uiState.copy(
+            gridForm = uiState.gridForm.copy(
+                symbol = card.symbol,
+                longExchange = longExchange,
+                shortExchange = shortExchange,
+                setupMode = "adopt_existing_full_grid",
+            ),
+            statusText = "Grid form filled from position.",
+        )
+    }
+
+    fun refreshGridStatus() {
+        viewModelScope.launch {
+            runCatching { api.getAutoArb() }
+                .onSuccess { payload ->
+                    uiState = uiState.copy(gridRulesText = formatGridRules(payload))
+                }
+                .onFailure { error ->
+                    uiState = uiState.copy(gridRulesText = "Grid status failed: ${error.message}")
+                }
+        }
+    }
+
+    fun analyzeGrid() {
+        val request = buildGridRequest(live = false) ?: return
+        viewModelScope.launch {
+            pendingGridRequest = null
+            uiState = uiState.copy(gridLoading = true, gridStatusText = "Analyzing Grid...")
+            runCatching { api.analyzeAutoArb(request) }
+                .onSuccess { payload ->
+                    uiState = uiState.copy(
+                        gridLoading = false,
+                        gridPlanText = formatGridPlan(payload),
+                        gridStatusText = if (payload.hasErrors()) "Grid analysis completed with errors." else "Grid analysis completed.",
+                    )
+                }
+                .onFailure { error ->
+                    uiState = uiState.copy(
+                        gridLoading = false,
+                        gridStatusText = "Grid analysis failed: ${error.message}",
+                    )
+                }
+        }
+    }
+
+    fun startGrid() {
+        val preflight = buildGridRequest(live = false) ?: return
+        viewModelScope.launch {
+            pendingGridRequest = null
+            uiState = uiState.copy(gridLoading = true, gridStatusText = "Running Grid preflight...")
+            runCatching { api.analyzeAutoArb(preflight) }
+                .onSuccess { payload ->
+                    uiState = uiState.copy(
+                        gridLoading = false,
+                        gridPlanText = formatGridPlan(payload),
+                    )
+                    if (payload.hasErrors()) {
+                        uiState = uiState.copy(gridStatusText = "Grid preflight failed.")
+                        return@onSuccess
+                    }
+                    val liveRequest = buildGridRequest(live = true) ?: return@onSuccess
+                    pendingGridRequest = liveRequest
+                    uiState = uiState.copy(
+                        gridConfirmationText = buildGridConfirmation(liveRequest, payload),
+                        gridStatusText = "Grid preflight passed. Confirm Live start.",
+                    )
+                }
+                .onFailure { error ->
+                    uiState = uiState.copy(
+                        gridLoading = false,
+                        gridStatusText = "Grid preflight failed: ${error.message}",
+                    )
+                }
+        }
+    }
+
+    fun confirmGridStart() {
+        val request = pendingGridRequest ?: return
+        viewModelScope.launch {
+            uiState = uiState.copy(
+                gridLoading = true,
+                gridConfirmationText = null,
+                gridStatusText = "Starting Live Grid...",
+            )
+            runCatching { api.upsertAutoArbRule(request) }
+                .onSuccess { payload ->
+                    pendingGridRequest = null
+                    uiState = uiState.copy(
+                        gridLoading = false,
+                        gridPlanText = formatGridPlan(payload),
+                        gridStatusText = "Live Grid started.",
+                    )
+                    refreshGridStatus()
+                    refreshPositions("Live Grid started. Account data updated.")
+                }
+                .onFailure { error ->
+                    pendingGridRequest = null
+                    uiState = uiState.copy(
+                        gridLoading = false,
+                        gridStatusText = "Live Grid start failed: ${error.message}",
+                    )
+                }
+        }
+    }
+
+    fun cancelGridStart() {
+        pendingGridRequest = null
+        uiState = uiState.copy(
+            gridConfirmationText = null,
+            gridStatusText = "Grid start canceled.",
+        )
     }
 
     fun saveAutoExit(card: PositionCardDto, enabled: Boolean, targetSpreadPct: String, exitPercentText: String) {
@@ -335,25 +485,37 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                 .onSuccess { result ->
                     pendingPositionAction = null
                     val executionId = result.get("execution_id")?.asString
+                    if (result.hasErrors() && executionId.isNullOrBlank()) {
+                        uiState = uiState.copy(
+                            positionActionLoading = false,
+                            executionStatus = "failed",
+                            statusText = "Position action failed: ${formatErrors(result)}",
+                        )
+                        return@onSuccess
+                    }
                     uiState = uiState.copy(
-                        positionActionLoading = false,
+                        positionActionLoading = !executionId.isNullOrBlank(),
                         executionId = executionId,
                         executionStatus = if (executionId.isNullOrBlank()) null else "running",
                         statusText = if (executionId.isNullOrBlank()) {
                             "Position action completed."
+                        } else if (result.hasErrors()) {
+                            "Position action started with API warnings: ${formatErrors(result)}"
                         } else {
                             "Position action started: $executionId"
                         },
                     )
                     if (!executionId.isNullOrBlank()) {
-                        startPollingExecution(executionId)
+                        startPollingExecution(executionId, positionAction = true)
+                    } else {
+                        refreshPositions("Position action completed. Account data updated.")
                     }
-                    refreshPositions()
                 }
                 .onFailure { error ->
                     pendingPositionAction = null
                     uiState = uiState.copy(
                         positionActionLoading = false,
+                        executionStatus = "submit_failed",
                         statusText = "Position action failed: ${error.message}",
                     )
                 }
@@ -449,27 +611,40 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             )
             runCatching { endpoint(executeRequest) }
                 .onSuccess { payload ->
-                    val executionId = payload.get("execution_id")?.asString
                     clearPendingExecute()
                     uiState = uiState.copy(
                         manualLoading = false,
                         manualPlanText = formatPlan(payload),
                     )
+                    val executionId = payload.get("execution_id")?.asString
                     if (!executionId.isNullOrBlank()) {
                         uiState = uiState.copy(
                             executionId = executionId,
                             executionStatus = "running",
-                            manualStatusText = "Execution started.",
+                            manualStatusText = if (payload.hasErrors()) {
+                                "Execution started with API warnings: ${formatErrors(payload)}"
+                            } else {
+                                "Execution started."
+                            },
                         )
                         startPollingExecution(executionId)
+                    } else if (payload.hasErrors()) {
+                        uiState = uiState.copy(
+                            executionStatus = "failed",
+                            manualStatusText = "Execution failed: ${formatErrors(payload)}",
+                        )
                     } else {
-                        uiState = uiState.copy(manualStatusText = "Execution completed.")
+                        uiState = uiState.copy(
+                            executionStatus = "completed",
+                            manualStatusText = "Execution completed.",
+                        )
                     }
                 }
                 .onFailure { error ->
                     clearPendingExecute()
                     uiState = uiState.copy(
                         manualLoading = false,
+                        executionStatus = "submit_failed",
                         manualStatusText = "Execution failed: ${error.message}",
                     )
                 }
@@ -536,31 +711,47 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    private fun startPollingExecution(executionId: String) {
+    private fun startPollingExecution(executionId: String, positionAction: Boolean = false) {
         pollingJob?.cancel()
         pollingJob = viewModelScope.launch {
             while (true) {
                 runCatching { api.manualExecStatus(executionId) }
                     .onSuccess { payload ->
+                        val terminal = payload.status != "running"
+                        val statusMessage = when (payload.status) {
+                            "running" -> if (payload.stop_requested) "Stop requested; waiting..." else "Execution running..."
+                            "completed" -> "Execution completed."
+                            "completed_with_errors" -> "Execution completed with errors."
+                            "failed" -> "Execution failed: ${payload.error ?: "unknown error"}"
+                            else -> "Execution status: ${payload.status ?: "-"}"
+                        }
                         uiState = uiState.copy(
                             executionId = executionId,
                             executionStatus = payload.status,
                             executionLogText = formatLogs(payload.logs),
-                            manualPlanText = payload.result?.let(::formatPlan) ?: uiState.manualPlanText,
-                            manualStatusText = when (payload.status) {
-                                "running" -> if (payload.stop_requested) "Stop requested; waiting..." else "Execution running..."
-                                "completed" -> "Execution completed."
-                                "completed_with_errors" -> "Execution completed with errors."
-                                "failed" -> "Execution failed: ${payload.error ?: "unknown error"}"
-                                else -> "Execution status: ${payload.status ?: "-"}"
-                            },
+                            manualPlanText = payload.result?.asObjectOrNull()?.let(::formatPlan) ?: uiState.manualPlanText,
+                            manualStatusText = statusMessage,
+                            positionActionLoading = if (positionAction) !terminal else uiState.positionActionLoading,
+                            statusText = if (positionAction) "Position action: $statusMessage" else uiState.statusText,
                         )
-                        if (payload.status != "running") {
+                        if (terminal) {
+                            if (positionAction) {
+                                refreshPositions("Position action: $statusMessage Account data updated.")
+                            }
                             return@launch
                         }
                     }
                     .onFailure { error ->
-                        uiState = uiState.copy(manualStatusText = "Execution polling failed: ${error.message}")
+                        uiState = uiState.copy(
+                            executionStatus = "polling_failed",
+                            manualStatusText = "Execution polling failed: ${error.message}",
+                            positionActionLoading = if (positionAction) false else uiState.positionActionLoading,
+                            statusText = if (positionAction) {
+                                "Position action polling failed: ${error.message}"
+                            } else {
+                                uiState.statusText
+                            },
+                        )
                         return@launch
                     }
                 delay(2_000)
@@ -620,14 +811,36 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         } else {
             if (form.action == "exit") "smart-exit" else "smart-enter"
         }
+        val triggerSpread = form.triggerSpreadPct.toDoubleOrNull()
+        val triggerOperator = when (form.action) {
+            "enter" -> "lte"
+            "exit" -> "gte"
+            else -> form.rollTriggerOperator
+        }
+        val runtimeMinutes = advanced.maxRuntimeMinutes.trim().toIntOrNull()
+        if (
+            !advanced.untilFilled &&
+            advanced.maxRuntimeMinutes.isNotBlank() &&
+            (runtimeMinutes == null || runtimeMinutes !in 1..30)
+        ) {
+            uiState = uiState.copy(manualStatusText = "Execution time must be between 1 and 30 minutes.")
+            return null
+        }
+        val maxRuntimeSec = if (advanced.untilFilled) {
+            30 * 60
+        } else {
+            runtimeMinutes?.times(60)
+        }
         return ManualRequest(
             symbol = symbol,
             qty = qty,
             notional = notional,
             mode = mode,
             max_slippage_bps = advanced.maxSlippageBps.toDoubleOrNull(),
+            spread_min_pct = if (triggerSpread != null && triggerOperator == "gte") triggerSpread else null,
+            spread_max_pct = if (triggerSpread != null && triggerOperator == "lte") triggerSpread else null,
             timeout_sec = advanced.timeoutSec.toIntOrNull(),
-            max_runtime_sec = advanced.maxRuntimeSec.toIntOrNull(),
+            max_runtime_sec = maxRuntimeSec,
             reprice_sec = advanced.repriceSec.toDoubleOrNull(),
             chunk_qty = advanced.chunkQty.toDoubleOrNull(),
             chunk_notional = advanced.chunkNotional.toDoubleOrNull(),
@@ -641,6 +854,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             limit_offset_ticks = advanced.limitOffsetTicks.toIntOrNull(),
             max_limit_deviation_bps = advanced.maxLimitDeviationBps.toDoubleOrNull(),
             use_orderbook_check = advanced.useOrderbookCheck,
+            allow_liquidity_chunking = true,
             fallback_to_market = false,
             async_run = !dryRun,
             dry_run = dryRun,
@@ -695,8 +909,139 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         uiState = uiState.copy(executeConfirmationText = null)
     }
 
+    private fun buildGridRequest(live: Boolean): AutoArbRuleRequest? {
+        val form = uiState.gridForm
+        val symbol = form.symbol.trim().uppercase()
+        val longExchange = form.longExchange.trim()
+        val shortExchange = form.shortExchange.trim()
+        val maxNotional = form.maxNotional.toDoubleOrNull()
+        val rangeStart = form.rangeStartPct.toDoubleOrNull()
+        val rangeEnd = form.rangeEndPct.toDoubleOrNull()
+        val levelCount = form.levelCount.toIntOrNull()
+        if (symbol.isBlank()) {
+            uiState = uiState.copy(gridStatusText = "Grid symbol is required.")
+            return null
+        }
+        if (longExchange.isBlank() || shortExchange.isBlank() || longExchange == shortExchange) {
+            uiState = uiState.copy(gridStatusText = "Choose different long and short exchanges.")
+            return null
+        }
+        if (maxNotional == null || maxNotional <= 0.0) {
+            uiState = uiState.copy(gridStatusText = "Grid USDT budget is required.")
+            return null
+        }
+        if (rangeStart == null || rangeEnd == null || rangeStart == rangeEnd) {
+            uiState = uiState.copy(gridStatusText = "Grid spread range must contain two different values.")
+            return null
+        }
+        if (levelCount == null || levelCount !in 2..20) {
+            uiState = uiState.copy(gridStatusText = "Grid levels must be from 2 to 20.")
+            return null
+        }
+        val usesExitRange = form.setupMode == "adopt_existing_full_grid" ||
+            form.setupMode == "existing_position_exit_range"
+        return AutoArbRuleRequest(
+            symbol = symbol,
+            long_exchange = longExchange,
+            short_exchange = shortExchange,
+            setup_mode = form.setupMode,
+            budget_mode = "notional",
+            max_notional = maxNotional,
+            range_start_pct = rangeStart,
+            range_end_pct = rangeEnd,
+            exit_range_start_pct = if (usesExitRange) rangeStart else null,
+            exit_range_end_pct = if (usesExitRange) rangeEnd else null,
+            level_count = levelCount,
+            max_slippage_bps = uiState.advancedSettings.maxSlippageBps.toDoubleOrNull() ?: 8.0,
+            liquidity_safety_factor = 0.70,
+            confirm_samples = 2,
+            enabled = true,
+            live = live,
+        )
+    }
+
+    private fun formatGridPlan(payload: JsonObject): String {
+        val lines = mutableListOf<String>()
+        appendJsonArray(lines, "Errors", payload.getAsJsonArray("errors"))
+        appendJsonArray(lines, "Warnings", payload.getAsJsonArray("warnings"))
+        val config = payload.objectOrNull("config") ?: payload.objectOrNull("rule")
+        if (config != null) {
+            lines += "Symbol: ${config.optString("symbol").ifBlank { "-" }}"
+            lines += "Pair: ${config.optString("long_exchange").uppercase()} long / ${config.optString("short_exchange").uppercase()} short"
+            lines += "Mode: ${gridModeLabel(config.optString("setup_mode"))}"
+            lines += "Levels: ${config.optIntOrNull("level_count") ?: "-"}"
+            config.optDoubleOrNull("max_notional")?.let { lines += "Budget: ${formatCompact(it)} USDT" }
+            config.optDoubleOrNull("total_notional_estimate")?.let { lines += "Total estimate: ${formatCompact(it)} USDT" }
+            config.optDoubleOrNull("chunk_qty")?.let { lines += "Level qty: ${formatCompact(it)}" }
+            config.optDoubleOrNull("chunk_notional_estimate")?.let { lines += "Level estimate: ${formatCompact(it)} USDT" }
+            config.optDoubleOrNull("range_start_pct")?.let { start ->
+                val end = config.optDoubleOrNull("range_end_pct")
+                lines += "Entry range: ${formatCompact(start)}% -> ${formatCompact(end)}%"
+            }
+            config.optDoubleOrNull("exit_gap_pct")?.let { lines += "Exit step: ${formatCompact(it)}%" }
+            val fit = config.objectOrNull("existing_position_fit")
+            if (fit != null) {
+                fit.optDoubleOrNull("existing_qty")?.let { lines += "Existing qty: ${formatCompact(it)}" }
+                fit.optIntOrNull("adoption_level")?.let { lines += "Adopt level: $it" }
+            }
+            config.optString("status").takeIf { it.isNotBlank() }?.let { lines += "Status: $it" }
+            config.optString("mode").takeIf { it.isNotBlank() }?.let { lines += "Live mode: $it" }
+        }
+        val spreads = payload.objectOrNull("live_spreads")
+        spreads?.optDoubleOrNull("entry_spread_pct")?.let { lines += "Entry spread now: ${formatCompact(it)}%" }
+        spreads?.optDoubleOrNull("exit_spread_pct")?.let { lines += "Exit spread now: ${formatCompact(it)}%" }
+        if (lines.isEmpty()) return gson.toJson(payload)
+        return lines.joinToString("\n")
+    }
+
+    private fun formatGridRules(payload: JsonObject): String {
+        val rules = payload.getAsJsonArray("rules")
+        if (rules == null || rules.size() == 0) return "No Grid rules."
+        return rules.take(6).joinToString("\n\n") { item ->
+            val rule = item.asJsonObject
+            buildString {
+                append(rule.optString("symbol").ifBlank { "-" })
+                append(" ")
+                append(rule.optString("long_exchange").uppercase())
+                append("/")
+                append(rule.optString("short_exchange").uppercase())
+                append("\n")
+                append("Mode: ${rule.optString("mode").ifBlank { "shadow" }}")
+                append(" | Status: ${rule.optString("status").ifBlank { "-" }}")
+                rule.optIntOrNull("live_level")?.let { append(" | Level: $it") }
+                rule.optDoubleOrNull("actual_hedged_qty")?.let { append("\nHedged: ${formatCompact(it)}") }
+                rule.optString("blocked_reason").takeIf { it.isNotBlank() }?.let { append("\nBlocked: $it") }
+            }
+        }
+    }
+
+    private fun buildGridConfirmation(request: AutoArbRuleRequest, preview: JsonObject): String {
+        val config = preview.objectOrNull("config")
+        val lines = mutableListOf<String>()
+        lines += "Start Live Grid"
+        lines += "Symbol: ${request.symbol}"
+        lines += "Long / Short: ${request.long_exchange.uppercase()} / ${request.short_exchange.uppercase()}"
+        lines += "Mode: ${gridModeLabel(request.setup_mode)}"
+        lines += "Budget: ${formatCompact(request.max_notional)} USDT"
+        lines += "Range: ${formatCompact(request.range_start_pct)}% -> ${formatCompact(request.range_end_pct)}%"
+        lines += "Levels: ${request.level_count ?: "-"}"
+        config?.optDoubleOrNull("chunk_qty")?.let { lines += "Level qty: ${formatCompact(it)}" }
+        config?.optDoubleOrNull("chunk_notional_estimate")?.let { lines += "Level estimate: ${formatCompact(it)} USDT" }
+        appendJsonArray(lines, "Warnings", preview.getAsJsonArray("warnings"))
+        return lines.joinToString("\n")
+    }
+
+    private fun gridModeLabel(mode: String): String {
+        return when (mode) {
+            "adopt_existing_full_grid" -> "Adopt full grid"
+            "existing_position_exit_range" -> "Existing exit"
+            else -> "New grid"
+        }
+    }
+
     private fun formatPlan(payload: JsonObject): String {
         val lines = mutableListOf<String>()
+        payload.optStringOrNull("error")?.let { lines += "Error: $it" }
         appendJsonArray(lines, "Errors", payload.getAsJsonArray("errors"))
         appendJsonArray(lines, "Warnings", payload.getAsJsonArray("warnings"))
         payload.optDoubleOrNull("spread_pct")?.let { lines += "Spread: ${formatCompact(it)}%" }
@@ -708,6 +1053,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun formatErrors(payload: JsonObject): String {
+        payload.optStringOrNull("error")?.let { return it }
         val errors = payload.getAsJsonArray("errors") ?: return "unknown error"
         return errors.joinToString("; ") { it.asString }
     }
@@ -770,7 +1116,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             val ts = entry.ts?.let { "[$it] " }.orEmpty()
             val event = entry.event?.let { "$it: " }.orEmpty()
             val message = entry.message.orEmpty()
-            val data = entry.data?.takeIf { it.size() > 0 }?.let { " ${gson.toJson(it)}" }.orEmpty()
+            val data = entry.data?.takeIf { !it.isJsonNull }?.let { " ${gson.toJson(it)}" }.orEmpty()
             "$ts$event$message$data"
         }
     }
@@ -796,6 +1142,12 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         request.chunk_qty?.let { lines += "Chunk qty: ${formatCompact(it)}" }
         request.chunk_notional?.let { lines += "Chunk notional: ${formatCompact(it)}" }
         request.max_slippage_bps?.let { lines += "Max slippage: ${formatCompact(it)} bps" }
+        request.max_runtime_sec?.let {
+            val suffix = if (uiState.advancedSettings.untilFilled) " (until filled limit)" else ""
+            lines += "Execution time: ${it / 60} min$suffix"
+        }
+        request.spread_min_pct?.let { lines += "Spread trigger: >= ${formatCompact(it)}%" }
+        request.spread_max_pct?.let { lines += "Spread trigger: <= ${formatCompact(it)}%" }
         request.margin_mode?.let { lines += "Margin mode: $it" }
         return lines.joinToString("\n")
     }
@@ -811,9 +1163,36 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         return runCatching { element.asDouble }.getOrNull()
     }
 
+    private fun JsonObject.optIntOrNull(key: String): Int? {
+        val element = get(key) ?: return null
+        return runCatching { element.asInt }.getOrNull()
+    }
+
+    private fun JsonObject.optString(key: String): String {
+        val element = get(key) ?: return ""
+        return if (element.isJsonNull) "" else runCatching { element.asString }.getOrDefault("")
+    }
+
+    private fun JsonObject.optStringOrNull(key: String): String? {
+        val value = optString(key).trim()
+        return value.ifBlank { null }
+    }
+
+    private fun JsonObject.objectOrNull(key: String): JsonObject? {
+        val element = get(key) ?: return null
+        return if (!element.isJsonNull && element.isJsonObject) element.asJsonObject else null
+    }
+
     private fun JsonObject.hasErrors(): Boolean {
+        if (optStringOrNull("error") != null) {
+            return true
+        }
         val element = get("errors")
         return element != null && element.isJsonArray && element.asJsonArray.size() > 0
+    }
+
+    private fun JsonElement.asObjectOrNull(): JsonObject? {
+        return if (!isJsonNull && isJsonObject) asJsonObject else null
     }
 
     private fun formatCompact(value: Double): String {

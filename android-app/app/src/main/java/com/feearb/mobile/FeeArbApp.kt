@@ -63,6 +63,7 @@ private enum class AppTab(val title: String) {
     Balances("Balances"),
     Positions("Positions"),
     Manual("Manual"),
+    Grid("Grid"),
     Settings("Settings"),
 }
 
@@ -106,6 +107,23 @@ fun FeeArbApp(viewModel: MobileViewModel) {
                         onClick = viewModel::cancelPositionAction,
                         enabled = !state.positionActionLoading,
                     ) {
+                        Text("Cancel")
+                    }
+                },
+            )
+        }
+        state.gridConfirmationText?.let { confirmationText ->
+            AlertDialog(
+                onDismissRequest = viewModel::cancelGridStart,
+                title = { Text("Confirm Live Grid") },
+                text = { Text(confirmationText) },
+                confirmButton = {
+                    Button(onClick = viewModel::confirmGridStart, enabled = !state.gridLoading) {
+                        Text(if (state.gridLoading) "Starting..." else "Start Live")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = viewModel::cancelGridStart, enabled = !state.gridLoading) {
                         Text("Cancel")
                     }
                 },
@@ -160,6 +178,12 @@ fun FeeArbApp(viewModel: MobileViewModel) {
                         label = { Text("Manual") },
                     )
                     NavigationBarItem(
+                        selected = currentTab == AppTab.Grid,
+                        onClick = { currentTab = AppTab.Grid },
+                        icon = { Icon(Icons.AutoMirrored.Outlined.ListAlt, contentDescription = null) },
+                        label = { Text("Grid") },
+                    )
+                    NavigationBarItem(
                         selected = currentTab == AppTab.Settings,
                         onClick = { currentTab = AppTab.Settings },
                         icon = { Icon(Icons.Outlined.Settings, contentDescription = null) },
@@ -191,6 +215,10 @@ fun FeeArbApp(viewModel: MobileViewModel) {
                         viewModel.prefillManualFromPosition(it)
                         currentTab = AppTab.Manual
                     },
+                    onUseInGrid = {
+                        viewModel.prefillGridFromPosition(it)
+                        currentTab = AppTab.Grid
+                    },
                     onPositionAction = viewModel::startPositionAction,
                     onSaveAutoExit = viewModel::saveAutoExit,
                     actionLoading = state.positionActionLoading,
@@ -205,6 +233,14 @@ fun FeeArbApp(viewModel: MobileViewModel) {
                     onStop = viewModel::stopExecution,
                     onRefreshSpread = viewModel::refreshManualSpread,
                     onReloadDefaults = viewModel::loadManualDefaults,
+                    modifier = Modifier.padding(padding),
+                )
+                AppTab.Grid -> GridScreen(
+                    state = state,
+                    onFormChange = viewModel::updateGridForm,
+                    onAnalyze = viewModel::analyzeGrid,
+                    onStart = viewModel::startGrid,
+                    onRefresh = viewModel::refreshGridStatus,
                     modifier = Modifier.padding(padding),
                 )
                 AppTab.Settings -> SettingsScreen(
@@ -305,6 +341,7 @@ private fun PositionsScreen(
     onFilterSelected: (PositionFilter) -> Unit,
     onSortSelected: (PositionSort) -> Unit,
     onUseInManual: (PositionCardDto) -> Unit,
+    onUseInGrid: (PositionCardDto) -> Unit,
     onPositionAction: (PositionCardDto, String, String) -> Unit,
     onSaveAutoExit: (PositionCardDto, Boolean, String, String) -> Unit,
     actionLoading: Boolean,
@@ -397,6 +434,7 @@ private fun PositionsScreen(
                 card = card,
                 actionLoading = actionLoading,
                 onUseInManual = { onUseInManual(card) },
+                onUseInGrid = { onUseInGrid(card) },
                 onPositionAction = { action, percent -> onPositionAction(card, action, percent) },
                 onSaveAutoExit = { enabled, target, percent ->
                     onSaveAutoExit(card, enabled, target, percent)
@@ -423,6 +461,13 @@ private fun BalanceCard(balance: BalanceDto) {
         }
         MetricBlock("Used", formatMoney(balance.used))
         KeyValue("Margin", formatRatio(balance.margin_ratio))
+        if (!balance.error.isNullOrBlank()) {
+            Text(
+                balance.error,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
         if (!balance.updated_at.isNullOrBlank()) {
             Text(
                 "Updated: ${balance.updated_at}",
@@ -439,6 +484,7 @@ private fun PositionCard(
     card: PositionCardDto,
     actionLoading: Boolean,
     onUseInManual: () -> Unit,
+    onUseInGrid: () -> Unit,
     onPositionAction: (String, String) -> Unit,
     onSaveAutoExit: (Boolean, String, String) -> Unit,
 ) {
@@ -566,6 +612,7 @@ private fun PositionCard(
             }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 TextButton(onClick = onUseInManual) { Text("Manual setup") }
+                TextButton(onClick = onUseInGrid) { Text("Grid setup") }
                 TextButton(onClick = { expanded = !expanded }) { Text(if (expanded) "Hide details" else "Details") }
             }
             AnimatedVisibility(expanded) {
@@ -684,6 +731,32 @@ private fun ManualScreen(
                 OutlinedTextField(value = state.advancedSettings.chunkQty, onValueChange = { value -> onAdvancedChange { it.copy(chunkQty = value) } }, label = { Text("Chunk qty") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(value = state.advancedSettings.chunkNotional, onValueChange = { value -> onAdvancedChange { it.copy(chunkNotional = value) } }, label = { Text("Chunk notional USDT") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(8.dp))
+                if (state.manualForm.action == "roll") {
+                    SimpleSelect(
+                        "Spread condition",
+                        if (state.manualForm.rollTriggerOperator == "gte") "\u2265" else "\u2264",
+                        listOf("\u2264", "\u2265"),
+                    ) { selected ->
+                        onFormChange { it.copy(rollTriggerOperator = if (selected == "\u2265") "gte" else "lte") }
+                    }
+                }
+                OutlinedTextField(
+                    value = state.manualForm.triggerSpreadPct,
+                    onValueChange = { value -> onFormChange { it.copy(triggerSpreadPct = value) } },
+                    label = {
+                        Text(
+                            when (state.manualForm.action) {
+                                "enter" -> "Enter when spread \u2264"
+                                "exit" -> "Exit when spread \u2265"
+                                else -> "Roll trigger spread"
+                            }
+                        )
+                    },
+                    suffix = { Text("%") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
                 Spacer(Modifier.height(10.dp))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf("smart", "fast").forEach { mode ->
@@ -728,10 +801,21 @@ private fun ManualScreen(
                 }
                 KeyValue("Max slippage", "${state.advancedSettings.maxSlippageBps.ifBlank { "-" }} bps")
                 KeyValue("Margin mode", state.advancedSettings.marginMode.ifBlank { "-" })
+                KeyValue(
+                    "Execution time",
+                    if (state.advancedSettings.untilFilled) {
+                        "Until filled (max 30 min)"
+                    } else {
+                        "${state.advancedSettings.maxRuntimeMinutes.ifBlank { "default" }} min"
+                    },
+                )
                 Spacer(Modifier.height(10.dp))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = onAnalyze, enabled = manualReady && !state.manualLoading) { Text("Dry Run") }
-                    Button(onClick = onExecute, enabled = manualReady && !state.manualLoading) { Text("Execute") }
+                    Button(
+                        onClick = onExecute,
+                        enabled = manualReady && !state.manualLoading && state.executionStatus != "running",
+                    ) { Text("Execute") }
                     Button(onClick = onStop, enabled = state.executionId != null && !state.manualLoading) { Text("Stop") }
                 }
                 if (state.manualLoading) {
@@ -756,6 +840,122 @@ private fun ManualScreen(
 }
 
 @Composable
+private fun GridScreen(
+    state: MobileUiState,
+    onFormChange: ((GridFormUiState) -> GridFormUiState) -> Unit,
+    onAnalyze: () -> Unit,
+    onStart: () -> Unit,
+    onRefresh: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val defaults = state.manualDefaults
+    val exchanges = defaults?.exchanges.orEmpty()
+    val ready = defaults != null && exchanges.isNotEmpty()
+    val setupLabels = listOf("New grid", "Adopt full grid")
+    val currentSetupLabel = when (state.gridForm.setupMode) {
+        "adopt_existing_full_grid" -> "Adopt full grid"
+        else -> "New grid"
+    }
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = PaddingValues(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item {
+            SectionCard("Live Grid") {
+                SimpleSelect("Setup", currentSetupLabel, setupLabels) { selected ->
+                    onFormChange {
+                        it.copy(
+                            setupMode = if (selected == "Adopt full grid") {
+                                "adopt_existing_full_grid"
+                            } else {
+                                "entry_range"
+                            }
+                        )
+                    }
+                }
+                OutlinedTextField(
+                    value = state.gridForm.symbol,
+                    onValueChange = { value -> onFormChange { it.copy(symbol = value) } },
+                    label = { Text("Symbol") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+                SimpleSelect("Long exchange", state.gridForm.longExchange, exchanges) { selected ->
+                    onFormChange { it.copy(longExchange = selected) }
+                }
+                SimpleSelect("Short exchange", state.gridForm.shortExchange, exchanges) { selected ->
+                    onFormChange { it.copy(shortExchange = selected) }
+                }
+                OutlinedTextField(
+                    value = state.gridForm.maxNotional,
+                    onValueChange = { value -> onFormChange { it.copy(maxNotional = value) } },
+                    label = { Text("Full budget") },
+                    suffix = { Text("USDT") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedTextField(
+                        value = state.gridForm.rangeStartPct,
+                        onValueChange = { value -> onFormChange { it.copy(rangeStartPct = value) } },
+                        label = { Text(if (state.gridForm.setupMode == "adopt_existing_full_grid") "Exit high" else "Entry start") },
+                        suffix = { Text("%") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                    )
+                    OutlinedTextField(
+                        value = state.gridForm.rangeEndPct,
+                        onValueChange = { value -> onFormChange { it.copy(rangeEndPct = value) } },
+                        label = { Text(if (state.gridForm.setupMode == "adopt_existing_full_grid") "Exit low" else "Entry end") },
+                        suffix = { Text("%") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                    )
+                }
+                OutlinedTextField(
+                    value = state.gridForm.levelCount,
+                    onValueChange = { value -> onFormChange { it.copy(levelCount = value) } },
+                    label = { Text("Levels") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                )
+                KeyValue("Max slippage", "${state.advancedSettings.maxSlippageBps.ifBlank { "8" }} bps")
+                KeyValue("Confirm samples", "2")
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = onAnalyze, enabled = ready && !state.gridLoading) {
+                        Text("Dry Run")
+                    }
+                    Button(onClick = onStart, enabled = ready && !state.gridLoading) {
+                        Text("Start Live Grid")
+                    }
+                    TextButton(onClick = onRefresh, enabled = !state.gridLoading) {
+                        Text("Refresh")
+                    }
+                }
+                if (state.gridLoading) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        CircularProgressIndicator(modifier = Modifier.width(18.dp), strokeWidth = 2.dp)
+                        Text("Working...", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                Text(state.gridStatusText, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
+        item {
+            SectionCard("Preview") {
+                MonoBlock(state.gridPlanText)
+            }
+        }
+        item {
+            SectionCard("Active Grid Rules") {
+                MonoBlock(state.gridRulesText)
+            }
+        }
+    }
+}
+
+@Composable
 private fun SettingsScreen(
     state: MobileUiState,
     onBaseUrlChange: (String) -> Unit,
@@ -764,6 +964,7 @@ private fun SettingsScreen(
     onAdvancedChange: ((AdvancedSettingsUiState) -> AdvancedSettingsUiState) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var executionTimingExpanded by remember { mutableStateOf(false) }
     LazyColumn(modifier = modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             SectionCard("Connection") {
@@ -786,6 +987,42 @@ private fun SettingsScreen(
             }
         }
         item {
+            SectionCard("Execution timing") {
+                KeyValue(
+                    "Current limit",
+                    if (state.advancedSettings.untilFilled) {
+                        "Until filled, max 30 min"
+                    } else {
+                        "${state.advancedSettings.maxRuntimeMinutes.ifBlank { "backend default" }} min"
+                    },
+                )
+                TextButton(onClick = { executionTimingExpanded = !executionTimingExpanded }) {
+                    Text(if (executionTimingExpanded) "Hide execution settings" else "Execution settings")
+                }
+                AnimatedVisibility(executionTimingExpanded) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        SettingsField(
+                            "Execution time, minutes (1-30)",
+                            state.advancedSettings.maxRuntimeMinutes,
+                        ) { value ->
+                            onAdvancedChange { it.copy(maxRuntimeMinutes = value.filter(Char::isDigit)) }
+                        }
+                        BooleanSetting(
+                            "Until filled (max 30 min)",
+                            state.advancedSettings.untilFilled,
+                        ) { value ->
+                            onAdvancedChange { it.copy(untilFilled = value) }
+                        }
+                        Text(
+                            "Smart execution keeps retrying while quantity remains. The checkbox uses a hard 30-minute ceiling; Stop remains available at any time.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+        item {
             SectionCard("Trading Safety") {
                 SettingsField("Max slippage bps", state.advancedSettings.maxSlippageBps) { value -> onAdvancedChange { it.copy(maxSlippageBps = value) } }
                 SimpleSelect("Margin mode", state.advancedSettings.marginMode, listOf("isolated", "cross")) { selected -> onAdvancedChange { it.copy(marginMode = selected) } }
@@ -797,7 +1034,7 @@ private fun SettingsScreen(
         }
         item {
             SectionCard("System") {
-                Text("Timeouts, reprice controls, hedge offsets, and WS controls stay on the backend in this mobile build.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Reprice controls, hedge offsets, and WS controls stay on the backend in this mobile build.", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -864,6 +1101,13 @@ private fun RiskChip(distancePct: Double?, riskLevel: String?) {
 @Composable
 private fun StatusPill(status: String) {
     val color = when (status) {
+        "ok" -> Color(0xFF2E7D32)
+        "watch" -> Color(0xFFE67E22)
+        "stress" -> Color(0xFFB91C1C)
+        "error" -> Color(0xFFB91C1C)
+        "partial" -> Color(0xFFE67E22)
+        "unavailable" -> Color(0xFFB91C1C)
+        "missing_credentials" -> Color(0xFFB91C1C)
         "armed" -> Color(0xFF2E7D32)
         "waiting" -> Color(0xFF1565C0)
         "no_live_spread" -> Color(0xFFE67E22)

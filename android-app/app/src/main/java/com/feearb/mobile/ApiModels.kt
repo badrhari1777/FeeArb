@@ -1,5 +1,6 @@
 package com.feearb.mobile
 
+import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 
 data class MobilePositionsResponse(
@@ -19,6 +20,7 @@ data class BalanceDto(
     val used: Double? = null,
     val margin_ratio: Double? = null,
     val status: String? = null,
+    val error: String? = null,
     val updated_at: String? = null,
 )
 
@@ -169,6 +171,27 @@ data class AutoExitRuleRequest(
     val exit_once: Boolean? = true,
 )
 
+data class AutoArbRuleRequest(
+    val id: String? = null,
+    val symbol: String,
+    val long_exchange: String,
+    val short_exchange: String,
+    val setup_mode: String = "entry_range",
+    val budget_mode: String = "notional",
+    val max_qty: Double? = null,
+    val max_notional: Double? = null,
+    val range_start_pct: Double,
+    val range_end_pct: Double,
+    val exit_range_start_pct: Double? = null,
+    val exit_range_end_pct: Double? = null,
+    val level_count: Int? = null,
+    val max_slippage_bps: Double = 8.0,
+    val liquidity_safety_factor: Double = 0.70,
+    val confirm_samples: Int = 2,
+    val enabled: Boolean = true,
+    val live: Boolean = false,
+)
+
 data class PositionActionRequest(
     val symbol: String,
     val long_exchange: String,
@@ -202,6 +225,7 @@ data class ManualRequest(
     val limit_offset_ticks: Int? = null,
     val max_limit_deviation_bps: Double? = null,
     val use_orderbook_check: Boolean = true,
+    val allow_liquidity_chunking: Boolean = true,
     val fallback_to_market: Boolean = false,
     val async_run: Boolean = true,
     val dry_run: Boolean = false,
@@ -260,7 +284,7 @@ data class ManualExecStatusResponse(
     val status: String? = null,
     val error: String? = null,
     val stop_requested: Boolean = false,
-    val result: JsonObject? = null,
+    val result: JsonElement? = null,
     val logs: List<ManualExecLogEntry> = emptyList(),
 )
 
@@ -268,5 +292,5 @@ data class ManualExecLogEntry(
     val ts: String? = null,
     val event: String? = null,
     val message: String? = null,
-    val data: JsonObject? = null,
+    val data: JsonElement? = null,
 )
