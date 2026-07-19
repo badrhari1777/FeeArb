@@ -17,5 +17,6 @@ state/
 
 # Local diagnostics, exports, and recovery archives.
 backups/
+snapshots/
 tmp/
 *.bundle
