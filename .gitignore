@@ -11,4 +11,11 @@ dist/
 data/
 logs/
 *.log
-state/remote_access_token.txt
+
+# Runtime state is local and mutable. Source-controlled defaults belong in code/config.
+state/
+
+# Local diagnostics, exports, and recovery archives.
+backups/
+tmp/
+*.bundle

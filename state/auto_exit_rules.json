@@ -1,9 +1,0 @@
-{
-  "defaults": {
-    "auto_clear_no_position_sec": 120,
-    "cooldown_sec": 300,
-    "max_runtime_sec": 600,
-    "require_live": true
-  },
-  "rules": {}
-}
