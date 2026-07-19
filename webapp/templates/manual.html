@@ -32,14 +32,13 @@
       <a class="button" href="/">Back to dashboard</a>
       <a class="button" href="/manual-tests">Open exchange tests</a>
       <a class="button" href="/spread-monitor">Open spread monitor</a>
-      <a class="button" href="/mobile">Open mobile UI</a>
     </div>
   </header>
 
   <main class="content">
     <section class="panel">
       <h2>Manual trading</h2>
-      <form id="manual-form" class="analysis-form">
+      <form id="manual-form" class="analysis-form manual-form">
         <label>
           Action
           <select id="manual-action">
@@ -129,12 +128,16 @@
           </select>
         </label>
         <label>
-          Spread min (%)
-          <input type="number" id="manual-spread-min" step="0.01" />
+          Spread condition
+          <select id="manual-trigger-operator">
+            <option value="lte">&le;</option>
+            <option value="gte">&ge;</option>
+          </select>
         </label>
         <label>
-          Spread max (%)
-          <input type="number" id="manual-spread-max" step="0.01" />
+          Trigger spread (%)
+          <input type="number" id="manual-trigger-spread" step="0.01" placeholder="optional" />
+          <span class="hint" id="manual-trigger-hint">Enter starts when spread is at or below the target.</span>
         </label>
         <label>
           Max limit deviation (bps)
@@ -146,7 +149,7 @@
         </label>
         <label class="settings-checkbox">
           <input type="checkbox" id="manual-force-chunk" />
-          Force chunk qty
+          Use entered chunk as target (live liquidity cap still applies)
         </label>
         <label>
           Chunk notional (USDT)
@@ -162,15 +165,19 @@
         </label>
         <label>
           Max slippage (bps)
-          <input type="number" id="manual-slippage" min="0" step="0.1" value="8" />
+          <input type="number" id="manual-slippage" min="0" step="0.1" value="12" />
         </label>
         <label>
           Reprice interval (sec)
-          <input type="number" id="manual-reprice" min="0" step="0.1" value="2" />
+          <input type="number" id="manual-reprice" min="0" step="0.1" value="5" />
         </label>
         <label>
           Max runtime (sec)
-          <input type="number" id="manual-runtime" min="1" step="1" value="60" />
+          <input type="number" id="manual-runtime" min="1" step="1" value="180" />
+        </label>
+        <label>
+          Trigger wait before first order (sec)
+          <input type="number" id="manual-trigger-wait" min="1" step="1" value="30" />
         </label>
         <label class="manual-scope-enter-exit manual-scope-market">
           Market refill bps
@@ -238,7 +245,7 @@
             <option value="cross">Cross</option>
           </select>
         </label>
-        <div class="panel-label">WS order stream health</div>
+        <div class="panel-label" id="manual-ws-health-label">WS order stream health</div>
         <label>
           Bybit heartbeat interval (sec)
           <input type="number" id="manual-ws-bybit-heartbeat-interval" min="1" step="1" value="{{ ws_health.get('bybit', {}).get('heartbeat_interval', 15) }}" />
@@ -369,30 +376,34 @@
           <button type="button" class="button button--copy" data-copy-target="manual-exec-log">Copy</button>
         </div>
         <pre id="manual-exec-log" class="code-block code-block--log code-block--wrap">Execution log will appear here after Execute now.</pre>
-        <div class="panel-label">WS order raw streams</div>
-        <label class="settings-checkbox">
-          <input type="checkbox" id="manual-ws-raw-enabled" />
-          Enable WS raw streams
-        </label>
-        <p class="muted">WS raw streams open extra websocket connections. Through Tailscale + BasicAuth this can trigger repeated auth prompts on mobile.</p>
-        <div class="manual-ws-raw-grid">
-          <div>
-            <div class="code-block-header">
-              <div class="panel-label">Long leg</div>
-              <button type="button" class="button button--copy" data-copy-target="manual-ws-long-log">Copy</button>
+        <details class="manual-settings-group">
+          <summary>WS raw streams</summary>
+          <div class="manual-settings-group__body">
+            <label class="settings-checkbox">
+              <input type="checkbox" id="manual-ws-raw-enabled" />
+              Enable WS raw streams
+            </label>
+            <p class="muted">Open only for exchange diagnostics.</p>
+            <div class="manual-ws-raw-grid">
+              <div>
+                <div class="code-block-header">
+                  <div class="panel-label">Long leg</div>
+                  <button type="button" class="button button--copy" data-copy-target="manual-ws-long-log">Copy</button>
+                </div>
+                <span class="settings-status" id="manual-ws-long-status" aria-live="polite"></span>
+                <pre id="manual-ws-long-log" class="code-block code-block--log"></pre>
+              </div>
+              <div>
+                <div class="code-block-header">
+                  <div class="panel-label">Short leg</div>
+                  <button type="button" class="button button--copy" data-copy-target="manual-ws-short-log">Copy</button>
+                </div>
+                <span class="settings-status" id="manual-ws-short-status" aria-live="polite"></span>
+                <pre id="manual-ws-short-log" class="code-block code-block--log"></pre>
+              </div>
             </div>
-            <span class="settings-status" id="manual-ws-long-status" aria-live="polite"></span>
-            <pre id="manual-ws-long-log" class="code-block code-block--log"></pre>
           </div>
-          <div>
-            <div class="code-block-header">
-              <div class="panel-label">Short leg</div>
-              <button type="button" class="button button--copy" data-copy-target="manual-ws-short-log">Copy</button>
-            </div>
-            <span class="settings-status" id="manual-ws-short-status" aria-live="polite"></span>
-            <pre id="manual-ws-short-log" class="code-block code-block--log"></pre>
-          </div>
-        </div>
+        </details>
       </div>
     </section>
   </main>

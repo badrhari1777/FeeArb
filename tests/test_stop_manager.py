@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import time
 import unittest
+from unittest.mock import patch
 
 from risk.config import RiskConfig
-from risk.stop_manager import ProtectiveOrderManager, ProtectiveTarget
+from risk.stop_manager import ProtectiveOrderManager, ProtectiveTarget, TakeTarget
+from utils.cache_db import SymbolMeta
 
 
 class _FakeClient:
@@ -98,6 +100,7 @@ class StopManagerBinanceAlgoSideTestCase(unittest.TestCase):
         manager = ProtectiveOrderManager(RiskConfig())
         gateway = _FakeGateway()
         captured: dict[str, object] = {}
+        manager._refresh_symbol_meta = lambda *_args, **_kwargs: None  # type: ignore[method-assign]
 
         async def _fake_request(
             _gateway,
@@ -137,6 +140,62 @@ class StopManagerBinanceAlgoSideTestCase(unittest.TestCase):
         self.assertEqual(captured.get("path"), "algoOrder")
         self.assertEqual(params.get("workingType"), "MARK_PRICE")
         self.assertEqual(params.get("priceProtect"), "TRUE")
+
+    def test_place_binance_algo_conditional_uses_symbol_meta_precision_fallback(self) -> None:
+        class _NoPrecisionClient(_FakeClient):
+            def price_to_precision(self, _symbol, _price):  # noqa: D401
+                raise RuntimeError("market missing")
+
+            def amount_to_precision(self, _symbol, _amount):  # noqa: D401
+                raise RuntimeError("market missing")
+
+        manager = ProtectiveOrderManager(RiskConfig())
+        gateway = _FakeGateway()
+        gateway.client = _NoPrecisionClient()
+        captured: dict[str, object] = {}
+        manager._refresh_symbol_meta = lambda *_args, **_kwargs: SymbolMeta(  # type: ignore[method-assign]
+            exchange="binance",
+            symbol="LABUSDT",
+            tick_size=0.0001,
+            price_step=0.0001,
+            qty_step=1.0,
+        )
+
+        async def _fake_request(
+            _gateway,
+            *,
+            method: str,  # noqa: ARG001
+            path: str,  # noqa: ARG001
+            params: dict[str, object],
+        ):
+            captured["params"] = dict(params)
+            return {"ok": True}
+
+        manager._binance_algo_request = _fake_request  # type: ignore[method-assign]
+
+        async def _run() -> None:
+            await manager._place_binance_algo_conditional(
+                gateway,
+                ProtectiveTarget(
+                    stop=100.0,
+                    takes=[],
+                    quantity=12.9,
+                    side="long",
+                    exchange="binance",
+                    symbol="LAB/USDT:USDT",
+                    position_id="p1",
+                    pos_side="both",
+                ),
+                order_type="STOP_MARKET",
+                trigger_price=14.818691234,
+                quantity=12.9,
+            )
+
+        asyncio.run(_run())
+        params = captured.get("params") or {}
+        self.assertEqual(params.get("symbol"), "LAB/USDT:USDT")
+        self.assertEqual(params.get("triggerPrice"), "14.8187")
+        self.assertEqual(params.get("quantity"), "12")
 
 
 class StopManagerTriggerBasisParamsTestCase(unittest.TestCase):
@@ -189,6 +248,71 @@ class StopManagerTriggerBasisParamsTestCase(unittest.TestCase):
         take_params = client.orders[1]["params"]
         self.assertEqual(stop_params.get("slTriggerPxType"), "mark")
         self.assertEqual(take_params.get("tpTriggerPxType"), "mark")
+
+    def test_bitget_stop_and_take_use_uta_strategy_mark_trigger(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        client = _RecordingOrderClient()
+        gateway = _RecordingGateway("bitget", client)
+        target = ProtectiveTarget(
+            stop=100.0,
+            takes=[],
+            quantity=2.0,
+            side="short",
+            exchange="bitget",
+            symbol="BTCUSDT",
+            position_id="p1",
+        )
+
+        async def _run() -> None:
+            await manager._place_stop(gateway, target, 101.0)
+            await manager._place_take(gateway, target, 95.0)
+
+        asyncio.run(_run())
+        stop_params = client.orders[0]["params"]
+        take_params = client.orders[1]["params"]
+        self.assertIs(stop_params.get("uta"), True)
+        self.assertIs(take_params.get("uta"), True)
+        self.assertEqual(stop_params.get("slTriggerBy"), "mark")
+        self.assertEqual(take_params.get("tpTriggerBy"), "mark")
+        self.assertEqual(stop_params.get("posSide"), "short")
+        self.assertEqual(take_params.get("posSide"), "short")
+        self.assertNotIn("planType", stop_params)
+        self.assertNotIn("planType", take_params)
+
+    def test_bitget_classic_stop_and_take_use_contract_tpsl_mark_trigger(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        client = _RecordingOrderClient()
+        gateway = _RecordingGateway("bitget", client)
+        target = ProtectiveTarget(
+            stop=100.0,
+            takes=[],
+            quantity=2.0,
+            side="short",
+            exchange="bitget",
+            symbol="BTCUSDT",
+            position_id="p1",
+        )
+
+        async def _run() -> None:
+            with patch.dict("os.environ", {"BITGET_ACCOUNT_MODE": "classic"}):
+                await manager._place_stop(gateway, target, 101.0)
+                await manager._place_take(gateway, target, 95.0)
+
+        asyncio.run(_run())
+        stop_params = client.orders[0]["params"]
+        take_params = client.orders[1]["params"]
+        self.assertEqual(stop_params.get("triggerType"), "mark_price")
+        self.assertEqual(take_params.get("triggerType"), "mark_price")
+        self.assertEqual(stop_params.get("planType"), "loss_plan")
+        self.assertEqual(take_params.get("planType"), "profit_plan")
+        self.assertEqual(stop_params.get("executePrice"), "0")
+        self.assertEqual(take_params.get("executePrice"), "0")
+        self.assertEqual(stop_params.get("holdSide"), "short")
+        self.assertEqual(take_params.get("holdSide"), "short")
+        self.assertNotIn("slTriggerType", stop_params)
+        self.assertNotIn("tpTriggerType", take_params)
+        self.assertNotIn("tpslMode", stop_params)
+        self.assertNotIn("tpslMode", take_params)
 
     def test_kucoin_stop_and_take_use_mark_price_type(self) -> None:
         manager = ProtectiveOrderManager(RiskConfig())
@@ -313,6 +437,56 @@ class StopManagerStaleGuardTestCase(unittest.TestCase):
         )
         self.assertFalse(should_update)
 
+    def test_close_all_take_does_not_require_reported_quantity(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        should_update, delta = manager._needs_take_update(
+            [{"id": "1", "price": 90.0, "qty": None, "close_all": True}],
+            [TakeTarget(price=90.0, quantity=25000.0)],
+            price_threshold=0.005,
+            qty_threshold=0.01,
+        )
+        self.assertFalse(should_update)
+        self.assertEqual(delta, 0.0)
+
+    def test_short_fallback_take_is_bounded_away_from_zero(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig(fallback_take_rr_pct=1.0))
+        price = manager._fallback_take_price(
+            "short",
+            mark_price=0.40,
+            entry_price=None,
+            ratio=1.0,
+        )
+        self.assertEqual(price, 0.20)
+
+    def test_invalid_peer_take_uses_safe_fallback_side(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig(fallback_take_rr_pct=0.10))
+        targets = manager._compute_targets(
+            "HUSDT",
+            [
+                {
+                    "exchange": "binance",
+                    "symbol": "H/USDT:USDT",
+                    "side": "short",
+                    "contracts": 1000.0,
+                    "mark_price": 0.40,
+                    "entry_price": 0.35,
+                    "liquidation_price": 0.60,
+                },
+                {
+                    "exchange": "kucoin",
+                    "symbol": "H/USDT:USDT",
+                    "side": "long",
+                    "contracts": 100.0,
+                    "mark_price": 0.41,
+                    "entry_price": 0.34,
+                    "liquidation_price": 0.20,
+                },
+            ],
+        )
+        short_target = next(target for target in targets if target.side == "short")
+        self.assertTrue(short_target.takes)
+        self.assertLess(short_target.takes[0].price, short_target.mark_price or 0.0)
+
 
 class _CacheClient:
     def __init__(self) -> None:
@@ -359,6 +533,107 @@ class StopManagerExistingCacheTestCase(unittest.TestCase):
         self.assertEqual(client.calls, 2)
 
 
+class _BitgetPlanClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    async def fetch_open_orders(self, symbol: str, params: dict | None = None):
+        self.calls.append((symbol, dict(params or {})))
+        if not params:
+            return []
+        if params.get("planType") != "profit_loss" and not (params.get("uta") and params.get("trigger")):
+            return []
+        return [
+            {
+                "id": "sl-plan",
+                "type": "market",
+                "side": "sell",
+                "amount": 1.0,
+                "stopLossPrice": 99.0,
+                "reduceOnly": True,
+                "timestamp": int(time.time() * 1000),
+                "info": {
+                    "orderId": "sl-plan",
+                    "planType": "loss_plan",
+                    "triggerPrice": "99",
+                    "size": "1",
+                    "posSide": "long",
+                },
+            },
+            {
+                "id": "tp-plan",
+                "type": "market",
+                "side": "sell",
+                "amount": 1.0,
+                "takeProfitPrice": 104.0,
+                "reduceOnly": True,
+                "timestamp": int(time.time() * 1000),
+                "info": {
+                    "orderId": "tp-plan",
+                    "planType": "profit_plan",
+                    "triggerPrice": "104",
+                    "size": "1",
+                    "posSide": "long",
+                },
+            },
+        ]
+
+
+class _BitgetPlanGateway:
+    slug = "bitget"
+
+    def __init__(self, client: _BitgetPlanClient) -> None:
+        self.client = client
+
+    def map_symbol(self, symbol: str) -> str:
+        return symbol
+
+
+class StopManagerBitgetPlanFetchTestCase(unittest.TestCase):
+    def test_fetch_existing_includes_bitget_uta_strategy_orders(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        client = _BitgetPlanClient()
+        gateway = _BitgetPlanGateway(client)
+
+        async def _run() -> dict:
+            return await manager._fetch_existing(
+                gateway,
+                "BTC/USDT:USDT",
+                None,
+                "long",
+                mark_price=100.0,
+                entry_price=100.0,
+                force_fetch=True,
+            )
+
+        result = asyncio.run(_run())
+        self.assertEqual([call[1] for call in client.calls], [{"uta": True}, {"uta": True, "trigger": True}])
+        self.assertEqual(result.get("order_ids"), ["sl-plan", "tp-plan"])
+        self.assertEqual([item.get("id") for item in result.get("stop_orders") or []], ["sl-plan"])
+        self.assertEqual([item.get("id") for item in result.get("take_orders") or []], ["tp-plan"])
+
+    def test_fetch_existing_includes_bitget_classic_profit_loss_plan_orders(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        client = _BitgetPlanClient()
+        gateway = _BitgetPlanGateway(client)
+
+        async def _run() -> dict:
+            with patch.dict("os.environ", {"BITGET_ACCOUNT_MODE": "classic"}):
+                return await manager._fetch_existing(
+                    gateway,
+                    "BTC/USDT:USDT",
+                    None,
+                    "long",
+                    mark_price=100.0,
+                    entry_price=100.0,
+                    force_fetch=True,
+                )
+
+        result = asyncio.run(_run())
+        self.assertEqual([call[1] for call in client.calls], [{}, {"trigger": True, "planType": "profit_loss"}])
+        self.assertEqual(result.get("order_ids"), ["sl-plan", "tp-plan"])
+
+
 class _SyncClient:
     def __init__(self, fail_ids: set[str] | None = None) -> None:
         self._fail_ids = set(fail_ids or set())
@@ -403,7 +678,102 @@ class _RetrySyncGateway(_SyncGateway):
         return await callback()
 
 
+class _BitgetSyncGateway(_SyncGateway):
+    slug = "bitget"
+
+
+class _KucoinSyncGateway(_SyncGateway):
+    slug = "kucoin"
+
+
 class StopManagerCancelSafetyTestCase(unittest.TestCase):
+    def test_cleanup_orphaned_protective_orders_cancels_existing_orders(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        client = _SyncClient()
+        gateway = _SyncGateway(client)
+        manager._gateways = {"bybit": gateway}
+
+        fetch_calls: list[tuple[str, bool]] = []
+
+        async def _fake_fetch_existing(
+            _gw,
+            _symbol,
+            _position_id,
+            side,
+            *,
+            mark_price=None,  # noqa: ARG001
+            entry_price=None,  # noqa: ARG001
+            force_fetch: bool = False,
+        ):
+            fetch_calls.append((side, force_fetch))
+            if len(fetch_calls) == 1:
+                return {
+                    "stop_orders": [{"id": "old-stop", "price": 100.0, "qty": 1.0}],
+                    "take_orders": [{"id": "old-take", "price": 90.0, "qty": 1.0}],
+                    "unknown_orders": [],
+                    "order_ids": ["old-stop", "old-take"],
+                    "algo_order_ids": [],
+                    "invalid_side": False,
+                }
+            return {
+                "stop_orders": [],
+                "take_orders": [],
+                "unknown_orders": [],
+                "order_ids": [],
+                "algo_order_ids": [],
+                "invalid_side": False,
+            }
+
+        manager._fetch_existing = _fake_fetch_existing  # type: ignore[method-assign]
+
+        async def _run() -> list[dict]:
+            return await manager.cleanup_orphaned_protective_orders("bybit", "BTCUSDT")
+
+        result = asyncio.run(_run())
+        self.assertEqual([item.get("status") for item in result], ["cleanup_cancelled", "cleanup_skipped_no_orders"])
+        self.assertEqual([call[0] for call in client.cancel_calls], ["old-stop", "old-take"])
+        self.assertEqual(fetch_calls, [("long", True), ("long", True), ("short", True)])
+
+    def test_cleanup_orphaned_protective_orders_reports_pending_cancel(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        client = _SyncClient()
+        gateway = _SyncGateway(client)
+        manager._gateways = {"bybit": gateway}
+
+        fetch_calls = 0
+
+        async def _fake_fetch_existing(
+            _gw,
+            _symbol,
+            _position_id,
+            _side,
+            *,
+            mark_price=None,  # noqa: ARG001
+            entry_price=None,  # noqa: ARG001
+            force_fetch: bool = False,  # noqa: ARG001
+        ):
+            nonlocal fetch_calls
+            fetch_calls += 1
+            return {
+                "stop_orders": [{"id": "old-stop", "price": 100.0, "qty": 1.0}],
+                "take_orders": [],
+                "unknown_orders": [],
+                "order_ids": ["old-stop"],
+                "algo_order_ids": [],
+                "invalid_side": False,
+            }
+
+        manager._fetch_existing = _fake_fetch_existing  # type: ignore[method-assign]
+
+        async def _run() -> list[dict]:
+            return await manager.cleanup_orphaned_protective_orders("bybit", "BTCUSDT", sides=("long",))
+
+        result = asyncio.run(_run())
+        self.assertEqual(result[0].get("status"), "cleanup_cancel_pending")
+        self.assertEqual(result[0].get("cancel_pending_ids"), ["old-stop"])
+        self.assertEqual([call[0] for call in client.cancel_calls], ["old-stop"])
+        self.assertEqual(fetch_calls, 2)
+
     def test_sync_leg_skips_new_orders_when_cancel_fails(self) -> None:
         manager = ProtectiveOrderManager(RiskConfig())
         client = _SyncClient(fail_ids={"old-stop"})
@@ -505,6 +875,143 @@ class StopManagerCancelSafetyTestCase(unittest.TestCase):
 
         asyncio.run(_run())
         self.assertEqual(gateway.retry_operations, ["cancel_order"])
+
+    def test_sync_leg_treats_kucoin_already_final_cancel_as_resolved(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        client = _SyncClient(fail_ids={"old-stop"})
+
+        async def _kucoin_cancel(order_id: str, symbol: str, params: dict | None = None):
+            client.cancel_calls.append((order_id, symbol, params))
+            raise RuntimeError('kucoinfutures {"msg":"The order cannot be canceled.","code":"100004"}')
+
+        client.cancel_order = _kucoin_cancel  # type: ignore[method-assign]
+        gateway = _KucoinSyncGateway(client)
+        manager._gateways = {"kucoin": gateway}
+        place_stop_calls = 0
+        fetch_count = 0
+
+        async def _fake_fetch_existing(
+            _gw,
+            _symbol,
+            _position_id,
+            _side,
+            *,
+            mark_price=None,  # noqa: ARG001
+            entry_price=None,  # noqa: ARG001
+            force_fetch: bool = False,
+        ):
+            nonlocal fetch_count
+            fetch_count += 1
+            if force_fetch:
+                return {
+                    "stop_orders": [],
+                    "take_orders": [],
+                    "unknown_orders": [],
+                    "order_ids": [],
+                    "algo_order_ids": [],
+                    "invalid_side": False,
+                }
+            return {
+                "stop_orders": [{"id": "old-stop", "price": 100.0, "qty": 1.0}],
+                "take_orders": [],
+                "unknown_orders": [],
+                "order_ids": ["old-stop"],
+                "algo_order_ids": [],
+                "invalid_side": False,
+            }
+
+        async def _fake_place_stop(_gw, _target, _price):
+            nonlocal place_stop_calls
+            place_stop_calls += 1
+
+        manager._fetch_existing = _fake_fetch_existing  # type: ignore[method-assign]
+        manager._place_stop = _fake_place_stop  # type: ignore[method-assign]
+
+        async def _run() -> dict:
+            return await manager._sync_leg(
+                ProtectiveTarget(
+                    stop=101.0,
+                    takes=[],
+                    quantity=1.0,
+                    side="long",
+                    exchange="kucoin",
+                    symbol="BTCUSDTM",
+                    position_id="p1",
+                )
+            )
+
+        result = asyncio.run(_run())
+        self.assertEqual(result.get("status"), "updated")
+        self.assertEqual(place_stop_calls, 1)
+        self.assertEqual(fetch_count, 2)
+        self.assertEqual(client.cancel_calls, [("old-stop", "BTCUSDTM", {"stop": True})])
+
+    def test_sync_leg_cancels_bitget_uta_tpsl_as_trigger_strategy_order(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        client = _SyncClient()
+        gateway = _BitgetSyncGateway(client)
+        manager._gateways = {"bitget": gateway}
+
+        fetch_calls = 0
+        place_stop_calls = 0
+
+        async def _fake_fetch_existing(
+            _gw,
+            _symbol,
+            _position_id,
+            _side,
+            *,
+            mark_price=None,  # noqa: ARG001
+            entry_price=None,  # noqa: ARG001
+            force_fetch: bool = False,  # noqa: ARG001
+        ):
+            nonlocal fetch_calls
+            fetch_calls += 1
+            if fetch_calls == 1:
+                return {
+                    "stop_orders": [{"id": "old-stop", "price": 100.0, "qty": 1.0}],
+                    "take_orders": [],
+                    "unknown_orders": [],
+                    "order_ids": ["old-stop"],
+                    "algo_order_ids": [],
+                    "invalid_side": False,
+                }
+            return {
+                "stop_orders": [],
+                "take_orders": [],
+                "unknown_orders": [],
+                "order_ids": [],
+                "algo_order_ids": [],
+                "invalid_side": False,
+            }
+
+        async def _fake_place_stop(_gw, _target, _price):
+            nonlocal place_stop_calls
+            place_stop_calls += 1
+
+        manager._fetch_existing = _fake_fetch_existing  # type: ignore[method-assign]
+        manager._place_stop = _fake_place_stop  # type: ignore[method-assign]
+
+        async def _run() -> dict:
+            return await manager._sync_leg(
+                ProtectiveTarget(
+                    stop=101.0,
+                    takes=[],
+                    quantity=1.0,
+                    side="long",
+                    exchange="bitget",
+                    symbol="BTC/USDT:USDT",
+                    position_id="p1",
+                )
+            )
+
+        result = asyncio.run(_run())
+        self.assertEqual(result.get("status"), "updated")
+        self.assertEqual(place_stop_calls, 1)
+        self.assertEqual(
+            client.cancel_calls,
+            [("old-stop", "BTC/USDT:USDT", {"uta": True, "trigger": True})],
+        )
 
     def test_sync_leg_skips_new_orders_when_cancel_not_confirmed(self) -> None:
         manager = ProtectiveOrderManager(RiskConfig())

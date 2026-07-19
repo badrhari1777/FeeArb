@@ -117,6 +117,47 @@ class FundingHistoryAnalysisTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(float(best.get("net_bps") or 0.0), 4.0, places=6)
         self.assertAlmostEqual(float(best.get("coverage_pct") or 0.0), 100.0, places=6)
         self.assertEqual(best.get("status"), "ok")
+        next_best = (payload.get("best_by_window") or {}).get("next") or {}
+        self.assertEqual(next_best.get("long_exchange"), "kucoin")
+        self.assertEqual(next_best.get("short_exchange"), "binance")
+        self.assertAlmostEqual(float(next_best.get("net_hourly_bps") or 0.0), 1.0, places=6)
+        self.assertIn("next_funding_windows", payload)
+        first_exchange = payload["exchanges"][0]
+        self.assertIn("latest_funding_bps", first_exchange)
+        self.assertIn("next_funding_bps", first_exchange)
+        self.assertEqual(first_exchange["next_funding_source"], "history_latest_fallback")
+
+    async def test_analyze_funding_history_defaults_exclude_bingx_and_include_seven_public_venues(self) -> None:
+        service = DataService(settings_manager=SettingsManager())
+
+        class _FakeAdapter:
+            def __init__(self, exchange: str) -> None:
+                self.exchange = exchange
+
+            def map_symbol(self, symbol: str) -> str | None:
+                return symbol.upper()
+
+            async def fetch_market_snapshots_async(self, _symbols):  # noqa: ANN001, ANN201
+                return []
+
+            def funding_history(self, _symbol: str, limit: int = 200):  # noqa: ANN001, ANN201
+                del limit
+                return []
+
+        with patch(
+            "webapp.services.get_adapter_cached",
+            side_effect=lambda exchange: _FakeAdapter(exchange),
+        ), patch.object(service, "_persist_coin_funding_history", return_value=0):
+            payload = await service.analyze_funding_history(
+                "LABUSDT",
+                funding_points=24,
+            )
+
+        self.assertEqual(
+            payload["selected_exchanges"],
+            ["binance", "bybit", "okx", "gate", "bitget", "mexc", "kucoin"],
+        )
+        self.assertNotIn("bingx", payload["selected_exchanges"])
 
 
 if __name__ == "__main__":

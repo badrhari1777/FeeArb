@@ -15,6 +15,7 @@ import websockets
 
 from execution.accounts import ExchangeGateway, EXCHANGE_SPECS, _bootstrap_env, normalize_symbol
 from execution.accounts import _safe_float
+from execution.kucoin_auth import fetch_kucoin_private_ws_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -612,7 +613,13 @@ class KucoinPositionStream(_BasePositionStream):
         if not api_key or not api_secret or not passphrase:
             logger.warning("kucoin ws auth missing api key/secret/passphrase")
             return None
-        # Use ccxt client for REST token fetch to avoid new deps.
+        try:
+            endpoint = await fetch_kucoin_private_ws_endpoint(self._gateway)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("kucoin position ws direct token fetch failed: %s", exc)
+            endpoint = None
+        if endpoint:
+            return endpoint
         await self._gateway.ensure_client()
         client = self._gateway.client
         if not client:
@@ -620,10 +627,11 @@ class KucoinPositionStream(_BasePositionStream):
         try:
             token_info = await client.futuresPrivatePostBulletPrivate()
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("kucoin ws token fetch failed: %s", exc)
+            logger.warning("kucoin position ws ccxt token fetch failed: %s", exc)
             return None
         data = (token_info or {}).get("data") or {}
-        endpoint = data.get("instanceServers", [{}])[0].get("endpoint") if data else None
+        server = data.get("instanceServers", [{}])[0] if data else {}
+        endpoint = data.get("endpoint") or server.get("endpoint") if data else None
         token = data.get("token") if data else None
         if not endpoint or not token:
             return None

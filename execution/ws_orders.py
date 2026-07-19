@@ -15,6 +15,7 @@ import zlib
 import websockets
 
 from execution.accounts import EXCHANGE_SPECS, ExchangeGateway, _bootstrap_env, _safe_float, normalize_symbol
+from execution.kucoin_auth import fetch_kucoin_private_ws_endpoint
 from exchanges import normalize_exchange_name
 
 logger = logging.getLogger(__name__)
@@ -1321,6 +1322,14 @@ class KucoinOrderStream(_BaseOrderStream):
             self._emit_event("auth_missing")
             logger.warning("kucoin ws auth missing api key/secret/passphrase")
             return None
+        try:
+            endpoint = await fetch_kucoin_private_ws_endpoint(self._gateway)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("kucoin ws direct token fetch failed: %s", exc)
+            self._emit_event("auth_failed", {"error": str(exc), "mode": "direct"})
+            endpoint = None
+        if endpoint:
+            return endpoint
         await self._gateway.ensure_client()
         client = self._gateway.client
         if not client:
@@ -1328,11 +1337,12 @@ class KucoinOrderStream(_BaseOrderStream):
         try:
             token_info = await client.futuresPrivatePostBulletPrivate()
         except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("kucoin ws token fetch failed: %s", exc)
-            self._emit_event("auth_failed", {"error": str(exc)})
+            logger.warning("kucoin ws ccxt token fetch failed: %s", exc)
+            self._emit_event("auth_failed", {"error": str(exc), "mode": "ccxt"})
             return None
         data = (token_info or {}).get("data") or {}
-        endpoint = data.get("instanceServers", [{}])[0].get("endpoint") if data else None
+        server = data.get("instanceServers", [{}])[0] if data else {}
+        endpoint = data.get("endpoint") or server.get("endpoint") if data else None
         token = data.get("token") if data else None
         if not endpoint or not token:
             self._emit_event("auth_failed", {"error": "missing_token"})

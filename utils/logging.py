@@ -1,7 +1,34 @@
 from __future__ import annotations
 
 import logging
+import re
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+APP_LOG_MAX_BYTES = 100 * 1024 * 1024
+APP_LOG_BACKUP_COUNT = 5
+
+
+def redact_sensitive_text(value: object) -> str:
+    text = str(value)
+    text = re.sub(
+        r"(?i)([?&](?:signature|api[_-]?key|apikey|token|secret|passphrase)=)[^&\s]+",
+        r"\1<redacted>",
+        text,
+    )
+    text = re.sub(
+        r'(?i)(["\'](?:signature|api[_-]?key|apikey|token|secret|passphrase)["\']\s*:\s*["\'])[^"\']+',
+        r"\1<redacted>",
+        text,
+    )
+    return text
+
+
+class _SensitiveDataFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact_sensitive_text(record.getMessage())
+        record.args = ()
+        return True
 
 
 def _is_same_file_handler(handler: logging.Handler, log_path: Path) -> bool:
@@ -14,11 +41,21 @@ def _is_same_file_handler(handler: logging.Handler, log_path: Path) -> bool:
 
 
 def _ensure_file_handler(logger: logging.Logger, log_path: Path, formatter: logging.Formatter) -> None:
-    for handler in logger.handlers:
+    for handler in list(logger.handlers):
         if _is_same_file_handler(handler, log_path):
-            return
-    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+            if isinstance(handler, RotatingFileHandler):
+                return
+            logger.removeHandler(handler)
+            handler.close()
+    file_handler = RotatingFileHandler(
+        log_path,
+        mode="a",
+        maxBytes=APP_LOG_MAX_BYTES,
+        backupCount=APP_LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
     file_handler.setFormatter(formatter)
+    file_handler.addFilter(_SensitiveDataFilter())
     logger.addHandler(file_handler)
 
 

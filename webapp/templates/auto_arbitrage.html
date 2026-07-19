@@ -17,15 +17,15 @@
     <div>
       <p class="back-link"><a href="/">Назад на Dashboard</a></p>
       <h1>Автоарбитражная сетка</h1>
-      <p class="subtitle">Расчёт и запуск Grid сразу в ограниченном Live для теста малым объёмом</p>
+      <p class="subtitle">Расчёт и запуск Live Grid с динамическими чанками и сверкой реальных позиций</p>
     </div>
     <div class="status-block">
       <dl>
-        <div><dt>Режим</dt><dd>Restricted Live</dd></div>
+        <div><dt>Режим</dt><dd>Live</dd></div>
         <div><dt>Стратегий</dt><dd id="aa-rule-count">0</dd></div>
         <div><dt>Обновлено</dt><dd id="aa-updated">-</dd></div>
       </dl>
-      <p class="hint">Live: не более 50 USDT на чанк и 100 USDT общей позиции на одну ногу.</p>
+      <p class="hint">Максимальный объём задаётся бюджетом стратегии. Реальные ордера ограничиваются текущей ликвидностью и slippage.</p>
     </div>
   </header>
 
@@ -46,6 +46,14 @@
           <select id="aa-short" required></select>
         </label>
         <label>
+          Режим расчёта
+          <select id="aa-setup-mode">
+            <option value="entry_range">Entry range</option>
+            <option value="adopt_existing_full_grid">Adopt current position into full grid</option>
+            <option value="existing_position_exit_range">Current position exit range</option>
+          </select>
+        </label>
+        <label>
           Бюджет
           <select id="aa-budget-mode">
             <option value="qty">В монетах</option>
@@ -61,20 +69,22 @@
           <input id="aa-max-notional" type="number" min="0" step="any" value="1000" />
         </label>
         <label>
-          Первый вход, %
+          <span id="aa-range-start-label">Первый вход, %</span>
           <input id="aa-range-start" type="number" step="any" value="-2" required />
         </label>
         <label>
-          Последний вход, %
+          <span id="aa-range-end-label">Последний вход, %</span>
           <input id="aa-range-end" type="number" step="any" value="-10" required />
+          <span class="hint" id="aa-range-hint">Entry spread must move lower to add position.</span>
         </label>
         <label>
           Уровней
           <input id="aa-level-count" type="number" min="2" max="20" step="1" placeholder="Авто" />
         </label>
         <label>
-          Exit gap, %
-          <input id="aa-exit-gap" type="number" min="0" step="any" placeholder="Авто" />
+          Exit gap, % (авто)
+          <input id="aa-exit-gap" type="number" step="any" placeholder="После расчёта" readonly />
+          <span class="hint">Равен шагу между соседними уровнями.</span>
         </label>
         <label>
           Max slippage, bps

@@ -159,6 +159,35 @@ class FundingHistoryAdaptersTestCase(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertAlmostEqual(float(rows[0].get("interval_hours") or 0.0), 8.0, places=6)
 
+    def test_mexc_history_uses_query_endpoint_and_result_list(self) -> None:
+        seen_urls: list[str] = []
+        payload = {
+            "success": True,
+            "code": 0,
+            "data": {
+                "resultList": [
+                    {"settleTime": 1_700_028_800_000, "fundingRate": "0.0001", "collectCycle": 8},
+                    {"settleTime": 1_700_000_000_000, "fundingRate": "0.0002", "collectCycle": 8},
+                ]
+            },
+        }
+
+        def _fake_get_json(url: str):  # noqa: ANN001
+            seen_urls.append(url)
+            return payload
+
+        with patch("exchanges.mexc._get_json", side_effect=_fake_get_json), patch(
+            "exchanges.mexc.get_or_fetch_funding_history",
+            side_effect=_cache_passthrough,
+        ):
+            rows = MexcAdapter().funding_history("BTCUSDT", limit=2)
+
+        self.assertEqual(len(rows), 2)
+        self.assertIn("/contract/funding_rate/history?", seen_urls[0])
+        self.assertIn("symbol=BTC_USDT", seen_urls[0])
+        self.assertEqual(int(rows[0].get("ts_ms") or 0), 1_700_028_800_000)
+        self.assertAlmostEqual(float(rows[0].get("interval_hours") or 0.0), 8.0, places=6)
+
     def test_bingx_seconds_datetime_parsing(self) -> None:
         dt = bingx_to_datetime(1_700_000_000)
         self.assertIsNotNone(dt)

@@ -10,6 +10,7 @@
     symbol: document.getElementById('aa-symbol'),
     longExchange: document.getElementById('aa-long'),
     shortExchange: document.getElementById('aa-short'),
+    setupMode: document.getElementById('aa-setup-mode'),
     budgetMode: document.getElementById('aa-budget-mode'),
     maxQty: document.getElementById('aa-max-qty'),
     maxNotional: document.getElementById('aa-max-notional'),
@@ -17,6 +18,9 @@
     notionalWrap: document.getElementById('aa-notional-wrap'),
     rangeStart: document.getElementById('aa-range-start'),
     rangeEnd: document.getElementById('aa-range-end'),
+    rangeStartLabel: document.getElementById('aa-range-start-label'),
+    rangeEndLabel: document.getElementById('aa-range-end-label'),
+    rangeHint: document.getElementById('aa-range-hint'),
     levelCount: document.getElementById('aa-level-count'),
     exitGap: document.getElementById('aa-exit-gap'),
     slippage: document.getElementById('aa-slippage'),
@@ -71,33 +75,80 @@
   }
 
   function formPayload() {
+    var setupMode = el.setupMode ? el.setupMode.value : 'entry_range';
+    var rangeStart = numberValue(el.rangeStart);
+    var rangeEnd = numberValue(el.rangeEnd);
     var payload = {
       symbol: el.symbol.value.trim().toUpperCase(),
       long_exchange: el.longExchange.value,
       short_exchange: el.shortExchange.value,
+      setup_mode: setupMode,
       budget_mode: el.budgetMode.value,
-      range_start_pct: numberValue(el.rangeStart),
-      range_end_pct: numberValue(el.rangeEnd),
+      range_start_pct: rangeStart,
+      range_end_pct: rangeEnd,
       max_slippage_bps: numberValue(el.slippage),
       confirm_samples: numberValue(el.confirmSamples),
       liquidity_safety_factor: 0.70,
       enabled: true,
       live: true
     };
-    if (payload.budget_mode === 'notional') {
-      payload.max_notional = numberValue(el.maxNotional);
+    if (setupMode === 'existing_position_exit_range' || setupMode === 'adopt_existing_full_grid') {
+      payload.exit_range_start_pct = rangeStart;
+      payload.exit_range_end_pct = rangeEnd;
+    }
+    if (setupMode === 'existing_position_exit_range') {
+      payload.budget_mode = 'qty';
     } else {
-      payload.max_qty = numberValue(el.maxQty);
+      if (payload.budget_mode === 'notional') {
+        payload.max_notional = numberValue(el.maxNotional);
+      } else {
+        payload.max_qty = numberValue(el.maxQty);
+      }
     }
     var count = numberValue(el.levelCount);
-    var gap = numberValue(el.exitGap);
     if (count !== null) {
       payload.level_count = count;
     }
-    if (gap !== null) {
-      payload.exit_gap_pct = gap;
-    }
     return payload;
+  }
+
+  function updateAutoGapPreview() {
+    var start = numberValue(el.rangeStart);
+    var end = numberValue(el.rangeEnd);
+    var count = numberValue(el.levelCount);
+    if (start === null || end === null || count === null || count < 2) {
+      el.exitGap.value = '';
+      return;
+    }
+    el.exitGap.value = fmt(Math.abs(start - end) / (count - 1), 6);
+  }
+
+  function updateSetupMode() {
+    var setupMode = el.setupMode ? el.setupMode.value : 'entry_range';
+    var useExitRange = setupMode === 'existing_position_exit_range' || setupMode === 'adopt_existing_full_grid';
+    var useCurrentAsMax = setupMode === 'existing_position_exit_range';
+    var budgetLabel = el.budgetMode && el.budgetMode.closest ? el.budgetMode.closest('label') : null;
+    if (budgetLabel) {
+      budgetLabel.hidden = useCurrentAsMax;
+    }
+    el.qtyWrap.hidden = useCurrentAsMax || el.budgetMode.value === 'notional';
+    el.notionalWrap.hidden = useCurrentAsMax || el.budgetMode.value !== 'notional';
+    if (el.rangeStartLabel) {
+      el.rangeStartLabel.textContent = useExitRange ? 'Первый выход, %' : 'Первый вход, %';
+    }
+    if (el.rangeEndLabel) {
+      el.rangeEndLabel.textContent = useExitRange ? 'Последний выход, %' : 'Последний вход, %';
+    }
+    if (el.rangeHint) {
+      if (setupMode === 'existing_position_exit_range') {
+        el.rangeHint.textContent = 'Берётся текущая hedged-позиция; Grid продаёт на росте spread и докупает обратно ниже.';
+      } else if (setupMode === 'adopt_existing_full_grid') {
+        el.rangeHint.textContent = 'Текущая hedged-позиция принимается внутрь полной сетки; максимум монет остается лимитом стратегии.';
+      } else {
+        el.rangeHint.textContent = 'Entry spread must move lower to add position.';
+      }
+    }
+    updateAutoGapPreview();
   }
 
   function setBusy(message) {
@@ -108,6 +159,19 @@
     lastAnalysis = data;
     var config = data.config || {};
     var levels = config.levels || [];
+    var fit = config.existing_position_fit || null;
+    var fitSummary = '';
+    if (fit && fit.existing_qty) {
+      fitSummary = ' | real position: <strong>' + fmt(fit.existing_qty, 6) + '</strong>' +
+        ' -> ' + (fit.adoption_partial ? 'partial ' : '') +
+        'level <strong>' + escapeHtml(fit.level || 0) + '</strong>';
+      if (fit.adoption_partial) {
+        fitSummary += ' / sized from real qty';
+      } else {
+        fitSummary += ' / diff ' + fmt(fit.diff_qty, 6) +
+          ' <= tol ' + fmt(fit.tolerance_qty, 6);
+      }
+    }
     el.save.disabled = !levels.length;
     el.levelCount.value = config.level_count || '';
     el.exitGap.value = config.exit_gap_pct || '';
@@ -119,7 +183,9 @@
       ' | уровней: <strong>' + escapeHtml(config.level_count || '-') + '</strong>' +
       ' | чанк: <strong>' + fmt(config.chunk_qty, 6) + '</strong>' +
       ' | safe chunk dry run: ' + fmt(data.safe_chunk_qty, 6) +
-      ' | шаг: ' + fmt(data.grid_step_pct, 4) + '%';
+      ' | шаг: ' + fmt(data.grid_step_pct, 4) + '%' +
+      ' | exit gap auto: <strong>' + fmt(config.exit_gap_pct, 4) + '%</strong>' +
+      fitSummary;
     el.levels.innerHTML = levels.map(function (level) {
       var currentEntry = data.live_spreads && data.live_spreads.entry_spread_pct;
       var status = currentEntry !== null && currentEntry !== undefined &&
@@ -158,6 +224,7 @@
       var mode = rule.mode || 'shadow';
       var currentLevel = mode === 'live' ? (rule.live_level || 0) : (rule.shadow_level || 0);
       var currentQty = mode === 'live' ? (rule.actual_hedged_qty || 0) : (rule.shadow_qty || 0);
+      var transition = rule.pending_transition || {};
       var modeAction = mode === 'live'
         ? ''
         : '<button class="button" data-action="arm-live" data-id="' + escapeHtml(rule.id) + '">Включить Live</button>';
@@ -175,10 +242,16 @@
           '<div><span>Уровень</span><strong>' + escapeHtml(currentLevel) + ' / ' +
           escapeHtml(rule.level_count || 0) + '</strong></div>' +
           '<div><span>Фактический qty</span><strong>' + fmt(currentQty, 8) + '</strong></div>' +
+          '<div><span>Принято при старте</span><strong>ур. ' +
+          escapeHtml(rule.adopted_level || 0) + ' · ' + fmt(rule.adopted_qty || 0, 8) + '</strong></div>' +
+          '<div><span>Текущая ступень</span><strong>' +
+          escapeHtml(transition.action || '-') + ' · остаток ' +
+          fmt(transition.remaining_qty, 8) + '</strong></div>' +
           '<div><span>Entry spread</span><strong>' + fmt(rule.live_entry_spread_pct, 4) + '%</strong></div>' +
           '<div><span>Exit spread</span><strong>' + fmt(rule.live_exit_spread_pct, 4) + '%</strong></div>' +
           '<div><span>Диапазон</span><strong>' + fmt(rule.range_start_pct, 2) + '% ... ' +
           fmt(rule.range_end_pct, 2) + '%</strong></div>' +
+          '<div><span>Exit gap auto</span><strong>' + fmt(rule.exit_gap_pct, 4) + '%</strong></div>' +
           '<div><span>Pending</span><strong>' + escapeHtml(rule.pending_action || '-') + ' ' +
           escapeHtml(rule.pending_samples || 0) + '/' + escapeHtml(rule.confirm_samples || 1) + '</strong></div>' +
           '<div><span>Active execution</span><strong>' + escapeHtml(rule.active_execution_id || '-') + '</strong></div>' +
@@ -219,9 +292,14 @@
   }
 
   el.budgetMode.addEventListener('change', function () {
-    var notional = el.budgetMode.value === 'notional';
-    el.qtyWrap.hidden = notional;
-    el.notionalWrap.hidden = !notional;
+    updateSetupMode();
+  });
+  if (el.setupMode) {
+    el.setupMode.addEventListener('change', updateSetupMode);
+  }
+  [el.rangeStart, el.rangeEnd, el.levelCount].forEach(function (input) {
+    input.addEventListener('input', updateAutoGapPreview);
+    input.addEventListener('change', updateAutoGapPreview);
   });
 
   el.form.addEventListener('submit', function (event) {
@@ -243,7 +321,17 @@
     }
     el.save.disabled = true;
     setBusy('Сохраняется и проверяется Live-стратегия...');
-    request('POST', '/api/auto-arb/rules', formPayload()).then(function () {
+    request('POST', '/api/auto-arb/rules', formPayload()).then(function (data) {
+      var rule = data && data.rule ? data.rule : {};
+      if (!rule.id) {
+        throw new Error('Rule was saved but id is missing.');
+      }
+      return request(
+        'POST',
+        '/api/auto-arb/rules/' + encodeURIComponent(rule.id) + '/arm-live',
+        { confirmation: 'LIVE ' + rule.id }
+      );
+    }).then(function () {
       setBusy('Live-сетка включена.');
       refreshRules();
     }).catch(function (error) {
@@ -264,7 +352,7 @@
     }
     if (action === 'arm-live') {
       var confirmation = window.prompt(
-        'Restricted Live размещает реальные ордера. Для подтверждения введите: LIVE ' + id
+        'Live Grid размещает реальные ордера. Для подтверждения введите: LIVE ' + id
       );
       if (confirmation === null) {
         return;
@@ -274,7 +362,7 @@
         '/api/auto-arb/rules/' + encodeURIComponent(id) + '/arm-live',
         { confirmation: confirmation }
       ).then(function () {
-        setBusy('Restricted Live включён. Сетка ожидает следующий подтверждённый уровень.');
+        setBusy('Live Grid включён. Сетка ожидает следующий подтверждённый уровень.');
         refreshRules();
       }).catch(function (error) {
         setBusy(error.message);
@@ -296,6 +384,8 @@
   });
 
   populateExchanges();
+  updateSetupMode();
+  updateAutoGapPreview();
   renderRules({ rules: initial.rules || [], generated_at: '-' });
   refreshRules();
   window.setInterval(refreshRules, 3000);

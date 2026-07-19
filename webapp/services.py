@@ -9,7 +9,8 @@ import json
 import math
 from pathlib import Path
 import time
-from typing import Any, Callable, Dict, List, Literal, Mapping, Optional
+import traceback
+from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -38,12 +39,14 @@ from execution import (
     PositionManager,
     TelemetryClient,
 )
-from execution.accounts import _safe_float
+from execution.accounts import _safe_float, bitget_position_side, bitget_private_params, bitget_uta_enabled
 from execution.allocator import Allocator
 from execution.lifecycle import LifecycleController
 from execution.settings import ExecutionSettings
-from execution.storage import JsonStateStore, JsonlEventStore
+from execution.storage import JsonStateStore, JsonlEventStore, RotatingJsonlEventStore
 from execution.auto_arb_grid import (
+    MAX_LEVELS,
+    MIN_LEVELS,
     build_grid_levels,
     decide_grid_transition,
     normalize_level_count,
@@ -64,6 +67,7 @@ from risk.derisk_manager import (
     build_exchange_health,
     classify_residual_leg,
     derisk_candidate_score,
+    derisk_score_allowed,
     derive_cluster_rules,
     exchange_stress_state,
     hedged_pair_key,
@@ -144,6 +148,7 @@ FUNDING_CACHE_TTL_SEC = 120
 POSITIONS_MARKET_CONCURRENCY = 3
 AUTO_EXIT_POLL_SEC = 2.0
 AUTO_EXIT_LOG_COOLDOWN_SEC = 30.0
+AUTO_EXIT_SKIP_LOG_COOLDOWN_SEC = 300.0
 DERISK_LOG_COOLDOWN_SEC = 15.0
 DERISK_EVENT_LIMIT = 80
 DERISK_OUTCOME_HORIZONS_SEC = {
@@ -157,6 +162,10 @@ AUTO_EXIT_DEFAULTS = {
     "require_live": True,
     "auto_clear_no_position_sec": 120,
     "restore_spread_on_missing": True,
+    "clear_verified_missing": True,
+    "verified_missing_confirmations": 2,
+    "position_mode": "current_balanced",
+    "spread_confirm_cycles": 2,
 }
 AUTO_EXIT_STATE_PATH = STATE_DIR / "auto_exit_rules.json"
 AUTO_EXIT_HISTORY_PATH = BASE_DIR / "logs" / "auto_exit_history.jsonl"
@@ -170,11 +179,20 @@ AUTO_STRATEGY_DEFAULTS = {
     "poll_sec": 2.0,
     "balance_retry_sec": 60,
 }
-AUTO_ARB_LIVE_MAX_CHUNK_NOTIONAL_USD = 50.0
-AUTO_ARB_LIVE_MAX_TOTAL_NOTIONAL_USD = 100.0
+AUTO_ARB_COMPLETION_TOLERANCE_PCT = 1.0
+AUTO_ARB_RETRY_SEC = 2.0
 HEDGE_CLUSTER_STATE_PATH = STATE_DIR / "hedge_clusters.json"
 DERISK_HISTORY_PATH = BASE_DIR / "logs" / "derisk_history.jsonl"
 DERISK_OUTCOME_STATE_PATH = STATE_DIR / "derisk_outcome_state.json"
+PROTECTIVE_SHADOW_HISTORY_PATH = BASE_DIR / "logs" / "protective_shadow_history.jsonl"
+DERISK_HISTORY_MAX_BYTES = 256 * 1024 * 1024
+DERISK_HISTORY_MAX_BACKUPS = 3
+DERISK_CYCLE_HEARTBEAT_SEC = 60.0
+DERISK_EVENT_HEARTBEAT_SEC = 900.0
+PROTECTIVE_SHADOW_HISTORY_MAX_BYTES = 64 * 1024 * 1024
+AUTO_EXIT_HISTORY_MAX_BYTES = 64 * 1024 * 1024
+PROTECTIVE_SHADOW_EVENT_LIMIT = 100
+PROTECTIVE_SHADOW_HEARTBEAT_SEC = 900.0
 AUTO_EXIT_MULTILEG_MARKER = "multileg"
 AUTO_EXIT_MULTILEG_PAIR_BUFFER_PCT = 0.02
 AUTO_EXIT_EXECUTABLE_MAX_SLIPPAGE_BPS = 8.0
@@ -203,6 +221,8 @@ AUTO_EXIT_V1_TAKE_PROFIT_FUNDING_MULT = 4.0
 AUTO_EXIT_V1_SOFT_EXIT_THRESHOLD_BPS = -4.0
 AUTO_EXIT_V1_HOLD_THRESHOLD_BPS = 2.0
 AUTO_EXIT_V1_REVERSION_CREDIT_CAP_BPS = 12.0
+AUTO_EXIT_POSITION_MODE_CURRENT_BALANCED = "current_balanced"
+AUTO_EXIT_POSITION_MODE_STRICT_SIGNATURE = "strict_signature"
 AUTO_EXIT_POLICY_SETTINGS_DEFAULTS = {
     "tier1": dict(AUTO_EXIT_POLICY_BY_TIER[1]),
     "tier2": dict(AUTO_EXIT_POLICY_BY_TIER[2]),
@@ -211,7 +231,16 @@ AUTO_EXIT_POLICY_SETTINGS_DEFAULTS = {
 MANUAL_EXEC_LOG_DIR = BASE_DIR / "logs" / "manual_exec"
 COIN_ANALYSIS_CORE_EXCHANGES: tuple[str, ...] = ("binance", "kucoin")
 COIN_ANALYSIS_CACHE_TTL_SEC = 90
-FUNDING_HISTORY_DEFAULT_EXCHANGES: tuple[str, ...] = ("binance", "kucoin")
+FUNDING_HISTORY_EXCLUDED_EXCHANGES: tuple[str, ...] = ("bingx",)
+FUNDING_HISTORY_DEFAULT_EXCHANGES: tuple[str, ...] = (
+    "binance",
+    "bybit",
+    "okx",
+    "gate",
+    "bitget",
+    "mexc",
+    "kucoin",
+)
 FUNDING_HISTORY_WINDOWS_HOURS: tuple[int, ...] = (4, 12, 24, 72)
 FUNDING_HISTORY_MAX_POINTS = 200
 COIN_ANALYSIS_SESSION_TTL_SEC = 30 * 60
@@ -469,6 +498,29 @@ def _auto_exit_select_pair_from_legs(
     }
 
 
+def _auto_exit_balanced_qty_from_legs(legs: Iterable[Mapping[str, Any]]) -> dict[str, float]:
+    long_qty = 0.0
+    short_qty = 0.0
+    for leg in legs or []:
+        side = str(leg.get("side") or "").strip().lower()
+        if side not in {"long", "short"}:
+            continue
+        qty = abs(_safe_float(leg.get("quantity")) or _safe_float(leg.get("qty")) or 0.0)
+        if qty <= 0:
+            continue
+        if side == "long":
+            long_qty += qty
+        else:
+            short_qty += qty
+    balanced_qty = min(long_qty, short_qty)
+    return {
+        "long_qty": float(long_qty),
+        "short_qty": float(short_qty),
+        "balanced_qty": float(balanced_qty),
+        "imbalance_qty": float(abs(long_qty - short_qty)),
+    }
+
+
 def _is_auto_exit_multileg_rule(long_exchange: str | None, short_exchange: str | None) -> bool:
     return (
         normalize_exchange_name(str(long_exchange or "")) == AUTO_EXIT_MULTILEG_MARKER
@@ -591,6 +643,100 @@ def _auto_exit_signature_match(
     return True, "position_signature_match"
 
 
+def _auto_exit_partial_progress_rebind_mode(
+    rule: Mapping[str, Any],
+    current_signature: Mapping[str, Any] | None,
+    current_hedged_qty: float,
+) -> str | None:
+    expected_signature = rule.get("position_signature")
+    if not isinstance(expected_signature, Mapping) or not isinstance(current_signature, Mapping):
+        return None
+    if normalize_symbol(str(expected_signature.get("symbol") or "")) != normalize_symbol(
+        str(current_signature.get("symbol") or "")
+    ):
+        return None
+    expected_legs = {
+        (normalize_exchange_name(str(item.get("exchange") or "")), str(item.get("side") or "").lower()): item
+        for item in list(expected_signature.get("legs") or [])
+        if isinstance(item, Mapping)
+    }
+    current_legs = {
+        (normalize_exchange_name(str(item.get("exchange") or "")), str(item.get("side") or "").lower()): item
+        for item in list(current_signature.get("legs") or [])
+        if isinstance(item, Mapping)
+    }
+    if len(expected_legs) < 2 or set(expected_legs) != set(current_legs):
+        return None
+    expected_quantities: list[float] = []
+    for key, expected_leg in expected_legs.items():
+        current_leg = current_legs.get(key) or {}
+        expected_qty = _safe_float(expected_leg.get("qty"))
+        current_qty = _safe_float(current_leg.get("qty"))
+        if expected_qty is None or expected_qty <= 0 or current_qty is None or current_qty <= 0:
+            return None
+        expected_quantities.append(float(expected_qty))
+        expected_entry = _safe_float(expected_leg.get("entry_price"))
+        current_entry = _safe_float(current_leg.get("entry_price"))
+        if expected_entry is not None and current_entry is not None and expected_entry > 0 and current_entry > 0:
+            entry_delta = abs(current_entry - expected_entry) / max(abs(expected_entry), 1e-12)
+            if entry_delta > AUTO_EXIT_SIGNATURE_ENTRY_TOLERANCE_PCT:
+                return None
+    previous_hedged_qty = min(expected_quantities)
+    if previous_hedged_qty <= 0 or current_hedged_qty <= 0:
+        return None
+    for mode in ("spread", "v1"):
+        target_qty = _safe_float(rule.get(f"{mode}_target_qty"))
+        remaining_qty = _safe_float(rule.get(f"{mode}_remaining_qty"))
+        if target_qty is None or target_qty <= 0 or remaining_qty is None:
+            continue
+        remaining_qty = max(0.0, min(float(target_qty), float(remaining_qty)))
+        executed_qty = max(0.0, float(target_qty) - remaining_qty)
+        if executed_qty <= 0:
+            continue
+        expected_current_qty = max(0.0, previous_hedged_qty - executed_qty)
+        tolerance = max(1e-9, float(target_qty) * 0.01)
+        if abs(float(current_hedged_qty) - expected_current_qty) <= tolerance:
+            return mode
+    return None
+
+
+def _auto_exit_pending_continuation_mode(rule: Mapping[str, Any]) -> str | None:
+    explicit_mode = str(rule.get("continuation_trigger_mode") or "").strip().lower()
+    if explicit_mode in {"spread", "v1"}:
+        target_qty = _safe_float(rule.get(f"{explicit_mode}_target_qty"))
+        remaining_qty = _safe_float(rule.get(f"{explicit_mode}_remaining_qty"))
+        if target_qty is not None and target_qty > 0 and remaining_qty is not None:
+            tolerance = max(1e-9, float(target_qty) * 0.01)
+            if float(remaining_qty) > tolerance:
+                return explicit_mode
+    for mode in ("spread", "v1"):
+        target_qty = _safe_float(rule.get(f"{mode}_target_qty"))
+        remaining_qty = _safe_float(rule.get(f"{mode}_remaining_qty"))
+        if target_qty is None or target_qty <= 0 or remaining_qty is None:
+            continue
+        tolerance = max(1e-9, float(target_qty) * 0.01)
+        if float(remaining_qty) > tolerance and float(remaining_qty) < float(target_qty):
+            return mode
+    return None
+
+
+def _auto_exit_position_mode(rule: Mapping[str, Any], defaults: Mapping[str, Any] | None = None) -> str:
+    raw = str(rule.get("position_mode") or (defaults or {}).get("position_mode") or "").strip().lower()
+    if raw in {"strict", "strict_signature", "signature"}:
+        return AUTO_EXIT_POSITION_MODE_STRICT_SIGNATURE
+    return AUTO_EXIT_POSITION_MODE_CURRENT_BALANCED
+
+
+def _auto_exit_spread_confirm_cycles(rule: Mapping[str, Any], defaults: Mapping[str, Any] | None = None) -> int:
+    raw = rule.get("spread_confirm_cycles")
+    if raw is None and defaults is not None:
+        raw = defaults.get("spread_confirm_cycles")
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return int(AUTO_EXIT_DEFAULTS["spread_confirm_cycles"])
+
+
 def _auto_exit_overall_spread_from_legs(
     legs: Iterable[Mapping[str, Any]],
     live_mid_by_exchange: Mapping[str, float] | None = None,
@@ -632,13 +778,14 @@ def _auto_exit_overall_spread_from_legs(
 def _auto_exit_spread_trigger_status(
     *,
     is_multileg: bool,
+    use_overall_trigger: bool = False,
     target_pct: float,
     overall_spread_pct: float | None,
     pair_spread_pct: float | None,
     pair_net_spread_pct: float | None,
     edge_buffer_pct: float,
 ) -> dict[str, Any]:
-    if is_multileg:
+    if is_multileg or use_overall_trigger:
         trigger_spread = overall_spread_pct
         required_spread = float(target_pct)
         live_ready = (
@@ -658,11 +805,11 @@ def _auto_exit_spread_trigger_status(
             live_ready
             and (
                 float(trigger_spread) >= float(required_spread)
-                if is_multileg
+                if is_multileg or use_overall_trigger
                 else float(pair_net_spread_pct) >= float(required_spread)
             )
         ),
-        "scope": "overall_basket" if is_multileg else "pair_executable",
+        "scope": "overall_basket" if is_multileg or use_overall_trigger else "pair_executable",
     }
 
 
@@ -1696,6 +1843,22 @@ def _resolve_funding_interval_hours(
     return _resolve_row_interval_hours(inferred, timestamp_interval, snapshot_interval)
 
 
+def _funding_interval_quality(
+    interval_hours: float | None,
+    timestamp_interval_hours: float | None,
+) -> str:
+    interval = normalize_interval_hours(interval_hours)
+    ts_interval = normalize_interval_hours(timestamp_interval_hours)
+    if interval is None:
+        return "unresolved"
+    if ts_interval is None:
+        return "snapshot_or_declared_only"
+    tolerance = max(0.1, min(interval, ts_interval) * 0.2)
+    if abs(interval - ts_interval) <= tolerance:
+        return "history_confirmed"
+    return "history_mismatch"
+
+
 def _spread_series_from_candles(
     left: list[dict[str, Any]],
     right: list[dict[str, Any]],
@@ -2156,6 +2319,100 @@ def _build_funding_history_pair_analysis(
         )
     )
     return pair_rows, best_by_window, spread_series
+
+
+def _build_funding_history_next_analysis(
+    exchange_rows: list[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    usable = [
+        row
+        for row in exchange_rows
+        if row.get("status") in {"ok", "partial"}
+        and _safe_float(row.get("next_funding_rate")) is not None
+        and _safe_float(row.get("funding_interval_hours_resolved")) is not None
+    ]
+    rows: list[dict[str, Any]] = []
+    for i in range(len(usable)):
+        for j in range(i + 1, len(usable)):
+            left = usable[i]
+            right = usable[j]
+            left_exchange = str(left.get("exchange") or "")
+            right_exchange = str(right.get("exchange") or "")
+            left_rate = _safe_float(left.get("next_funding_rate"))
+            right_rate = _safe_float(right.get("next_funding_rate"))
+            left_interval = _safe_float(left.get("funding_interval_hours_resolved"))
+            right_interval = _safe_float(right.get("funding_interval_hours_resolved"))
+            if left_rate is None or right_rate is None or not left_interval or not right_interval:
+                continue
+            for direction in ("long_a_short_b", "long_b_short_a"):
+                left_mult = _funding_position_multiplier(direction, leg="left")
+                right_mult = _funding_position_multiplier(direction, leg="right")
+                if direction == "long_b_short_a":
+                    long_exchange = right_exchange
+                    short_exchange = left_exchange
+                else:
+                    long_exchange = left_exchange
+                    short_exchange = right_exchange
+                left_pct = left_mult * left_rate
+                right_pct = right_mult * right_rate
+                net_pct = left_pct + right_pct
+                left_hourly_pct = left_mult * left_rate / left_interval
+                right_hourly_pct = right_mult * right_rate / right_interval
+                net_hourly_pct = left_hourly_pct + right_hourly_pct
+                next_left = str(left.get("next_funding_time") or "")
+                next_right = str(right.get("next_funding_time") or "")
+                next_sync = bool(next_left and next_right and next_left == next_right)
+                status = "ok" if next_sync else "async_next_funding"
+                rows.append(
+                    {
+                        "pair_key": f"{left_exchange}|{right_exchange}",
+                        "pair_label": f"{left_exchange} vs {right_exchange}",
+                        "left_exchange": left_exchange,
+                        "right_exchange": right_exchange,
+                        "direction": direction,
+                        "direction_label": _direction_label(direction, left_exchange, right_exchange),
+                        "long_exchange": long_exchange,
+                        "short_exchange": short_exchange,
+                        "window_label": "next",
+                        "window_hours": None,
+                        "next_left_time": next_left or None,
+                        "next_right_time": next_right or None,
+                        "next_sync": next_sync,
+                        "left_interval_hours": left_interval,
+                        "right_interval_hours": right_interval,
+                        "left_leg_bps": left_pct * 10000.0,
+                        "right_leg_bps": right_pct * 10000.0,
+                        "net_bps": net_pct * 10000.0,
+                        "net_pct": net_pct * 100.0,
+                        "net_hourly_bps": net_hourly_pct * 10000.0,
+                        "annualized_pct": net_hourly_pct * 24.0 * 365.0 * 100.0,
+                        "usd_per_1000_notional": net_pct * 1000.0,
+                        "coverage_pct": 100.0 if next_sync else 50.0,
+                        "status": status,
+                    }
+                )
+    rows.sort(
+        key=lambda row: (
+            -(float(_safe_float(row.get("net_hourly_bps")) or -999999.0)),
+            -(float(_safe_float(row.get("net_bps")) or -999999.0)),
+            str(row.get("pair_label") or ""),
+        )
+    )
+    if not rows:
+        return rows, {}
+    complete = [row for row in rows if row.get("status") == "ok"]
+    pool = complete or rows
+    best = max(
+        pool,
+        key=lambda row: (
+            float(_safe_float(row.get("net_hourly_bps")) or -999999.0),
+            float(_safe_float(row.get("net_bps")) or -999999.0),
+        ),
+    )
+    verdict = "favorable" if float(_safe_float(best.get("net_hourly_bps")) or 0.0) > 0 else "avoid"
+    if best.get("status") != "ok":
+        verdict = "async_next_funding"
+    return rows, {**best, "verdict": verdict}
 
 
 def _build_funding_history_timeline(
@@ -3112,6 +3369,7 @@ class DataService:
             summary_interval=self._summary_interval,
             on_margin_adjust=self._on_margin_adjust_events,
             notifier=self._notifier,
+            enabled_exchanges=self._account_monitor_enabled_exchanges(),
         )
         self._positions_market_lock = asyncio.Lock()
         self._positions_market_cache: dict[tuple[str, str], MarketSnapshot] = {}
@@ -3132,6 +3390,14 @@ class DataService:
         self._rebalance_prev_positions: dict[tuple[str, str, str], float] = {}
         self._rebalance_last: dict[tuple[str, str], float] = {}
         self._rebalance_blocked_exchanges: set[str] = {"mexc"}
+        self._protective_shadow_history_store = RotatingJsonlEventStore(
+            PROTECTIVE_SHADOW_HISTORY_PATH,
+            max_bytes=PROTECTIVE_SHADOW_HISTORY_MAX_BYTES,
+            max_backups=3,
+        )
+        self._protective_shadow_events: list[dict[str, Any]] = []
+        self._protective_shadow_fingerprints: dict[str, str] = {}
+        self._protective_shadow_last_ts: dict[str, float] = {}
         self._market_data = MarketDataBus()
         self._manual = ManualTradeManager(orderbook_provider=self._market_data)
         self._manual_runs: Dict[str, dict[str, Any]] = {}
@@ -3155,7 +3421,11 @@ class DataService:
         self._auto_strategy_events: list[dict[str, Any]] = []
         self._auto_strategy_event_limit = 100
         self._auto_exit_store = JsonStateStore(AUTO_EXIT_STATE_PATH)
-        self._auto_exit_history_store = JsonlEventStore(AUTO_EXIT_HISTORY_PATH)
+        self._auto_exit_history_store = RotatingJsonlEventStore(
+            AUTO_EXIT_HISTORY_PATH,
+            max_bytes=AUTO_EXIT_HISTORY_MAX_BYTES,
+            max_backups=3,
+        )
         self._auto_exit: dict[str, Any] = self._load_auto_exit_config()
         self._auto_exit_lock = asyncio.Lock()
         self._auto_exit_task: Optional[asyncio.Task] = None
@@ -3171,7 +3441,11 @@ class DataService:
         self._auto_exit_log_cooldown_sec = AUTO_EXIT_LOG_COOLDOWN_SEC
         self._hedge_cluster_store = JsonStateStore(HEDGE_CLUSTER_STATE_PATH)
         self._hedge_clusters: dict[str, Any] = self._load_hedge_cluster_config()
-        self._derisk_history_store = JsonlEventStore(DERISK_HISTORY_PATH)
+        self._derisk_history_store = RotatingJsonlEventStore(
+            DERISK_HISTORY_PATH,
+            max_bytes=DERISK_HISTORY_MAX_BYTES,
+            max_backups=DERISK_HISTORY_MAX_BACKUPS,
+        )
         self._derisk_outcome_store = JsonStateStore(DERISK_OUTCOME_STATE_PATH)
         self._derisk_lock = asyncio.Lock()
         self._derisk_task: Optional[asyncio.Task] = None
@@ -3181,10 +3455,15 @@ class DataService:
         self._derisk_events: list[dict[str, Any]] = []
         self._derisk_event_limit = DERISK_EVENT_LIMIT
         self._derisk_last_log_ts: dict[str, float] = {}
+        self._derisk_last_log_fingerprint: dict[str, str] = {}
         self._derisk_log_cooldown_sec = DERISK_LOG_COOLDOWN_SEC
         self._derisk_cluster_state: dict[str, Any] = {}
         self._derisk_poll_sec = 5.0
+        self._derisk_last_worker_cycle_ts = 0.0
         self._derisk_active_cycle_id: str | None = None
+        self._derisk_last_cycle_history_ts = 0.0
+        self._derisk_last_cycle_history_fingerprint: str | None = None
+        self._derisk_preflight_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._derisk_outcome_state: dict[str, Any] = self._load_derisk_outcome_state()
         self._coin_analysis_cache: dict[tuple[str, int, int, tuple[str, ...]], tuple[float, dict[str, Any]]] = {}
         self._coin_focus_task: Optional[asyncio.Task] = None
@@ -5606,6 +5885,7 @@ class DataService:
             exchange
             for exchange in SUPPORTED_EXCHANGES
             if normalize_exchange_name(exchange) in ADAPTER_FACTORIES
+            and normalize_exchange_name(exchange) not in FUNDING_HISTORY_EXCLUDED_EXCHANGES
         ]
         requested = list(exchanges or FUNDING_HISTORY_DEFAULT_EXCHANGES)
         selected: list[str] = []
@@ -5633,6 +5913,9 @@ class DataService:
             exchange_rows,
             windows,
         )
+        next_funding_rows, best_next_funding = _build_funding_history_next_analysis(exchange_rows)
+        if best_next_funding:
+            best_by_window["next"] = best_next_funding
         timeline = _build_funding_history_timeline(exchange_rows, max_hours=max_window_hours)
         chart_series: dict[str, Any] = {}
         for row in exchange_rows:
@@ -5666,6 +5949,8 @@ class DataService:
             "exchanges": exchange_rows,
             "best_by_window": best_by_window,
             "pair_windows": pair_windows,
+            "next_funding_windows": next_funding_rows,
+            "best_next_funding": best_next_funding,
             "timeline": timeline,
             "charts": {
                 "exchange_rates": chart_series,
@@ -5755,11 +6040,37 @@ class DataService:
             if result.get("latest_funding_rate") is not None
             else None
         )
+        result["latest_funding_hourly_bps"] = (
+            float(result["latest_funding_rate"]) / float(interval_hours) * 10000.0
+            if result.get("latest_funding_rate") is not None and interval_hours
+            else None
+        )
+        next_funding_time = snapshot_dict.get("next_funding_time")
+        if not next_funding_time:
+            next_funding_time = project_next_funding_time_iso(funding_history, interval_hours=interval_hours)
+        result["next_funding_time"] = next_funding_time
+        snapshot_funding_rate = _safe_float(snapshot_dict.get("funding_rate"))
+        result["next_funding_source"] = "snapshot_current" if snapshot_funding_rate is not None else "history_latest_fallback"
+        result["next_funding_rate"] = snapshot_funding_rate if snapshot_funding_rate is not None else result["latest_funding_rate"]
+        result["next_funding_bps"] = (
+            float(result["next_funding_rate"]) * 10000.0
+            if result.get("next_funding_rate") is not None
+            else None
+        )
+        result["next_funding_hourly_bps"] = (
+            float(result["next_funding_rate"]) / float(interval_hours) * 10000.0
+            if result.get("next_funding_rate") is not None and interval_hours
+            else None
+        )
         result["windows"] = _funding_history_exchange_windows(funding_history, interval_hours, windows)
+        timestamp_interval = _infer_history_timestamp_interval_hours(funding_history)
         result["data_quality"] = {
             "funding_points_received": len(funding_history),
             "oldest_ts_ms": funding_history[-1].get("ts_ms") if funding_history else None,
             "latest_ts_ms": funding_history[0].get("ts_ms") if funding_history else None,
+            "timestamp_interval_hours": timestamp_interval,
+            "snapshot_interval_hours": _safe_float(snapshot_dict.get("funding_interval_hours")),
+            "interval_quality": _funding_interval_quality(interval_hours, timestamp_interval),
         }
         if funding_history and interval_hours is None:
             warnings.append("funding_interval_unresolved")
@@ -6208,8 +6519,6 @@ class DataService:
             self._protective_task = asyncio.create_task(self._protective_scheduler())
         if self._auto_exit_task is None:
             self._auto_exit_task = asyncio.create_task(self._auto_exit_scheduler())
-        if self._derisk_task is None:
-            self._derisk_task = asyncio.create_task(self._derisk_scheduler())
         if self._coin_focus_task is None:
             self._coin_focus_task = asyncio.create_task(self._coin_focus_scheduler())
         if self._coin_outcomes_task is None:
@@ -6315,6 +6624,8 @@ class DataService:
         await self._market_data.shutdown()
         await self._telemetry.stop()
         await self._accounts.stop()
+        await self._manual.close()
+        await self._protective_manager.close()
 
     async def _scheduler(self) -> None:
         try:
@@ -6398,8 +6709,8 @@ class DataService:
             logger.exception("emergency de-risk loop failed: %s", exc)
 
     async def _restart_derisk_scheduler(self) -> None:
-        if self._loop is None or self._loop.is_closed():
-            return
+        # De-risk is dispatched by the single auto-agent worker. Only clean up
+        # a legacy standalone task if one survived a hot reload.
         if self._derisk_task:
             self._derisk_task.cancel()
             try:
@@ -6407,7 +6718,6 @@ class DataService:
             except asyncio.CancelledError:
                 pass
             self._derisk_task = None
-        self._derisk_task = asyncio.create_task(self._derisk_scheduler())
 
     async def _coin_focus_scheduler(self) -> None:
         try:
@@ -6830,9 +7140,24 @@ class DataService:
         await self._restart_coin_outcomes_scheduler()
         self._accounts.update_interval(self._account_interval)
         self._accounts.update_summary_interval(self._summary_interval)
+        self._accounts.update_enabled_exchanges(self._account_monitor_enabled_exchanges())
         # Kick an async refresh so UI sees new cadence sooner.
         asyncio.create_task(self._accounts.refresh_now(force_env=True))
         asyncio.create_task(self._refresh_positions_market_snapshots(force=True))
+
+    def _account_monitor_enabled_exchanges(self) -> set[str]:
+        """Use both venue selectors so disabling a venue everywhere stops private polling."""
+        current = self._settings_manager.current
+        result: set[str] = set()
+        for flags in (
+            getattr(current, "exchanges", None) or {},
+            getattr(current, "analysis_exchanges", None) or {},
+        ):
+            for name, enabled in flags.items():
+                normalized = normalize_exchange_name(str(name))
+                if enabled and normalized:
+                    result.add(normalized)
+        return result
 
     async def manual_enter(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("dry_run"):
@@ -7358,7 +7683,7 @@ class DataService:
                 "use_orderbook_check": True,
                 "fallback_to_market": False,
                 "hedge_order_type": "limit",
-                "hedge_limit_mode": "passive",
+                "hedge_limit_mode": "passive" if action == "enter" else "aggressive",
                 "async_run": True,
                 "dry_run": False,
                 "long_exchange": strategy.get("long_exchange"),
@@ -7561,11 +7886,11 @@ class DataService:
         rules.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         return {
             "version": 1,
-            "mode": "shadow_and_restricted_live",
+            "mode": "live",
             "live_limits": {
-                "max_chunk_notional_usd": AUTO_ARB_LIVE_MAX_CHUNK_NOTIONAL_USD,
-                "max_total_notional_usd": AUTO_ARB_LIVE_MAX_TOTAL_NOTIONAL_USD,
-                "max_live_rules": 1,
+                "max_chunk_notional_usd": None,
+                "max_total_notional_usd": None,
+                "max_live_rules": None,
             },
             "rules": rules,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -7615,19 +7940,84 @@ class DataService:
         if long_exchange == short_exchange:
             raise ValueError("long_exchange and short_exchange must be different.")
 
+        warnings: list[str] = []
+        setup_mode = str(payload.get("setup_mode") or "entry_range").strip().lower()
+        existing_exit_setup = setup_mode in {
+            "existing_position_exit_range",
+            "adopt_existing_full_grid",
+        }
+        if setup_mode not in {
+            "entry_range",
+            "existing_position_exit_range",
+            "adopt_existing_full_grid",
+        }:
+            raise ValueError(
+                "setup_mode must be entry_range, existing_position_exit_range, "
+                "or adopt_existing_full_grid."
+            )
         range_start = _safe_float(payload.get("range_start_pct"))
         range_end = _safe_float(payload.get("range_end_pct"))
-        if range_start is None or range_end is None:
+        exit_range_start = _safe_float(payload.get("exit_range_start_pct"))
+        exit_range_end = _safe_float(payload.get("exit_range_end_pct"))
+        if existing_exit_setup:
+            if exit_range_start is None:
+                exit_range_start = range_start
+            if exit_range_end is None:
+                exit_range_end = range_end
+            if exit_range_start is None or exit_range_end is None:
+                raise ValueError("exit_range_start_pct and exit_range_end_pct are required.")
+            if math.isclose(float(exit_range_start), float(exit_range_end), abs_tol=1e-12):
+                raise ValueError("Exit spread range must contain at least two different values.")
+        elif range_start is None or range_end is None:
             raise ValueError("range_start_pct and range_end_pct are required.")
         budget_mode = str(payload.get("budget_mode") or "qty").strip().lower()
         if budget_mode not in {"qty", "notional"}:
             raise ValueError("budget_mode must be qty or notional.")
+        requested_count = payload.get("level_count")
+        requested_count_norm = (
+            normalize_level_count(requested_count)
+            if requested_count
+            else None
+        )
+        inferred_exit_count = None
+        if existing_exit_setup:
+            exit_span = abs(float(exit_range_end) - float(exit_range_start))
+            whole_step_count = int(round(exit_span))
+            if math.isclose(exit_span, float(whole_step_count), abs_tol=1e-9):
+                candidate_count = whole_step_count + 1
+                if MIN_LEVELS <= candidate_count <= MAX_LEVELS:
+                    inferred_exit_count = candidate_count
+        try:
+            account_snapshot = self._accounts.snapshot() or {}
+            quantities = _position_pair_quantities(
+                account_snapshot.get("positions") or [],
+                symbol=symbol,
+                long_exchange=long_exchange,
+                short_exchange=short_exchange,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            quantities = {}
+            warnings.append(f"Existing position check failed: {exc}")
+        existing_hedged_qty = _safe_float(quantities.get("hedged_qty")) if quantities else None
         max_qty = _safe_float(payload.get("max_qty"))
         max_notional = _safe_float(payload.get("max_notional"))
-        if budget_mode == "qty" and (max_qty is None or max_qty <= 0):
-            raise ValueError("max_qty must be greater than zero.")
-        if budget_mode == "notional" and (max_notional is None or max_notional <= 0):
-            raise ValueError("max_notional must be greater than zero.")
+        if existing_exit_setup and (existing_hedged_qty is None or existing_hedged_qty <= 0):
+            raise ValueError(
+                "No existing balanced position was found for this symbol and exchange pair."
+            )
+        if setup_mode == "existing_position_exit_range":
+            if existing_hedged_qty is None or existing_hedged_qty <= 0:
+                raise ValueError(
+                    "No existing balanced position was found for this symbol and exchange pair."
+                )
+            budget_mode = "qty"
+            max_qty = float(existing_hedged_qty)
+            max_notional = None
+        if setup_mode != "existing_position_exit_range":
+            if budget_mode == "qty" and (max_qty is None or max_qty <= 0):
+                raise ValueError("max_qty must be greater than zero.")
+            if budget_mode == "notional" and (max_notional is None or max_notional <= 0):
+                raise ValueError("max_notional must be greater than zero.")
 
         max_slippage_bps = max(0.0, _safe_float(payload.get("max_slippage_bps")) or 8.0)
         live_spreads = await self.auto_arb_spreads(
@@ -7648,6 +8038,14 @@ class DataService:
             total_qty = float(max_notional) / reference_price
         if total_qty is None or total_qty <= 0:
             raise ValueError("Unable to resolve total grid quantity.")
+        if (
+            setup_mode == "adopt_existing_full_grid"
+            and existing_hedged_qty is not None
+            and float(existing_hedged_qty) > float(total_qty)
+        ):
+            raise ValueError(
+                "Existing hedged quantity is larger than the configured full grid max_qty."
+            )
 
         manual_base = {
             "symbol": symbol,
@@ -7662,7 +8060,6 @@ class DataService:
             "margin_mode": "isolated",
         }
         plans: dict[str, Any] = {}
-        warnings: list[str] = []
         for action in ("enter", "exit"):
             try:
                 plans[action] = await self.manual_analyze(
@@ -7691,21 +8088,122 @@ class DataService:
                 min_chunk_candidates.append(minimum)
         liquidity_factor = _safe_float(payload.get("liquidity_safety_factor")) or 0.70
         liquidity_factor = min(1.0, max(0.1, liquidity_factor))
-        requested_count = payload.get("level_count")
-        fallback_count = normalize_level_count(requested_count or 6)
+        fallback_count = requested_count_norm or inferred_exit_count or normalize_level_count(6)
         safe_chunk = min(safe_candidates) * liquidity_factor if safe_candidates else total_qty / fallback_count
         if min_chunk_candidates:
             safe_chunk = max(safe_chunk, max(min_chunk_candidates))
         safe_chunk = min(float(total_qty), safe_chunk)
-        level_count = (
-            normalize_level_count(requested_count)
-            if requested_count
-            else recommend_level_count(total_qty=total_qty, safe_chunk_qty=safe_chunk)
+        recommended_count = recommend_level_count(
+            total_qty=total_qty,
+            safe_chunk_qty=safe_chunk,
         )
+        level_count = requested_count_norm or inferred_exit_count or recommended_count
+        existing_position_fit = None
+        if existing_hedged_qty and existing_hedged_qty > 0:
+            fit = self._auto_arb_level_count_for_existing_qty(
+                total_qty=float(total_qty),
+                existing_qty=float(existing_hedged_qty),
+                preferred_count=level_count,
+            )
+            if fit is not None:
+                original_level_count = int(level_count)
+                selected_count = int(fit["level_count"])
+                fit.update(
+                    {
+                        "long_qty": float(quantities.get("long_qty") or 0.0),
+                        "short_qty": float(quantities.get("short_qty") or 0.0),
+                        "imbalance_qty": float(quantities.get("imbalance_qty") or 0.0),
+                        "imbalance_pct": float(quantities.get("imbalance_pct") or 0.0),
+                        "requested_level_count": requested_count_norm,
+                        "recommended_level_count": recommended_count,
+                        "original_level_count": original_level_count,
+                        "level_count_adjusted": bool(
+                            fit["matches"] and selected_count != original_level_count
+                        ),
+                    }
+                )
+                if fit["matches"]:
+                    level_count = selected_count
+                    fit["adoption_will_match"] = True
+                    fit["adoption_exact"] = True
+                    fit["adoption_partial"] = False
+                    if fit["level_count_adjusted"]:
+                        warnings.append(
+                            "Grid levels adjusted from "
+                            f"{original_level_count} to {selected_count} so the "
+                            f"existing {float(existing_hedged_qty):g} qty matches "
+                            f"level {int(fit['level'])} within tolerance."
+                        )
+                elif setup_mode == "adopt_existing_full_grid":
+                    fit["adoption_will_match"] = False
+                    fit["adoption_exact"] = False
+                    fit["adoption_partial"] = True
+                else:
+                    fit["adoption_will_match"] = False
+                    fit["adoption_exact"] = False
+                    fit["adoption_partial"] = False
+                    warnings.append(
+                        "Existing hedged quantity does not match any grid level "
+                        f"within {AUTO_ARB_COMPLETION_TOLERANCE_PCT:g}% tolerance "
+                        f"for level counts {MIN_LEVELS}-{MAX_LEVELS}; closest is "
+                        f"{selected_count} levels, level {int(fit['level'])}, "
+                        f"diff {float(fit['diff_qty']):g} > tolerance "
+                        f"{float(fit['tolerance_qty']):g}."
+                    )
+                existing_position_fit = fit
+        if existing_exit_setup:
+            exit_low = min(float(exit_range_start), float(exit_range_end))
+            exit_high = max(float(exit_range_start), float(exit_range_end))
+            grid_step_for_range = (exit_high - exit_low) / (level_count - 1)
+            range_start = exit_high - grid_step_for_range
+            range_end = exit_low - grid_step_for_range
+            if float(exit_range_start) > float(exit_range_end):
+                warnings.append(
+                    "Exit range was reordered from high-to-low to low-to-high for current-position Grid setup."
+                )
+            imbalance_tolerance = self._auto_arb_completion_tolerance(
+                {"chunk_qty": float(total_qty) / level_count}
+            )
+            if setup_mode == "adopt_existing_full_grid" and existing_hedged_qty:
+                imbalance_tolerance = max(
+                    imbalance_tolerance,
+                    self._auto_arb_completion_tolerance(
+                        {"chunk_qty": float(existing_hedged_qty)}
+                    ),
+                )
+            if quantities and float(quantities.get("imbalance_qty") or 0.0) > imbalance_tolerance:
+                warnings.append(
+                    "Current long/short quantities are imbalanced; Live activation may be blocked until they match."
+                )
         chunk_qty = float(total_qty) / level_count
-        exit_gap = _safe_float(payload.get("exit_gap_pct"))
-        if exit_gap is None or exit_gap <= 0:
-            exit_gap = max(0.25, max_slippage_bps * 4.0 / 100.0)
+        if (
+            setup_mode == "adopt_existing_full_grid"
+            and existing_position_fit is not None
+            and existing_hedged_qty
+            and not bool(existing_position_fit.get("adoption_exact"))
+        ):
+            partial_level = max(
+                0,
+                min(
+                    int(level_count),
+                    int(math.ceil(float(existing_hedged_qty) / chunk_qty)),
+                ),
+            )
+            if partial_level > 0:
+                existing_position_fit["closest_level"] = existing_position_fit.get("level")
+                existing_position_fit["level"] = partial_level
+                existing_position_fit["adoption_level"] = partial_level
+                existing_position_fit["adoption_will_match"] = True
+                existing_position_fit["adoption_partial"] = True
+                existing_position_fit["chunk_qty"] = chunk_qty
+                existing_position_fit["cumulative_qty"] = partial_level * chunk_qty
+                warnings.append(
+                    "Existing hedged quantity will be adopted as partial level "
+                    f"{partial_level}/{level_count}; transitions will be sized from "
+                    "the real current position."
+                )
+        grid_step = abs(float(range_start) - float(range_end)) / (level_count - 1)
+        exit_gap = grid_step
         levels = build_grid_levels(
             range_start_pct=range_start,
             range_end_pct=range_end,
@@ -7734,11 +8232,6 @@ class DataService:
             level["exit_condition"] = (
                 f"exit spread >= {float(level['exit_spread_pct']):g}%"
             )
-        grid_step = abs(float(range_start) - float(range_end)) / (level_count - 1)
-        if grid_step <= exit_gap:
-            warnings.append(
-                "Grid step is not wider than the exit gap; reduce level count or exit gap."
-            )
         if not safe_candidates:
             warnings.append("Dry run did not return a safe chunk; budget/count fallback was used.")
 
@@ -7746,10 +8239,23 @@ class DataService:
             "symbol": symbol,
             "long_exchange": long_exchange,
             "short_exchange": short_exchange,
-            "direction": "negative_expansion",
+            "direction": "long_spread",
+            "setup_mode": setup_mode,
             "budget_mode": budget_mode,
             "max_qty": float(total_qty),
             "max_notional": float(max_notional) if max_notional else None,
+            "exit_range_start_pct": float(exit_range_start) if exit_range_start is not None else None,
+            "exit_range_end_pct": float(exit_range_end) if exit_range_end is not None else None,
+            "exit_range_low_pct": (
+                min(float(exit_range_start), float(exit_range_end))
+                if exit_range_start is not None and exit_range_end is not None
+                else None
+            ),
+            "exit_range_high_pct": (
+                max(float(exit_range_start), float(exit_range_end))
+                if exit_range_start is not None and exit_range_end is not None
+                else None
+            ),
             "range_start_pct": float(range_start),
             "range_end_pct": float(range_end),
             "level_count": level_count,
@@ -7762,8 +8268,11 @@ class DataService:
                 float(total_qty) * reference_price if reference_price else None
             ),
             "exit_gap_pct": float(exit_gap),
+            "exit_gap_mode": "arithmetic_grid_step",
+            "grid_interval_count": level_count - 1,
             "max_slippage_bps": max_slippage_bps,
             "liquidity_safety_factor": liquidity_factor,
+            "existing_position_fit": existing_position_fit,
             "confirm_samples": max(1, int(payload.get("confirm_samples") or 2)),
             "max_levels_per_cycle": 1,
             "levels": levels,
@@ -7819,6 +8328,12 @@ class DataService:
                 "active_from_level": None,
                 "active_to_level": None,
                 "active_target_qty": None,
+                "active_start_hedged_qty": None,
+                "pending_transition": None,
+                "adopted_level": int(existing.get("adopted_level") or 0),
+                "adopted_qty": float(existing.get("adopted_qty") or 0.0),
+                "adopted_at": existing.get("adopted_at"),
+                "next_eligible_ts": 0.0,
                 "pending_action": None,
                 "pending_samples": 0,
                 "last_decision": None,
@@ -7880,15 +8395,96 @@ class DataService:
                 continue
             candidate_long = normalize_exchange_name(str(candidate.get("long_exchange") or ""))
             candidate_short = normalize_exchange_name(str(candidate.get("short_exchange") or ""))
+            if (
+                candidate_long == AUTO_EXIT_MULTILEG_MARKER
+                or candidate_short == AUTO_EXIT_MULTILEG_MARKER
+            ):
+                return True
             if candidate_long == long_exchange and candidate_short == short_exchange:
                 return True
         return False
 
     @staticmethod
-    def _auto_arb_level_for_qty(rule: Mapping[str, Any], hedged_qty: float) -> int | None:
+    def _auto_arb_completion_tolerance(
+        rule: Mapping[str, Any],
+        target_qty: float | None = None,
+    ) -> float:
+        qty = max(
+            0.0,
+            float(
+                target_qty
+                if target_qty is not None
+                else rule.get("chunk_qty")
+                or rule.get("max_qty")
+                or 0.0
+            ),
+        )
+        return max(1e-8, qty * AUTO_ARB_COMPLETION_TOLERANCE_PCT / 100.0)
+
+    @classmethod
+    def _auto_arb_transition_completion_tolerance(
+        cls,
+        rule: Mapping[str, Any],
+        transition_qty: float | None = None,
+    ) -> float:
+        return max(
+            cls._auto_arb_completion_tolerance(rule, transition_qty),
+            cls._auto_arb_completion_tolerance(rule),
+        )
+
+    @classmethod
+    def _auto_arb_hedge_imbalance_tolerance(
+        cls,
+        rule: Mapping[str, Any],
+        *,
+        transition_qty: float | None = None,
+        hedged_qty: float | None = None,
+    ) -> float:
+        tolerance = max(
+            cls._auto_arb_completion_tolerance(rule, transition_qty),
+            cls._auto_arb_completion_tolerance(rule),
+        )
+        if str(rule.get("setup_mode") or "") == "adopt_existing_full_grid":
+            current_qty = _safe_float(hedged_qty)
+            if current_qty and current_qty > 0:
+                tolerance = max(
+                    tolerance,
+                    cls._auto_arb_completion_tolerance(rule, current_qty),
+                )
+        return tolerance
+
+    @staticmethod
+    def _auto_arb_non_closeable_dust(
+        result: Mapping[str, Any] | None,
+        remaining_qty: float,
+    ) -> bool:
+        if remaining_qty <= 0 or not isinstance(result, Mapping):
+            return False
+        messages: list[str] = []
+        messages.extend(str(item) for item in (result.get("errors") or []))
+        messages.extend(str(item) for item in (result.get("warnings") or []))
+        for action in result.get("actions") or []:
+            if not isinstance(action, Mapping):
+                continue
+            messages.append(str(action.get("error") or ""))
+            messages.append(str(action.get("error_type") or ""))
+            messages.append(str(action.get("market_reason") or ""))
+        joined = " ".join(messages).lower()
+        return (
+            "non-closeable dust" in joined
+            or "below exchange minimum" in joined
+            or "below min qty" in joined
+            or "min_order_size" in joined
+        )
+
+    @classmethod
+    def _auto_arb_level_for_qty(
+        cls,
+        rule: Mapping[str, Any],
+        hedged_qty: float,
+    ) -> int | None:
         qty = max(0.0, float(hedged_qty or 0.0))
-        total_qty = max(0.0, float(rule.get("max_qty") or 0.0))
-        tolerance = max(1e-8, total_qty * 1e-5)
+        tolerance = cls._auto_arb_completion_tolerance(rule)
         if qty <= tolerance:
             return 0
         for level in rule.get("levels") or []:
@@ -7896,6 +8492,96 @@ class DataService:
             if abs(qty - cumulative) <= tolerance:
                 return int(level.get("level") or 0)
         return None
+
+    @staticmethod
+    def _auto_arb_level_qty(
+        rule: Mapping[str, Any],
+        level: int,
+    ) -> float:
+        if level <= 0:
+            return 0.0
+        levels = rule.get("levels") or []
+        if level > len(levels):
+            return 0.0
+        try:
+            return float((levels[level - 1] or {}).get("cumulative_qty") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @classmethod
+    def _auto_arb_partial_adoption_level_for_qty(
+        cls,
+        rule: Mapping[str, Any],
+        hedged_qty: float,
+    ) -> int | None:
+        qty = max(0.0, float(hedged_qty or 0.0))
+        tolerance = cls._auto_arb_completion_tolerance(rule)
+        if qty <= tolerance:
+            return 0
+        levels = list(rule.get("levels") or [])
+        if not levels:
+            return None
+        max_level = len(levels)
+        max_qty = cls._auto_arb_level_qty(rule, max_level)
+        if max_qty <= 0:
+            max_qty = float(rule.get("max_qty") or 0.0)
+        if max_qty <= 0 or qty > max_qty + tolerance:
+            return None
+        for level in levels:
+            cumulative = float(level.get("cumulative_qty") or 0.0)
+            if qty <= cumulative + tolerance:
+                return int(level.get("level") or 0)
+        return max_level
+
+    @staticmethod
+    def _auto_arb_level_count_for_existing_qty(
+        *,
+        total_qty: float,
+        existing_qty: float,
+        preferred_count: int,
+    ) -> dict[str, Any] | None:
+        if total_qty <= 0 or existing_qty <= 0:
+            return None
+        preferred = max(MIN_LEVELS, min(MAX_LEVELS, int(preferred_count or MIN_LEVELS)))
+        candidates: list[dict[str, Any]] = []
+        for count in range(MIN_LEVELS, MAX_LEVELS + 1):
+            chunk_qty = float(total_qty) / count
+            if chunk_qty <= 0:
+                continue
+            level = max(0, min(count, int(round(float(existing_qty) / chunk_qty))))
+            cumulative_qty = float(level) * chunk_qty
+            diff_qty = abs(float(existing_qty) - cumulative_qty)
+            tolerance_qty = max(
+                1e-8,
+                chunk_qty * AUTO_ARB_COMPLETION_TOLERANCE_PCT / 100.0,
+            )
+            matches = diff_qty <= tolerance_qty
+            candidates.append(
+                {
+                    "level_count": count,
+                    "level": level,
+                    "chunk_qty": chunk_qty,
+                    "cumulative_qty": cumulative_qty,
+                    "existing_qty": float(existing_qty),
+                    "diff_qty": diff_qty,
+                    "tolerance_qty": tolerance_qty,
+                    "matches": matches,
+                    "distance_from_preferred": abs(count - preferred),
+                    "normalized_diff": diff_qty / tolerance_qty if tolerance_qty else math.inf,
+                }
+            )
+        if not candidates:
+            return None
+        matching = [item for item in candidates if item["matches"]]
+        pool = matching or candidates
+        return min(
+            pool,
+            key=lambda item: (
+                item["distance_from_preferred"],
+                item["normalized_diff"],
+                item["level_count"],
+            ),
+        )
 
     async def _auto_arb_refresh_quantities(self, rule: Mapping[str, Any]) -> dict[str, float]:
         refresh = getattr(self._accounts, "refresh_now_for_protective", None)
@@ -7912,37 +8598,15 @@ class DataService:
     async def arm_auto_arb_live(self, rule_id: str, confirmation: str) -> dict[str, Any]:
         expected_confirmation = f"LIVE {rule_id}"
         if str(confirmation or "").strip() != expected_confirmation:
-            raise ValueError(f"Type '{expected_confirmation}' to enable restricted Live mode.")
+            raise ValueError(f"Type '{expected_confirmation}' to enable Live mode.")
         async with self._auto_arb_lock:
             rule = (self._auto_arb.get("rules") or {}).get(rule_id)
             if not isinstance(rule, dict):
                 raise ValueError("Auto-arbitrage rule not found.")
             if rule.get("active_execution_id"):
                 raise ValueError("The grid already has an active execution.")
-            for candidate in (self._auto_arb.get("rules") or {}).values():
-                if (
-                    isinstance(candidate, Mapping)
-                    and candidate.get("id") != rule_id
-                    and candidate.get("mode") == "live"
-                    and candidate.get("enabled")
-                ):
-                    raise ValueError("Only one restricted Live grid may be enabled.")
             rule_copy = dict(rule)
 
-        chunk_notional = _safe_float(rule_copy.get("chunk_notional_estimate"))
-        total_notional = _safe_float(rule_copy.get("total_notional_estimate"))
-        if chunk_notional is None or total_notional is None:
-            raise ValueError("Live mode requires a current reference price and notional estimate.")
-        if chunk_notional > AUTO_ARB_LIVE_MAX_CHUNK_NOTIONAL_USD + 1e-9:
-            raise ValueError(
-                f"Chunk estimate {chunk_notional:.2f} USDT exceeds the restricted Live limit "
-                f"of {AUTO_ARB_LIVE_MAX_CHUNK_NOTIONAL_USD:.2f} USDT."
-            )
-        if total_notional > AUTO_ARB_LIVE_MAX_TOTAL_NOTIONAL_USD + 1e-9:
-            raise ValueError(
-                f"Total estimate {total_notional:.2f} USDT exceeds the restricted Live limit "
-                f"of {AUTO_ARB_LIVE_MAX_TOTAL_NOTIONAL_USD:.2f} USDT."
-            )
         if self._auto_arb_auto_exit_conflict(rule_copy):
             raise ValueError("Disable the matching Auto Exit rule before enabling Grid Live.")
         if self._auto_exit_running_exec():
@@ -7956,13 +8620,26 @@ class DataService:
             rule_copy,
             float(quantities.get("hedged_qty") or 0.0),
         )
+        if live_level is None and str(rule_copy.get("setup_mode") or "") == "adopt_existing_full_grid":
+            live_level = self._auto_arb_partial_adoption_level_for_qty(
+                rule_copy,
+                float(quantities.get("hedged_qty") or 0.0),
+            )
         if live_level is None:
             raise ValueError(
                 "The existing hedged quantity does not match a grid level. "
                 "Flatten it or configure a grid that matches the real position."
             )
         imbalance_qty = float(quantities.get("imbalance_qty") or 0.0)
-        tolerance = max(1e-8, float(rule_copy.get("max_qty") or 0.0) * 1e-5)
+        tolerance = self._auto_arb_completion_tolerance(rule_copy)
+        if str(rule_copy.get("setup_mode") or "") == "adopt_existing_full_grid":
+            tolerance = max(
+                tolerance,
+                self._auto_arb_completion_tolerance(
+                    rule_copy,
+                    float(quantities.get("hedged_qty") or 0.0),
+                ),
+            )
         if imbalance_qty > tolerance:
             raise ValueError(
                 "Long and short quantities are imbalanced; Live Grid cannot take ownership."
@@ -7977,6 +8654,11 @@ class DataService:
             rule["enabled"] = True
             rule["live_level"] = int(live_level)
             rule["actual_hedged_qty"] = float(quantities.get("hedged_qty") or 0.0)
+            rule["adopted_level"] = int(live_level)
+            rule["adopted_qty"] = float(quantities.get("hedged_qty") or 0.0)
+            rule["adopted_at"] = now_iso
+            rule["pending_transition"] = None
+            rule["next_eligible_ts"] = 0.0
             rule["status"] = "waiting_entry" if live_level == 0 else "monitoring"
             rule["blocked_reason"] = None
             rule["pending_action"] = None
@@ -8069,14 +8751,83 @@ class DataService:
             rule_copy = dict(rule)
         run = self._manual_runs.get(exec_id)
         if not isinstance(run, Mapping):
+            repair_quantities: dict[str, float] | None = None
+            reconcile_error = None
+            quantities: dict[str, float] | None = None
+            if str(rule_copy.get("active_action") or "") == "repair":
+                try:
+                    quantities = await self._auto_arb_refresh_quantities(rule_copy)
+                except Exception as exc:  # pylint: disable=broad-except
+                    reconcile_error = str(exc)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            event: dict[str, Any] = {
+                "event": "live_execution_state_missing",
+                "rule_id": rule_id,
+                "execution_id": exec_id,
+                "action": rule_copy.get("active_action"),
+                "ts": now_iso,
+            }
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
                 if isinstance(current, dict):
-                    current["enabled"] = False
-                    current["status"] = "error"
-                    current["blocked_reason"] = "active_execution_state_missing"
-                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    if quantities is not None and str(current.get("active_action") or "") == "repair":
+                        hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+                        imbalance_qty = float(quantities.get("imbalance_qty") or 0.0)
+                        tolerance = self._auto_arb_hedge_imbalance_tolerance(
+                            current,
+                            hedged_qty=hedged_qty,
+                        )
+                        current["active_execution_id"] = None
+                        current["active_action"] = None
+                        current["active_from_level"] = None
+                        current["active_to_level"] = None
+                        current["active_target_qty"] = None
+                        current["active_start_hedged_qty"] = None
+                        current["actual_hedged_qty"] = hedged_qty
+                        current["last_execution"] = {
+                            "execution_id": exec_id,
+                            "status": "missing_after_restart",
+                            "error": "active_execution_state_missing",
+                            "result": None,
+                            "observed_hedged_qty": hedged_qty,
+                            "observed_imbalance_qty": imbalance_qty,
+                            "reconciled_at": now_iso,
+                        }
+                        if imbalance_qty <= tolerance:
+                            transition = dict(current.get("pending_transition") or {})
+                            current["status"] = (
+                                f"partial_{transition.get('action')}"
+                                if transition
+                                else ("waiting_entry" if not current.get("live_level") else "monitoring")
+                            )
+                            current["blocked_reason"] = None
+                            current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+                            event["event"] = "live_hedge_repair_missing_but_balanced"
+                        else:
+                            current["status"] = "hedge_repair_required"
+                            current["blocked_reason"] = "active_execution_state_missing"
+                            current["next_eligible_ts"] = time.time()
+                            repair_quantities = dict(quantities)
+                            event["event"] = "live_hedge_repair_missing_retry"
+                        event["actual_hedged_qty"] = hedged_qty
+                        event["imbalance_qty"] = imbalance_qty
+                    elif reconcile_error:
+                        current["status"] = "waiting_reconcile"
+                        current["blocked_reason"] = (
+                            f"position_refresh_failed: {reconcile_error}"
+                        )
+                        current["next_eligible_ts"] = time.time() + 30.0
+                        event["event"] = "live_execution_state_missing_reconcile_deferred"
+                        event["error"] = reconcile_error
+                    else:
+                        current["enabled"] = False
+                        current["status"] = "error"
+                        current["blocked_reason"] = "active_execution_state_missing"
+                    current["updated_at"] = now_iso
                     self._save_auto_arb_config()
+            self._auto_arb_history_store.append(event)
+            if repair_quantities is not None:
+                await self._start_auto_arb_hedge_repair(rule_id, repair_quantities)
             return False
         status = str(run.get("status") or "")
         if status == "running":
@@ -8093,69 +8844,413 @@ class DataService:
             "to_level": rule_copy.get("active_to_level"),
             "ts": now_iso,
         }
-        success = status == "completed" and not (
-            isinstance(run.get("result"), Mapping) and run["result"].get("errors")
-        )
         quantities: dict[str, float] | None = None
         reconcile_error = None
-        if success:
-            try:
-                quantities = await self._auto_arb_refresh_quantities(rule_copy)
-            except Exception as exc:  # pylint: disable=broad-except
-                reconcile_error = str(exc)
-                success = False
+        try:
+            quantities = await self._auto_arb_refresh_quantities(rule_copy)
+        except Exception as exc:  # pylint: disable=broad-except
+            reconcile_error = str(exc)
 
+        repair_quantities: dict[str, float] | None = None
+        completed = False
         async with self._auto_arb_lock:
             current = (self._auto_arb.get("rules") or {}).get(rule_id)
             if not isinstance(current, dict):
                 return False
+            active_action = str(current.get("active_action") or "")
             current["active_execution_id"] = None
             current["active_action"] = None
             current["active_from_level"] = None
             current["active_to_level"] = None
-            expected_qty = _safe_float(current.get("active_target_qty"))
             current["active_target_qty"] = None
-            if success and quantities is not None:
+            start_hedged_qty = _safe_float(current.get("active_start_hedged_qty"))
+            current["active_start_hedged_qty"] = None
+            if quantities is not None:
                 hedged_qty = float(quantities.get("hedged_qty") or 0.0)
                 imbalance_qty = float(quantities.get("imbalance_qty") or 0.0)
-                tolerance = max(1e-8, float(current.get("max_qty") or 0.0) * 1e-5)
-                matched_level = self._auto_arb_level_for_qty(current, hedged_qty)
-                target_level = int(rule_copy.get("active_to_level") or 0)
-                target_matches = matched_level == target_level
-                qty_matches = expected_qty is None or abs(hedged_qty - expected_qty) <= tolerance
-                if target_matches and qty_matches and imbalance_qty <= tolerance:
-                    current["live_level"] = target_level
-                    current["actual_hedged_qty"] = hedged_qty
-                    current["status"] = "waiting_entry" if target_level == 0 else "monitoring"
-                    current["blocked_reason"] = None
-                    event["event"] = f"live_{rule_copy.get('active_action')}"
-                    event["live_level"] = target_level
-                    event["actual_hedged_qty"] = hedged_qty
+                transition = dict(current.get("pending_transition") or {})
+                total_transition_qty = max(
+                    0.0,
+                    float(transition.get("target_qty") or 0.0),
+                )
+                transition_tolerance = self._auto_arb_transition_completion_tolerance(
+                    current,
+                    total_transition_qty or None,
+                )
+                hedge_tolerance = self._auto_arb_hedge_imbalance_tolerance(
+                    current,
+                    transition_qty=total_transition_qty or None,
+                    hedged_qty=hedged_qty,
+                )
+                current["actual_hedged_qty"] = hedged_qty
+                current["last_execution"] = {
+                    "execution_id": exec_id,
+                    "status": status,
+                    "error": run.get("error"),
+                    "result": run.get("result"),
+                    "observed_hedged_qty": hedged_qty,
+                    "observed_imbalance_qty": imbalance_qty,
+                    "reconciled_at": now_iso,
+                }
+                if active_action == "repair":
+                    if imbalance_qty <= hedge_tolerance:
+                        current["status"] = (
+                            f"partial_{transition.get('action')}"
+                            if transition
+                            else ("waiting_entry" if not current.get("live_level") else "monitoring")
+                        )
+                        current["blocked_reason"] = None
+                        current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+                        event["event"] = "live_hedge_repaired"
+                        event["actual_hedged_qty"] = hedged_qty
+                        event["imbalance_qty"] = imbalance_qty
+                        completed = True
+                    else:
+                        current["status"] = "hedge_repair_retry"
+                        run_result = run.get("result")
+                        result_errors = []
+                        if isinstance(run_result, Mapping):
+                            result_errors = [
+                                str(item) for item in (run_result.get("errors") or [])
+                            ]
+                        repair_error = str(run.get("error") or "") or "; ".join(result_errors)
+                        current["blocked_reason"] = (
+                            repair_error or "hedge_imbalance_above_tolerance"
+                        )
+                        current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+                        if status == "completed" or not repair_error:
+                            repair_quantities = dict(quantities)
+                        event["event"] = "live_hedge_repair_partial"
+                        event["imbalance_qty"] = imbalance_qty
+                        if repair_error:
+                            event["error"] = repair_error
+                elif transition:
+                    transition_action = str(transition.get("action") or active_action)
+                    if start_hedged_qty is None:
+                        start_hedged_qty = float(
+                            transition.get("last_start_hedged_qty") or hedged_qty
+                        )
+                    observed_run_fill = (
+                        max(0.0, hedged_qty - float(start_hedged_qty))
+                        if transition_action == "enter"
+                        else max(0.0, float(start_hedged_qty) - hedged_qty)
+                    )
+                    previous_filled = max(0.0, float(transition.get("filled_qty") or 0.0))
+                    filled_qty = min(
+                        total_transition_qty,
+                        previous_filled + observed_run_fill,
+                    )
+                    remaining_qty = max(0.0, total_transition_qty - filled_qty)
+                    transition.update(
+                        {
+                            "filled_qty": filled_qty,
+                            "remaining_qty": remaining_qty,
+                            "last_execution_id": exec_id,
+                            "last_execution_status": status,
+                            "last_observed_fill_qty": observed_run_fill,
+                            "updated_at": now_iso,
+                        }
+                    )
+                    event.update(
+                        {
+                            "filled_qty": filled_qty,
+                            "remaining_qty": remaining_qty,
+                            "completion_tolerance_qty": transition_tolerance,
+                            "hedge_imbalance_tolerance_qty": hedge_tolerance,
+                            "actual_hedged_qty": hedged_qty,
+                            "imbalance_qty": imbalance_qty,
+                        }
+                    )
+                    run_result = run.get("result")
+                    non_closeable_dust = (
+                        filled_qty > 0
+                        and remaining_qty > 0
+                        and self._auto_arb_non_closeable_dust(
+                            run_result if isinstance(run_result, Mapping) else None,
+                            remaining_qty,
+                        )
+                    )
+                    if imbalance_qty > hedge_tolerance:
+                        current["pending_transition"] = transition
+                        current["status"] = "hedge_repair_required"
+                        current["blocked_reason"] = "hedge_imbalance_above_tolerance"
+                        current["next_eligible_ts"] = time.time()
+                        repair_quantities = dict(quantities)
+                        event["event"] = "live_hedge_repair_required"
+                    elif remaining_qty <= transition_tolerance or non_closeable_dust:
+                        target_level = int(transition.get("to_level") or 0)
+                        current["live_level"] = target_level
+                        current["pending_transition"] = None
+                        current["status"] = "waiting_entry" if target_level == 0 else "monitoring"
+                        current["blocked_reason"] = None
+                        current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+                        event["event"] = f"live_{transition_action}"
+                        event["live_level"] = target_level
+                        event["dust_completed"] = remaining_qty > 1e-9
+                        event["non_closeable_dust_completed"] = bool(non_closeable_dust)
+                        completed = True
+                    else:
+                        current["pending_transition"] = transition
+                        result_errors = []
+                        if isinstance(run_result, Mapping):
+                            result_errors = [
+                                str(item) for item in (run_result.get("errors") or [])
+                            ]
+                        if run.get("error"):
+                            result_errors.append(str(run.get("error")))
+                        if observed_run_fill <= 0 and result_errors:
+                            joined_errors = " ".join(result_errors).lower()
+                            balance_blocked = "balance" in joined_errors or "margin" in joined_errors
+                            current["status"] = (
+                                "blocked_balance"
+                                if balance_blocked
+                                else "retry_execution_error"
+                            )
+                            current["blocked_reason"] = "; ".join(result_errors)
+                            current["next_eligible_ts"] = time.time() + (
+                                60.0 if balance_blocked else 30.0
+                            )
+                            event["event"] = "live_transition_retry_deferred"
+                            event["errors"] = result_errors
+                        else:
+                            current["status"] = f"partial_{transition_action}"
+                            current["blocked_reason"] = None
+                            current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+                            event["event"] = f"live_{transition_action}_partial"
+                        current["pending_action"] = None
+                        current["pending_samples"] = 0
                 else:
-                    current["enabled"] = False
-                    current["status"] = "paused_reconcile_mismatch"
-                    current["blocked_reason"] = "actual_position_does_not_match_target_level"
                     current["actual_hedged_qty"] = hedged_qty
-                    event["event"] = "live_reconcile_mismatch"
-                    event["matched_level"] = matched_level
-                    event["actual_hedged_qty"] = hedged_qty
-                    event["imbalance_qty"] = imbalance_qty
-                    success = False
+                    current["status"] = "monitoring"
+                    current["blocked_reason"] = None
+                    completed = True
             else:
-                current["enabled"] = False
-                current["status"] = "error"
+                current["active_execution_id"] = exec_id
+                current["active_action"] = rule_copy.get("active_action")
+                current["active_from_level"] = rule_copy.get("active_from_level")
+                current["active_to_level"] = rule_copy.get("active_to_level")
+                current["active_target_qty"] = rule_copy.get("active_target_qty")
+                current["active_start_hedged_qty"] = rule_copy.get(
+                    "active_start_hedged_qty"
+                )
+                current["status"] = "waiting_reconcile"
                 current["blocked_reason"] = (
                     f"position_refresh_failed: {reconcile_error}"
                     if reconcile_error
                     else f"execution_{status or 'unknown'}"
                 )
-                event["event"] = "live_execution_failed"
+                current["next_eligible_ts"] = time.time() + 30.0
+                event["event"] = "live_reconcile_deferred"
                 event["error"] = reconcile_error or run.get("error")
                 event["result"] = run.get("result")
             current["updated_at"] = now_iso
             self._save_auto_arb_config()
         self._auto_arb_history_store.append(event)
-        return success
+        if repair_quantities is not None:
+            await self._start_auto_arb_hedge_repair(rule_id, repair_quantities)
+        return completed
+
+    async def _start_auto_arb_hedge_repair(
+        self,
+        rule_id: str,
+        quantities: Mapping[str, Any],
+    ) -> None:
+        if self._auto_exit_running_exec():
+            return
+        async with self._auto_arb_lock:
+            rule = (self._auto_arb.get("rules") or {}).get(rule_id)
+            if not isinstance(rule, dict) or not rule.get("enabled"):
+                return
+            rule_copy = dict(rule)
+        long_qty = float(quantities.get("long_qty") or 0.0)
+        short_qty = float(quantities.get("short_qty") or 0.0)
+        imbalance_qty = abs(long_qty - short_qty)
+        tolerance = self._auto_arb_hedge_imbalance_tolerance(
+            rule_copy,
+            hedged_qty=float(quantities.get("hedged_qty") or 0.0),
+        )
+        if imbalance_qty <= tolerance:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            async with self._auto_arb_lock:
+                current = (self._auto_arb.get("rules") or {}).get(rule_id)
+                if not isinstance(current, dict):
+                    return
+                transition = dict(current.get("pending_transition") or {})
+                remaining_qty = max(0.0, float(transition.get("remaining_qty") or 0.0))
+                transition_action = str(transition.get("action") or "")
+                transition_tolerance = self._auto_arb_transition_completion_tolerance(
+                    current,
+                    float(transition.get("target_qty") or 0.0) or None,
+                )
+                last_execution = current.get("last_execution")
+                last_result = (
+                    last_execution.get("result")
+                    if isinstance(last_execution, Mapping)
+                    else None
+                )
+                non_closeable_dust = (
+                    bool(transition)
+                    and remaining_qty > 0
+                    and self._auto_arb_non_closeable_dust(
+                        last_result if isinstance(last_result, Mapping) else None,
+                        remaining_qty,
+                    )
+                )
+                if transition and (remaining_qty <= transition_tolerance or non_closeable_dust):
+                    target_level = int(
+                        transition.get("to_level")
+                        or current.get("live_level")
+                        or 0
+                    )
+                    current["live_level"] = target_level
+                    current["pending_transition"] = None
+                    current["status"] = "waiting_entry" if target_level == 0 else "monitoring"
+                elif transition:
+                    current["status"] = f"partial_{transition_action or 'transition'}"
+                else:
+                    current["status"] = (
+                        "waiting_entry" if not current.get("live_level") else "monitoring"
+                    )
+                current["active_execution_id"] = None
+                current["active_action"] = None
+                current["active_from_level"] = None
+                current["active_to_level"] = None
+                current["active_target_qty"] = None
+                current["active_start_hedged_qty"] = None
+                current["actual_hedged_qty"] = float(quantities.get("hedged_qty") or 0.0)
+                current["blocked_reason"] = None
+                current["pending_action"] = None
+                current["pending_samples"] = 0
+                current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+                current["updated_at"] = now_iso
+                self._save_auto_arb_config()
+            self._auto_arb_history_store.append(
+                {
+                    "event": "live_hedge_imbalance_within_tolerance",
+                    "rule_id": rule_id,
+                    "imbalance_qty": imbalance_qty,
+                    "tolerance_qty": tolerance,
+                    "remaining_qty": remaining_qty,
+                    "non_closeable_dust_completed": bool(non_closeable_dust),
+                    "ts": now_iso,
+                }
+            )
+            return
+        cleanup_long = long_qty > short_qty
+        cleanup_exchange = (
+            rule_copy.get("long_exchange")
+            if cleanup_long
+            else rule_copy.get("short_exchange")
+        )
+        cleanup_side = "long" if cleanup_long else "short"
+        close_side = "sell" if cleanup_side == "long" else "buy"
+        preflight: dict[str, Any] = {}
+        try:
+            preflight = await self._manual.analyze_rebalance(
+                exchange=str(cleanup_exchange or ""),
+                symbol=str(rule_copy.get("symbol") or ""),
+                side=close_side,
+                qty_base=imbalance_qty,
+                max_slippage_bps=float(rule_copy.get("max_slippage_bps") or 8.0),
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            preflight = {"errors": [str(exc)]}
+        min_required = _safe_float(preflight.get("min_qty_required"))
+        if min_required and imbalance_qty < min_required:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            async with self._auto_arb_lock:
+                current = (self._auto_arb.get("rules") or {}).get(rule_id)
+                if not isinstance(current, dict):
+                    return
+                transition = dict(current.get("pending_transition") or {})
+                target_level = int(
+                    transition.get("to_level")
+                    or current.get("live_level")
+                    or 0
+                )
+                current["active_execution_id"] = None
+                current["active_action"] = None
+                current["active_from_level"] = None
+                current["active_to_level"] = None
+                current["active_target_qty"] = None
+                current["active_start_hedged_qty"] = None
+                current["actual_hedged_qty"] = float(quantities.get("hedged_qty") or 0.0)
+                current["live_level"] = target_level
+                current["pending_transition"] = None
+                current["pending_action"] = None
+                current["pending_samples"] = 0
+                current["status"] = "waiting_entry" if target_level == 0 else "monitoring"
+                current["blocked_reason"] = None
+                current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+                current["updated_at"] = now_iso
+                self._save_auto_arb_config()
+            self._auto_arb_history_store.append(
+                {
+                    "event": "live_hedge_repair_non_closeable_dust",
+                    "rule_id": rule_id,
+                    "live_level": target_level,
+                    "cleanup_exchange": cleanup_exchange,
+                    "cleanup_side": cleanup_side,
+                    "imbalance_qty": imbalance_qty,
+                    "min_qty_required": min_required,
+                    "preflight": preflight,
+                    "ts": now_iso,
+                }
+            )
+            return
+        payload = {
+            "symbol": rule_copy.get("symbol"),
+            "qty": imbalance_qty,
+            "cleanup_exchange": cleanup_exchange,
+            "cleanup_position_side": cleanup_side,
+            "panic_cleanup_mode": False,
+            "max_slippage_bps": float(rule_copy.get("max_slippage_bps") or 8.0),
+            "max_runtime_sec": 120,
+            "reprice_sec": 4.0,
+            "use_orderbook_check": True,
+            "fallback_to_market": False,
+            "async_run": True,
+            "dry_run": False,
+            "margin_mode": "isolated",
+            "auto_arb_agent": True,
+            "auto_arb_rule_id": rule_id,
+            "auto_arb_rule_generation": int(rule_copy.get("generation") or 0),
+        }
+        result = await self.manual_orphan_cleanup(payload)
+        exec_id = str((result or {}).get("execution_id") or "")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        async with self._auto_arb_lock:
+            current = (self._auto_arb.get("rules") or {}).get(rule_id)
+            if not isinstance(current, dict):
+                return
+            if exec_id:
+                current["active_execution_id"] = exec_id
+                current["active_action"] = "repair"
+                current["active_start_hedged_qty"] = float(
+                    quantities.get("hedged_qty") or 0.0
+                )
+                current["status"] = "repairing_hedge"
+                current["blocked_reason"] = None
+            else:
+                current["status"] = "hedge_repair_retry"
+                current["blocked_reason"] = str(
+                    (result or {}).get("error") or "hedge_repair_worker_busy"
+                )
+                current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+            current["updated_at"] = now_iso
+            self._save_auto_arb_config()
+        self._auto_arb_history_store.append(
+            {
+                "event": "live_hedge_repair_started" if exec_id else "live_hedge_repair_deferred",
+                "rule_id": rule_id,
+                "execution_id": exec_id or None,
+                "cleanup_exchange": cleanup_exchange,
+                "cleanup_side": cleanup_side,
+                "qty": imbalance_qty,
+                "result": result,
+                "ts": now_iso,
+            }
+        )
 
     async def _start_auto_arb_live_transition(
         self,
@@ -8199,26 +9294,105 @@ class DataService:
         level_index = to_level - 1 if action == "enter" else from_level - 1
         if level_index < 0 or level_index >= len(levels):
             raise ValueError("Grid transition level is outside the configured range.")
-        qty = float(levels[level_index].get("qty") or 0.0)
+        level_qty = float(levels[level_index].get("qty") or 0.0)
         target_qty = (
             float(levels[to_level - 1].get("cumulative_qty") or 0.0)
             if to_level > 0
             else 0.0
         )
+        try:
+            quantities = await self._auto_arb_refresh_quantities(rule_copy)
+        except Exception as exc:  # pylint: disable=broad-except
+            async with self._auto_arb_lock:
+                current = (self._auto_arb.get("rules") or {}).get(rule_id)
+                if isinstance(current, dict):
+                    current["status"] = "waiting_positions"
+                    current["blocked_reason"] = f"position_refresh_failed: {exc}"
+                    current["next_eligible_ts"] = time.time() + 30.0
+                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    self._save_auto_arb_config()
+            return
+        existing_transition = dict(rule_copy.get("pending_transition") or {})
+        same_transition = (
+            str(existing_transition.get("action") or "") == action
+            and int(existing_transition.get("from_level") or 0) == from_level
+            and int(existing_transition.get("to_level") or 0) == to_level
+        )
+        current_hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+        desired_qty = (
+            max(0.0, target_qty - current_hedged_qty)
+            if action == "enter"
+            else max(0.0, current_hedged_qty - target_qty)
+        )
+        transition_qty = desired_qty if desired_qty > 0 else level_qty
+        transition = existing_transition if same_transition else {
+            "action": action,
+            "from_level": from_level,
+            "to_level": to_level,
+            "target_qty": transition_qty,
+            "filled_qty": 0.0,
+            "remaining_qty": transition_qty,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        total_transition_qty = max(
+            0.0,
+            float(transition.get("target_qty") or transition_qty or level_qty),
+        )
+        qty = max(0.0, float(transition.get("remaining_qty") or total_transition_qty))
+        tolerance = self._auto_arb_transition_completion_tolerance(
+            rule_copy,
+            total_transition_qty,
+        )
+        if qty <= tolerance:
+            async with self._auto_arb_lock:
+                current = (self._auto_arb.get("rules") or {}).get(rule_id)
+                if isinstance(current, dict):
+                    current["live_level"] = to_level
+                    current["pending_transition"] = None
+                    current["actual_hedged_qty"] = current_hedged_qty
+                    current["status"] = "waiting_entry" if to_level == 0 else "monitoring"
+                    current["blocked_reason"] = None
+                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    self._save_auto_arb_config()
+            return
+        worst_tier = max(
+            venue_liquidity_tier(str(rule_copy.get("long_exchange") or "")),
+            venue_liquidity_tier(str(rule_copy.get("short_exchange") or "")),
+        )
+        chunk_notional = 750.0 if worst_tier <= 1 else 500.0 if worst_tier == 2 else 250.0
+        trigger_level = levels[level_index]
         payload = {
             "symbol": rule_copy.get("symbol"),
             "qty": qty,
             "notional": None,
             "mode": "smart-enter" if action == "enter" else "smart-exit",
             "max_slippage_bps": float(rule_copy.get("max_slippage_bps") or 8.0),
-            "timeout_sec": 15,
-            "max_runtime_sec": 600,
+            "spread_min_pct": (
+                -100.0
+                if action == "enter"
+                else float(
+                    transition.get("spread_min_pct")
+                    if transition.get("spread_min_pct") is not None
+                    else trigger_level.get("exit_spread_pct")
+                )
+            ),
+            "spread_max_pct": (
+                float(trigger_level.get("entry_spread_pct")) if action == "enter" else 100.0
+            ),
+            "timeout_sec": 0,
+            "max_runtime_sec": 120,
             "reprice_sec": 5.0,
-            "chunk_qty": qty,
-            "chunk_notional": None,
-            "force_chunk_qty": True,
+            "chunk_qty": None,
+            "chunk_notional": chunk_notional,
+            "force_chunk_qty": False,
             "use_orderbook_check": True,
+            "allow_liquidity_chunking": True,
             "fallback_to_market": False,
+            "hedge_order_type": "limit",
+            "hedge_limit_mode": "passive" if action == "enter" else "aggressive",
+            "hedge_favorable_bps": 2.0,
+            "hedge_adverse_bps": 8.0,
+            "hedge_reprice_min_sec": 3.0 if action == "exit" else 5.0,
             "async_run": True,
             "dry_run": False,
             "long_exchange": rule_copy.get("long_exchange"),
@@ -8242,17 +9416,28 @@ class DataService:
             current["pending_action"] = None
             current["pending_samples"] = 0
             if exec_id:
+                transition["last_start_hedged_qty"] = float(
+                    quantities.get("hedged_qty") or 0.0
+                )
+                transition["updated_at"] = now_iso
+                current["pending_transition"] = transition
                 current["active_execution_id"] = exec_id
                 current["active_action"] = action
                 current["active_from_level"] = from_level
                 current["active_to_level"] = to_level
                 current["active_target_qty"] = target_qty
+                current["active_start_hedged_qty"] = float(
+                    quantities.get("hedged_qty") or 0.0
+                )
                 current["status"] = f"executing_{action}"
                 current["blocked_reason"] = None
             else:
-                current["enabled"] = False
-                current["status"] = "error"
-                current["blocked_reason"] = "manual_execution_did_not_return_execution_id"
+                current["pending_transition"] = transition
+                current["status"] = "blocked_conflict"
+                current["blocked_reason"] = str(
+                    (result or {}).get("error") or "execution_worker_busy"
+                )
+                current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
             current["updated_at"] = now_iso
             self._save_auto_arb_config()
         self._auto_arb_history_store.append(
@@ -8263,6 +9448,7 @@ class DataService:
                 "from_level": from_level,
                 "to_level": to_level,
                 "qty": qty,
+                "liquidity_chunking": True,
                 "result": result,
                 "ts": now_iso,
             }
@@ -8278,7 +9464,24 @@ class DataService:
         for rule in rules:
             rule_id = str(rule.get("id") or "")
             if rule.get("mode") == "live" and rule.get("active_execution_id"):
+                if (
+                    str(rule.get("status") or "") == "waiting_reconcile"
+                    and time.time() < float(rule.get("next_eligible_ts") or 0.0)
+                ):
+                    continue
                 await self._reconcile_auto_arb_execution(rule_id)
+                continue
+            if time.time() < float(rule.get("next_eligible_ts") or 0.0):
+                continue
+            if str(rule.get("status") or "") in {
+                "hedge_repair_required",
+                "hedge_repair_retry",
+            }:
+                try:
+                    quantities = await self._auto_arb_refresh_quantities(rule)
+                except Exception:  # pylint: disable=broad-except
+                    continue
+                await self._start_auto_arb_hedge_repair(rule_id, quantities)
                 continue
             live_spreads = await self.auto_arb_spreads(
                 symbol=str(rule.get("symbol") or ""),
@@ -8309,20 +9512,232 @@ class DataService:
                         if mode == "live"
                         else int(current.get("shadow_level") or 0)
                     )
-                    decision = decide_grid_transition(
-                        entry_spread_pct=entry_spread,
-                        exit_spread_pct=exit_spread,
-                        levels=current.get("levels") or [],
-                        current_level=current_level,
-                        max_levels_per_cycle=current.get("max_levels_per_cycle") or 1,
+                    pending_transition = (
+                        dict(current.get("pending_transition") or {})
+                        if mode == "live"
+                        else {}
                     )
+                    if pending_transition:
+                        pending_remaining = max(
+                            0.0,
+                            float(pending_transition.get("remaining_qty") or 0.0),
+                        )
+                        pending_tolerance = self._auto_arb_transition_completion_tolerance(
+                            current,
+                            float(pending_transition.get("target_qty") or 0.0) or None,
+                        )
+                        pending_filled = max(
+                            0.0,
+                            float(pending_transition.get("filled_qty") or 0.0),
+                        )
+                        last_execution = current.get("last_execution")
+                        last_result = (
+                            last_execution.get("result")
+                            if isinstance(last_execution, Mapping)
+                            else None
+                        )
+                        if (
+                            pending_remaining <= pending_tolerance
+                            or (
+                                pending_filled > 0
+                                and self._auto_arb_non_closeable_dust(
+                                    last_result if isinstance(last_result, Mapping) else None,
+                                    pending_remaining,
+                                )
+                            )
+                        ):
+                            pending_action = str(pending_transition.get("action") or "")
+                            from_level = int(
+                                pending_transition.get("from_level") or current_level
+                            )
+                            to_level = int(
+                                pending_transition.get("to_level") or current_level
+                            )
+                            current_level = to_level
+                            current["live_level"] = to_level
+                            current["pending_transition"] = None
+                            current["pending_action"] = None
+                            current["pending_samples"] = 0
+                            current["blocked_reason"] = None
+                            current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+                            current["status"] = (
+                                "waiting_entry" if to_level == 0 else "monitoring"
+                            )
+                            decision = {
+                                "action": "none",
+                                "current_level": to_level,
+                                "target_level": to_level,
+                                "entry_target_level": None,
+                                "exit_target_level": None,
+                                "levels_delta": to_level - from_level,
+                                "continuation": True,
+                                "remaining_qty": pending_remaining,
+                                "dust_completed": pending_remaining > 1e-9,
+                                "non_closeable_dust_completed": pending_remaining > pending_tolerance,
+                            }
+                            transition_event = {
+                                "event": f"live_{pending_action}",
+                                "rule_id": current.get("id"),
+                                "generation": current.get("generation"),
+                                "symbol": current.get("symbol"),
+                                "long_exchange": current.get("long_exchange"),
+                                "short_exchange": current.get("short_exchange"),
+                                "from_level": from_level,
+                                "to_level": to_level,
+                                "live_level": to_level,
+                                "remaining_qty": pending_remaining,
+                                "completion_tolerance_qty": pending_tolerance,
+                                "dust_completed": pending_remaining > 1e-9,
+                                "non_closeable_dust_completed": pending_remaining > pending_tolerance,
+                                "ts": now_iso,
+                            }
+                            pending_transition = {}
+                        else:
+                            pending_action = str(pending_transition.get("action") or "")
+                            from_level = int(
+                                pending_transition.get("from_level") or current_level
+                            )
+                            to_level = int(
+                                pending_transition.get("to_level") or current_level
+                            )
+                            levels = current.get("levels") or []
+                            level_index = to_level - 1 if pending_action == "enter" else from_level - 1
+                            trigger_level = (
+                                levels[level_index]
+                                if 0 <= level_index < len(levels)
+                                else {}
+                            )
+                            trigger_matched = (
+                                entry_spread
+                                <= float(trigger_level.get("entry_spread_pct"))
+                                if pending_action == "enter"
+                                and trigger_level.get("entry_spread_pct") is not None
+                                else exit_spread
+                                >= float(trigger_level.get("exit_spread_pct"))
+                                if pending_action == "exit"
+                                and trigger_level.get("exit_spread_pct") is not None
+                                else False
+                            )
+                            decision = {
+                                "action": pending_action if trigger_matched else "none",
+                                "current_level": current_level,
+                                "target_level": to_level,
+                                "entry_target_level": None,
+                                "exit_target_level": None,
+                                "levels_delta": to_level - from_level,
+                                "continuation": True,
+                                "remaining_qty": pending_transition.get("remaining_qty"),
+                            }
+                            if (
+                                pending_action == "exit"
+                                and not trigger_matched
+                                and pending_filled <= 0
+                            ):
+                                fresh_decision = decide_grid_transition(
+                                    entry_spread_pct=entry_spread,
+                                    exit_spread_pct=exit_spread,
+                                    levels=levels,
+                                    current_level=current_level,
+                                    max_levels_per_cycle=(
+                                        current.get("max_levels_per_cycle") or 1
+                                    ),
+                                )
+                                if fresh_decision.get("action") == "enter":
+                                    current["pending_transition"] = None
+                                    current["pending_action"] = None
+                                    current["pending_samples"] = 0
+                                    current["blocked_reason"] = None
+                                    decision = {
+                                        **fresh_decision,
+                                        "stale_pending_exit_cleared": True,
+                                        "cleared_pending_exit": dict(pending_transition),
+                                    }
+                                    transition_event = {
+                                        "event": "live_pending_exit_cleared",
+                                        "rule_id": current.get("id"),
+                                        "generation": current.get("generation"),
+                                        "symbol": current.get("symbol"),
+                                        "long_exchange": current.get("long_exchange"),
+                                        "short_exchange": current.get("short_exchange"),
+                                        "from_level": from_level,
+                                        "to_level": to_level,
+                                        "remaining_qty": pending_remaining,
+                                        "reason": "entry_trigger_recovered_after_zero_fill_exit",
+                                        "entry_spread_pct": entry_spread,
+                                        "exit_spread_pct": exit_spread,
+                                        "ts": now_iso,
+                                    }
+                                    pending_transition = {}
+                            if (
+                                pending_action == "enter"
+                                and not trigger_matched
+                                and from_level > 0
+                            ):
+                                base_qty = self._auto_arb_level_qty(current, from_level)
+                                actual_qty = float(current.get("actual_hedged_qty") or 0.0)
+                                rollback_qty = max(0.0, actual_qty - base_qty)
+                                tolerance = self._auto_arb_completion_tolerance(
+                                    current,
+                                    rollback_qty or None,
+                                )
+                                exit_level = (
+                                    levels[from_level - 1]
+                                    if 0 <= from_level - 1 < len(levels)
+                                    else {}
+                                )
+                                exit_threshold = exit_level.get("exit_spread_pct")
+                                reversal_matched = (
+                                    exit_threshold is not None
+                                    and rollback_qty > tolerance
+                                    and exit_spread >= float(exit_threshold)
+                                )
+                                if reversal_matched:
+                                    pending_transition = {
+                                        "action": "exit",
+                                        "from_level": to_level,
+                                        "to_level": from_level,
+                                        "target_qty": rollback_qty,
+                                        "filled_qty": 0.0,
+                                        "remaining_qty": rollback_qty,
+                                        "spread_min_pct": float(exit_threshold),
+                                        "created_at": now_iso,
+                                        "reversal_of": dict(
+                                            current.get("pending_transition") or {}
+                                        ),
+                                        "reason": "partial_enter_reversed_by_exit_trigger",
+                                    }
+                                    current["pending_transition"] = pending_transition
+                                    decision = {
+                                        "action": "exit",
+                                        "current_level": current_level,
+                                        "target_level": from_level,
+                                        "entry_target_level": None,
+                                        "exit_target_level": from_level,
+                                        "levels_delta": from_level - to_level,
+                                        "continuation": False,
+                                        "reversal": True,
+                                        "rollback_qty": rollback_qty,
+                                        "exit_threshold_pct": float(exit_threshold),
+                                    }
+                    else:
+                        decision = decide_grid_transition(
+                            entry_spread_pct=entry_spread,
+                            exit_spread_pct=exit_spread,
+                            levels=current.get("levels") or [],
+                            current_level=current_level,
+                            max_levels_per_cycle=current.get("max_levels_per_cycle") or 1,
+                        )
                     action = decision["action"]
                     current["last_decision"] = decision
                     current["blocked_reason"] = None
                     if action == "none":
                         current["pending_action"] = None
                         current["pending_samples"] = 0
-                        current["status"] = "waiting_entry" if not current_level else "monitoring"
+                        current["status"] = (
+                            f"partial_{pending_transition.get('action')}_waiting_trigger"
+                            if pending_transition
+                            else ("waiting_entry" if not current_level else "monitoring")
+                        )
                     else:
                         if current.get("pending_action") == action:
                             current["pending_samples"] = int(current.get("pending_samples") or 0) + 1
@@ -8332,8 +9747,16 @@ class DataService:
                         current["status"] = f"confirming_{action}"
                         required = max(1, int(current.get("confirm_samples") or 2))
                         if int(current["pending_samples"]) >= required:
-                            previous_level = current_level
-                            new_level = int(decision["target_level"])
+                            previous_level = (
+                                int(pending_transition.get("from_level") or current_level)
+                                if pending_transition
+                                else current_level
+                            )
+                            new_level = int(
+                                pending_transition.get("to_level")
+                                if pending_transition
+                                else decision["target_level"]
+                            )
                             if mode == "live":
                                 current["status"] = f"queued_{action}"
                                 live_transition = (rule_id, action, previous_level, new_level)
@@ -8368,6 +9791,8 @@ class DataService:
                 self._auto_arb_history_store.append(transition_event)
             if live_transition:
                 await self._start_auto_arb_live_transition(*live_transition)
+                if self._auto_exit_running_exec():
+                    break
 
     async def _auto_arb_scheduler(self) -> None:
         try:
@@ -8440,7 +9865,7 @@ class DataService:
             "qty": float(action_qty),
             "notional": None,
             "mode": "smart-enter" if action == "add" else "smart-exit",
-            "max_slippage_bps": 8.0,
+            "max_slippage_bps": 12.0 if action == "add" else 8.0,
             "timeout_sec": 15,
             "max_runtime_sec": 600,
             "reprice_sec": 5.0,
@@ -8448,6 +9873,7 @@ class DataService:
             "chunk_notional": None,
             "force_chunk_qty": False,
             "use_orderbook_check": True,
+            "allow_liquidity_chunking": True,
             "fallback_to_market": False,
             "async_run": bool(async_run and not dry_run),
             "dry_run": dry_run,
@@ -9470,7 +10896,8 @@ class DataService:
         if not ccxt_symbol:
             return {"errors": [f"{exchange}: unable to resolve symbol {symbol}"]}
         try:
-            result = await client.cancel_order(order_id, ccxt_symbol)
+            params = bitget_private_params({}) if exchange == "bitget" else {}
+            result = await client.cancel_order(order_id, ccxt_symbol, params)
         except Exception as exc:  # pylint: disable=broad-except
             return {"errors": [str(exc)]}
         return {
@@ -9568,9 +10995,13 @@ class DataService:
                 if exchange == "okx":
                     leverage_params["tdMode"] = mode
                 elif exchange == "bitget":
-                    leverage_params["marginMode"] = mode
+                    leverage_params = bitget_private_params(leverage_params)
+                    leverage_params["marginMode"] = "isolated" if mode == "isolated" else "crossed"
+                    leverage_params["posSide"] = bitget_position_side(side, reduce_only=reduce_only)
                 else:
                     leverage_params["marginMode"] = mode
+            elif exchange == "bitget":
+                leverage_params = bitget_private_params(leverage_params)
             try:
                 await client.set_leverage(DEFAULT_MANUAL_LEVERAGE, ccxt_symbol, leverage_params or None)
             except Exception as exc:  # pylint: disable=broad-except
@@ -9631,10 +11062,19 @@ class DataService:
         params: dict[str, Any] = {}
         if reduce_only:
             params["reduceOnly"] = True
-        if exchange == "bitget" and not position_side:
-            position_side = "net"
-            if margin_mode:
-                params["marginMode"] = margin_mode.lower()
+        if exchange == "bitget":
+            if bitget_uta_enabled():
+                params = bitget_private_params(params)
+                if margin_mode:
+                    mode = margin_mode.lower()
+                    params["marginMode"] = "isolated" if mode == "isolated" else "crossed"
+                if not position_side:
+                    position_side = bitget_position_side(side, reduce_only=reduce_only)
+                    params["hedged"] = True
+            elif not position_side:
+                position_side = "net"
+                if margin_mode:
+                    params["marginMode"] = margin_mode.lower()
         if exchange == "okx" and margin_mode:
             params["tdMode"] = margin_mode.lower()
         if exchange == "kucoin":
@@ -9647,7 +11087,8 @@ class DataService:
         if position_side:
             if exchange != "kucoin":
                 params["posSide"] = position_side
-            params["positionSide"] = position_side
+            if not (exchange == "bitget" and bitget_uta_enabled()):
+                params["positionSide"] = position_side
 
         try:
             if order_type == "limit":
@@ -9656,7 +11097,7 @@ class DataService:
                 order = await client.create_order(ccxt_symbol, "market", side, order_qty, None, params)
         except Exception as exc:  # pylint: disable=broad-except
             message = str(exc)
-            if exchange == "bitget" and "40774" in message:
+            if exchange == "bitget" and not bitget_uta_enabled() and "40774" in message:
                 retry_params = dict(params)
                 if params.get("posSide") == "net":
                     retry_params.pop("posSide", None)
@@ -9747,7 +11188,7 @@ class DataService:
             "stop_force_finalize": bool(run.get("stop_force_finalize")),
             "stop_reason": run.get("stop_reason") or None,
             "logs": list(run.get("logs") or []),
-            "result": run.get("result"),
+            "result": run.get("result") or {},
             "error": run.get("error"),
             "log_path": run.get("log_path"),
         }
@@ -9867,6 +11308,11 @@ class DataService:
             "auto_exit_exit_percent": _safe_float((payload or {}).get("auto_exit_exit_percent")),
             "auto_exit_hedged_qty": _safe_float((payload or {}).get("auto_exit_hedged_qty")),
             "auto_exit_requested_qty": _safe_float((payload or {}).get("auto_exit_requested_qty")),
+            "auto_exit_total_target_qty": _safe_float((payload or {}).get("auto_exit_total_target_qty")),
+            "auto_exit_total_remaining_qty": _safe_float((payload or {}).get("auto_exit_total_remaining_qty")),
+            "auto_exit_position_mode": str((payload or {}).get("auto_exit_position_mode") or ""),
+            "auto_exit_aggregate_spread_pct": _safe_float((payload or {}).get("auto_exit_aggregate_spread_pct")),
+            "auto_exit_pair_spread_pct": _safe_float((payload or {}).get("auto_exit_pair_spread_pct")),
             "auto_arb_agent": bool((payload or {}).get("auto_arb_agent")),
             "auto_arb_rule_id": str((payload or {}).get("auto_arb_rule_id") or ""),
             "auto_arb_rule_generation": max(
@@ -9933,18 +11379,82 @@ class DataService:
                 else:
                     result = {"errors": [f"unsupported manual action {action}"]}
                 run["result"] = result
-                if result.get("errors"):
+                result_warnings = [str(item) for item in (result.get("warnings") or [])]
+                remaining_qty = _safe_float(result.get("remaining_qty")) or 0.0
+                incomplete_runtime_end = remaining_qty > 0 and any(
+                    "runtime ended" in warning.lower()
+                    and any(token in warning.lower() for token in ("not entered", "not exited", "not rolled"))
+                    for warning in result_warnings
+                )
+                if result.get("errors") or incomplete_runtime_end:
                     run["status"] = "completed_with_errors"
-                    _append_log(
-                        {
-                            "ts": datetime.now(timezone.utc).isoformat(),
-                            "event": "errors",
-                            "message": "Result errors",
-                            "data": {"errors": result.get("errors")},
-                        }
-                    )
+                    if result.get("errors"):
+                        _append_log(
+                            {
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "event": "errors",
+                                "message": "Result errors",
+                                "data": {"errors": result.get("errors")},
+                            }
+                        )
                 else:
                     run["status"] = "completed"
+                result_actions = [
+                    dict(item)
+                    for item in (result.get("actions") or [])
+                    if isinstance(item, Mapping)
+                ]
+                fills_by_exchange: dict[str, float] = {}
+                order_ids: list[str] = []
+                for item in result_actions:
+                    exchange = normalize_exchange_name(str(item.get("exchange") or ""))
+                    filled_qty = _safe_float(item.get("filled_qty")) or 0.0
+                    if exchange and filled_qty > 0:
+                        fills_by_exchange[exchange] = (
+                            fills_by_exchange.get(exchange, 0.0) + filled_qty
+                        )
+                    order_id = str(item.get("order_id") or "")
+                    if order_id:
+                        order_ids.append(order_id)
+                terminal_reason = "completed"
+                if result.get("errors"):
+                    terminal_reason = "completed_with_errors"
+                elif incomplete_runtime_end:
+                    terminal_reason = "runtime_ended_incomplete"
+                elif "stopped_by_user" in result_warnings:
+                    terminal_reason = "stopped_by_user"
+                elif "condition_not_met" in result_warnings:
+                    terminal_reason = "condition_not_met"
+                _log_cb(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "event": "summary",
+                        "message": "execution summary",
+                        "data": {
+                            "execution_id": exec_id,
+                            "action": action,
+                            "symbol": result.get("symbol") or payload.get("symbol"),
+                            "requested_qty": _safe_float(result.get("qty"))
+                            or _safe_float(payload.get("qty")),
+                            "remaining_qty": _safe_float(result.get("remaining_qty")),
+                            "fills_by_exchange": fills_by_exchange,
+                            "order_ids": order_ids,
+                            "order_count": len(order_ids),
+                            "cancel_event_count": sum(
+                                1
+                                for entry in (run.get("logs") or [])
+                                if entry.get("event") == "cancel"
+                            ),
+                            "duration_sec": round(
+                                max(0.0, time.time() - float(run.get("created_at_ts") or time.time())),
+                                3,
+                            ),
+                            "terminal_reason": terminal_reason,
+                            "warning_count": len(result_warnings),
+                            "error_count": len(result.get("errors") or []),
+                        },
+                    }
+                )
             except Exception as exc:  # pylint: disable=broad-except
                 run["status"] = "failed"
                 run["error"] = str(exc)
@@ -9953,7 +11463,7 @@ class DataService:
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "event": "exception",
                         "message": "Execution failed",
-                        "data": {"error": str(exc)},
+                        "data": {"error": str(exc), "traceback": traceback.format_exc()},
                     }
                 )
             run["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -10084,7 +11594,10 @@ class DataService:
         accounts_snapshot = self._accounts.snapshot()
         positions = accounts_snapshot.get("positions") or []
         balances = self._mobile_compact_balances(
-            self._sanitize_balances(accounts_snapshot.get("balances") or [])
+            self._balances_with_status_rows(
+                self._sanitize_balances(accounts_snapshot.get("balances") or []),
+                accounts_snapshot.get("status") or [],
+            )
         )
         market_lookup, market_ts_lookup = self._positions_market_snapshot_lookup()
         rows, grouped = self._positions_by_symbol(
@@ -10219,6 +11732,16 @@ class DataService:
                 "target_spread_pct": _safe_float((rule or {}).get("target_spread_pct")),
                 "exit_percent": _safe_float((rule or {}).get("exit_percent")) or 100.0,
                 "exit_once": bool((rule or {}).get("exit_once", True)),
+                "position_mode": _auto_exit_position_mode(rule or {}, auto_exit.get("defaults") or {}),
+                "spread_confirm_cycles": _auto_exit_spread_confirm_cycles(rule or {}, auto_exit.get("defaults") or {}),
+                "spread_confirm_samples": max(
+                    0,
+                    int(
+                        (diagnostic or {}).get("spread_confirm_samples")
+                        or (rule or {}).get("spread_confirm_samples")
+                        or 0
+                    ),
+                ),
                 "live_spread_pct": live_spread,
                 "live_spread_source": "auto_exit" if rule_key and rule_key in live_spreads else "summary_mark",
                 "status": status,
@@ -10369,7 +11892,10 @@ class DataService:
                 used = max(0.0, float(total) - float(available))
             if margin_ratio is None and total and used is not None and total > 0:
                 margin_ratio = float(used) / float(total)
-            if margin_ratio is None:
+            row_status = str(row.get("status") or "").strip().lower()
+            if row_status in {"error", "partial", "unavailable", "missing_credentials"}:
+                status = row_status
+            elif margin_ratio is None:
                 status = "unknown"
             elif margin_ratio >= 0.8:
                 status = "stress"
@@ -10386,6 +11912,7 @@ class DataService:
                     "used": used,
                     "margin_ratio": margin_ratio,
                     "status": status,
+                    "error": row.get("error"),
                     "updated_at": row.get("updated_at") or row.get("timestamp"),
                 }
             )
@@ -10606,7 +12133,7 @@ class DataService:
                 "max_slippage_bps": 8.0,
                 "margin_mode": "isolated",
                 "timeout_sec": 15,
-                "max_runtime_sec": 60,
+                "max_runtime_sec": 600,
                 "reprice_sec": 2.0,
                 "chunk_qty": None,
                 "chunk_notional": None,
@@ -10765,7 +12292,10 @@ class DataService:
             return self._account_state_cache
         payload = dict(payload)
         positions = payload.get("positions") or []
-        balances = self._sanitize_balances(payload.get("balances") or [])
+        balances = self._balances_with_status_rows(
+            self._sanitize_balances(payload.get("balances") or []),
+            payload.get("status") or [],
+        )
         payload["balances"] = balances
         market_lookup, market_ts_lookup = self._positions_market_snapshot_lookup()
         positions_by_symbol, grouped = self._positions_by_symbol(
@@ -10779,6 +12309,7 @@ class DataService:
         payload["positions_market"] = self._positions_market_state(positions)
         payload["margin_diagnostics"] = self._margin_diagnostics(positions, balances)
         payload["margin_logic_log"] = list(self._margin_logic_log)
+        payload["protective_shadow_events"] = list(self._protective_shadow_events)
         payload["exchange_health"] = json.loads(json.dumps(self._derisk_exchange_health))
         payload["hedge_clusters"] = self._active_hedge_clusters()
         payload["derisk_diagnostics"] = list(self._derisk_diagnostics)
@@ -10797,10 +12328,43 @@ class DataService:
         if len(self._margin_logic_log) > self._margin_logic_log_limit:
             self._margin_logic_log = self._margin_logic_log[-self._margin_logic_log_limit :]
 
+    def _protective_shadow_event(
+        self,
+        event: str,
+        payload: Mapping[str, Any],
+        *,
+        identity: str,
+    ) -> None:
+        now_ts = time.time()
+        stable_payload = dict(payload or {})
+        fingerprint = json.dumps(stable_payload, sort_keys=True, default=str)
+        event_key = f"{event}|{identity}"
+        previous = self._protective_shadow_fingerprints.get(event_key)
+        last_ts = float(self._protective_shadow_last_ts.get(event_key) or 0.0)
+        if previous == fingerprint and (now_ts - last_ts) < PROTECTIVE_SHADOW_HEARTBEAT_SEC:
+            return
+        row = {
+            "record_type": "shadow",
+            "event": event,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            **stable_payload,
+        }
+        self._protective_shadow_fingerprints[event_key] = fingerprint
+        self._protective_shadow_last_ts[event_key] = now_ts
+        self._protective_shadow_events.append(row)
+        if len(self._protective_shadow_events) > PROTECTIVE_SHADOW_EVENT_LIMIT:
+            self._protective_shadow_events = self._protective_shadow_events[
+                -PROTECTIVE_SHADOW_EVENT_LIMIT:
+            ]
+        try:
+            self._protective_shadow_history_store.append(row)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("failed to append protective shadow history: %s", exc)
+
     def _margin_diagnostics(self, positions: list[dict[str, Any]], balances: list[dict[str, Any]]) -> list[dict[str, Any]]:
         protective = getattr(self._settings_manager.current, "protective", {}) or {}
         add_enabled = bool(protective.get("auto_margin_enabled", True))
-        reduce_enabled = bool(protective.get("auto_margin_reduce_enabled", True))
+        reduce_enabled = bool(protective.get("auto_margin_reduce_enabled", False))
         enforce_mode = bool(protective.get("enforce_isolated_margin", True))
         enforce_leverage = bool(protective.get("enforce_leverage", True))
         target_leverage = _safe_float(protective.get("target_leverage"))
@@ -10879,6 +12443,35 @@ class DataService:
                 else:
                     decision = "blocked"
                     reason = "auto_reduce_disabled"
+                    margin_used = _safe_float(position.get("margin_used"))
+                    if margin_used is None:
+                        margin_used = _safe_float(position.get("initial_margin"))
+                    reduce_amount = None
+                    if margin_used is not None and margin_used > 0 and liq_buffer_ratio > 0:
+                        reduce_amount = margin_used * (
+                            1.0 - target_buffer / liq_buffer_ratio
+                        )
+                    self._protective_shadow_event(
+                        "margin_reduce_candidate",
+                        {
+                            "exchange": exchange,
+                            "symbol": symbol,
+                            "side": side,
+                            "margin_mode": margin_mode,
+                            "liq_buffer_pct": liq_buffer_ratio * 100.0,
+                            "reduce_trigger_pct": reduce_trigger * 100.0,
+                            "target_buffer_pct": target_buffer * 100.0,
+                            "margin_used_usd": margin_used,
+                            "planned_reduce_usd": (
+                                max(0.0, float(reduce_amount))
+                                if reduce_amount is not None
+                                else None
+                            ),
+                            "live_enabled": False,
+                            "reason": reason,
+                        },
+                        identity=f"{exchange}|{symbol}|{side or '-'}",
+                    )
 
             key = f"{exchange}|{symbol}|{side or '-'}"
             fingerprint = "|".join(
@@ -10976,6 +12569,51 @@ class DataService:
         return cleaned
 
     @staticmethod
+    def _balances_with_status_rows(
+        rows: list[dict[str, Any]],
+        status_entries: list[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        result = [dict(row) for row in rows]
+        seen = {
+            normalize_exchange_name(str(row.get("exchange") or ""))
+            for row in result
+            if str(row.get("exchange") or "").strip()
+        }
+        for entry in status_entries or []:
+            exchange = normalize_exchange_name(str(entry.get("exchange") or ""))
+            if not exchange or exchange in seen:
+                continue
+            status = str(entry.get("status") or "").strip().lower()
+            if status not in {"error", "partial", "unavailable", "missing_credentials"}:
+                continue
+            error = (
+                entry.get("balance_error")
+                or entry.get("error")
+                or entry.get("message")
+                or entry.get("positions_error")
+            )
+            result.append(
+                {
+                    "exchange": exchange,
+                    "asset": "USDT",
+                    "total": None,
+                    "available": None,
+                    "used": None,
+                    "margin_ratio": None,
+                    "equity": None,
+                    "buffer_pct": None,
+                    "initial_margin": None,
+                    "maintenance_margin": None,
+                    "status": status or "unknown",
+                    "error": str(error or ""),
+                    "timestamp": entry.get("checked_at"),
+                }
+            )
+            seen.add(exchange)
+        result.sort(key=lambda item: normalize_exchange_name(str(item.get("exchange") or "")))
+        return result
+
+    @staticmethod
     def _parse_iso_ts(value: Any) -> datetime | None:
         if value in (None, ""):
             return None
@@ -10985,6 +12623,95 @@ class DataService:
             return datetime.fromisoformat(str(value)).astimezone(timezone.utc)
         except Exception:  # pylint: disable=broad-except
             return None
+
+    @classmethod
+    def _position_scan_evidence(
+        cls,
+        accounts_snapshot: Mapping[str, Any] | None,
+        exchanges: Iterable[str],
+        *,
+        now_ts: float | None = None,
+        stale_after_sec: float = 180.0,
+    ) -> dict[str, Any]:
+        """Describe whether position absence is backed by fresh successful venue scans."""
+        required = sorted(
+            {
+                normalize_exchange_name(str(exchange))
+                for exchange in exchanges
+                if normalize_exchange_name(str(exchange))
+                and normalize_exchange_name(str(exchange)) != "multileg"
+            }
+        )
+        now_value = float(now_ts or time.time())
+        status_by_exchange = {
+            normalize_exchange_name(str(item.get("exchange") or "")): dict(item)
+            for item in ((accounts_snapshot or {}).get("status") or [])
+            if normalize_exchange_name(str(item.get("exchange") or ""))
+        }
+        rows: list[dict[str, Any]] = []
+        trusted = bool(required)
+        for exchange in required:
+            status = status_by_exchange.get(exchange) or {}
+            checked_dt = cls._parse_iso_ts(status.get("checked_at"))
+            checked_ts = checked_dt.timestamp() if checked_dt else None
+            age_sec = max(0.0, now_value - checked_ts) if checked_ts is not None else None
+            explicit_fetch_ok = status.get("positions_fetch_ok")
+            positions_fetch_ok = bool(explicit_fetch_ok) if explicit_fetch_ok is not None else (
+                str(status.get("status") or "").lower() == "ok"
+                and not status.get("positions_error")
+            )
+            row_trusted = bool(
+                positions_fetch_ok
+                and age_sec is not None
+                and age_sec <= max(30.0, float(stale_after_sec))
+            )
+            trusted = trusted and row_trusted
+            rows.append(
+                {
+                    "exchange": exchange,
+                    "trusted": row_trusted,
+                    "positions_fetch_ok": positions_fetch_ok,
+                    "positions_count": status.get("positions_count"),
+                    "checked_at": status.get("checked_at"),
+                    "age_sec": round(age_sec, 3) if age_sec is not None else None,
+                    "status": status.get("status"),
+                    "positions_error": status.get("positions_error"),
+                }
+            )
+        evidence_id = "|".join(
+            f"{row['exchange']}:{row.get('checked_at') or ''}"
+            for row in rows
+        )
+        return {
+            "trusted": trusted,
+            "required_exchanges": required,
+            "evidence_id": evidence_id if trusted else "",
+            "rows": rows,
+        }
+
+    @staticmethod
+    def _auto_exit_rule_exchanges(
+        rule: Mapping[str, Any],
+        selected_pair: Mapping[str, Any] | None = None,
+    ) -> set[str]:
+        exchanges: set[str] = set()
+        for field in ("long_exchange", "short_exchange"):
+            exchange = normalize_exchange_name(str(rule.get(field) or ""))
+            if exchange and exchange != "multileg":
+                exchanges.add(exchange)
+        signature = rule.get("position_signature")
+        if isinstance(signature, Mapping):
+            for leg in signature.get("legs") or []:
+                if not isinstance(leg, Mapping):
+                    continue
+                exchange = normalize_exchange_name(str(leg.get("exchange") or ""))
+                if exchange and exchange != "multileg":
+                    exchanges.add(exchange)
+        for field in ("long_exchange", "short_exchange"):
+            exchange = normalize_exchange_name(str((selected_pair or {}).get(field) or ""))
+            if exchange and exchange != "multileg":
+                exchanges.add(exchange)
+        return exchanges
 
     def _collect_positions_market_symbols(
         self, positions: list[dict[str, Any]]
@@ -11582,7 +13309,7 @@ class DataService:
             if now_ts - cached_ts <= FUNDING_CACHE_TTL_SEC:
                 return rate, next_iso, mark_val
 
-        logger.info(
+        logger.debug(
             "funding fetch start exchange=%s key=%s canonical=%s candidates=%s",
             exchange,
             key,
@@ -12144,7 +13871,33 @@ class DataService:
     def _active_hedge_clusters(self) -> dict[str, Any]:
         explicit = self.hedge_cluster_payload()
         auto_exit_rules = (self._auto_exit or {}).get("rules") or {}
-        return derive_cluster_rules(explicit, auto_exit_rules)
+        active_position_legs: set[tuple[str, str, str]] = set()
+        for position in (self._accounts.snapshot() or {}).get("positions") or []:
+            symbol = _dedupe_settle(
+                position.get("symbol_normalized")
+                or position.get("symbol")
+                or position.get("exchange_symbol")
+            )
+            exchange = normalize_exchange_name(str(position.get("exchange") or ""))
+            qty_hint = _safe_float(position.get("coin_qty"))
+            if qty_hint is None:
+                qty_hint = _safe_float(position.get("quantity"))
+            if qty_hint is None:
+                qty_hint = _safe_float(position.get("contracts"))
+            side = str(position.get("side") or "").strip().lower()
+            if side in {"buy", "long"}:
+                side = "long"
+            elif side in {"sell", "short"}:
+                side = "short"
+            elif qty_hint is not None:
+                side = "short" if qty_hint < 0 else "long" if qty_hint > 0 else ""
+            if symbol and exchange and side:
+                active_position_legs.add((symbol, exchange, side))
+        return derive_cluster_rules(
+            explicit,
+            auto_exit_rules,
+            active_position_legs=active_position_legs,
+        )
 
     def _load_derisk_outcome_state(self) -> dict[str, Any]:
         payload = self._derisk_outcome_store.load({"tracked": {}})
@@ -12211,6 +13964,8 @@ class DataService:
             "velocity_trigger_bps": _num("derisk_velocity_trigger_bps", 120.0),
             "qty_tolerance_pct": _num("derisk_qty_tolerance_pct", 0.10),
             "max_single_action_notional_usd": _num("derisk_max_single_action_notional_usd", 500.0),
+            "max_candidate_score": _num("derisk_max_candidate_score", 0.25),
+            "preflight_ttl_sec": int(protective.get("derisk_preflight_ttl_sec", 60) or 60),
             "market_cleanup_only_in_emergency": bool(
                 protective.get("derisk_market_cleanup_only_in_emergency", True)
             ),
@@ -12258,6 +14013,28 @@ class DataService:
                     defaults["restore_spread_on_missing"] = bool(
                         incoming_defaults.get("restore_spread_on_missing")
                     )
+                if "clear_verified_missing" in incoming_defaults:
+                    defaults["clear_verified_missing"] = bool(
+                        incoming_defaults.get("clear_verified_missing")
+                    )
+                if incoming_defaults.get("verified_missing_confirmations") is not None:
+                    try:
+                        defaults["verified_missing_confirmations"] = max(
+                            2,
+                            int(incoming_defaults.get("verified_missing_confirmations")),
+                        )
+                    except Exception:
+                        pass
+                if "position_mode" in incoming_defaults:
+                    defaults["position_mode"] = _auto_exit_position_mode(incoming_defaults, {})
+                if incoming_defaults.get("spread_confirm_cycles") is not None:
+                    try:
+                        defaults["spread_confirm_cycles"] = max(
+                            1,
+                            int(incoming_defaults.get("spread_confirm_cycles")),
+                        )
+                    except Exception:
+                        pass
                 if incoming_defaults.get("auto_clear_no_position_sec") is not None:
                     try:
                         defaults["auto_clear_no_position_sec"] = max(0, int(incoming_defaults.get("auto_clear_no_position_sec")))
@@ -12294,6 +14071,10 @@ class DataService:
                         "last_v1_triggered_ts": float(rule.get("last_v1_triggered_ts") or 0.0),
                         "updated_at": rule.get("updated_at"),
                         "missing_since_ts": float(rule.get("missing_since_ts") or 0.0),
+                        "verified_missing_count": max(0, int(rule.get("verified_missing_count") or 0)),
+                        "verified_missing_evidence_id": str(
+                            rule.get("verified_missing_evidence_id") or ""
+                        ),
                         "v1_pending_exit_cycles": max(0, int(rule.get("v1_pending_exit_cycles") or 0)),
                         "position_signature": (
                             dict(rule.get("position_signature"))
@@ -12303,6 +14084,9 @@ class DataService:
                         "bound_at": rule.get("bound_at"),
                         "signature_status": str(rule.get("signature_status") or ""),
                         "rule_generation": max(1, int(rule.get("rule_generation") or 1)),
+                        "position_mode": _auto_exit_position_mode(rule, defaults),
+                        "spread_confirm_cycles": _auto_exit_spread_confirm_cycles(rule, defaults),
+                        "spread_confirm_samples": max(0, int(rule.get("spread_confirm_samples") or 0)),
                         "spread_target_qty": _safe_float(rule.get("spread_target_qty")),
                         "spread_remaining_qty": _safe_float(rule.get("spread_remaining_qty")),
                         "v1_target_qty": _safe_float(rule.get("v1_target_qty")),
@@ -12329,7 +14113,8 @@ class DataService:
         short_exchange: str,
     ) -> dict[str, Any] | None:
         try:
-            positions = self._accounts.snapshot().get("positions") or []
+            accounts_snapshot = self._accounts.snapshot() or {}
+            positions = accounts_snapshot.get("positions") or []
             market_lookup, market_ts_lookup = self._positions_market_snapshot_lookup()
             _, grouped = self._positions_by_symbol(
                 positions,
@@ -12359,6 +14144,10 @@ class DataService:
             require_live = payload.get("require_live")
             auto_clear = payload.get("auto_clear_no_position_sec")
             restore_spread = payload.get("restore_spread_on_missing")
+            clear_verified_missing = payload.get("clear_verified_missing")
+            verified_missing_confirmations = payload.get("verified_missing_confirmations")
+            position_mode = payload.get("position_mode")
+            spread_confirm_cycles = payload.get("spread_confirm_cycles")
             if runtime is not None:
                 defaults["max_runtime_sec"] = max(30, int(runtime))
             if cooldown is not None:
@@ -12367,6 +14156,17 @@ class DataService:
                 defaults["require_live"] = bool(require_live)
             if restore_spread is not None:
                 defaults["restore_spread_on_missing"] = bool(restore_spread)
+            if clear_verified_missing is not None:
+                defaults["clear_verified_missing"] = bool(clear_verified_missing)
+            if verified_missing_confirmations is not None:
+                defaults["verified_missing_confirmations"] = max(
+                    2,
+                    int(verified_missing_confirmations),
+                )
+            if position_mode is not None:
+                defaults["position_mode"] = _auto_exit_position_mode({"position_mode": position_mode}, {})
+            if spread_confirm_cycles is not None:
+                defaults["spread_confirm_cycles"] = max(1, int(spread_confirm_cycles))
             if auto_clear is not None:
                 defaults["auto_clear_no_position_sec"] = max(0, int(auto_clear))
             self._auto_exit["defaults"] = defaults
@@ -12451,6 +14251,8 @@ class DataService:
             exit_percent_in = _safe_float(payload.get("exit_percent"))
             exit_once_in = payload.get("exit_once")
             persist_on_missing_in = payload.get("persist_on_missing")
+            position_mode_in = payload.get("position_mode")
+            spread_confirm_cycles_in = payload.get("spread_confirm_cycles")
             defaults = self._auto_exit.get("defaults", {}) or {}
             default_persist_on_missing = bool(
                 defaults.get(
@@ -12484,6 +14286,16 @@ class DataService:
                 bool(prev.get("persist_on_missing", default_persist_on_missing))
                 if persist_on_missing_in is None
                 else bool(persist_on_missing_in)
+            )
+            position_mode = (
+                _auto_exit_position_mode(prev, defaults)
+                if position_mode_in is None
+                else _auto_exit_position_mode({"position_mode": position_mode_in}, defaults)
+            )
+            spread_confirm_cycles = (
+                _auto_exit_spread_confirm_cycles(prev, defaults)
+                if spread_confirm_cycles_in is None
+                else max(1, int(spread_confirm_cycles_in))
             )
             target = _safe_float(payload.get("target_spread_pct"))
             if not spread_enabled:
@@ -12522,10 +14334,14 @@ class DataService:
                     "bound_at": now_iso if position_signature else None,
                     "signature_status": signature_status,
                     "rule_generation": rule_generation,
+                    "position_mode": position_mode,
+                    "spread_confirm_cycles": int(spread_confirm_cycles),
+                    "spread_confirm_samples": 0,
                     "spread_target_qty": None,
                     "spread_remaining_qty": None,
                     "v1_target_qty": None,
                     "v1_remaining_qty": None,
+                    "continuation_trigger_mode": None,
                 }
             self._auto_exit["rules"] = rules
             self._auto_exit_store.save(self._auto_exit)
@@ -12656,6 +14472,8 @@ class DataService:
             "action_qty": _safe_float(payload.get("action_qty")),
             "action_mode": payload.get("action_mode"),
             "candidate_score": _safe_float(payload.get("candidate_score")),
+            "score_eligible": payload.get("score_eligible"),
+            "max_candidate_score": _safe_float(payload.get("max_candidate_score")),
             "residual_status": payload.get("residual_status"),
             "qty_mismatch_ratio": _safe_float(payload.get("qty_mismatch_ratio")),
             "missing_cycles": int(payload.get("missing_cycles") or 0),
@@ -12677,6 +14495,20 @@ class DataService:
         unexpected_legs = list(payload.get("unexpected_legs") or [])
         if unexpected_legs:
             result["unexpected_legs"] = unexpected_legs
+        market_preflight = payload.get("market_preflight")
+        if isinstance(market_preflight, Mapping):
+            result["market_preflight"] = {
+                "eligible": bool(market_preflight.get("eligible")),
+                "reason": market_preflight.get("reason"),
+                "errors": list(market_preflight.get("errors") or []),
+                "requested_qty": _safe_float(market_preflight.get("requested_qty")),
+                "min_qty_required": _safe_float(
+                    market_preflight.get("min_qty_required")
+                ),
+                "amount_step": _safe_float(market_preflight.get("amount_step")),
+                "min_notional": _safe_float(market_preflight.get("min_notional")),
+                "checked_at": market_preflight.get("checked_at"),
+            }
         return result
 
     def _persist_derisk_cycle_history(
@@ -12692,6 +14524,7 @@ class DataService:
     ) -> None:
         status_counts: dict[str, int] = {}
         compact_rows: list[dict[str, Any]] = []
+        state_rows: list[tuple[Any, ...]] = []
         for row in diagnostics or []:
             status = str(row.get("status") or "")
             if status:
@@ -12704,6 +14537,41 @@ class DataService:
                 or str(row.get("action_mode") or "") not in {"", "none"}
             ):
                 compact_rows.append(self._compact_derisk_diagnostic_row(row))
+            state_rows.append(
+                (
+                    kind,
+                    str(row.get("key") or ""),
+                    status,
+                    str(row.get("reason") or ""),
+                    str(row.get("stress_status") or ""),
+                    str(row.get("action_mode") or ""),
+                    bool(row.get("cluster_conflict", False)),
+                    str(row.get("long_health") or ""),
+                    str(row.get("short_health") or ""),
+                )
+            )
+        now_ts = time.time()
+        state_fingerprint = json.dumps(
+            {
+                "settings": {
+                    "enabled": bool(settings.get("enabled")),
+                    "shadow_mode": bool(settings.get("shadow_mode")),
+                    "orphan_cleanup_enabled": bool(
+                        settings.get("orphan_cleanup_enabled", True)
+                    ),
+                },
+                "rows": sorted(state_rows),
+                "running": bool(running_execution),
+            },
+            sort_keys=True,
+            default=str,
+        )
+        state_changed = state_fingerprint != self._derisk_last_cycle_history_fingerprint
+        heartbeat_due = (
+            now_ts - float(self._derisk_last_cycle_history_ts or 0.0)
+        ) >= DERISK_CYCLE_HEARTBEAT_SEC
+        if not cycle_action and not state_changed and not heartbeat_due:
+            return
         history_row = {
             "record_type": "cycle",
             "cycle_id": cycle_id,
@@ -12720,6 +14588,7 @@ class DataService:
                 "cooldown_sec": int(settings.get("cooldown_sec") or 0),
                 "qty_tolerance_pct": _safe_float(settings.get("qty_tolerance_pct")),
                 "max_single_action_notional_usd": _safe_float(settings.get("max_single_action_notional_usd")),
+                "max_candidate_score": _safe_float(settings.get("max_candidate_score")),
                 "dust_notional_usd": _safe_float(settings.get("dust_notional_usd")),
             },
             "status_counts": status_counts,
@@ -12730,6 +14599,8 @@ class DataService:
             "rows": compact_rows,
         }
         self._append_derisk_history(history_row)
+        self._derisk_last_cycle_history_ts = now_ts
+        self._derisk_last_cycle_history_fingerprint = state_fingerprint
 
     @staticmethod
     def _compact_balance_lookup_rows(
@@ -13003,10 +14874,194 @@ class DataService:
     ) -> None:
         log_key = f"{key}|{event}"
         last_ts = float(self._derisk_last_log_ts.get(log_key) or 0.0)
-        if (now_ts - last_ts) < float(self._derisk_log_cooldown_sec):
+        stable_payload = {
+            name: payload.get(name)
+            for name in (
+                "symbol",
+                "status",
+                "reason",
+                "long_exchange",
+                "short_exchange",
+                "orphan_exchange",
+                "orphan_position_side",
+                "cluster_conflict",
+                "long_health",
+                "short_health",
+            )
+        }
+        stable_payload["overlap_conflicts"] = sorted(
+            str(item) for item in (payload.get("overlap_conflicts") or [])
+        )
+        stable_payload["unexpected_leg_count"] = int(
+            payload.get("unexpected_leg_count") or 0
+        )
+        fingerprint = json.dumps(stable_payload, sort_keys=True, default=str)
+        previous_fingerprint = self._derisk_last_log_fingerprint.get(log_key)
+        if (
+            previous_fingerprint == fingerprint
+            and (now_ts - last_ts) < DERISK_EVENT_HEARTBEAT_SEC
+        ):
+            return
+        if (
+            previous_fingerprint != fingerprint
+            and (now_ts - last_ts) < float(self._derisk_log_cooldown_sec)
+        ):
             return
         self._derisk_last_log_ts[log_key] = now_ts
+        self._derisk_last_log_fingerprint[log_key] = fingerprint
         self._derisk_event(event, payload)
+
+    async def _derisk_market_preflight(
+        self,
+        item: Mapping[str, Any],
+        *,
+        orphan: bool,
+        ttl_sec: int,
+    ) -> dict[str, Any]:
+        symbol = _dedupe_settle(item.get("symbol"))
+        qty = _safe_float(
+            item.get("orphan_qty") if orphan else item.get("action_qty")
+        )
+        if not symbol or qty is None or qty <= 0:
+            return {
+                "eligible": False,
+                "reason": "invalid_preflight_input",
+                "errors": ["invalid symbol or quantity"],
+            }
+        if orphan:
+            exchange = normalize_exchange_name(
+                str(item.get("orphan_exchange") or "")
+            )
+            position_side = str(
+                item.get("orphan_position_side") or ""
+            ).strip().lower()
+            side = "sell" if position_side == "long" else "buy"
+            cache_key = f"orphan|{symbol}|{exchange}|{side}"
+        else:
+            long_exchange = normalize_exchange_name(
+                str(item.get("long_exchange") or "")
+            )
+            short_exchange = normalize_exchange_name(
+                str(item.get("short_exchange") or "")
+            )
+            cache_key = f"pair|{symbol}|{long_exchange}|{short_exchange}"
+        now_ts = time.time()
+        cached = self._derisk_preflight_cache.get(cache_key)
+        if cached and (now_ts - cached[0]) < max(1, int(ttl_sec)):
+            base = dict(cached[1])
+        else:
+            try:
+                if orphan:
+                    raw = await self._manual.analyze_rebalance(
+                        exchange=exchange,
+                        symbol=symbol,
+                        side=side,
+                        qty_base=float(qty),
+                        max_slippage_bps=18.0,
+                    )
+                    constraints = dict(raw.get("constraints") or {})
+                    base = {
+                        "errors": list(raw.get("errors") or []),
+                        "constraints": {exchange: constraints},
+                        "min_qty_required": _safe_float(
+                            raw.get("min_qty_required")
+                        ),
+                        "amount_step": _safe_float(
+                            constraints.get("amount_step")
+                        ),
+                        "min_notional": _safe_float(
+                            constraints.get("min_notional")
+                        ),
+                        "mid_price": _safe_float(raw.get("mid_price")),
+                        "max_qty_under_slippage": _safe_float(
+                            raw.get("max_qty_under_slippage")
+                        ),
+                    }
+                else:
+                    raw = await self._manual.analyze(
+                        {
+                            "action": "exit",
+                            "mode": "smart-exit",
+                            "symbol": symbol,
+                            "qty": float(qty),
+                            "long_exchange": long_exchange,
+                            "short_exchange": short_exchange,
+                            "max_slippage_bps": 12.0,
+                            "use_orderbook_check": False,
+                            "dry_run": True,
+                            "async_run": False,
+                            "margin_mode": "isolated",
+                        }
+                    )
+                    constraints_map = dict(raw.get("market_constraints") or {})
+                    constraints_rows = [
+                        dict(value or {})
+                        for value in constraints_map.values()
+                        if isinstance(value, Mapping)
+                    ]
+                    min_required_values = [
+                        _safe_float(value.get("min_qty_required"))
+                        for value in constraints_rows
+                    ]
+                    amount_steps = [
+                        _safe_float(value.get("amount_step"))
+                        for value in constraints_rows
+                    ]
+                    min_notionals = [
+                        _safe_float(value.get("min_notional"))
+                        for value in constraints_rows
+                    ]
+                    base = {
+                        "errors": list(raw.get("errors") or []),
+                        "constraints": constraints_map,
+                        "min_qty_required": max(
+                            (value for value in min_required_values if value),
+                            default=None,
+                        ),
+                        "amount_step": max(
+                            (value for value in amount_steps if value),
+                            default=None,
+                        ),
+                        "min_notional": max(
+                            (value for value in min_notionals if value),
+                            default=None,
+                        ),
+                        "mid_price": _safe_float(
+                            ((raw.get("stats") or {}).get("long") or {}).get("mid")
+                        )
+                        or _safe_float(
+                            ((raw.get("stats") or {}).get("short") or {}).get("mid")
+                        ),
+                        "max_qty_under_slippage": None,
+                    }
+            except Exception as exc:  # pylint: disable=broad-except
+                base = {
+                    "errors": [str(exc)],
+                    "constraints": {},
+                    "min_qty_required": None,
+                    "amount_step": None,
+                    "min_notional": None,
+                    "mid_price": None,
+                    "max_qty_under_slippage": None,
+                }
+            base["checked_at"] = datetime.now(timezone.utc).isoformat()
+            self._derisk_preflight_cache[cache_key] = (now_ts, dict(base))
+        min_qty_required = _safe_float(base.get("min_qty_required"))
+        errors = [str(value) for value in (base.get("errors") or [])]
+        eligible = not errors and (
+            min_qty_required is None or float(qty) >= min_qty_required
+        )
+        reason = "ok"
+        if errors:
+            reason = "preflight_error"
+        elif min_qty_required is not None and float(qty) < min_qty_required:
+            reason = "below_market_minimum"
+        return {
+            **base,
+            "eligible": eligible,
+            "reason": reason,
+            "requested_qty": float(qty),
+        }
 
     async def _auto_derisk_cycle(self) -> None:
         if self._derisk_inflight:
@@ -13242,7 +15297,6 @@ class DataService:
                         status = "confirmed_orphan" if orphan_confirmed else "suspected_orphan"
                         reason = "single_leg_visible"
                 else:
-                    missing_cycles = 0
                     mismatch_ratio = qty_mismatch_ratio(
                         long_leg.get("coin_qty") or long_leg.get("quantity"),
                         short_leg.get("coin_qty") or short_leg.get("quantity"),
@@ -13254,11 +15308,14 @@ class DataService:
                         if health_block:
                             status = "blocked_by_exchange_health"
                             reason = "qty_mismatch_but_unhealthy"
+                            missing_cycles = 0
                         else:
                             missing_cycles += 1
                             orphan_confirmed = missing_cycles >= confirm_cycles
                             status = "confirmed_orphan" if orphan_confirmed else "suspected_orphan"
                             reason = "qty_mismatch"
+                    else:
+                        missing_cycles = 0
                 state["missing_cycles"] = missing_cycles
                 state["last_status"] = status
                 state["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -13279,6 +15336,9 @@ class DataService:
                 candidate_score = None
                 residual_status = None
                 action_mode = "none"
+                pair_qty = None
+                residual_qty = None
+                residual_notional = None
 
                 if long_leg and short_leg:
                     cluster_notional = sum(
@@ -13349,6 +15409,8 @@ class DataService:
                                 )
                                 if allow_full_cleanup and pair_qty > 0:
                                     action_qty = pair_qty
+                                    residual_qty = 0.0
+                                    residual_notional = 0.0
                                     residual_status = "flat"
                                     action_mode = "full_cleanup"
                             candidates.append(
@@ -13369,6 +15431,9 @@ class DataService:
                                     "candidate_score": candidate_score,
                                     "residual_status": residual_status,
                                     "stress_score": stress_score,
+                                    "pair_qty": pair_qty,
+                                    "residual_qty": residual_qty,
+                                    "residual_notional_usd": residual_notional,
                                 }
                             )
                 if status in {"suspected_orphan", "confirmed_orphan"}:
@@ -13503,6 +15568,13 @@ class DataService:
                     str(item.get("symbol") or ""),
                 )
             )
+            preflight_ttl_sec = int(settings.get("preflight_ttl_sec", 60) or 60)
+            if orphan_targets:
+                orphan_targets[0]["market_preflight"] = await self._derisk_market_preflight(
+                    orphan_targets[0],
+                    orphan=True,
+                    ttl_sec=preflight_ttl_sec,
+                )
             for item in orphan_targets:
                 diagnostics.append(
                     {
@@ -13518,6 +15590,40 @@ class DataService:
                     float(item.get("candidate_score")) if item.get("candidate_score") is not None else float("inf"),
                 )
             )
+            max_candidate_score = float(settings.get("max_candidate_score", 0.25))
+            for item in candidates:
+                score = _safe_float(item.get("candidate_score"))
+                item["score_eligible"] = derisk_score_allowed(
+                    score,
+                    max_candidate_score,
+                )
+                item["max_candidate_score"] = max_candidate_score
+            selected_candidate = next(
+                (item for item in candidates if item.get("score_eligible")),
+                None,
+            )
+            if selected_candidate:
+                selected_candidate["market_preflight"] = await self._derisk_market_preflight(
+                    selected_candidate,
+                    orphan=False,
+                    ttl_sec=preflight_ttl_sec,
+                )
+                preflight = dict(selected_candidate.get("market_preflight") or {})
+                residual_qty = _safe_float(selected_candidate.get("residual_qty"))
+                residual_notional = _safe_float(
+                    selected_candidate.get("residual_notional_usd")
+                )
+                if residual_qty is not None and residual_qty > 0:
+                    selected_candidate["residual_status"] = classify_residual_leg(
+                        qty=residual_qty,
+                        notional_usd=residual_notional,
+                        min_qty=_safe_float(preflight.get("min_qty_required")),
+                        min_notional=_safe_float(preflight.get("min_notional")),
+                        amount_step=_safe_float(preflight.get("amount_step")),
+                        dust_notional_usd=float(
+                            settings.get("dust_notional_usd", 10.0)
+                        ),
+                    )
             for item in candidates:
                 diagnostics.append(
                     {
@@ -13528,12 +15634,27 @@ class DataService:
                     }
                 )
 
-            if (
+            orphan_live_requested = (
                 orphan_targets
                 and bool(settings.get("enabled"))
                 and not bool(settings.get("shadow_mode"))
                 and bool(settings.get("orphan_cleanup_enabled", True))
-            ):
+            )
+            orphan_preflight = (
+                dict(orphan_targets[0].get("market_preflight") or {})
+                if orphan_targets
+                else {}
+            )
+            if orphan_live_requested and not bool(orphan_preflight.get("eligible")):
+                top_orphan = orphan_targets[0]
+                cycle_action = {
+                    "type": "blocked_preflight",
+                    "priority": "orphan",
+                    "symbol": top_orphan.get("symbol"),
+                    "reason": orphan_preflight.get("reason"),
+                    "preflight": orphan_preflight,
+                }
+            elif orphan_live_requested:
                 top_orphan = orphan_targets[0]
                 running = self._auto_exit_running_exec()
                 if running:
@@ -13605,14 +15726,17 @@ class DataService:
                             "orphan_qty": top_orphan.get("orphan_qty"),
                             "result": self._compact_derisk_result(result),
                         }
-            elif candidates:
-                top = candidates[0]
+            elif selected_candidate:
+                top = selected_candidate
+                candidate_preflight = dict(top.get("market_preflight") or {})
                 should_execute = (
                     bool(settings.get("enabled"))
                     and not bool(settings.get("shadow_mode"))
                     and str(top.get("stress_status") or "") in {"stress", "panic"}
                     and top.get("action_qty")
                     and top.get("candidate_score") is not None
+                    and bool(top.get("score_eligible"))
+                    and bool(candidate_preflight.get("eligible"))
                 )
                 if should_execute:
                     running = self._auto_exit_running_exec()
@@ -13665,7 +15789,7 @@ class DataService:
                                 "force_chunk_qty": False,
                                 "limit_offset_bps": 0.0,
                                 "limit_offset_ticks": 0,
-                                "use_orderbook_check": False,
+                                "use_orderbook_check": True,
                                 "fallback_to_market": (
                                     str(top.get("stress_status")) == "panic"
                                     and bool(settings.get("market_cleanup_only_in_emergency", True))
@@ -13756,14 +15880,16 @@ class DataService:
             status = str(run.get("status") or "")
             if status == "running":
                 continue
-            self._auto_exit_completed_run_cleanup.add(exec_id)
             if status != "completed":
+                self._auto_exit_completed_run_cleanup.add(exec_id)
                 continue
             symbol = normalize_symbol(str(run.get("payload_symbol") or ""))
             if not symbol:
+                self._auto_exit_completed_run_cleanup.add(exec_id)
                 continue
             result = run.get("result")
             if isinstance(result, Mapping) and result.get("errors"):
+                self._auto_exit_completed_run_cleanup.add(exec_id)
                 continue
             result_remaining_qty = (
                 _safe_float(result.get("remaining_qty"))
@@ -13795,9 +15921,31 @@ class DataService:
                         "reason": "run_rule_identity_missing",
                     },
                 )
+                self._auto_exit_completed_run_cleanup.add(exec_id)
                 continue
 
-            positions = self._accounts.snapshot().get("positions") or []
+            retry_after_ts = _safe_float(run.get("auto_exit_reconcile_retry_after_ts")) or 0.0
+            if retry_after_ts > time.time():
+                continue
+            refresh_accounts = getattr(self._accounts, "refresh_now_for_protective", None)
+            if not callable(refresh_accounts):
+                refresh_accounts = getattr(self._accounts, "refresh_now", None)
+            if callable(refresh_accounts):
+                try:
+                    await refresh_accounts(force_env=True)
+                    run.pop("auto_exit_reconcile_retry_after_ts", None)
+                except Exception as exc:  # pylint: disable=broad-except
+                    run["auto_exit_reconcile_retry_after_ts"] = time.time() + 30.0
+                    logger.warning(
+                        "auto-exit residual reconciliation refresh failed execution_id=%s symbol=%s: %s",
+                        exec_id,
+                        symbol,
+                        exc,
+                    )
+                    continue
+            self._auto_exit_completed_run_cleanup.add(exec_id)
+            accounts_snapshot = self._accounts.snapshot() or {}
+            positions = accounts_snapshot.get("positions") or []
             market_lookup, market_ts_lookup = self._positions_market_snapshot_lookup()
             _, grouped = self._positions_by_symbol(
                 positions,
@@ -13830,16 +15978,40 @@ class DataService:
                         trigger_mode = str(run.get("auto_exit_trigger_mode") or "spread")
                         target_field = "v1_target_qty" if trigger_mode == "v1" else "spread_target_qty"
                         remaining_field = "v1_remaining_qty" if trigger_mode == "v1" else "spread_remaining_qty"
-                        fixed_target_qty = _safe_float(stored.get(target_field)) or requested_qty
-                        completion_tolerance = max(
-                            1e-9,
-                            float(fixed_target_qty or 0.0) * 0.01,
+                        total_target_qty = _safe_float(run.get("auto_exit_total_target_qty"))
+                        fixed_target_qty = _safe_float(stored.get(target_field)) or total_target_qty or requested_qty
+                        previous_remaining_qty = (
+                            _safe_float(stored.get(remaining_field))
+                            or _safe_float(run.get("auto_exit_total_remaining_qty"))
+                            or fixed_target_qty
                         )
-                        one_shot_fulfilled = (
-                            result_remaining_qty is not None
-                            and float(result_remaining_qty) <= completion_tolerance
-                        )
+                        executed_qty = None
+                        if requested_qty is not None:
+                            executed_qty = max(
+                                0.0,
+                                float(requested_qty) - max(0.0, float(result_remaining_qty or 0.0)),
+                            )
+                        if total_target_qty is not None and trigger_mode == "spread":
+                            updated_remaining_qty = max(
+                                0.0,
+                                float(previous_remaining_qty or 0.0) - float(executed_qty or 0.0),
+                            )
+                            completion_tolerance = max(1e-9, float(fixed_target_qty or 0.0) * 0.01)
+                            one_shot_fulfilled = updated_remaining_qty <= completion_tolerance
+                        else:
+                            completion_tolerance = max(
+                                1e-9,
+                                float(fixed_target_qty or 0.0) * 0.01,
+                            )
+                            one_shot_fulfilled = (
+                                result_remaining_qty is not None
+                                and float(result_remaining_qty) <= completion_tolerance
+                            )
+                            updated_remaining_qty = 0.0 if one_shot_fulfilled else result_remaining_qty
                         event_payload["fixed_target_qty"] = fixed_target_qty
+                        event_payload["previous_remaining_qty"] = previous_remaining_qty
+                        event_payload["executed_qty"] = executed_qty
+                        event_payload["updated_remaining_qty"] = updated_remaining_qty
                         event_payload["completion_tolerance_qty"] = completion_tolerance
                         event_payload["dust_completed"] = bool(
                             one_shot_fulfilled
@@ -13847,8 +16019,9 @@ class DataService:
                             and float(result_remaining_qty) > 0
                         )
                         stored[target_field] = fixed_target_qty
-                        stored[remaining_field] = (
-                            0.0 if one_shot_fulfilled else result_remaining_qty
+                        stored[remaining_field] = float(updated_remaining_qty or 0.0)
+                        stored["continuation_trigger_mode"] = (
+                            None if one_shot_fulfilled else trigger_mode
                         )
                     if not (run_generation and current_generation != run_generation) and residual_legs:
                         current_signature = _auto_exit_position_signature(
@@ -13895,12 +16068,21 @@ class DataService:
                         self._auto_exit_store.save(self._auto_exit)
             self._auto_exit_event("rule_preserved_after_exit", event_payload)
 
+    async def _auto_agent_cycle(self) -> None:
+        now_ts = time.time()
+        if (
+            now_ts - float(self._derisk_last_worker_cycle_ts or 0.0)
+        ) >= max(2.0, float(self._derisk_poll_sec or 5.0)):
+            self._derisk_last_worker_cycle_ts = now_ts
+            await self._auto_derisk_cycle()
+        await self._auto_exit_cycle()
+        await self._auto_strategy_cycle()
+        await self._auto_arb_cycle()
+
     async def _auto_exit_scheduler(self) -> None:
         while True:
             try:
-                await self._auto_exit_cycle()
-                await self._auto_strategy_cycle()
-                await self._auto_arb_cycle()
+                await self._auto_agent_cycle()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pylint: disable=broad-except
@@ -13915,7 +16097,8 @@ class DataService:
             await self._cleanup_completed_auto_exit_spread_rules()
             async with self._auto_exit_lock:
                 config = json.loads(json.dumps(self._auto_exit))
-            positions = self._accounts.snapshot().get("positions") or []
+            accounts_snapshot = self._accounts.snapshot() or {}
+            positions = accounts_snapshot.get("positions") or []
             market_lookup, market_ts_lookup = self._positions_market_snapshot_lookup()
             _, grouped = self._positions_by_symbol(
                 positions,
@@ -13928,6 +16111,8 @@ class DataService:
             max_runtime_sec = int(defaults.get("max_runtime_sec", AUTO_EXIT_DEFAULTS["max_runtime_sec"]))
             cooldown_sec = int(defaults.get("cooldown_sec", AUTO_EXIT_DEFAULTS["cooldown_sec"]))
             require_live = bool(defaults.get("require_live", AUTO_EXIT_DEFAULTS["require_live"]))
+            default_position_mode = _auto_exit_position_mode(defaults, {})
+            default_spread_confirm_cycles = _auto_exit_spread_confirm_cycles(defaults, {})
             auto_clear_sec = int(defaults.get("auto_clear_no_position_sec", AUTO_EXIT_DEFAULTS["auto_clear_no_position_sec"]))
             restore_spread_on_missing = bool(
                 defaults.get(
@@ -13935,6 +16120,22 @@ class DataService:
                     AUTO_EXIT_DEFAULTS["restore_spread_on_missing"],
                 )
             )
+            clear_verified_missing = bool(
+                defaults.get(
+                    "clear_verified_missing",
+                    AUTO_EXIT_DEFAULTS["clear_verified_missing"],
+                )
+            )
+            verified_missing_confirmations = max(
+                2,
+                int(
+                    defaults.get(
+                        "verified_missing_confirmations",
+                        AUTO_EXIT_DEFAULTS["verified_missing_confirmations"],
+                    )
+                ),
+            )
+            position_evidence_stale_sec = max(120.0, float(self._account_interval) * 3.0)
             now_ts = time.time()
 
             live_spreads: dict[str, float] = {}
@@ -14026,6 +16227,7 @@ class DataService:
                 self._auto_exit_live_spreads = live_spreads
             rules_to_remove: set[str] = set()
             rules_to_update: dict[str, dict[str, Any]] = {}
+            protective_cleanup_targets: set[tuple[str, str]] = set()
             diagnostics_rows: list[dict[str, Any]] = []
             v1_diagnostics_rows: list[dict[str, Any]] = []
 
@@ -14097,6 +16299,9 @@ class DataService:
                         "reason": reason,
                         "signature_status": rule_state.get("signature_status"),
                         "bound_at": rule_state.get("bound_at"),
+                        "position_mode": _auto_exit_position_mode(rule_state, defaults),
+                        "spread_confirm_cycles": _auto_exit_spread_confirm_cycles(rule_state, defaults),
+                        "spread_confirm_samples": max(0, int(rule_state.get("spread_confirm_samples") or 0)),
                         "target_spread_pct": float(target_pct) if target_pct is not None else None,
                         "gross_spread_pct": float(trigger_spread) if trigger_spread is not None else None,
                         "overall_spread_pct": float(overall_spread) if overall_spread is not None else None,
@@ -14235,14 +16440,73 @@ class DataService:
                 selected_pair: Mapping[str, Any] | None = None,
                 pair_metrics: Mapping[str, Any] | None = None,
             ) -> bool:
+                evidence = self._position_scan_evidence(
+                    accounts_snapshot,
+                    self._auto_exit_rule_exchanges(rule_state, selected_pair),
+                    now_ts=now_ts,
+                    stale_after_sec=position_evidence_stale_sec,
+                )
+                payload["position_evidence"] = evidence
+                if not bool(evidence.get("trusted")):
+                    payload["position_trust"] = "untrusted"
+                    self._auto_exit_log_event(rule_key, "skip", payload, now_ts)
+                    diagnostic_reason = f"{reason}_untrusted"
+                    if spread_enabled:
+                        append_diagnostic(
+                            rule_key,
+                            rule_state,
+                            status="skip",
+                            reason=diagnostic_reason,
+                            selected_pair=selected_pair,
+                            pair_metrics=pair_metrics,
+                        )
+                    if v1_enabled:
+                        append_v1_diagnostic(
+                            rule_key,
+                            rule_state,
+                            status="skip",
+                            reason=diagnostic_reason,
+                            selected_pair=selected_pair,
+                            pair_metrics=pair_metrics,
+                            pending_exit_cycles=int(rule_state.get("v1_pending_exit_cycles") or 0),
+                        )
+                    return True
+
                 missing_since = float(rule_state.get("missing_since_ts") or 0.0)
                 persist_on_missing = bool(rule_state.get("persist_on_missing", True)) and restore_spread_on_missing
                 if missing_since <= 0:
                     missing_since = now_ts
-                    merge_rule_updates(rule_key, {"missing_since_ts": missing_since})
+                previous_evidence_id = str(rule_state.get("verified_missing_evidence_id") or "")
+                evidence_id = str(evidence.get("evidence_id") or "")
+                verified_count = max(0, int(rule_state.get("verified_missing_count") or 0))
+                if evidence_id and evidence_id != previous_evidence_id:
+                    verified_count += 1
+                merge_rule_updates(
+                    rule_key,
+                    {
+                        "missing_since_ts": missing_since,
+                        "verified_missing_count": verified_count,
+                        "verified_missing_evidence_id": evidence_id,
+                    },
+                )
                 elapsed = max(0.0, now_ts - missing_since)
-                if not persist_on_missing and auto_clear_sec and elapsed >= auto_clear_sec:
+                absence_confirmed = verified_count >= verified_missing_confirmations
+                payload["position_trust"] = "verified"
+                payload["verified_missing_count"] = verified_count
+                payload["verified_missing_confirmations"] = verified_missing_confirmations
+                should_auto_clear = (
+                    auto_clear_sec > 0
+                    and elapsed >= auto_clear_sec
+                    and absence_confirmed
+                    and (clear_verified_missing or not persist_on_missing)
+                )
+                if should_auto_clear:
                     rules_to_remove.add(rule_key)
+                    if reason == "no_position":
+                        for exchange in evidence.get("required_exchanges") or []:
+                            protective_cleanup_targets.add(
+                                (normalize_exchange_name(str(exchange)), normalize_symbol(payload.get("symbol")))
+                            )
                     self._auto_exit_event(
                         "auto_clear",
                         {
@@ -14251,11 +16515,18 @@ class DataService:
                             "short_exchange": payload.get("short_exchange"),
                             "reason": reason,
                             "elapsed_sec": round(elapsed, 1),
+                            "verified_missing_count": verified_count,
+                            "position_evidence": evidence,
                         },
                     )
                     return True
-                if not persist_on_missing and auto_clear_sec:
+                if auto_clear_sec:
                     payload["auto_clear_remaining_sec"] = round(max(0.0, auto_clear_sec - elapsed), 1)
+                if not absence_confirmed:
+                    payload["auto_clear_waiting_for_fresh_scans"] = max(
+                        0,
+                        verified_missing_confirmations - verified_count,
+                    )
                 if persist_on_missing:
                     payload["persist_on_missing"] = True
                 self._auto_exit_log_event(rule_key, "skip", payload, now_ts)
@@ -14281,8 +16552,19 @@ class DataService:
                 return True
 
             def clear_missing(rule_key: str, rule_state: Mapping[str, Any]) -> None:
-                if float(rule_state.get("missing_since_ts") or 0.0) > 0:
-                    merge_rule_updates(rule_key, {"missing_since_ts": 0.0})
+                if (
+                    float(rule_state.get("missing_since_ts") or 0.0) > 0
+                    or int(rule_state.get("verified_missing_count") or 0) > 0
+                    or str(rule_state.get("verified_missing_evidence_id") or "")
+                ):
+                    merge_rule_updates(
+                        rule_key,
+                        {
+                            "missing_since_ts": 0.0,
+                            "verified_missing_count": 0,
+                            "verified_missing_evidence_id": "",
+                        },
+                    )
 
             for key, rule in rules.items():
                 symbol = str(rule.get("symbol") or "").upper().strip()
@@ -14290,6 +16572,14 @@ class DataService:
                 long_exchange = normalize_exchange_name(str(rule.get("long_exchange") or ""))
                 short_exchange = normalize_exchange_name(str(rule.get("short_exchange") or ""))
                 rule_is_multileg = _is_auto_exit_multileg_rule(long_exchange, short_exchange)
+                position_mode = _auto_exit_position_mode(
+                    rule,
+                    {"position_mode": default_position_mode},
+                )
+                spread_confirm_cycles = _auto_exit_spread_confirm_cycles(
+                    rule,
+                    {"spread_confirm_cycles": default_spread_confirm_cycles},
+                )
                 target = _safe_float(rule.get("target_spread_pct"))
                 spread_rule_enabled = bool(rule.get("enabled", True)) and target is not None
                 v1_rule_enabled = bool(rule.get("v1_enabled", False))
@@ -14424,19 +16714,29 @@ class DataService:
                         selected_pair=selected,
                     )
                     continue
-                hedged_qty = float(selected.get("qty") or 0.0)
+                pair_route_qty = float(selected.get("qty") or 0.0)
+                basket_quantities = _auto_exit_balanced_qty_from_legs(legs)
+                hedged_qty = (
+                    float(basket_quantities.get("balanced_qty") or 0.0)
+                    if position_mode == AUTO_EXIT_POSITION_MODE_CURRENT_BALANCED or rule_is_multileg
+                    else pair_route_qty
+                )
                 exit_percent = _safe_float(rule.get("exit_percent")) or 100.0
                 if exit_percent <= 0 or exit_percent > 100:
                     exit_percent = 100.0
                 qty = hedged_qty * float(exit_percent) / 100.0
+                route_qty = min(pair_route_qty, qty)
                 spread_qty = min(
-                    hedged_qty,
+                    route_qty,
                     _safe_float(rule.get("spread_remaining_qty")) or qty,
                 )
                 v1_qty = min(
-                    hedged_qty,
+                    route_qty,
                     _safe_float(rule.get("v1_remaining_qty")) or qty,
                 )
+                continuation_mode = _auto_exit_pending_continuation_mode(rule)
+                spread_execution_enabled = continuation_mode in (None, "spread")
+                v1_execution_enabled = continuation_mode in (None, "v1")
                 if hedged_qty <= 0 or qty <= 0:
                     mark_missing(
                         key,
@@ -14467,7 +16767,84 @@ class DataService:
                     rule.get("position_signature"),
                     current_signature,
                 )
+                if (
+                    position_mode == AUTO_EXIT_POSITION_MODE_CURRENT_BALANCED
+                    and current_signature is not None
+                    and signature_reason in {
+                        "unbound_position_signature",
+                        "position_signature_qty_changed",
+                        "position_signature_entry_changed",
+                    }
+                ):
+                    signature_ok = True
+                    merge_rule_updates(
+                        key,
+                        {
+                            "position_signature": current_signature,
+                            "bound_at": datetime.now(timezone.utc).isoformat() if current_signature else rule.get("bound_at"),
+                            "signature_status": (
+                                "current_balanced"
+                                if signature_reason == "unbound_position_signature"
+                                else f"current_balanced_{signature_reason}"
+                            ),
+                            "position_mode": AUTO_EXIT_POSITION_MODE_CURRENT_BALANCED,
+                        },
+                    )
+                    signature_reason = "current_balanced"
+                if not signature_ok and signature_reason == "position_signature_qty_changed":
+                    rebind_mode = _auto_exit_partial_progress_rebind_mode(
+                        rule,
+                        current_signature,
+                        hedged_qty,
+                    )
+                    if rebind_mode:
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        rule = dict(rule)
+                        rule["position_signature"] = current_signature
+                        rule["bound_at"] = now_iso
+                        rule["signature_status"] = "rebound_after_partial_progress"
+                        merge_rule_updates(
+                            key,
+                            {
+                                "position_signature": current_signature,
+                                "bound_at": now_iso,
+                                "signature_status": "rebound_after_partial_progress",
+                                "missing_since_ts": 0.0,
+                            },
+                        )
+                        self._auto_exit_event(
+                            "partial_progress_rebound",
+                            {
+                                "symbol": symbol,
+                                "rule_key": key,
+                                "trigger_mode": rebind_mode,
+                                "hedged_qty": hedged_qty,
+                                "remaining_qty": _safe_float(rule.get(f"{rebind_mode}_remaining_qty")),
+                            },
+                        )
+                        signature_ok = True
+                        signature_reason = "rebound_after_partial_progress"
                 if not signature_ok:
+                    if signature_reason == "position_signature_legs_changed":
+                        merge_rule_updates(key, {"signature_status": signature_reason})
+                        mark_missing(
+                            key,
+                            {**dict(rule), "signature_status": signature_reason},
+                            signature_reason,
+                            {
+                                "symbol": symbol,
+                                "long_exchange": selected_long_exchange,
+                                "short_exchange": selected_short_exchange,
+                                "rule_long_exchange": long_exchange,
+                                "rule_short_exchange": short_exchange,
+                                "reason": signature_reason,
+                                "trigger_mode": "signature_guard",
+                            },
+                            spread_enabled=spread_rule_enabled and not spread_on_cooldown,
+                            v1_enabled=v1_monitor_enabled and (not v1_rule_enabled or not v1_on_cooldown),
+                            selected_pair=selected,
+                        )
+                        continue
                     merge_rule_updates(
                         key,
                         {
@@ -14507,13 +16884,29 @@ class DataService:
                             pending_exit_cycles=int(rule.get("v1_pending_exit_cycles") or 0),
                         )
                     continue
-                if str(rule.get("signature_status") or "") != "position_signature_match":
-                    merge_rule_updates(key, {"signature_status": "position_signature_match"})
+                if continuation_mode:
+                    remaining_field = f"{continuation_mode}_remaining_qty"
+                    stored_remaining_qty = _safe_float(rule.get(remaining_field))
+                    continuation_updates: dict[str, Any] = {
+                        "continuation_trigger_mode": continuation_mode,
+                    }
+                    if stored_remaining_qty is not None and stored_remaining_qty > hedged_qty:
+                        continuation_updates[remaining_field] = float(hedged_qty)
+                        rule = dict(rule)
+                        rule[remaining_field] = float(hedged_qty)
+                        if continuation_mode == "spread":
+                            spread_qty = min(float(route_qty), float(hedged_qty))
+                        else:
+                            v1_qty = min(float(route_qty), float(hedged_qty))
+                    merge_rule_updates(key, continuation_updates)
+                if position_mode == AUTO_EXIT_POSITION_MODE_STRICT_SIGNATURE:
+                    if str(rule.get("signature_status") or "") != "position_signature_match":
+                        merge_rule_updates(key, {"signature_status": "position_signature_match"})
                 pair_exit_metrics = await resolve_pair_exit_metrics(
                     symbol_key,
                     selected_long_exchange,
                     selected_short_exchange,
-                    qty,
+                    max(spread_qty, v1_qty, min(route_qty, qty)),
                 )
                 selected_pair_spread = _safe_float((pair_exit_metrics or {}).get("spread_pct"))
                 selected_pair_net_spread = _safe_float((pair_exit_metrics or {}).get("net_spread_pct"))
@@ -14524,10 +16917,11 @@ class DataService:
                 fee_bps = _safe_float((pair_exit_metrics or {}).get("fee_bps")) or 0.0
                 edge_buffer_pct = _safe_float((pair_exit_metrics or {}).get("edge_buffer_pct")) or 0.0
                 overall_spread = None
-                if rule_is_multileg:
+                if rule_is_multileg or position_mode == AUTO_EXIT_POSITION_MODE_CURRENT_BALANCED:
                     overall_spread = await resolve_overall_spread(symbol_key, legs)
                 spread_trigger = _auto_exit_spread_trigger_status(
                     is_multileg=rule_is_multileg,
+                    use_overall_trigger=position_mode == AUTO_EXIT_POSITION_MODE_CURRENT_BALANCED,
                     target_pct=float(target) if target is not None else 0.0,
                     overall_spread_pct=overall_spread,
                     pair_spread_pct=selected_pair_spread,
@@ -14577,7 +16971,7 @@ class DataService:
                         window=window,
                     )
                 standard_triggered = False
-                if spread_rule_enabled and not spread_on_cooldown:
+                if spread_rule_enabled and not spread_on_cooldown and spread_execution_enabled:
                     if not bool(spread_trigger.get("live_ready")) and require_live:
                         self._auto_exit_log_event(
                             key,
@@ -14628,6 +17022,8 @@ class DataService:
                             required_net_spread_pct=required_net_spread_pct,
                         )
                     elif not bool(spread_trigger.get("target_reached")):
+                        if int(rule.get("spread_confirm_samples") or 0) > 0:
+                            merge_rule_updates(key, {"spread_confirm_samples": 0})
                         self._auto_exit_log_event(
                             key,
                             "wait",
@@ -14668,11 +17064,58 @@ class DataService:
                             required_net_spread_pct=required_net_spread_pct,
                         )
                     else:
+                        confirm_samples = int(rule.get("spread_confirm_samples") or 0) + 1
+                        if confirm_samples < spread_confirm_cycles:
+                            merge_rule_updates(key, {"spread_confirm_samples": confirm_samples})
+                            self._auto_exit_log_event(
+                                key,
+                                "wait",
+                                {
+                                    "symbol": symbol,
+                                    "long_exchange": selected_long_exchange,
+                                    "short_exchange": selected_short_exchange,
+                                    "rule_long_exchange": long_exchange,
+                                    "rule_short_exchange": short_exchange,
+                                    "selection_mode": selected_mode,
+                                    "spread_scope": spread_scope,
+                                    "spread_pct": float(trigger_spread),
+                                    "overall_spread_pct": float(overall_spread) if overall_spread is not None else None,
+                                    "pair_spread_pct": float(selected_pair_spread) if selected_pair_spread is not None else None,
+                                    "net_spread_pct": selected_pair_net_spread,
+                                    "required_net_spread_pct": required_net_spread_pct,
+                                    "confirm_samples": confirm_samples,
+                                    "confirm_cycles": spread_confirm_cycles,
+                                    "reason": "target_confirmation",
+                                    "target_pct": float(target),
+                                    "trigger_mode": "spread",
+                                },
+                                now_ts,
+                            )
+                            append_diagnostic(
+                                key,
+                                {
+                                    **dict(rule),
+                                    "spread_confirm_samples": confirm_samples,
+                                    "spread_confirm_cycles": spread_confirm_cycles,
+                                },
+                                status="wait",
+                                reason="target_confirmation",
+                                selected_pair=selected,
+                                pair_metrics=pair_exit_metrics,
+                                overall_spread=overall_spread,
+                                trigger_spread=trigger_spread,
+                                target_pct=float(target),
+                                required_net_spread_pct=required_net_spread_pct,
+                            )
+                            continue
+                        merge_rule_updates(key, {"spread_confirm_samples": 0})
                         payload_spread_min = float(target) + (fee_bps + edge_buffer_bps) / 100.0
-                        if rule_is_multileg and selected_pair_spread is not None:
-                            payload_spread_min = max(
-                                payload_spread_min,
-                                float(selected_pair_spread) - AUTO_EXIT_MULTILEG_PAIR_BUFFER_PCT,
+                        if (
+                            (rule_is_multileg or position_mode == AUTO_EXIT_POSITION_MODE_CURRENT_BALANCED)
+                            and selected_pair_spread is not None
+                        ):
+                            payload_spread_min = (
+                                float(selected_pair_spread) - AUTO_EXIT_MULTILEG_PAIR_BUFFER_PCT
                             )
                         if not self._auto_exit_has_running():
                             self._auto_exit_event(
@@ -14689,6 +17132,8 @@ class DataService:
                                     "selected_min_side": selected.get("selected_min_side"),
                                     "selected_min_exchange": selected.get("selected_min_exchange"),
                                     "selected_min_qty": selected.get("selected_min_qty"),
+                                    "position_mode": position_mode,
+                                    "confirm_cycles": spread_confirm_cycles,
                                     "spread_scope": spread_scope,
                                     "spread_pct": float(trigger_spread),
                                     "overall_spread_pct": float(overall_spread) if overall_spread is not None else None,
@@ -14741,10 +17186,10 @@ class DataService:
                                 "hedge_order_type": "limit",
                                 "hedge_offset_bps": 0.0,
                                 "hedge_offset_ticks": 0,
-                                "hedge_limit_mode": "passive",
+                                "hedge_limit_mode": "aggressive",
                                 "hedge_favorable_bps": 2.0,
                                 "hedge_adverse_bps": 8.0,
-                                "hedge_reprice_min_sec": 6.0,
+                                "hedge_reprice_min_sec": 3.0,
                                 "max_limit_deviation_bps": 30.0,
                                 "async_run": True,
                                 "dry_run": False,
@@ -14758,6 +17203,11 @@ class DataService:
                                 "auto_exit_exit_percent": float(exit_percent),
                                 "auto_exit_hedged_qty": float(hedged_qty),
                                 "auto_exit_requested_qty": float(spread_qty),
+                                "auto_exit_total_target_qty": float(qty),
+                                "auto_exit_total_remaining_qty": float(_safe_float(rule.get("spread_remaining_qty")) or qty),
+                                "auto_exit_position_mode": position_mode,
+                                "auto_exit_aggregate_spread_pct": float(trigger_spread),
+                                "auto_exit_pair_spread_pct": float(selected_pair_spread) if selected_pair_spread is not None else None,
                                 "auto_exit_dynamic_chunk": True,
                                 "auto_exit_market_cleanup_notional_max": _safe_float(
                                     pair_policy.get("market_cleanup_notional_cap_usd")
@@ -14796,7 +17246,9 @@ class DataService:
                                 if stored is not None:
                                     if _safe_float(stored.get("spread_target_qty")) is None:
                                         stored["spread_target_qty"] = float(qty)
-                                    stored["spread_remaining_qty"] = float(spread_qty)
+                                    if _safe_float(stored.get("spread_remaining_qty")) is None:
+                                        stored["spread_remaining_qty"] = float(qty)
+                                    stored["continuation_trigger_mode"] = "spread"
                                     stored["last_triggered_ts"] = now_ts
                                     stored["updated_at"] = datetime.now(timezone.utc).isoformat()
                                     self._auto_exit_store.save(self._auto_exit)
@@ -14826,7 +17278,35 @@ class DataService:
                     )
                 if standard_triggered:
                     break
-                if v1_rule_enabled and not v1_on_cooldown and v1_decision is not None:
+                if (
+                    v1_rule_enabled
+                    and not v1_execution_enabled
+                    and not v1_on_cooldown
+                    and v1_decision is not None
+                ):
+                    if pending_cycles > 0:
+                        merge_rule_updates(key, {"v1_pending_exit_cycles": 0})
+                    append_v1_diagnostic(
+                        key,
+                        rule,
+                        status="wait",
+                        reason=f"{continuation_mode}_continuation_pending",
+                        selected_pair=selected,
+                        pair_metrics=pair_exit_metrics,
+                        decision=v1_decision,
+                        window=window,
+                        context=position_context,
+                        close_now_bps=close_now_bps,
+                        funding_to_next_bps=funding_to_next_bps,
+                        reversion_credit_bps=reversion_credit_bps,
+                        pending_exit_cycles=0,
+                    )
+                if (
+                    v1_rule_enabled
+                    and v1_execution_enabled
+                    and not v1_on_cooldown
+                    and v1_decision is not None
+                ):
                     decision_name = str(v1_decision.get("decision") or "")
                     if decision_name == "skip":
                         if pending_cycles > 0:
@@ -14964,15 +17444,15 @@ class DataService:
                         "force_chunk_qty": False,
                         "limit_offset_bps": 0.0,
                         "limit_offset_ticks": 0,
-                        "use_orderbook_check": False,
+                        "use_orderbook_check": True,
                         "fallback_to_market": False,
                         "hedge_order_type": "limit",
                         "hedge_offset_bps": 0.0,
                         "hedge_offset_ticks": 0,
-                        "hedge_limit_mode": "passive",
+                        "hedge_limit_mode": "aggressive",
                         "hedge_favorable_bps": 2.0,
                         "hedge_adverse_bps": 8.0,
-                        "hedge_reprice_min_sec": 6.0,
+                        "hedge_reprice_min_sec": 3.0,
                         "max_limit_deviation_bps": 30.0,
                         "async_run": True,
                         "dry_run": False,
@@ -15016,6 +17496,7 @@ class DataService:
                             if _safe_float(stored.get("v1_target_qty")) is None:
                                 stored["v1_target_qty"] = float(qty)
                             stored["v1_remaining_qty"] = float(v1_qty)
+                            stored["continuation_trigger_mode"] = "v1"
                             stored["last_v1_triggered_ts"] = now_ts
                             stored["updated_at"] = datetime.now(timezone.utc).isoformat()
                             stored["v1_pending_exit_cycles"] = 0
@@ -15060,6 +17541,11 @@ class DataService:
                             changed = True
                     if changed:
                         self._auto_exit_store.save(self._auto_exit)
+            if protective_cleanup_targets:
+                await self._cleanup_verified_orphan_protective_targets(
+                    protective_cleanup_targets,
+                    reason="auto_exit_verified_absence",
+                )
         finally:
             self._auto_exit_inflight = False
 
@@ -15111,7 +17597,12 @@ class DataService:
     ) -> None:
         log_key = f"{key}:{event}"
         last_ts = self._auto_exit_last_log_ts.get(log_key, 0.0)
-        if (now_ts - last_ts) < self._auto_exit_log_cooldown_sec:
+        cooldown = (
+            AUTO_EXIT_SKIP_LOG_COOLDOWN_SEC
+            if event in {"skip", "skip_running"}
+            else self._auto_exit_log_cooldown_sec
+        )
+        if (now_ts - last_ts) < cooldown:
             return
         self._auto_exit_last_log_ts[log_key] = now_ts
         self._auto_exit_event(event, payload)
@@ -15177,9 +17668,6 @@ class DataService:
         protective = getattr(settings, "protective", {}) or {}
         auto_rebalance = bool(protective.get("auto_rebalance_enabled", False))
         current = self._rebalance_positions_snapshot(positions)
-        if not auto_rebalance:
-            self._rebalance_prev_positions = current
-            return
         if not self._rebalance_prev_positions:
             self._rebalance_prev_positions = current
             return
@@ -15191,6 +17679,7 @@ class DataService:
         max_slippage_bps = _safe_float(protective.get("rebalance_max_slippage_bps")) or 0.0
         now_ts = time.time()
         reductions: dict[tuple[str, str], float] = {}
+        reduction_sources: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for key, prev_qty in self._rebalance_prev_positions.items():
             if prev_qty <= 0:
                 continue
@@ -15203,6 +17692,45 @@ class DataService:
             symbol, _exchange, side = key
             reduce_side = "long" if side == "short" else "short"
             reductions[(symbol, reduce_side)] = reductions.get((symbol, reduce_side), 0.0) + drop
+            reduction_sources.setdefault((symbol, reduce_side), []).append(
+                {
+                    "exchange": _exchange,
+                    "side": side,
+                    "previous_qty": prev_qty,
+                    "current_qty": current_qty,
+                    "drop_qty": drop,
+                    "drop_pct": (drop / prev_qty) * 100.0,
+                }
+            )
+        if not auto_rebalance:
+            for (symbol, reduce_side), drop_qty in reductions.items():
+                opposite_legs = [
+                    {
+                        "exchange": exchange,
+                        "side": side,
+                        "qty": qty,
+                    }
+                    for (leg_symbol, exchange, side), qty in current.items()
+                    if leg_symbol == symbol and side == reduce_side
+                ]
+                available_qty = sum(float(item["qty"]) for item in opposite_legs)
+                self._protective_shadow_event(
+                    "rebalance_candidate",
+                    {
+                        "symbol": symbol,
+                        "reduce_side": reduce_side,
+                        "drop_qty": drop_qty,
+                        "planned_qty": min(drop_qty, available_qty),
+                        "available_opposite_qty": available_qty,
+                        "sources": reduction_sources.get((symbol, reduce_side), []),
+                        "opposite_legs": opposite_legs,
+                        "delta_threshold_pct": delta_pct * 100.0,
+                        "live_enabled": False,
+                    },
+                    identity=f"{symbol}|{reduce_side}",
+                )
+            self._rebalance_prev_positions = current
+            return
         actions: list[dict[str, Any]] = []
         for (symbol, reduce_side), drop_qty in reductions.items():
             cooldown_key = (symbol, reduce_side)
@@ -15348,6 +17876,82 @@ class DataService:
             emergency_retry=True,
         )
 
+    async def _cleanup_verified_orphan_protective_targets(
+        self,
+        targets: Iterable[tuple[str, str]],
+        *,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        """Cancel protective orders only after a fresh successful empty position scan."""
+        protective = getattr(self._settings_manager.current, "protective", {}) or {}
+        if not bool(protective.get("orphan_cleanup_enabled", True)):
+            return []
+        normalized_targets = sorted(
+            {
+                (normalize_exchange_name(str(exchange)), normalize_symbol(symbol))
+                for exchange, symbol in targets
+                if normalize_exchange_name(str(exchange)) and normalize_symbol(symbol)
+            }
+        )
+        if not normalized_targets:
+            return []
+        await self._accounts.refresh_now_for_protective(force_env=True)
+        snapshot = self._accounts.snapshot() or {}
+        positions = list(snapshot.get("positions") or [])
+        now_ts = time.time()
+        actions: list[dict[str, Any]] = []
+        for exchange, symbol in normalized_targets:
+            evidence = self._position_scan_evidence(
+                snapshot,
+                {exchange},
+                now_ts=now_ts,
+                stale_after_sec=90.0,
+            )
+            has_position = any(
+                normalize_exchange_name(str(position.get("exchange") or "")) == exchange
+                and _strip_settle(
+                    normalize_symbol(
+                        position.get("symbol_normalized")
+                        or position.get("symbol")
+                        or position.get("exchange_symbol")
+                    )
+                )
+                == _strip_settle(symbol)
+                for position in positions
+            )
+            if has_position or not bool(evidence.get("trusted")):
+                actions.append(
+                    {
+                        "exchange": exchange,
+                        "symbol": symbol,
+                        "status": "cleanup_skipped_position_or_untrusted",
+                        "has_position": has_position,
+                        "position_evidence": evidence,
+                    }
+                )
+                continue
+            cleanup = await self._protective_manager.cleanup_orphaned_protective_orders(
+                exchange,
+                symbol,
+                force_fetch_existing=True,
+            )
+            actions.extend(cleanup)
+        logger.info(
+            "protective orphan cleanup (%s): targets=%s actions=%s",
+            reason,
+            normalized_targets,
+            [
+                {
+                    "exchange": item.get("exchange"),
+                    "symbol": item.get("symbol"),
+                    "status": item.get("status"),
+                    "cancel_order_ids": item.get("cancel_order_ids"),
+                }
+                for item in actions
+            ],
+        )
+        return actions
+
     async def _maybe_sync_protective_orders(
         self,
         *,
@@ -15380,6 +17984,16 @@ class DataService:
                 filtered.append(pos)
             positions = filtered
             if not positions:
+                if target_exchanges and target_symbols and (auto_protect or auto_take):
+                    await self._cleanup_verified_orphan_protective_targets(
+                        {
+                            (exchange, symbol)
+                            for exchange in target_exchanges
+                            for symbol in target_symbols
+                        },
+                        reason=reason,
+                    )
+                    return
                 logger.info(
                     "protective sync skipped (%s): no matching positions for exchanges=%s symbols=%s",
                     reason,

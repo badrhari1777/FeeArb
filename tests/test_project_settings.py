@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from execution.storage import JsonStateStore, JsonlEventStore
 from project_settings import SettingsManager
 from webapp.services import (
     DataService,
+    _auto_exit_pending_continuation_mode,
+    _auto_exit_partial_progress_rebind_mode,
     _auto_exit_position_signature,
     _position_pair_quantities,
     _protective_issue_kind,
@@ -35,7 +38,24 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
             patch("webapp.services.HEDGE_CLUSTER_STATE_PATH", state_dir / "hedge_clusters.json"),
             patch("webapp.services.DERISK_HISTORY_PATH", log_dir / "derisk_history.jsonl"),
             patch("webapp.services.DERISK_OUTCOME_STATE_PATH", state_dir / "derisk_outcome_state.json"),
+            patch(
+                "webapp.services.PROTECTIVE_SHADOW_HISTORY_PATH",
+                log_dir / "protective_shadow_history.jsonl",
+            ),
             patch("execution.wallet.WalletService.DEFAULT_STATE_PATH", state_dir / "wallet_state.json"),
+            patch(
+                "webapp.services.DataService._derisk_market_preflight",
+                new_callable=AsyncMock,
+                return_value={
+                    "eligible": True,
+                    "reason": "ok",
+                    "errors": [],
+                    "min_qty_required": 0.001,
+                    "amount_step": 0.001,
+                    "min_notional": 1.0,
+                    "checked_at": "2026-06-14T00:00:00+00:00",
+                },
+            ),
         ]
         for patcher in self._service_path_patchers:
             patcher.start()
@@ -572,7 +592,29 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(float(captured["qty"]), 25000.0)
         self.assertAlmostEqual(result["position_action"]["hedged_qty"], 100000.0)
         self.assertAlmostEqual(result["position_action"]["action_qty"], 25000.0)
+        self.assertEqual(captured["max_slippage_bps"], 8.0)
+        self.assertTrue(captured["allow_liquidity_chunking"])
         self.assertEqual(result["position_action"]["quantity_basis"], "min_long_short_coin_qty")
+
+        async def _manual_enter(payload):
+            captured.clear()
+            captured.update(payload)
+            return {"dry_run": True, "errors": []}
+
+        service.manual_enter = _manual_enter  # type: ignore[assignment]
+        await service.position_action(
+            {
+                "symbol": "LABUSDT",
+                "long_exchange": "binance",
+                "short_exchange": "kucoin",
+                "action": "add",
+                "percent": 25,
+                "dry_run": True,
+                "async_run": False,
+            }
+        )
+        self.assertEqual(captured["max_slippage_bps"], 12.0)
+        self.assertTrue(captured["allow_liquidity_chunking"])
 
     async def test_mobile_manual_spread_uses_ws_orderbook(self) -> None:
         service = DataService(settings_manager=self.manager)
@@ -603,6 +645,50 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(payload["sell_price"], 103.0)
         self.assertAlmostEqual(payload["spread_pct"], (101.0 - 103.0) / 101.0 * 100.0)
         self.assertEqual(payload["quotes"]["binance"]["source"], "websocket")
+
+    async def test_manual_async_runtime_end_remaining_qty_is_error_status(self) -> None:
+        service = DataService(settings_manager=self.manager)
+
+        async def _manual_enter(payload, **_kwargs):
+            return {
+                "dry_run": False,
+                "action": "enter",
+                "symbol": payload["symbol"],
+                "qty": 100.0,
+                "errors": [],
+                "warnings": ["Remaining qty 100 not entered (smart-enter runtime ended)."],
+                "remaining_qty": 100.0,
+                "actions": [],
+            }
+
+        service._manual.enter = _manual_enter  # type: ignore[method-assign]
+        started = await service.manual_enter(
+            {
+                "symbol": "ESPORTS",
+                "long_exchange": "binance",
+                "short_exchange": "kucoin",
+                "qty": 100.0,
+                "mode": "smart-enter",
+                "async_run": True,
+                "dry_run": False,
+            }
+        )
+
+        exec_id = str(started["execution_id"])
+        status = {}
+        for _ in range(20):
+            status = await service.manual_exec_status(exec_id)
+            if status.get("status") != "running":
+                break
+            await asyncio.sleep(0.01)
+
+        self.assertEqual(status.get("status"), "completed_with_errors")
+        summary = next(
+            entry
+            for entry in (status.get("logs") or [])
+            if entry.get("event") == "summary"
+        )
+        self.assertEqual(summary["data"]["terminal_reason"], "runtime_ended_incomplete")
 
     async def test_mobile_manual_spread_roll_short_maps_buy_from_sell_to(self) -> None:
         service = DataService(settings_manager=self.manager)
@@ -722,10 +808,26 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_auto_exit_cycle_clears_missing_rule_when_restore_disabled(self) -> None:
         service = DataService(settings_manager=self.manager)
         service._auto_exit_store = JsonStateStore(Path(self.tmp_dir.name) / "auto_exit.json")  # type: ignore[attr-defined]
+        service._cleanup_verified_orphan_protective_targets = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        checked_at = datetime.now(timezone.utc).isoformat()
         service._accounts = type(  # type: ignore[attr-defined]
             "X",
             (),
-            {"snapshot": lambda self=None: {"positions": []}},
+            {
+                "snapshot": lambda self=None: {
+                    "positions": [],
+                    "status": [
+                        {
+                            "exchange": exchange,
+                            "status": "ok",
+                            "positions_fetch_ok": True,
+                            "positions_count": 0,
+                            "checked_at": checked_at,
+                        }
+                        for exchange in ("binance", "okx")
+                    ],
+                }
+            },
         )()
         service._positions_by_symbol = (  # type: ignore[attr-defined]
             lambda positions, return_grouped=True, market_lookup=None, market_ts_lookup=None: ([], {})
@@ -746,6 +848,8 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
                     "persist_on_missing": True,
                     "target_spread_pct": -0.5,
                     "missing_since_ts": missing_since,
+                    "verified_missing_count": 1,
+                    "verified_missing_evidence_id": "older-scan",
                 }
             },
         }
@@ -754,6 +858,82 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
 
         rules = (service._auto_exit.get("rules") or {})  # type: ignore[attr-defined]
         self.assertNotIn("BTCUSDT|binance|okx", rules)
+
+    async def test_auto_exit_cycle_clears_persistent_rule_after_verified_absence(self) -> None:
+        service = DataService(settings_manager=self.manager)
+        service._auto_exit_store = JsonStateStore(Path(self.tmp_dir.name) / "auto_exit_verified.json")  # type: ignore[attr-defined]
+        cleanup = AsyncMock(return_value=[])
+        service._cleanup_verified_orphan_protective_targets = cleanup  # type: ignore[method-assign]
+        checked_at = datetime.now(timezone.utc).isoformat()
+        service._accounts = type(  # type: ignore[attr-defined]
+            "X",
+            (),
+            {
+                "snapshot": lambda self=None: {
+                    "positions": [],
+                    "status": [
+                        {
+                            "exchange": exchange,
+                            "status": "ok",
+                            "positions_fetch_ok": True,
+                            "positions_count": 0,
+                            "checked_at": checked_at,
+                        }
+                        for exchange in ("binance", "okx")
+                    ],
+                }
+            },
+        )()
+        service._positions_by_symbol = (  # type: ignore[attr-defined]
+            lambda positions, return_grouped=True, market_lookup=None, market_ts_lookup=None: ([], {})
+        )
+        service._auto_exit = {  # type: ignore[attr-defined]
+            "defaults": {
+                "auto_clear_no_position_sec": 60,
+                "restore_spread_on_missing": True,
+                "clear_verified_missing": True,
+                "verified_missing_confirmations": 2,
+            },
+            "rules": {
+                "BTCUSDT|binance|okx": {
+                    "symbol": "BTCUSDT",
+                    "long_exchange": "binance",
+                    "short_exchange": "okx",
+                    "enabled": True,
+                    "v1_enabled": False,
+                    "persist_on_missing": True,
+                    "target_spread_pct": -0.5,
+                    "missing_since_ts": datetime.now(timezone.utc).timestamp() - 600.0,
+                    "verified_missing_count": 1,
+                    "verified_missing_evidence_id": "older-scan",
+                }
+            },
+        }
+
+        await service._auto_exit_cycle()
+
+        rules = (service._auto_exit.get("rules") or {})  # type: ignore[attr-defined]
+        self.assertNotIn("BTCUSDT|binance|okx", rules)
+        cleanup.assert_awaited_once()
+
+    def test_position_scan_evidence_rejects_failed_position_fetch(self) -> None:
+        checked_at = datetime.now(timezone.utc).isoformat()
+        evidence = DataService._position_scan_evidence(
+            {
+                "status": [
+                    {
+                        "exchange": "binance",
+                        "status": "error",
+                        "positions_fetch_ok": False,
+                        "positions_error": "timeout",
+                        "checked_at": checked_at,
+                    }
+                ]
+            },
+            {"binance"},
+        )
+
+        self.assertFalse(evidence["trusted"])
 
     async def test_clear_auto_exit_spread_cache_preserves_v1_only_rule(self) -> None:
         service = DataService(settings_manager=self.manager)
@@ -1081,6 +1261,208 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rule.get("v1_enabled"))
         self.assertEqual(rule.get("signature_status"), "rebound_after_partial_auto_exit")
 
+    async def test_partial_auto_exit_refreshes_accounts_before_residual_rebind(self) -> None:
+        service = DataService(settings_manager=self.manager)
+        service._auto_exit_store = JsonStateStore(Path(self.tmp_dir.name) / "auto_exit.json")  # type: ignore[attr-defined]
+        stale_legs = [
+            {
+                "exchange": "binance",
+                "side": "long",
+                "quantity": 25000.0,
+                "entry_price": 0.054352924,
+                "mark_price": 0.0426,
+            },
+            {
+                "exchange": "kucoin",
+                "side": "short",
+                "quantity": -25000.0,
+                "entry_price": 0.0555,
+                "mark_price": 0.04308,
+            },
+        ]
+        fresh_legs = [
+            {
+                "exchange": "binance",
+                "side": "long",
+                "quantity": 19169.0,
+                "entry_price": 0.054352924,
+                "mark_price": 0.0426,
+            },
+            {
+                "exchange": "kucoin",
+                "side": "short",
+                "quantity": -19160.0,
+                "entry_price": 0.0555,
+                "mark_price": 0.04308,
+            },
+        ]
+
+        class Accounts:
+            def __init__(self) -> None:
+                self.refreshed = False
+
+            async def refresh_now_for_protective(self, *, force_env: bool = False) -> None:
+                self.refreshed = force_env
+
+            def snapshot(self) -> dict:
+                return {"positions": fresh_legs if self.refreshed else stale_legs}
+
+        accounts = Accounts()
+        service._accounts = accounts  # type: ignore[attr-defined]
+        service._positions_by_symbol = (  # type: ignore[attr-defined]
+            lambda positions, return_grouped=True, market_lookup=None, market_ts_lookup=None: (
+                [],
+                {"SIRENUSDT": positions},
+            )
+        )
+        service._auto_exit = {  # type: ignore[attr-defined]
+            "defaults": {},
+            "rules": {
+                "SIRENUSDT|binance|kucoin": {
+                    "symbol": "SIRENUSDT",
+                    "long_exchange": "binance",
+                    "short_exchange": "kucoin",
+                    "enabled": True,
+                    "v1_enabled": True,
+                    "target_spread_pct": -1.3,
+                    "exit_once": True,
+                    "rule_generation": 5,
+                },
+            },
+        }
+        service._manual_runs = {  # type: ignore[attr-defined]
+            "siren-partial-exit": {
+                "action": "exit",
+                "status": "completed",
+                "auto_exit_agent": True,
+                "payload_symbol": "SIRENUSDT",
+                "auto_exit_rule_key": "SIRENUSDT|binance|kucoin",
+                "auto_exit_rule_generation": 5,
+                "auto_exit_trigger_mode": "spread",
+                "auto_exit_exit_percent": 100.0,
+                "auto_exit_hedged_qty": 25000.0,
+                "auto_exit_requested_qty": 25000.0,
+                "result": {"remaining_qty": 19160.0},
+            }
+        }
+
+        await service._cleanup_completed_auto_exit_spread_rules()
+
+        rule = (service._auto_exit.get("rules") or {}).get("SIRENUSDT|binance|kucoin") or {}  # type: ignore[attr-defined]
+        signature = rule.get("position_signature") or {}
+        quantities = sorted(float(item.get("qty") or 0.0) for item in signature.get("legs") or [])
+        self.assertTrue(accounts.refreshed)
+        self.assertEqual(quantities, [19160.0, 19169.0])
+        self.assertEqual(rule.get("spread_remaining_qty"), 19160.0)
+        self.assertIn("siren-partial-exit", service._auto_exit_completed_run_cleanup)  # type: ignore[attr-defined]
+
+    async def test_partial_auto_exit_retries_reconciliation_after_refresh_failure(self) -> None:
+        service = DataService(settings_manager=self.manager)
+        service._accounts.refresh_now_for_protective = AsyncMock(side_effect=RuntimeError("offline"))  # type: ignore[attr-defined]
+        service._manual_runs = {  # type: ignore[attr-defined]
+            "partial-exit": {
+                "action": "exit",
+                "status": "completed",
+                "auto_exit_agent": True,
+                "payload_symbol": "SIRENUSDT",
+                "auto_exit_rule_key": "SIRENUSDT|binance|kucoin",
+                "auto_exit_rule_generation": 1,
+                "result": {"remaining_qty": 10.0},
+            }
+        }
+
+        await service._cleanup_completed_auto_exit_spread_rules()
+
+        self.assertNotIn("partial-exit", service._auto_exit_completed_run_cleanup)  # type: ignore[attr-defined]
+        self.assertGreater(
+            float(service._manual_runs["partial-exit"].get("auto_exit_reconcile_retry_after_ts") or 0.0),  # type: ignore[attr-defined]
+            0.0,
+        )
+
+    def test_partial_progress_signature_can_rebind_only_expected_residual(self) -> None:
+        old_legs = [
+            {
+                "exchange": "binance",
+                "side": "long",
+                "quantity": 25000.0,
+                "entry_price": 0.054352924,
+            },
+            {
+                "exchange": "kucoin",
+                "side": "short",
+                "quantity": -25000.0,
+                "entry_price": 0.0555,
+            },
+        ]
+        current_legs = [
+            {
+                "exchange": "binance",
+                "side": "long",
+                "quantity": 19169.0,
+                "entry_price": 0.054352924,
+            },
+            {
+                "exchange": "kucoin",
+                "side": "short",
+                "quantity": -19160.0,
+                "entry_price": 0.0555,
+            },
+        ]
+        old_signature = _auto_exit_position_signature(
+            "SIRENUSDT",
+            old_legs,
+            rule_long_exchange="binance",
+            rule_short_exchange="kucoin",
+        )
+        current_signature = _auto_exit_position_signature(
+            "SIRENUSDT",
+            current_legs,
+            rule_long_exchange="binance",
+            rule_short_exchange="kucoin",
+        )
+        rule = {
+            "position_signature": old_signature,
+            "spread_target_qty": 25000.0,
+            "spread_remaining_qty": 19160.0,
+        }
+
+        self.assertEqual(
+            _auto_exit_partial_progress_rebind_mode(rule, current_signature, 19160.0),
+            "spread",
+        )
+        self.assertIsNone(
+            _auto_exit_partial_progress_rebind_mode(rule, current_signature, 18000.0),
+        )
+
+    def test_partial_spread_continuation_owns_residual_before_v1(self) -> None:
+        rule = {
+            "spread_target_qty": 25000.0,
+            "spread_remaining_qty": 19160.0,
+            "v1_target_qty": 19160.0,
+            "v1_remaining_qty": 19040.0,
+        }
+
+        self.assertEqual(_auto_exit_pending_continuation_mode(rule), "spread")
+
+    def test_completed_or_dust_target_does_not_lock_continuation(self) -> None:
+        rule = {
+            "spread_target_qty": 25000.0,
+            "spread_remaining_qty": 200.0,
+            "v1_target_qty": None,
+            "v1_remaining_qty": None,
+        }
+
+        self.assertIsNone(_auto_exit_pending_continuation_mode(rule))
+
+    def test_explicit_continuation_owner_survives_zero_fill(self) -> None:
+        rule = {
+            "continuation_trigger_mode": "spread",
+            "spread_target_qty": 25000.0,
+            "spread_remaining_qty": 25000.0,
+        }
+
+        self.assertEqual(_auto_exit_pending_continuation_mode(rule), "spread")
+
     async def test_fulfilled_one_shot_auto_exit_disarms_rule_after_completion(self) -> None:
         service = DataService(settings_manager=self.manager)
         service._auto_exit_store = JsonStateStore(Path(self.tmp_dir.name) / "auto_exit.json")  # type: ignore[attr-defined]
@@ -1204,6 +1586,7 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
                     "enabled": True,
                     "v1_enabled": False,
                     "target_spread_pct": -1.0,
+                    "position_mode": "strict_signature",
                 }
             },
         }
@@ -1213,6 +1596,106 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [])
         diagnostics = service._auto_exit_diagnostics  # type: ignore[attr-defined]
         self.assertEqual(diagnostics[0]["reason"], "unbound_position_signature")
+
+    async def test_auto_exit_current_balanced_ignores_qty_signature_and_uses_balanced_qty(self) -> None:
+        service = DataService(settings_manager=self.manager)
+        old_legs = [
+            {
+                "exchange": "bybit",
+                "side": "long",
+                "quantity": 5_000_000.0,
+                "amount": 1700.0,
+                "entry_price": 0.00032854,
+                "mark_price": 0.0003462,
+            },
+            {
+                "exchange": "kucoin",
+                "side": "short",
+                "quantity": -5_000_000.0,
+                "amount": 1600.0,
+                "entry_price": 0.0003199,
+                "mark_price": 0.0003404,
+            },
+        ]
+        current_legs = [
+            {
+                "exchange": "bybit",
+                "side": "long",
+                "quantity": 15_000_000.0,
+                "amount": 5850.0,
+                "entry_price": 0.00037367,
+                "mark_price": 0.0003900,
+            },
+            {
+                "exchange": "kucoin",
+                "side": "short",
+                "quantity": -10_000_000.0,
+                "amount": 3500.0,
+                "entry_price": 0.0003355,
+                "mark_price": 0.0003500,
+            },
+        ]
+        service._accounts = type(  # type: ignore[attr-defined]
+            "X",
+            (),
+            {"snapshot": lambda self=None: {"positions": [{"symbol": "BLASTUSDT"}]}},
+        )()
+        service._positions_by_symbol = (  # type: ignore[attr-defined]
+            lambda positions, return_grouped=True, market_lookup=None, market_ts_lookup=None: (
+                [],
+                {"BLASTUSDT": list(current_legs)},
+            )
+        )
+
+        async def _book(exchange, symbol, depth=20, max_age_sec=15.0):  # noqa: ANN001
+            if str(exchange).lower() == "bybit":
+                return {"bids": [[0.000389, 20_000_000.0]], "asks": [[0.000390, 20_000_000.0]]}
+            return {"bids": [[0.000349, 20_000_000.0]], "asks": [[0.000350, 20_000_000.0]]}
+
+        service._market_data = type("MD", (), {"get_orderbook": staticmethod(_book)})()  # type: ignore[attr-defined]
+        calls: list[dict[str, object]] = []
+
+        async def _manual_exit(payload):
+            calls.append(dict(payload))
+            return {"execution_id": "auto-exit-blast", "status": "running"}
+
+        service.manual_exit = _manual_exit  # type: ignore[assignment]
+        service._auto_exit = {  # type: ignore[attr-defined]
+            "defaults": {
+                "require_live": True,
+                "position_mode": "current_balanced",
+                "spread_confirm_cycles": 1,
+            },
+            "rules": {
+                "BLASTUSDT|bybit|kucoin": {
+                    "symbol": "BLASTUSDT",
+                    "long_exchange": "bybit",
+                    "short_exchange": "kucoin",
+                    "enabled": True,
+                    "v1_enabled": False,
+                    "target_spread_pct": 8.0,
+                    "exit_percent": 100.0,
+                    "exit_once": True,
+                    "position_mode": "current_balanced",
+                    "spread_confirm_cycles": 1,
+                    "position_signature": _auto_exit_position_signature(
+                        "BLASTUSDT",
+                        old_legs,
+                        rule_long_exchange="bybit",
+                        rule_short_exchange="kucoin",
+                    ),
+                }
+            },
+        }
+
+        await service._auto_exit_cycle()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["qty"], 10_000_000.0)
+        self.assertEqual(calls[0]["long_exchange"], "bybit")
+        self.assertEqual(calls[0]["short_exchange"], "kucoin")
+        self.assertEqual(calls[0]["auto_exit_total_target_qty"], 10_000_000.0)
+        self.assertEqual(calls[0]["auto_exit_position_mode"], "current_balanced")
 
     async def test_update_auto_exit_rule_binds_current_position_signature(self) -> None:
         service = DataService(settings_manager=self.manager)
@@ -1278,6 +1761,17 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
             {
                 "snapshot": lambda self=None: {
                     "positions": [
+                        {
+                            "exchange": "binance",
+                            "symbol": "BTCUSDT",
+                            "symbol_normalized": "BTCUSDT",
+                            "side": "long",
+                            "quantity": 2.0,
+                            "coin_qty": 2.0,
+                            "amount": 200.0,
+                            "entry_price": 100.0,
+                            "mark_price": 99.0,
+                        },
                         {
                             "exchange": "okx",
                             "symbol": "BTCUSDT",
@@ -2462,6 +2956,87 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         second = service._account_state()
         second_log = second.get("margin_logic_log") or []
         self.assertEqual(len(second_log), len(logic_log))
+
+    def test_margin_reduce_disabled_persists_shadow_candidate(self) -> None:
+        self.manager.update(
+            {"protective": {"auto_margin_reduce_enabled": False}}
+        )
+        service = DataService(settings_manager=self.manager)
+        rows = service._margin_diagnostics(  # type: ignore[attr-defined]
+            [
+                {
+                    "exchange": "binance",
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "long",
+                    "margin_mode": "isolated",
+                    "mark_price": 100.0,
+                    "liquidation_price": 50.0,
+                    "margin_used": 200.0,
+                }
+            ],
+            [],
+        )
+        self.assertEqual(rows[0]["decision"], "blocked")
+        events = service._protective_shadow_events  # type: ignore[attr-defined]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "margin_reduce_candidate")
+        self.assertEqual(events[0]["symbol"], "BTCUSDT")
+        self.assertGreater(float(events[0]["planned_reduce_usd"]), 0.0)
+
+    async def test_rebalance_disabled_persists_shadow_candidate(self) -> None:
+        self.manager.update(
+            {
+                "protective": {
+                    "auto_rebalance_enabled": False,
+                    "rebalance_delta_pct": 0.2,
+                }
+            }
+        )
+        service = DataService(settings_manager=self.manager)
+        service._rebalance_prev_positions = {  # type: ignore[attr-defined]
+            ("BTC", "binance", "long"): 10.0,
+            ("BTC", "okx", "short"): 10.0,
+        }
+        await service._maybe_rebalance_positions(  # type: ignore[attr-defined]
+            [
+                {
+                    "exchange": "binance",
+                    "symbol": "BTC/USDT:USDT",
+                    "side": "long",
+                    "coin_qty": 5.0,
+                },
+                {
+                    "exchange": "okx",
+                    "symbol": "BTCUSDT",
+                    "side": "short",
+                    "coin_qty": 10.0,
+                },
+            ]
+        )
+        events = service._protective_shadow_events  # type: ignore[attr-defined]
+        candidate = next(
+            item for item in events if item.get("event") == "rebalance_candidate"
+        )
+        self.assertEqual(candidate["symbol"], "BTC")
+        self.assertEqual(candidate["reduce_side"], "short")
+        self.assertAlmostEqual(float(candidate["planned_qty"]), 5.0)
+
+    async def test_auto_agent_worker_runs_derisk_before_other_strategies(self) -> None:
+        service = DataService(settings_manager=self.manager)
+        calls: list[str] = []
+
+        async def _record(name: str) -> None:
+            calls.append(name)
+
+        service._derisk_last_worker_cycle_ts = 0.0  # type: ignore[attr-defined]
+        service._auto_derisk_cycle = lambda: _record("derisk")  # type: ignore[assignment]
+        service._auto_exit_cycle = lambda: _record("auto_exit")  # type: ignore[assignment]
+        service._auto_strategy_cycle = lambda: _record("strategy")  # type: ignore[assignment]
+        service._auto_arb_cycle = lambda: _record("grid")  # type: ignore[assignment]
+
+        await service._auto_agent_cycle()  # type: ignore[attr-defined]
+
+        self.assertEqual(calls, ["derisk", "auto_exit", "strategy", "grid"])
 
     def test_account_state_caches_grouping_when_snapshot_unchanged(self) -> None:
         service = DataService(settings_manager=self.manager)

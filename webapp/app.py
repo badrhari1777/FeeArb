@@ -16,7 +16,9 @@ from project_settings import MIN_REFRESH_SECONDS, MAX_REFRESH_SECONDS, SettingsM
 from utils import setup_logging
 
 from .services import (
+    ADAPTER_FACTORIES,
     DataService,
+    FUNDING_HISTORY_EXCLUDED_EXCHANGES,
     FUNDING_HISTORY_DEFAULT_EXCHANGES,
     FUNDING_HISTORY_WINDOWS_HOURS,
 )
@@ -36,11 +38,17 @@ from .remote_access import (
     is_cloudflare_request,
     is_public_proxy_request,
 )
+from .bybit_pump_short_lab import (
+    BybitPumpShortLab,
+    normalize_run_config,
+    normalize_shadow_config,
+    normalize_shadow_schedule_config,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-06-13-02"
+STATIC_VERSION = "v2026-07-12-01"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -48,6 +56,7 @@ templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 settings_manager = SettingsManager()
 service = DataService(settings_manager=settings_manager)
+bybit_pump_short_lab = BybitPumpShortLab()
 logger = logging.getLogger(__name__)
 
 
@@ -82,11 +91,12 @@ class ManualBasePayload(BaseModel):
     qty: Optional[float] = Field(default=None, gt=0)
     notional: Optional[float] = Field(default=None, gt=0)
     mode: str = "limit-first-expensive"
-    max_slippage_bps: Optional[float] = Field(default=8.0, ge=0)
+    max_slippage_bps: Optional[float] = Field(default=12.0, ge=0)
     spread_min_pct: Optional[float] = None
     spread_max_pct: Optional[float] = None
     timeout_sec: Optional[int] = Field(default=15, ge=0)
-    max_runtime_sec: Optional[int] = Field(default=None, ge=1)
+    max_runtime_sec: Optional[int] = Field(default=None, ge=1, le=1800)
+    trigger_wait_sec: Optional[int] = Field(default=30, ge=1, le=60)
     reprice_sec: Optional[float] = Field(default=None, ge=0)
     chunk_qty: Optional[float] = Field(default=None, gt=0)
     chunk_notional: Optional[float] = Field(default=None, gt=0)
@@ -109,6 +119,7 @@ class ManualBasePayload(BaseModel):
     min_level_chunk_pct: Optional[float] = Field(default=None, ge=0)
     max_limit_deviation_bps: Optional[float] = Field(default=None, ge=0)
     use_orderbook_check: bool = True
+    allow_liquidity_chunking: bool = False
     fallback_to_market: bool = False
     async_run: bool = True
     dry_run: bool = False
@@ -153,6 +164,32 @@ class MobileManualSpreadPayload(BaseModel):
     side: Optional[str] = "long"
 
 
+def _manual_payload_dict(payload: ManualBasePayload) -> dict:
+    data = payload.dict()
+    provided_fields = getattr(payload, "__fields_set__", None)
+    if provided_fields is None:
+        provided_fields = getattr(payload, "model_fields_set", set())
+    mode = str(data.get("mode") or "").lower()
+    if mode.startswith("smart-") and "allow_liquidity_chunking" not in provided_fields:
+        data["allow_liquidity_chunking"] = True
+    notional = data.get("notional")
+    chunk_qty = data.get("chunk_qty")
+    chunk_notional = data.get("chunk_notional")
+    if (
+        mode.startswith("smart-")
+        and not data.get("dry_run")
+        and data.get("async_run") is not False
+        and isinstance(notional, (int, float))
+        and notional > 0
+        and not chunk_qty
+        and not chunk_notional
+    ):
+        current_runtime = data.get("max_runtime_sec")
+        if not isinstance(current_runtime, (int, float)) or current_runtime < 600:
+            data["max_runtime_sec"] = 600
+    return data
+
+
 class PositionActionPayload(BaseModel):
     symbol: str
     long_exchange: str
@@ -168,11 +205,14 @@ class AutoArbRulePayload(BaseModel):
     symbol: str
     long_exchange: str
     short_exchange: str
+    setup_mode: str = "entry_range"
     budget_mode: str = "qty"
     max_qty: Optional[float] = Field(default=None, gt=0)
     max_notional: Optional[float] = Field(default=None, gt=0)
     range_start_pct: float
     range_end_pct: float
+    exit_range_start_pct: Optional[float] = None
+    exit_range_end_pct: Optional[float] = None
     level_count: Optional[int] = Field(default=None, ge=2, le=20)
     exit_gap_pct: Optional[float] = Field(default=None, gt=0)
     max_slippage_bps: float = Field(default=8.0, ge=0)
@@ -258,6 +298,29 @@ class FundingHistoryAnalyzePayload(BaseModel):
     funding_points: Optional[int] = Field(default=200, ge=24, le=200)
 
 
+class BybitPumpShortStartPayload(BaseModel):
+    lookback_days: Optional[int] = Field(default=30, ge=1, le=90)
+    sleep_sec: Optional[float] = Field(default=0.8, ge=0.1, le=10.0)
+    max_symbols: Optional[int] = Field(default=None, ge=1, le=1000)
+    symbols: Optional[list[str]] = None
+    newest_first: Optional[bool] = True
+    resume: Optional[bool] = True
+
+
+class BybitPumpShortShadowStartPayload(BaseModel):
+    lookback_days: Optional[int] = Field(default=14, ge=2, le=30)
+    sleep_sec: Optional[float] = Field(default=0.8, ge=0.1, le=10.0)
+    max_symbols: Optional[int] = Field(default=50, ge=1, le=1000)
+    symbols: Optional[list[str]] = None
+    newest_first: Optional[bool] = True
+    recent_event_hours: Optional[int] = Field(default=168, ge=24, le=720)
+
+
+class BybitPumpShortShadowSchedulePayload(BybitPumpShortShadowStartPayload):
+    interval_sec: Optional[int] = Field(default=3600, ge=60, le=86400)
+    run_immediately: Optional[bool] = True
+
+
 class NotificationTestPayload(BaseModel):
     title: Optional[str] = "FeeArb test notification"
     message: Optional[str] = "FeeArb notification test from backend."
@@ -269,6 +332,10 @@ class AutoExitDefaultsPayload(BaseModel):
     require_live: Optional[bool] = None
     auto_clear_no_position_sec: Optional[int] = None
     restore_spread_on_missing: Optional[bool] = None
+    clear_verified_missing: Optional[bool] = None
+    verified_missing_confirmations: Optional[int] = Field(default=None, ge=2)
+    position_mode: Optional[str] = None
+    spread_confirm_cycles: Optional[int] = Field(default=None, ge=1)
 
 
 class AutoExitRulePayload(BaseModel):
@@ -281,6 +348,8 @@ class AutoExitRulePayload(BaseModel):
     target_spread_pct: Optional[float] = None
     exit_percent: Optional[float] = Field(default=None, gt=0, le=100)
     exit_once: Optional[bool] = None
+    position_mode: Optional[str] = None
+    spread_confirm_cycles: Optional[int] = Field(default=None, ge=1)
 
 
 class AutoExitClearSpreadPayload(BaseModel):
@@ -384,7 +453,11 @@ async def funding_history_page(
 ) -> HTMLResponse:
     initial = {
         "symbol": symbol,
-        "supported_exchanges": list(settings_manager.as_dict().get("analysis_exchanges", {}).keys()),
+        "supported_exchanges": [
+            exchange
+            for exchange in settings_manager.as_dict().get("analysis_exchanges", {}).keys()
+            if exchange in ADAPTER_FACTORIES and exchange not in FUNDING_HISTORY_EXCLUDED_EXCHANGES
+        ],
         "default_exchanges": list(FUNDING_HISTORY_DEFAULT_EXCHANGES),
         "windows": [
             {"hours": int(hours), "label": "1d" if int(hours) == 24 else "3d" if int(hours) == 72 else f"{int(hours)}h"}
@@ -400,6 +473,43 @@ async def funding_history_page(
             "static_version": STATIC_VERSION,
         },
     )
+
+
+@app.get("/pump-short-lab", response_class=HTMLResponse)
+async def pump_short_lab_page(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(
+        "pump_short_lab.html",
+        {
+            "request": request,
+            "initial": bybit_pump_short_lab.status(),
+            "static_version": STATIC_VERSION,
+        },
+    )
+
+
+@app.get("/pump-short", response_class=HTMLResponse)
+async def pump_short_page(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(
+        "pump_short.html",
+        {
+            "request": request,
+            "initial": bybit_pump_short_lab.pump_dashboard_status(),
+            "static_version": STATIC_VERSION,
+        },
+    )
+
+
+@app.get("/pump-short-strategies", response_class=HTMLResponse)
+async def pump_short_strategies_page(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(
+        "pump_short_strategies.html",
+        {
+            "request": request,
+            "initial": bybit_pump_short_lab.strategy_monitor_status(),
+            "static_version": STATIC_VERSION,
+        },
+    )
+
 
 @app.get("/manual", response_class=HTMLResponse)
 async def manual_page(request: Request) -> HTMLResponse:
@@ -456,19 +566,6 @@ async def strategies_page(request: Request) -> HTMLResponse:
     )
 
 
-@app.get("/mobile", response_class=HTMLResponse)
-async def mobile_page(request: Request) -> HTMLResponse:
-    state = service.state_payload()
-    return templates.TemplateResponse(
-        "mobile.html",
-        {
-            "request": request,
-            "state": state,
-            "static_version": STATIC_VERSION,
-        },
-    )
-
-
 @app.get("/manual-tests", response_class=HTMLResponse)
 async def manual_tests_page(request: Request) -> HTMLResponse:
     settings = settings_manager.as_dict()
@@ -515,6 +612,102 @@ async def funding_history_analyze_api(payload: FundingHistoryAnalyzePayload) -> 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JSONResponse(jsonable_encoder(result))
+
+
+@app.get("/api/pump-short/bybit/status")
+async def bybit_pump_short_status_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(bybit_pump_short_lab.status()))
+
+
+@app.get("/api/pump-short/dashboard")
+async def pump_short_dashboard_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(bybit_pump_short_lab.pump_dashboard_status()))
+
+
+@app.get("/api/pump-short/strategies")
+async def pump_short_strategies_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(bybit_pump_short_lab.strategy_monitor_status()))
+
+
+@app.post("/api/pump-short/bybit/start")
+async def bybit_pump_short_start_api(payload: BybitPumpShortStartPayload) -> JSONResponse:
+    try:
+        config = normalize_run_config(
+            lookback_days=payload.lookback_days,
+            sleep_sec=payload.sleep_sec,
+            max_symbols=payload.max_symbols,
+            symbols=payload.symbols or [],
+            newest_first=payload.newest_first,
+            resume=payload.resume,
+        )
+        status = bybit_pump_short_lab.start(config)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(status))
+
+
+@app.post("/api/pump-short/bybit/stop")
+async def bybit_pump_short_stop_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(bybit_pump_short_lab.stop()))
+
+
+@app.post("/api/pump-short/bybit/shadow/start")
+async def bybit_pump_short_shadow_start_api(payload: BybitPumpShortShadowStartPayload) -> JSONResponse:
+    try:
+        config = normalize_shadow_config(
+            lookback_days=payload.lookback_days,
+            sleep_sec=payload.sleep_sec,
+            max_symbols=payload.max_symbols,
+            symbols=payload.symbols or [],
+            newest_first=payload.newest_first,
+            recent_event_hours=payload.recent_event_hours,
+        )
+        status = bybit_pump_short_lab.start_shadow_scan(config)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(status))
+
+
+@app.get("/api/pump-short/bybit/shadow/status")
+async def bybit_pump_short_shadow_status_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(bybit_pump_short_lab.shadow_status()))
+
+
+@app.post("/api/pump-short/bybit/shadow/schedule/start")
+async def bybit_pump_short_shadow_schedule_start_api(
+    payload: BybitPumpShortShadowSchedulePayload,
+) -> JSONResponse:
+    try:
+        config = normalize_shadow_schedule_config(
+            lookback_days=payload.lookback_days,
+            sleep_sec=payload.sleep_sec,
+            max_symbols=payload.max_symbols,
+            symbols=payload.symbols or [],
+            newest_first=payload.newest_first,
+            recent_event_hours=payload.recent_event_hours,
+            interval_sec=payload.interval_sec,
+            run_immediately=payload.run_immediately,
+        )
+        status = bybit_pump_short_lab.start_shadow_schedule(config)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(status))
+
+
+@app.post("/api/pump-short/bybit/shadow/schedule/stop")
+async def bybit_pump_short_shadow_schedule_stop_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(bybit_pump_short_lab.stop_shadow_schedule()))
+
+
+@app.get("/api/pump-short/bybit/shadow/schedule/status")
+async def bybit_pump_short_shadow_schedule_status_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(bybit_pump_short_lab.shadow_schedule_status()))
 
 
 @app.post("/api/notifications/test")
@@ -1006,6 +1199,16 @@ async def mobile_manual_spread(payload: MobileManualSpreadPayload) -> JSONRespon
 
 @app.post("/api/position/action")
 async def position_action(payload: PositionActionPayload) -> JSONResponse:
+    logger.info(
+        "position action request symbol=%s pair=%s/%s action=%s percent=%s dry_run=%s async_run=%s",
+        payload.symbol,
+        payload.long_exchange,
+        payload.short_exchange,
+        payload.action,
+        payload.percent,
+        payload.dry_run,
+        payload.async_run,
+    )
     try:
         result = await service.position_action(payload.dict())
     except ValueError as exc:
@@ -1314,9 +1517,10 @@ async def update_hedge_cluster_rule(payload: HedgeClusterRulePayload) -> JSONRes
 
 @app.post("/api/manual/enter")
 async def manual_enter(payload: ManualEnterPayload) -> JSONResponse:
-    logger.info("manual enter request %s", payload.dict())
+    data = _manual_payload_dict(payload)
+    logger.info("manual enter request %s", data)
     try:
-        result = await service.manual_enter(payload.dict())
+        result = await service.manual_enter(data)
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("manual enter failed: %s", exc)
         result = {"errors": [str(exc)]}
@@ -1324,9 +1528,10 @@ async def manual_enter(payload: ManualEnterPayload) -> JSONResponse:
 
 @app.post("/api/manual/exit")
 async def manual_exit(payload: ManualExitPayload) -> JSONResponse:
-    logger.info("manual exit request %s", payload.dict())
+    data = _manual_payload_dict(payload)
+    logger.info("manual exit request %s", data)
     try:
-        result = await service.manual_exit(payload.dict())
+        result = await service.manual_exit(data)
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("manual exit failed: %s", exc)
         result = {"errors": [str(exc)]}
@@ -1334,9 +1539,10 @@ async def manual_exit(payload: ManualExitPayload) -> JSONResponse:
 
 @app.post("/api/manual/roll")
 async def manual_roll(payload: ManualRollPayload) -> JSONResponse:
-    logger.info("manual roll request %s", payload.dict())
+    data = _manual_payload_dict(payload)
+    logger.info("manual roll request %s", data)
     try:
-        result = await service.manual_roll(payload.dict())
+        result = await service.manual_roll(data)
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("manual roll failed: %s", exc)
         result = {"errors": [str(exc)]}
@@ -1344,9 +1550,10 @@ async def manual_roll(payload: ManualRollPayload) -> JSONResponse:
 
 @app.post("/api/manual/analyze")
 async def manual_analyze(payload: ManualAnalyzePayload) -> JSONResponse:
-    logger.info("manual analyze request %s", payload.dict())
+    data = _manual_payload_dict(payload)
+    logger.info("manual analyze request %s", data)
     try:
-        result = await service.manual_analyze(payload.dict())
+        result = await service.manual_analyze(data)
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception("manual analyze failed: %s", exc)
         result = {"errors": [str(exc)]}
@@ -1428,7 +1635,7 @@ async def manual_exec_list() -> JSONResponse:
 @app.get("/api/manual/exec/{exec_id}")
 async def manual_exec_status(exec_id: str) -> JSONResponse:
     result = await service.manual_exec_status(exec_id)
-    if result.get("error"):
+    if result.get("error") and not result.get("execution_id"):
         raise HTTPException(status_code=404, detail=result["error"])
     return JSONResponse(jsonable_encoder(result))
 

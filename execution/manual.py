@@ -16,6 +16,9 @@ from execution.accounts import (
     _extract_leverage,
     _extract_margin_mode,
     _safe_float,
+    bitget_position_side,
+    bitget_private_params,
+    bitget_uta_enabled,
     normalize_symbol,
 )
 from execution.ws_positions import LivePositionTracker
@@ -37,6 +40,11 @@ VENUE_LIQUIDITY_TIERS = {
 AUTO_EXIT_RECOMMENDED_CHUNK_SAFETY_FACTOR = 0.5
 AUTO_EXIT_FALLBACK_CHUNK_PCT = 0.25
 AUTO_EXIT_MARKET_FALLBACK_MAX_TIER = 2
+SMART_CHUNK_NOTIONAL_CAP_BY_TIER = {
+    1: 750.0,
+    2: 500.0,
+    3: 250.0,
+}
 
 
 def _now_iso() -> str:
@@ -53,6 +61,18 @@ def _is_binance_time_sync_error(exc: Exception) -> bool:
     )
 
 
+def _bitget_params(params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    return bitget_private_params(params)
+
+
+async def _fetch_positions_compat(client: Any, exchange: str, symbols: list[str] | None = None) -> Any:
+    if exchange == "bitget":
+        return await client.fetch_positions(symbols, _bitget_params({}))
+    if symbols is not None:
+        return await client.fetch_positions(symbols)
+    return await client.fetch_positions()
+
+
 @dataclass(slots=True)
 class OrderBookStats:
     best_bid: float | None
@@ -64,7 +84,7 @@ class OrderBookStats:
     min_liquidity_top3: float
 
 
-def _precision_to_step(value: Any) -> float | None:
+def _precision_to_step(value: Any, precision_mode: Any = None) -> float | None:
     if value is None:
         return None
     try:
@@ -73,6 +93,12 @@ def _precision_to_step(value: Any) -> float | None:
         return None
     if numeric <= 0:
         return None
+    try:
+        mode_value = int(precision_mode) if precision_mode is not None else None
+    except (TypeError, ValueError):
+        mode_value = None
+    if mode_value == 4 or str(precision_mode or "").upper() == "TICK_SIZE":
+        return numeric
     if numeric >= 1:
         try:
             return 10 ** (-int(numeric))
@@ -168,6 +194,24 @@ def _min_qty_with_buffer(
     return _round_to_step(buffered, amount_step, mode="up")
 
 
+def _pending_hedge_order_qty(
+    qty: float,
+    *,
+    min_qty_required: float | None,
+    amount_step: float | None,
+) -> float:
+    if qty <= 0:
+        return 0.0
+    rounded = _round_to_step(float(qty), amount_step, mode="down")
+    if rounded <= 0:
+        return 0.0
+    if min_qty_required:
+        tol = (float(amount_step) * 0.5) if amount_step and amount_step > 0 else 1e-12
+        if rounded + tol < float(min_qty_required):
+            return 0.0
+    return rounded
+
+
 def _entry_position_side(leg: Mapping[str, Any]) -> str:
     label = str(leg.get("label") or "").lower()
     if label in ("long", "short"):
@@ -198,10 +242,12 @@ def _position_side_for_leg(leg: Mapping[str, Any]) -> str:
     return _entry_position_side(leg)
 
 
-def _position_delta_for_leg(start: float, current: float, leg: Mapping[str, Any]) -> float:
+def _position_delta_for_leg(start: float | None, current: float | None, leg: Mapping[str, Any]) -> float:
+    start_qty = _safe_float(start) or 0.0
+    current_qty = _safe_float(current) or 0.0
     if leg.get("reduce_only"):
-        return max(0.0, start - current)
-    return max(0.0, current - start)
+        return max(0.0, start_qty - current_qty)
+    return max(0.0, current_qty - start_qty)
 
 
 def _cap_qty_to_target(
@@ -268,6 +314,39 @@ def _choose_chunk_qty(
     if chunk <= 0:
         return None, warnings
     return chunk, warnings
+
+
+def _default_smart_chunk_notional_cap(legs: Iterable[Mapping[str, Any]]) -> float:
+    tiers = [venue_liquidity_tier(leg.get("exchange")) for leg in legs if isinstance(leg, Mapping)]
+    worst_tier = max(tiers) if tiers else DEFAULT_VENUE_LIQUIDITY_TIER
+    if worst_tier <= 1:
+        return SMART_CHUNK_NOTIONAL_CAP_BY_TIER[1]
+    if worst_tier == 2:
+        return SMART_CHUNK_NOTIONAL_CAP_BY_TIER[2]
+    return SMART_CHUNK_NOTIONAL_CAP_BY_TIER[3]
+
+
+def _cap_auto_chunk_by_notional(
+    *,
+    requested_qty: float | None,
+    chunk_notional: float | None,
+    max_chunk: float | None,
+    mid_price: float | None,
+    legs: Iterable[Mapping[str, Any]],
+) -> tuple[float | None, float | None]:
+    if requested_qty is not None and requested_qty > 0:
+        return max_chunk, None
+    if chunk_notional is not None and chunk_notional > 0:
+        return max_chunk, None
+    if mid_price is None or mid_price <= 0:
+        return max_chunk, None
+    cap_notional = _default_smart_chunk_notional_cap(legs)
+    cap_qty = cap_notional / float(mid_price)
+    if cap_qty <= 0:
+        return max_chunk, None
+    if max_chunk is None or cap_qty < max_chunk:
+        return cap_qty, cap_notional
+    return max_chunk, cap_notional
 
 
 def _apply_price_offset(
@@ -729,6 +808,91 @@ def _to_ccxt_symbol(raw_symbol: str) -> str:
     return f"{symbol}/USDT"
 
 
+def _gate_contract_id(raw_symbol: str) -> str | None:
+    symbol = (raw_symbol or "").strip().upper()
+    if not symbol:
+        return None
+    if ":" in symbol:
+        symbol = symbol.split(":", 1)[0]
+    if "/" in symbol:
+        base, quote = symbol.split("/", 1)
+        quote = quote.split(":", 1)[0]
+        symbol = f"{base}{quote}"
+    symbol = symbol.replace("-", "").replace("_", "")
+    if symbol.endswith("USDTM"):
+        symbol = symbol[:-1]
+    if symbol.endswith("UMCBL") or symbol.endswith("DMCBL"):
+        symbol = symbol[:-5]
+    if symbol.endswith("SWAP"):
+        symbol = symbol[:-4]
+    if symbol.endswith("PERP"):
+        symbol = symbol[:-4]
+    if symbol.endswith("USDT"):
+        base = symbol[:-4]
+    else:
+        base = symbol
+    if not base:
+        return None
+    return f"{base}_USDT"
+
+
+def _gate_market_from_contract(contract: Mapping[str, Any]) -> dict[str, Any] | None:
+    contract_id = str(contract.get("name") or "").strip().upper()
+    if not contract_id or not contract_id.endswith("_USDT"):
+        return None
+    base = contract_id[:-5]
+    if not base:
+        return None
+    price_step = _safe_float(contract.get("order_price_round")) or _safe_float(
+        contract.get("mark_price_round")
+    )
+    amount_min = _safe_float(contract.get("order_size_min"))
+    amount_max = _safe_float(contract.get("order_size_max"))
+    contract_size = _safe_float(contract.get("quanto_multiplier")) or 1.0
+    symbol = f"{base}/USDT:USDT"
+    active = not bool(contract.get("in_delisting")) and str(
+        contract.get("status") or "trading"
+    ).lower() == "trading"
+    decimal_size = bool(contract.get("enable_decimal"))
+    amount_precision = amount_min if decimal_size and amount_min and amount_min > 0 else 1.0
+    return {
+        "id": contract_id,
+        "lowercaseId": contract_id.lower(),
+        "symbol": symbol,
+        "base": base,
+        "quote": "USDT",
+        "settle": "USDT",
+        "baseId": base,
+        "quoteId": "USDT",
+        "settleId": "usdt",
+        "type": "swap",
+        "spot": False,
+        "margin": False,
+        "swap": True,
+        "future": False,
+        "option": False,
+        "contract": True,
+        "linear": True,
+        "inverse": False,
+        "active": active,
+        "contractSize": contract_size,
+        "precision": {
+            "amount": amount_precision,
+            "price": price_step,
+        },
+        "limits": {
+            "amount": {"min": amount_min, "max": amount_max},
+            "price": {"min": price_step, "max": None},
+            "cost": {"min": None, "max": None},
+            "leverage": {
+                "min": _safe_float(contract.get("leverage_min")),
+                "max": _safe_float(contract.get("leverage_max")),
+            },
+        },
+        "info": dict(contract),
+    }
+
+
 def _normalize_manual_symbol(symbol: str | None) -> str:
     normalized = normalize_symbol(symbol or "")
     if not normalized:
@@ -755,11 +919,33 @@ def _symbol_matches(canonical: str, candidate: str) -> bool:
     candidate = _normalize_manual_symbol(candidate)
     if not canonical:
         return True
-    if canonical == candidate:
-        return True
-    if canonical.endswith(("USDT", "USDC", "USD")):
+    quote_suffixes = ("USDT", "USDC", "USD")
+
+    def _parts(symbol: str) -> tuple[str, str | None]:
+        for quote in quote_suffixes:
+            if symbol.endswith(quote):
+                symbol = symbol[: -len(quote)]
+                if symbol == "XBT":
+                    symbol = "BTC"
+                return symbol, quote
+        if symbol == "XBT":
+            symbol = "BTC"
+        return symbol, None
+
+    canonical_base, canonical_quote = _parts(canonical)
+    candidate_base, candidate_quote = _parts(candidate)
+    if canonical_base != candidate_base:
         return False
-    return candidate.startswith(canonical)
+    if canonical_quote is not None and candidate_quote is not None:
+        return canonical_quote == candidate_quote
+    return True
+
+
+def _trigger_wait_sec(payload: Mapping[str, Any], max_runtime_sec: float) -> float:
+    configured = _safe_float(payload.get("trigger_wait_sec"))
+    if configured is None:
+        configured = 30.0
+    return max(1.0, min(float(configured), max(1.0, float(max_runtime_sec))))
 
 
 def _normalize_position_side(side: Any, qty: float | None = None) -> str:
@@ -1014,6 +1200,14 @@ class ManualTradeManager:
         self._ws_orders_stale_sec = 45.0
         self._stop_check: Optional[callable] = None
         self._ws_order_blocked: dict[str, dict[str, Any]] = {}
+        self._prepared_margin_settings: set[tuple[str, str, str]] = set()
+        self._prepared_leverage_settings: set[tuple[str, str, str, int]] = set()
+
+    async def close(self) -> None:
+        await asyncio.gather(
+            *(gateway.close() for gateway in self._gateways.values()),
+            return_exceptions=True,
+        )
 
     def _contract_sizes_from_constraints(self, constraints: Mapping[str, Any]) -> dict[str, float | None]:
         sizes: dict[str, float | None] = {}
@@ -1072,6 +1266,29 @@ class ManualTradeManager:
                 return False
         return True
 
+    def _auto_exit_final_reconcile_blocked(
+        self,
+        payload: Mapping[str, Any] | None,
+        exchange: str | None,
+        *,
+        notional_usd: float | None = None,
+        primary_delta: float | None = None,
+        hedge_delta: float | None = None,
+        primary_filled_total: float | None = None,
+        hedge_filled_total: float | None = None,
+    ) -> bool:
+        filled_exposure_exists = any(
+            (_safe_float(value) or 0.0) > 0
+            for value in (primary_delta, hedge_delta, primary_filled_total, hedge_filled_total)
+        )
+        if filled_exposure_exists:
+            return False
+        return not self._auto_exit_market_fallback_allowed(
+            payload,
+            exchange,
+            notional_usd=notional_usd,
+        )
+
     def _apply_auto_exit_exit_overrides(
         self,
         payload: Mapping[str, Any],
@@ -1120,7 +1337,7 @@ class ManualTradeManager:
         if not updated_payload.get("hedge_order_type"):
             updated_payload["hedge_order_type"] = "limit"
             changes["hedge_order_type"] = "limit"
-        if not updated_payload.get("hedge_limit_mode"):
+        if updated_payload.get("hedge_limit_mode") != "aggressive":
             updated_payload["hedge_limit_mode"] = "aggressive"
             changes["hedge_limit_mode"] = "aggressive"
         if updated_payload.get("hedge_offset_ticks") is None and updated_payload.get("hedge_offset_bps") is None:
@@ -1585,6 +1802,8 @@ class ManualTradeManager:
         stop_cb: Optional[callable] = None,
     ) -> dict[str, Any]:
         async with self._lock:
+            self._prepared_margin_settings.clear()
+            self._prepared_leverage_settings.clear()
             self._apply_ws_orders_health(payload)
             if log_cb:
                 self._emit_log(log_cb, "payload", "manual payload", dict(payload))
@@ -1649,6 +1868,14 @@ class ManualTradeManager:
                             "warnings": [],
                             "generated_at": datetime.now(timezone.utc).isoformat(),
                         }
+                positions_for_plan = [
+                    position
+                    for position in positions_for_plan
+                    if _symbol_matches(
+                        symbol,
+                        str(position.get("symbol") or position.get("symbol_normalized") or ""),
+                    )
+                ]
                 if log_cb and action in ("exit", "roll"):
                     by_exchange_side: dict[str, float] = {}
                     sample: list[dict[str, Any]] = []
@@ -1719,7 +1946,7 @@ class ManualTradeManager:
                         else:
                             min_qty, step = self._min_qty_and_step(adjusted_plan)
                             per_exchange: dict[str, Any] = {}
-                            max_qty_candidates: list[float] = []
+                            balance_limits: list[dict[str, float | str]] = []
                             for exchange in exchanges_hint:
                                 available = _safe_float(balances.get(exchange, {}).get("available"))
                                 mark_price = prices.get(exchange)
@@ -1746,7 +1973,24 @@ class ManualTradeManager:
                                         * DEFAULT_MANUAL_LEVERAGE
                                         / (mark_price * (1.0 + PRECHECK_BALANCE_BUFFER_PCT))
                                     )
-                                    max_qty_candidates.append(max_qty)
+                                    min_qty_required = (
+                                        min_qty
+                                        * mark_price
+                                        / DEFAULT_MANUAL_LEVERAGE
+                                        * (1.0 + PRECHECK_BALANCE_BUFFER_PCT)
+                                        if min_qty
+                                        else 0.0
+                                    )
+                                    balance_limits.append(
+                                        {
+                                            "exchange": exchange,
+                                            "available": available,
+                                            "mark_price": mark_price,
+                                            "required": required,
+                                            "max_qty": max_qty,
+                                            "min_qty_required": min_qty_required,
+                                        }
+                                    )
                             if per_exchange:
                                 self._emit_log(
                                     log_cb,
@@ -1759,13 +2003,22 @@ class ManualTradeManager:
                                         "per_exchange": per_exchange,
                                     },
                                 )
-                            if max_qty_candidates:
-                                new_qty = min(max_qty_candidates + [qty])
+                            if balance_limits:
+                                limiting = min(
+                                    balance_limits,
+                                    key=lambda item: float(item.get("max_qty") or 0.0),
+                                )
+                                new_qty = min(
+                                    [float(item.get("max_qty") or 0.0) for item in balance_limits]
+                                    + [qty]
+                                )
                                 if step:
                                     new_qty = _round_to_step(new_qty, step, mode="down")
                                 if min_qty and new_qty < min_qty:
                                     precheck_errors.append(
-                                        f"insufficient balance for min qty {min_qty:g}"
+                                        f"{limiting['exchange']}: insufficient balance for min qty {min_qty:g} "
+                                        f"(available={float(limiting['available']):g} USDT, "
+                                        f"required_min={float(limiting['min_qty_required']):g} USDT)"
                                     )
                                 elif new_qty < qty:
                                     adjusted_payload, adjusted_plan = self._adjust_payload_qty(
@@ -1913,17 +2166,7 @@ class ManualTradeManager:
                         "precheck failed; stopping",
                         {"errors": precheck_errors},
                     )
-                return {
-                    "dry_run": False,
-                    "action": adjusted_plan.get("action") or action,
-                    "symbol": adjusted_plan.get("symbol") or symbol,
-                    "qty": adjusted_plan.get("qty"),
-                    "mode": adjusted_payload.get("mode"),
-                    "legs": list(adjusted_plan.get("legs") or []),
-                    "errors": precheck_errors,
-                    "warnings": list(adjusted_plan.get("warnings") or []),
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
-                }
+                return self._plan_with_runtime_errors(adjusted_plan, precheck_errors)
             leverage_errors = await self._ensure_binance_leverage_for_legs(
                 adjusted_plan.get("legs") or [],
                 symbol,
@@ -1938,17 +2181,7 @@ class ManualTradeManager:
                         "binance leverage precheck failed; stopping",
                         {"errors": leverage_errors},
                     )
-                return {
-                    "dry_run": False,
-                    "action": adjusted_plan.get("action") or action,
-                    "symbol": adjusted_plan.get("symbol") or symbol,
-                    "qty": adjusted_plan.get("qty"),
-                    "mode": adjusted_payload.get("mode"),
-                    "legs": list(adjusted_plan.get("legs") or []),
-                    "errors": leverage_errors,
-                    "warnings": list(adjusted_plan.get("warnings") or []),
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
-                }
+                return self._plan_with_runtime_errors(adjusted_plan, leverage_errors)
             kucoin_errors = await self._ensure_kucoin_margin_mode_for_legs(
                 adjusted_plan.get("legs") or [],
                 symbol,
@@ -1963,17 +2196,7 @@ class ManualTradeManager:
                         "kucoin margin mode precheck failed; stopping",
                         {"errors": kucoin_errors},
                     )
-                return {
-                    "dry_run": False,
-                    "action": adjusted_plan.get("action") or action,
-                    "symbol": adjusted_plan.get("symbol") or symbol,
-                    "qty": adjusted_plan.get("qty"),
-                    "mode": adjusted_payload.get("mode"),
-                    "legs": list(adjusted_plan.get("legs") or []),
-                    "errors": kucoin_errors,
-                    "warnings": list(adjusted_plan.get("warnings") or []),
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
-                }
+                return self._plan_with_runtime_errors(adjusted_plan, kucoin_errors)
             leverage_errors = await self._ensure_bingx_leverage_for_legs(
                 adjusted_plan.get("legs") or [],
                 symbol,
@@ -1988,17 +2211,7 @@ class ManualTradeManager:
                         "bingx leverage precheck failed; stopping",
                         {"errors": leverage_errors},
                     )
-                return {
-                    "dry_run": False,
-                    "action": adjusted_plan.get("action") or action,
-                    "symbol": adjusted_plan.get("symbol") or symbol,
-                    "qty": adjusted_plan.get("qty"),
-                    "mode": adjusted_payload.get("mode"),
-                    "legs": list(adjusted_plan.get("legs") or []),
-                    "errors": leverage_errors,
-                    "warnings": list(adjusted_plan.get("warnings") or []),
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
-                }
+                return self._plan_with_runtime_errors(adjusted_plan, leverage_errors)
             legs = list(adjusted_plan.get("legs") or [])
             exchanges = []
             for leg in legs:
@@ -2014,6 +2227,8 @@ class ManualTradeManager:
                     action = str(payload.get("action") or "event")
                     if action in ("listen_key_expired", "listen_key_failed"):
                         self._mark_ws_order_blocked(exchange, action)
+                    if action in ("probe_ping_sent", "probe_pong_received"):
+                        return
                     message = self._format_ws_probe_message(exchange, action, payload)
                     self._emit_story(log_cb, message, payload)
                 self._ws_orders.set_event_cb(_ws_event_cb)
@@ -2267,7 +2482,8 @@ class ManualTradeManager:
         used_cancel_all = False
         try:
             if hasattr(client, "cancel_all_orders"):
-                await client.cancel_all_orders(ccxt_symbol)
+                cancel_all_params = _bitget_params({}) if exchange == "bitget" else {}
+                await client.cancel_all_orders(ccxt_symbol, cancel_all_params)
                 used_cancel_all = True
                 self._emit_log(
                     log_cb,
@@ -2286,7 +2502,8 @@ class ManualTradeManager:
             )
         fetch_failed = False
         try:
-            orders = await client.fetch_open_orders(ccxt_symbol)
+            open_params = _bitget_params({}) if exchange == "bitget" else {}
+            orders = await client.fetch_open_orders(ccxt_symbol, params=open_params)
         except Exception as exc:  # pylint: disable=broad-except
             self._emit_log(
                 log_cb,
@@ -2306,7 +2523,8 @@ class ManualTradeManager:
             if not order_id:
                 continue
             try:
-                await client.cancel_order(order_id, ccxt_symbol)
+                cancel_params = _bitget_params({}) if exchange == "bitget" else {}
+                await client.cancel_order(order_id, ccxt_symbol, cancel_params)
                 canceled += 1
             except Exception:
                 continue
@@ -2949,6 +3167,7 @@ class ManualTradeManager:
         qty = _safe_float(payload.get("qty"))
         chunk_qty = _safe_float(payload.get("chunk_qty"))
         chunk_notional = _safe_float(payload.get("chunk_notional"))
+        allow_liquidity_chunking = bool(payload.get("allow_liquidity_chunking"))
         margin_mode = str(payload.get("margin_mode") or "").strip().lower()
         min_notional_overrides = payload.get("min_notional_overrides") or {}
         if not isinstance(min_notional_overrides, Mapping):
@@ -2958,6 +3177,7 @@ class ManualTradeManager:
             min_notional_buffer_pct = 0.0
         errors: list[str] = []
         warnings: list[str] = []
+        position_rows = list(positions or [])
         if action == "roll":
             from_exchange = normalize_exchange_name(str(payload.get("from_exchange") or ""))
             to_exchange = normalize_exchange_name(str(payload.get("to_exchange") or ""))
@@ -2976,11 +3196,44 @@ class ManualTradeManager:
                 errors.append("long_exchange and short_exchange are required.")
         if qty is None and notional is None:
             errors.append("qty or notional is required.")
+        if (
+            spread_min_pct is not None
+            and spread_max_pct is not None
+            and spread_min_pct > spread_max_pct
+        ):
+            errors.append(
+                "spread_min_pct must be less than or equal to spread_max_pct."
+            )
+        if bool(payload.get("force_chunk_qty")):
+            warnings.append(
+                "force_chunk_qty is treated as a requested target and remains capped by live liquidity."
+            )
 
         legs: list[dict[str, Any]] = []
-        def _leg_margin_mode(exchange: str) -> str | None:
+        def _position_margin_mode(exchange: str, position_side: str | None) -> str | None:
+            exchange_name = normalize_exchange_name(exchange)
+            target_side = str(position_side or "").strip().lower()
+            for pos in position_rows:
+                pos_exchange = normalize_exchange_name(str(pos.get("exchange") or ""))
+                if pos_exchange != exchange_name:
+                    continue
+                qty_value = _safe_float(pos.get("coin_qty"))
+                if qty_value is None:
+                    qty_value = _safe_float(pos.get("contracts")) or _safe_float(pos.get("amount"))
+                pos_side = _normalize_position_side(pos.get("side"), qty_value)
+                if target_side and pos_side and pos_side != target_side:
+                    continue
+                mode, _source = _extract_margin_mode(dict(pos), exchange_name)
+                if mode in ("isolated", "cross"):
+                    return mode
+            return None
+
+        def _leg_margin_mode(exchange: str, position_side: str | None = None) -> str | None:
             if margin_mode:
                 return margin_mode
+            position_mode = _position_margin_mode(exchange, position_side)
+            if position_mode:
+                return position_mode
             return "isolated"
 
         if action == "enter":
@@ -3007,14 +3260,14 @@ class ManualTradeManager:
                     "exchange": long_exchange,
                     "side": "sell",
                     "reduce_only": True,
-                    "margin_mode": _leg_margin_mode(long_exchange),
+                    "margin_mode": _leg_margin_mode(long_exchange, "long"),
                 },
                 {
                     "label": "short",
                     "exchange": short_exchange,
                     "side": "buy",
                     "reduce_only": True,
-                    "margin_mode": _leg_margin_mode(short_exchange),
+                    "margin_mode": _leg_margin_mode(short_exchange, "short"),
                 },
             ]
         elif action == "roll":
@@ -3035,7 +3288,7 @@ class ManualTradeManager:
                         "exchange": from_exchange,
                         "side": "sell",
                         "reduce_only": True,
-                        "margin_mode": _leg_margin_mode(from_exchange),
+                        "margin_mode": _leg_margin_mode(from_exchange, "long"),
                     },
                 ]
             elif side == "short":
@@ -3052,7 +3305,7 @@ class ManualTradeManager:
                         "exchange": from_exchange,
                         "side": "buy",
                         "reduce_only": True,
-                        "margin_mode": _leg_margin_mode(from_exchange),
+                        "margin_mode": _leg_margin_mode(from_exchange, "short"),
                     },
                 ]
             else:
@@ -3061,10 +3314,10 @@ class ManualTradeManager:
         if errors:
             return self._plan_response(payload, legs, errors, warnings, action=action)
 
-        if qty is None and positions:
+        if qty is None and position_rows:
             inferred = self._infer_qty_from_positions(
                 symbol,
-                positions,
+                position_rows,
                 action=action,
                 long_exchange=long_exchange,
                 short_exchange=short_exchange,
@@ -3175,7 +3428,7 @@ class ManualTradeManager:
                     if stats.min_liquidity_top3 is not None:
                         details.append(f"top3_usd={stats.min_liquidity_top3:.2f}")
                     message = "; ".join(details)
-                    if is_dry_run:
+                    if is_dry_run or allow_liquidity_chunking:
                         warnings.append(message)
                     else:
                         errors.append(message)
@@ -3588,6 +3841,7 @@ class ManualTradeManager:
         timeout = _resolve_timeout(payload, 10)
         reprice_sec = max(3.0, _safe_float(payload.get("reprice_sec")) or 2.0)
         max_runtime_sec = int(_safe_float(payload.get("max_runtime_sec")) or 60)
+        trigger_wait_sec = _trigger_wait_sec(payload, max_runtime_sec)
         limit_offset_bps = _safe_float(payload.get("limit_offset_bps")) or 0.0
         limit_offset_ticks = int(_safe_float(payload.get("limit_offset_ticks")) or 0)
         hedge_order_type = str(payload.get("hedge_order_type") or "market").lower()
@@ -3676,7 +3930,6 @@ class ManualTradeManager:
         )
         requested_chunk = _safe_float(payload.get("chunk_qty"))
         chunk_notional = _safe_float(payload.get("chunk_notional"))
-        force_chunk = bool(payload.get("force_chunk_qty")) and requested_chunk is not None
 
         positions, pos_errors = await self._fetch_positions_with_retry(
             exchanges=[primary_leg["exchange"], hedge_leg["exchange"]],
@@ -3742,18 +3995,18 @@ class ManualTradeManager:
         else:
             primary_side = _exit_position_side(primary_leg)
             hedge_side = _exit_position_side(hedge_leg)
-        primary_pos_qty = self._sum_position_qty(
+        primary_pos_qty = _safe_float(self._sum_position_qty(
             positions,
             exchange=primary_leg["exchange"],
             side=primary_side,
             symbol=symbol,
-        )
-        hedge_pos_qty = self._sum_position_qty(
+        )) or 0.0
+        hedge_pos_qty = _safe_float(self._sum_position_qty(
             positions,
             exchange=hedge_leg["exchange"],
             side=hedge_side,
             symbol=symbol,
-        )
+        )) or 0.0
         if primary_pos_qty or hedge_pos_qty:
             self._emit_log(
                 log_cb,
@@ -4032,16 +4285,6 @@ class ManualTradeManager:
                 active_filled = primary_fill_map.get(active_order_id, 0.0)
             if not used_ws:
                 return 0.0, False
-            if total_delta > 0:
-                _vlog(
-                    "fill",
-                    "primary fill update (ws orders)",
-                    {
-                        "delta": total_delta,
-                        "filled_total": primary_filled_total,
-                        "reason": reason,
-                    },
-                )
             return total_delta, True
 
         async def _sync_primary_fills(
@@ -4193,9 +4436,11 @@ class ManualTradeManager:
                     {"pending_qty": hedge_qty, "min_qty": min_hedge_qty, "reason": reason},
                 )
                 return
-            if min_hedge_qty:
-                hedge_qty = math.floor(hedge_qty / min_hedge_qty) * min_hedge_qty
-            hedge_qty = _round_to_step(hedge_qty, hedge_amount_step, mode="down")
+            hedge_qty = _pending_hedge_order_qty(
+                hedge_qty,
+                min_qty_required=min_hedge_qty,
+                amount_step=hedge_amount_step,
+            )
             if hedge_qty <= 0:
                 return
             self._emit_log(log_cb, "submit", f"hedge {hedge_leg['exchange']} qty={hedge_qty:g}")
@@ -4262,6 +4507,8 @@ class ManualTradeManager:
                     active_filled = 0.0
                     active_since = None
                     await _sync_primary_fills("stop_cancel", delay=0.2, include_active=False)
+                if pending_hedge_qty > 0:
+                    await _hedge_pending("stop_cancel")
                 break
             snapshot = await self._snapshot_legs(symbol, [primary_leg, hedge_leg], max_slippage_bps=max_slippage_bps)
             if snapshot.get("errors"):
@@ -4282,6 +4529,20 @@ class ManualTradeManager:
             spread_val = snapshot.get("spread_pct")
             within_range = self._within_spread(spread_val, spread_min_pct, spread_max_pct)
             if within_range is False:
+                if not actions and (time.time() - started_at) >= trigger_wait_sec:
+                    warnings.append("condition_not_met")
+                    self._emit_log(
+                        log_cb,
+                        "result",
+                        "spread condition not met; releasing execution worker",
+                        {
+                            "spread_pct": spread_val,
+                            "spread_min_pct": spread_min_pct,
+                            "spread_max_pct": spread_max_pct,
+                            "trigger_wait_sec": trigger_wait_sec,
+                        },
+                    )
+                    break
                 if active_order_id:
                     await _sync_primary_fills("spread_cancel")
                     if active_order_id:
@@ -4339,7 +4600,17 @@ class ManualTradeManager:
             max_candidates = [val for val in max_qty_by_exchange.values() if val]
             if max_candidates:
                 max_chunk = min(max_candidates)
-            if not force_chunk and max_slippage_bps > 0 and max_chunk is not None:
+            limiting_exchange = None
+            if max_chunk is not None:
+                limiting_exchange = next(
+                    (
+                        exchange
+                        for exchange, value in max_qty_by_exchange.items()
+                        if value is not None and abs(float(value) - float(max_chunk)) <= 1e-9
+                    ),
+                    None,
+                )
+            if max_slippage_bps > 0 and max_chunk is not None:
                 if max_chunk <= 0:
                     self._emit_log(log_cb, "wait", "liquidity below slippage cap; waiting")
                     await asyncio.sleep(max(0.2, reprice_sec))
@@ -4356,11 +4627,18 @@ class ManualTradeManager:
             requested = requested_chunk
             if requested is None and chunk_notional and mid_price:
                 requested = chunk_notional / mid_price
+            max_chunk_for_choice, auto_chunk_notional_cap = _cap_auto_chunk_by_notional(
+                requested_qty=requested,
+                chunk_notional=chunk_notional,
+                max_chunk=max_chunk if max_slippage_bps > 0 else None,
+                mid_price=mid_price,
+                legs=[primary_leg, hedge_leg],
+            )
             chunk, chunk_warnings = _choose_chunk_qty(
                 remaining=remaining,
                 requested_qty=requested,
                 min_chunk=min_chunk_qty,
-                max_chunk=None if force_chunk else max_chunk,
+                max_chunk=max_chunk_for_choice,
                 amount_step=amount_step,
             )
             warnings.extend(chunk_warnings)
@@ -4377,6 +4655,11 @@ class ManualTradeManager:
                     "chunk": chunk,
                     "min_chunk_qty": min_chunk_qty,
                     "max_chunk": max_chunk,
+                    "max_chunk_for_choice": max_chunk_for_choice,
+                    "auto_chunk_notional_cap": auto_chunk_notional_cap,
+                    "max_qty_by_exchange": dict(max_qty_by_exchange),
+                    "limiting_exchange": limiting_exchange,
+                    "max_slippage_bps": max_slippage_bps,
                     "amount_step": amount_step,
                 },
             )
@@ -4692,7 +4975,14 @@ class ManualTradeManager:
         if remaining > 0:
             warnings.append(f"Remaining qty {remaining:g} not exited (smart-exit runtime ended).")
 
-        if primary_leg and hedge_leg:
+        if stopped_by_user and not self._stop_force_finalize():
+            self._emit_log(
+                log_cb,
+                "warn",
+                "stop requested; skipping final reconcile",
+                {"remaining": remaining},
+            )
+        elif primary_leg and hedge_leg and "condition_not_met" not in warnings:
             use_observed = False
             post_positions, post_errors = await self._fetch_positions_for_symbol(
                 exchanges=[primary_leg["exchange"], hedge_leg["exchange"]],
@@ -4805,8 +5095,8 @@ class ManualTradeManager:
                     side=hedge_side,
                     symbol=symbol,
                 )
-                primary_delta = max(0.0, primary_pos_start - primary_current)
-                hedge_delta = max(0.0, hedge_pos_start - hedge_current)
+                primary_delta = _position_delta_for_leg(primary_pos_start, primary_current, primary_leg)
+                hedge_delta = _position_delta_for_leg(hedge_pos_start, hedge_current, hedge_leg)
             imbalance = primary_delta - hedge_delta
             if abs(imbalance) > 0:
                 if imbalance > 0:
@@ -4831,10 +5121,14 @@ class ManualTradeManager:
                             "final imbalance below fallback threshold",
                             {"imbalance": imbalance, "min_qty": threshold},
                         )
-                    elif not self._auto_exit_market_fallback_allowed(
+                    elif self._auto_exit_final_reconcile_blocked(
                         payload,
                         leg.get("exchange"),
                         notional_usd=reconcile_notional,
+                        primary_delta=primary_delta,
+                        hedge_delta=hedge_delta,
+                        primary_filled_total=primary_filled_total,
+                        hedge_filled_total=hedge_filled_total,
                     ):
                         warnings.append(
                             f"{leg['exchange']}: final reconcile market skipped by auto-exit tier guard"
@@ -4912,6 +5206,7 @@ class ManualTradeManager:
         max_slippage_bps = _safe_float(payload.get("max_slippage_bps")) or 0.0
         reprice_sec = _safe_float(payload.get("reprice_sec")) or 0.5
         max_runtime_sec = int(_safe_float(payload.get("max_runtime_sec")) or 20)
+        trigger_wait_sec = _trigger_wait_sec(payload, max_runtime_sec)
         market_refill_bps = _safe_float(payload.get("market_refill_bps"))
         if market_refill_bps is None:
             market_refill_bps = 10.0
@@ -4922,7 +5217,6 @@ class ManualTradeManager:
         market_fill_timeout_sec = _safe_float(payload.get("market_fill_timeout_sec")) or 3.0
         requested_chunk = _safe_float(payload.get("chunk_qty"))
         chunk_notional = _safe_float(payload.get("chunk_notional"))
-        force_chunk = bool(payload.get("force_chunk_qty")) and requested_chunk is not None
         constraints = plan.get("market_constraints") or {}
         contract_sizes = self._contract_sizes_from_constraints(constraints)
         amount_steps = [
@@ -5063,11 +5357,16 @@ class ManualTradeManager:
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                 }
         start_qty_by_exchange = {
-            leg["exchange"]: self._sum_position_qty(
-                start_positions,
-                exchange=leg["exchange"],
-                side=_exit_position_side(leg),
-                symbol=symbol,
+            leg["exchange"]: (
+                _safe_float(
+                    self._sum_position_qty(
+                        start_positions,
+                        exchange=leg["exchange"],
+                        side=_exit_position_side(leg),
+                        symbol=symbol,
+                    )
+                )
+                or 0.0
             )
             for leg in legs
         }
@@ -5092,13 +5391,27 @@ class ManualTradeManager:
                 spread_val = snapshot.get("spread_pct")
                 within_range = self._within_spread(spread_val, spread_min_pct, spread_max_pct)
                 if within_range is False:
+                    if not actions and (time.time() - started_at) >= trigger_wait_sec:
+                        warnings.append("condition_not_met")
+                        self._emit_log(
+                            log_cb,
+                            "result",
+                            "spread condition not met; releasing execution worker",
+                            {
+                                "spread_pct": spread_val,
+                                "spread_min_pct": spread_min_pct,
+                                "spread_max_pct": spread_max_pct,
+                                "trigger_wait_sec": trigger_wait_sec,
+                            },
+                        )
+                        break
                     await asyncio.sleep(max(0.2, reprice_sec))
                     continue
 
                 max_qty_by_exchange = snapshot.get("max_qty_by_exchange") or {}
                 max_candidates = [val for val in max_qty_by_exchange.values() if val]
                 max_chunk = min(max_candidates) if max_candidates else None
-                if not force_chunk and max_slippage_bps > 0 and max_chunk is not None:
+                if max_slippage_bps > 0 and max_chunk is not None:
                     if max_chunk <= 0:
                         self._emit_log(log_cb, "wait", "liquidity below slippage cap; waiting")
                         await asyncio.sleep(max(0.2, reprice_sec))
@@ -5115,11 +5428,18 @@ class ManualTradeManager:
                 requested = requested_chunk
                 if requested is None and chunk_notional and mid_price:
                     requested = chunk_notional / mid_price
+                max_chunk_for_choice, _auto_chunk_notional_cap = _cap_auto_chunk_by_notional(
+                    requested_qty=requested,
+                    chunk_notional=chunk_notional,
+                    max_chunk=max_chunk if max_slippage_bps > 0 else None,
+                    mid_price=mid_price,
+                    legs=legs,
+                )
                 chunk, chunk_warnings = _choose_chunk_qty(
                     remaining=remaining,
                     requested_qty=requested,
                     min_chunk=min_chunk_qty,
-                    max_chunk=None if force_chunk else max_chunk,
+                    max_chunk=max_chunk_for_choice,
                     amount_step=amount_step,
                 )
                 warnings.extend(chunk_warnings)
@@ -5322,20 +5642,25 @@ class ManualTradeManager:
                     "stop requested; forcing final reconcile",
                     {"remaining": remaining},
                 )
-            if len(legs) >= 2:
+            if len(legs) >= 2 and "condition_not_met" not in warnings:
                 deltas: dict[str, float] = {}
                 for leg in legs:
                     exchange = leg["exchange"]
                     if use_observed:
                         delta = observed_fills.get(exchange, 0.0)
                     else:
-                        end_qty = self._sum_position_qty(
-                            end_positions,
-                            exchange=exchange,
-                            side=_exit_position_side(leg),
-                            symbol=symbol,
+                        end_qty = (
+                            _safe_float(
+                                self._sum_position_qty(
+                                    end_positions,
+                                    exchange=exchange,
+                                    side=_exit_position_side(leg),
+                                    symbol=symbol,
+                                )
+                            )
+                            or 0.0
                         )
-                        start_qty = start_qty_by_exchange.get(exchange, 0.0)
+                        start_qty = _safe_float(start_qty_by_exchange.get(exchange)) or 0.0
                         delta = max(0.0, start_qty - end_qty)
                     deltas[exchange] = delta
                 primary = legs[0]
@@ -5418,6 +5743,7 @@ class ManualTradeManager:
         timeout = _resolve_timeout(payload, 10)
         reprice_sec = max(3.0, _safe_float(payload.get("reprice_sec")) or 2.0)
         max_runtime_sec = int(_safe_float(payload.get("max_runtime_sec")) or 60)
+        trigger_wait_sec = _trigger_wait_sec(payload, max_runtime_sec)
         limit_offset_bps = _safe_float(payload.get("limit_offset_bps")) or 0.0
         limit_offset_ticks = int(_safe_float(payload.get("limit_offset_ticks")) or 0)
         hedge_order_type = str(payload.get("hedge_order_type") or "market").lower()
@@ -5507,7 +5833,6 @@ class ManualTradeManager:
         )
         requested_chunk = _safe_float(payload.get("chunk_qty"))
         chunk_notional = _safe_float(payload.get("chunk_notional"))
-        force_chunk = bool(payload.get("force_chunk_qty")) and requested_chunk is not None
 
         primary_side = _position_side_for_leg(primary_leg)
         hedge_side = _position_side_for_leg(hedge_leg)
@@ -5560,18 +5885,18 @@ class ManualTradeManager:
                 "sources": {exchange: "rest" for exchange in exchange_list if exchange},
             },
         )
-        primary_pos_start = self._sum_position_qty(
+        primary_pos_start = _safe_float(self._sum_position_qty(
             positions,
             exchange=primary_leg["exchange"],
             side=primary_side,
             symbol=symbol,
-        )
-        hedge_pos_start = self._sum_position_qty(
+        )) or 0.0
+        hedge_pos_start = _safe_float(self._sum_position_qty(
             positions,
             exchange=hedge_leg["exchange"],
             side=hedge_side,
             symbol=symbol,
-        )
+        )) or 0.0
         # Smart-enter qty is an incremental target relative to start snapshot.
         # Absolute safety caps must use start+qty, not qty alone.
         primary_target_abs = max(0.0, primary_pos_start + qty)
@@ -5849,16 +6174,6 @@ class ManualTradeManager:
                 active_filled = primary_fill_map.get(active_order_id, 0.0)
             if not used_ws:
                 return 0.0, False
-            if total_delta > 0:
-                _vlog(
-                    "fill",
-                    "primary fill update (ws orders)",
-                    {
-                        "delta": total_delta,
-                        "filled_total": primary_filled_total,
-                        "reason": reason,
-                    },
-                )
             return total_delta, True
 
         async def _sync_primary_fills(
@@ -5940,7 +6255,8 @@ class ManualTradeManager:
                 )
             return total_delta
 
-        async def _final_reconcile_positions(reason: str) -> None:
+        async def _final_reconcile_positions(reason: str) -> bool:
+            nonlocal primary_filled_total, hedge_filled_total
             use_observed = False
             positions, pos_errors = await self._fetch_positions_for_symbol(
                 exchanges=[primary_leg["exchange"], hedge_leg["exchange"]],
@@ -6026,8 +6342,8 @@ class ManualTradeManager:
                 )
                 primary_delta = primary_filled_total
                 hedge_delta = hedge_filled_total
-                primary_current = primary_pos_start + primary_delta
-                hedge_current = hedge_pos_start + hedge_delta
+                primary_current = (_safe_float(primary_pos_start) or 0.0) + primary_delta
+                hedge_current = (_safe_float(hedge_pos_start) or 0.0) + hedge_delta
             else:
                 primary_current = self._sum_position_qty(
                     positions,
@@ -6059,7 +6375,7 @@ class ManualTradeManager:
                 )
             imbalance = primary_delta - hedge_delta
             if abs(imbalance) <= 0:
-                return
+                return True
             if imbalance > 0:
                 threshold = hedge_fallback_min
                 step = hedge_amount_step
@@ -6102,7 +6418,7 @@ class ManualTradeManager:
                         "leg_current": leg_current,
                     },
                 )
-                return
+                return True
             if threshold and qty_needed < threshold:
                 _vlog(
                     "wait",
@@ -6113,7 +6429,7 @@ class ManualTradeManager:
                         "min_qty": threshold,
                     },
                 )
-                return
+                return False
             self._emit_log(
                 log_cb,
                 "submit",
@@ -6129,6 +6445,16 @@ class ManualTradeManager:
             )
             actions.append(result)
             self._emit_log(log_cb, "result", "final reconcile result", result)
+            if result.get("status") == "error":
+                return False
+            filled = _safe_float(result.get("filled_qty")) or 0.0
+            if filled > 0:
+                leg_exchange = normalize_exchange_name(str(leg.get("exchange") or ""))
+                if leg_exchange == normalize_exchange_name(str(primary_leg.get("exchange") or "")):
+                    primary_filled_total += filled
+                elif leg_exchange == normalize_exchange_name(str(hedge_leg.get("exchange") or "")):
+                    hedge_filled_total += filled
+            return True
 
         async def _hedge_pending(reason: str) -> None:
             nonlocal pending_hedge_qty, hedge_failed, hedge_filled_total, warnings
@@ -6138,7 +6464,7 @@ class ManualTradeManager:
             pending_hedge_qty = 0.0
             cap_source = "observed"
             cap_leg_delta = hedge_filled_total
-            cap_current_qty = hedge_pos_start + cap_leg_delta
+            cap_current_qty = (_safe_float(hedge_pos_start) or 0.0) + cap_leg_delta
             pos_errors: list[str] = []
             cap_positions, cap_errors = await self._fetch_positions_for_symbol(
                 exchanges=[hedge_leg["exchange"]],
@@ -6214,9 +6540,11 @@ class ManualTradeManager:
                         "reason": reason,
                     },
                 )
-            if min_hedge_qty:
-                hedge_qty = math.floor(hedge_qty / min_hedge_qty) * min_hedge_qty
-            hedge_qty = _round_to_step(hedge_qty, hedge_amount_step, mode="down")
+            hedge_qty = _pending_hedge_order_qty(
+                hedge_qty,
+                min_qty_required=min_hedge_qty,
+                amount_step=hedge_amount_step,
+            )
             if hedge_qty <= 0:
                 _vlog(
                     "guard",
@@ -6261,6 +6589,23 @@ class ManualTradeManager:
             if hedge_result.get("status") == "error":
                 if primary_filled_total > hedge_filled_total:
                     hedge_result["risk_state"] = "partial_fill_exposure"
+                    reconciled = await _final_reconcile_positions("hedge_error")
+                    if reconciled:
+                        hedge_result["handled_error"] = "final_reconcile"
+                        hedge_result.pop("risk_state", None)
+                        warnings.append("hedge_error_reconciled")
+                        self._emit_log(
+                            log_cb,
+                            "warn",
+                            "hedge error reconciled; continuing smart enter",
+                            {
+                                "exchange": hedge_leg["exchange"],
+                                "error": hedge_result.get("error"),
+                                "primary_filled_total": primary_filled_total,
+                                "hedge_filled_total": hedge_filled_total,
+                            },
+                        )
+                        return
                     warnings.append("partial_fill_exposure")
                 errors.append(
                     f"hedge failed on {hedge_leg['exchange']}: {hedge_result.get('error') or 'unknown_error'}"
@@ -6304,6 +6649,8 @@ class ManualTradeManager:
                     active_filled = 0.0
                     active_since = None
                     await _sync_primary_fills("stop_cancel", delay=0.2, include_active=False)
+                if pending_hedge_qty > 0:
+                    await _hedge_pending("stop_cancel")
                 break
             snapshot = await self._snapshot_legs(symbol, [primary_leg, hedge_leg], max_slippage_bps=max_slippage_bps)
             if snapshot.get("errors"):
@@ -6324,6 +6671,20 @@ class ManualTradeManager:
             spread_val = snapshot.get("spread_pct")
             within_range = self._within_spread(spread_val, spread_min_pct, spread_max_pct)
             if within_range is False:
+                if not actions and (time.time() - started_at) >= trigger_wait_sec:
+                    warnings.append("condition_not_met")
+                    self._emit_log(
+                        log_cb,
+                        "result",
+                        "spread condition not met; releasing execution worker",
+                        {
+                            "spread_pct": spread_val,
+                            "spread_min_pct": spread_min_pct,
+                            "spread_max_pct": spread_max_pct,
+                            "trigger_wait_sec": trigger_wait_sec,
+                        },
+                    )
+                    break
                 if active_order_id:
                     ws_delta, used_ws = await _sync_primary_from_orders("spread_cancel")
                     if not used_ws:
@@ -6455,7 +6816,17 @@ class ManualTradeManager:
             max_candidates = [val for val in max_qty_by_exchange.values() if val]
             if max_candidates:
                 max_chunk = min(max_candidates)
-            if not force_chunk and max_slippage_bps > 0 and max_chunk is not None:
+            limiting_exchange = None
+            if max_chunk is not None:
+                limiting_exchange = next(
+                    (
+                        exchange
+                        for exchange, value in max_qty_by_exchange.items()
+                        if value is not None and abs(float(value) - float(max_chunk)) <= 1e-9
+                    ),
+                    None,
+                )
+            if max_slippage_bps > 0 and max_chunk is not None:
                 if max_chunk <= 0:
                     self._emit_log(log_cb, "wait", "liquidity below slippage cap; waiting")
                     await asyncio.sleep(max(0.2, reprice_sec))
@@ -6473,11 +6844,18 @@ class ManualTradeManager:
             requested = requested_chunk
             if requested is None and chunk_notional and mid_price:
                 requested = chunk_notional / mid_price
+            max_chunk_for_choice, auto_chunk_notional_cap = _cap_auto_chunk_by_notional(
+                requested_qty=requested,
+                chunk_notional=chunk_notional,
+                max_chunk=max_chunk if max_slippage_bps > 0 else None,
+                mid_price=mid_price,
+                legs=[primary_leg, hedge_leg],
+            )
             chunk, chunk_warnings = _choose_chunk_qty(
                 remaining=remaining,
                 requested_qty=requested,
                 min_chunk=min_chunk_qty,
-                max_chunk=None if force_chunk else max_chunk,
+                max_chunk=max_chunk_for_choice,
                 amount_step=amount_step,
             )
             warnings.extend(chunk_warnings)
@@ -6494,6 +6872,11 @@ class ManualTradeManager:
                     "chunk": chunk,
                     "min_chunk_qty": min_chunk_qty,
                     "max_chunk": max_chunk,
+                    "max_chunk_for_choice": max_chunk_for_choice,
+                    "auto_chunk_notional_cap": auto_chunk_notional_cap,
+                    "max_qty_by_exchange": dict(max_qty_by_exchange),
+                    "limiting_exchange": limiting_exchange,
+                    "max_slippage_bps": max_slippage_bps,
                     "amount_step": amount_step,
                 },
             )
@@ -6819,7 +7202,10 @@ class ManualTradeManager:
         if remaining > 0 and max_runtime_sec is not None:
             warnings.append(f"Remaining qty {remaining:g} not entered ({mode_label} runtime ended).")
 
-        if not stopped_by_user or self._stop_force_finalize():
+        if (
+            "condition_not_met" not in warnings
+            and (not stopped_by_user or self._stop_force_finalize())
+        ):
             await _final_reconcile_positions("final")
         return {
             "dry_run": False,
@@ -6850,6 +7236,7 @@ class ManualTradeManager:
         max_slippage_bps = _safe_float(payload.get("max_slippage_bps")) or 0.0
         reprice_sec = _safe_float(payload.get("reprice_sec")) or 0.5
         max_runtime_sec = int(_safe_float(payload.get("max_runtime_sec")) or 20)
+        trigger_wait_sec = _trigger_wait_sec(payload, max_runtime_sec)
         market_refill_bps = _safe_float(payload.get("market_refill_bps"))
         if market_refill_bps is None:
             market_refill_bps = 10.0
@@ -6860,7 +7247,6 @@ class ManualTradeManager:
         market_fill_timeout_sec = _safe_float(payload.get("market_fill_timeout_sec")) or 3.0
         requested_chunk = _safe_float(payload.get("chunk_qty"))
         chunk_notional = _safe_float(payload.get("chunk_notional"))
-        force_chunk = bool(payload.get("force_chunk_qty")) and requested_chunk is not None
         constraints = plan.get("market_constraints") or {}
         contract_sizes = self._contract_sizes_from_constraints(constraints)
         amount_steps = [
@@ -6984,11 +7370,16 @@ class ManualTradeManager:
                 "generated_at": datetime.now(timezone.utc).isoformat(),
             }
         start_qty_by_exchange = {
-            leg["exchange"]: self._sum_position_qty(
-                start_positions,
-                exchange=leg["exchange"],
-                side=_entry_position_side(leg),
-                symbol=symbol,
+            leg["exchange"]: (
+                _safe_float(
+                    self._sum_position_qty(
+                        start_positions,
+                        exchange=leg["exchange"],
+                        side=_entry_position_side(leg),
+                        symbol=symbol,
+                    )
+                )
+                or 0.0
             )
             for leg in legs
         }
@@ -7013,13 +7404,27 @@ class ManualTradeManager:
                 spread_val = snapshot.get("spread_pct")
                 within_range = self._within_spread(spread_val, spread_min_pct, spread_max_pct)
                 if within_range is False:
+                    if not actions and (time.time() - started_at) >= trigger_wait_sec:
+                        warnings.append("condition_not_met")
+                        self._emit_log(
+                            log_cb,
+                            "result",
+                            "spread condition not met; releasing execution worker",
+                            {
+                                "spread_pct": spread_val,
+                                "spread_min_pct": spread_min_pct,
+                                "spread_max_pct": spread_max_pct,
+                                "trigger_wait_sec": trigger_wait_sec,
+                            },
+                        )
+                        break
                     await asyncio.sleep(max(0.2, reprice_sec))
                     continue
 
                 max_qty_by_exchange = snapshot.get("max_qty_by_exchange") or {}
                 max_candidates = [val for val in max_qty_by_exchange.values() if val]
                 max_chunk = min(max_candidates) if max_candidates else None
-                if not force_chunk and max_slippage_bps > 0 and max_chunk is not None:
+                if max_slippage_bps > 0 and max_chunk is not None:
                     if max_chunk <= 0:
                         self._emit_log(log_cb, "wait", "liquidity below slippage cap; waiting")
                         await asyncio.sleep(max(0.2, reprice_sec))
@@ -7037,11 +7442,18 @@ class ManualTradeManager:
                 requested = requested_chunk
                 if requested is None and chunk_notional and mid_price:
                     requested = chunk_notional / mid_price
+                max_chunk_for_choice, _auto_chunk_notional_cap = _cap_auto_chunk_by_notional(
+                    requested_qty=requested,
+                    chunk_notional=chunk_notional,
+                    max_chunk=max_chunk if max_slippage_bps > 0 else None,
+                    mid_price=mid_price,
+                    legs=legs,
+                )
                 chunk, chunk_warnings = _choose_chunk_qty(
                     remaining=remaining,
                     requested_qty=requested,
                     min_chunk=min_chunk_qty,
-                    max_chunk=None if force_chunk else max_chunk,
+                    max_chunk=max_chunk_for_choice,
                     amount_step=amount_step,
                 )
                 warnings.extend(chunk_warnings)
@@ -7245,20 +7657,25 @@ class ManualTradeManager:
                     "stop requested; forcing final reconcile",
                     {"remaining": remaining},
                 )
-            if len(legs) >= 2:
+            if len(legs) >= 2 and "condition_not_met" not in warnings:
                 deltas: dict[str, float] = {}
                 for leg in legs:
                     exchange = leg["exchange"]
                     if use_observed:
                         delta = observed_fills.get(exchange, 0.0)
                     else:
-                        end_qty = self._sum_position_qty(
-                            end_positions,
-                            exchange=exchange,
-                            side=_entry_position_side(leg),
-                            symbol=symbol,
+                        end_qty = (
+                            _safe_float(
+                                self._sum_position_qty(
+                                    end_positions,
+                                    exchange=exchange,
+                                    side=_entry_position_side(leg),
+                                    symbol=symbol,
+                                )
+                            )
+                            or 0.0
                         )
-                        start_qty = start_qty_by_exchange.get(exchange, 0.0)
+                        start_qty = _safe_float(start_qty_by_exchange.get(exchange)) or 0.0
                         delta = max(0.0, end_qty - start_qty)
                     deltas[exchange] = delta
                 primary = legs[0]
@@ -7673,19 +8090,36 @@ class ManualTradeManager:
             min_qty = _safe_float(constraints.get("min_qty"))
             min_notional = _safe_float(constraints.get("min_notional"))
             mid_price = stats.mid if stats else _safe_float(snapshot.get("mid_price"))
-            min_required = _min_qty_required(min_qty, min_notional, mid_price or 0.0, amount_step)
+            min_required = _min_qty_required(
+                min_qty=min_qty,
+                min_notional=min_notional,
+                price=mid_price or 0.0,
+                amount_step=amount_step,
+            )
             max_chunk = None
             if slippage_bps > 0:
                 max_chunk = (snapshot.get("max_qty_by_exchange") or {}).get(exchange)
-            chunk = _choose_chunk_qty(remaining, min_required, max_chunk, amount_step)
-            if chunk <= 0:
+            chunk, chunk_warnings = _choose_chunk_qty(
+                remaining=remaining,
+                requested_qty=None,
+                min_chunk=min_required,
+                max_chunk=max_chunk,
+                amount_step=amount_step,
+            )
+            if chunk_warnings:
+                errors.extend(chunk_warnings)
+            if not chunk or chunk <= 0:
                 errors.append("chunk_below_min")
                 break
             limit_price = _resolve_smart_limit_price(
+                orderbook=(snapshot.get("orderbooks") or {}).get(exchange),
                 side=side,
+                book_side=None,
+                qty=chunk,
+                payload={},
                 best_bid=stats.best_bid if stats else None,
                 best_ask=stats.best_ask if stats else None,
-                mid=stats.mid if stats else None,
+                mid_price=stats.mid if stats else None,
                 price_step=price_step,
                 offset_bps=offset_bps,
                 offset_ticks=0,
@@ -7762,6 +8196,55 @@ class ManualTradeManager:
             "remaining_qty": remaining,
             "errors": errors,
             "actions": actions,
+        }
+
+    async def analyze_rebalance(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        side: str,
+        qty_base: float,
+        max_slippage_bps: float = 8.0,
+    ) -> dict[str, Any]:
+        """Read-only single-leg preflight used by protective agents."""
+        exchange = normalize_exchange_name(str(exchange or ""))
+        side = str(side or "").lower()
+        qty_val = _safe_float(qty_base)
+        if not exchange or side not in {"buy", "sell"} or not qty_val or qty_val <= 0:
+            return {"errors": ["invalid protective preflight request"]}
+        snapshot = await self._snapshot_legs(
+            symbol,
+            [{"exchange": exchange, "side": side, "label": "protective"}],
+            max_slippage_bps=max_slippage_bps,
+        )
+        errors = [str(item) for item in (snapshot.get("errors") or [])]
+        constraints = dict((snapshot.get("constraints") or {}).get(exchange) or {})
+        stats = (snapshot.get("stats") or {}).get(exchange)
+        mid_price = _safe_float(snapshot.get("mid_price"))
+        min_required = _min_qty_required(
+            min_qty=_safe_float(constraints.get("min_qty")),
+            min_notional=_safe_float(constraints.get("min_notional")),
+            price=mid_price or 0.0,
+            amount_step=_safe_float(constraints.get("amount_step")),
+        )
+        return {
+            "errors": errors,
+            "exchange": exchange,
+            "symbol": symbol,
+            "side": side,
+            "requested_qty": float(qty_val),
+            "constraints": constraints,
+            "min_qty_required": min_required,
+            "mid_price": mid_price,
+            "max_qty_under_slippage": (
+                snapshot.get("max_qty_by_exchange") or {}
+            ).get(exchange),
+            "stats": _stats_payload(stats),
+            "orderbook_source": (
+                snapshot.get("orderbook_sources") or {}
+            ).get(exchange),
+            "generated_at": _now_iso(),
         }
 
     async def _execute_orphan_cleanup(
@@ -8207,8 +8690,13 @@ class ManualTradeManager:
             params["reduceOnly"] = True
         kucoin_margin_mode = None
         leg_margin_mode = str(leg.get("margin_mode") or "").strip().lower()
-        if exchange not in ("kucoin", "binance") and leg_margin_mode in ("isolated", "cross") and hasattr(
-            client, "set_margin_mode"
+        margin_key = (exchange, ccxt_symbol, leg_margin_mode)
+        if (
+            exchange not in ("kucoin", "binance")
+            and not (exchange == "bitget" and bitget_uta_enabled())
+            and leg_margin_mode in ("isolated", "cross")
+            and hasattr(client, "set_margin_mode")
+            and margin_key not in self._prepared_margin_settings
         ):
             margin_params: dict[str, object] | None = None
             if exchange == "okx":
@@ -8218,6 +8706,7 @@ class ManualTradeManager:
                     await client.set_margin_mode(leg_margin_mode, ccxt_symbol, margin_params)
                 else:
                     await client.set_margin_mode(leg_margin_mode, ccxt_symbol)
+                self._prepared_margin_settings.add(margin_key)
             except Exception as exc:  # pylint: disable=broad-except
                 self._emit_log(
                     log_cb,
@@ -8230,25 +8719,60 @@ class ManualTradeManager:
                         "error": str(exc),
                     },
                 )
-        if exchange not in ("kucoin", "binance") and hasattr(client, "set_leverage"):
+        leverage_key = (
+            exchange,
+            ccxt_symbol,
+            leg_margin_mode,
+            int(DEFAULT_MANUAL_LEVERAGE),
+        )
+        if (
+            exchange not in ("kucoin", "binance")
+            and hasattr(client, "set_leverage")
+            and leverage_key not in self._prepared_leverage_settings
+        ):
             leverage_params: dict[str, object] = {}
             if leg_margin_mode in ("isolated", "cross"):
                 if exchange == "okx":
                     leverage_params["tdMode"] = leg_margin_mode
                 elif exchange == "bitget":
-                    leverage_params["marginMode"] = leg_margin_mode
+                    leverage_params = _bitget_params(leverage_params)
+                    leverage_params["marginMode"] = "isolated" if leg_margin_mode == "isolated" else "crossed"
+                    if leg_margin_mode == "isolated":
+                        leverage_params["posSide"] = bitget_position_side(
+                            str(leg.get("side") or ""),
+                            reduce_only=reduce_only,
+                        )
                 elif exchange != "bingx":
                     leverage_params["marginMode"] = leg_margin_mode
+            elif exchange == "bitget":
+                leverage_params = _bitget_params(leverage_params)
             if exchange == "bingx":
                 leverage_params["side"] = "LONG" if leg.get("side") == "buy" else "SHORT"
             try:
                 await client.set_leverage(DEFAULT_MANUAL_LEVERAGE, ccxt_symbol, leverage_params or None)
+                self._prepared_leverage_settings.add(leverage_key)
             except Exception as exc:  # pylint: disable=broad-except
-                if exchange == "bingx" and _bingx_invalid_leverage_params(exc):
+                error_text = str(exc).lower()
+                if exchange == "bybit" and (
+                    "110043" in error_text or "leverage not modified" in error_text
+                ):
+                    self._prepared_leverage_settings.add(leverage_key)
+                    self._emit_log(
+                        log_cb,
+                        "precheck",
+                        "leverage already configured",
+                        {
+                            "exchange": exchange,
+                            "symbol": symbol,
+                            "leverage": DEFAULT_MANUAL_LEVERAGE,
+                        },
+                    )
+                elif exchange == "bingx" and _bingx_invalid_leverage_params(exc):
                     fallback_params = dict(leverage_params)
                     fallback_params["side"] = "BOTH"
                     try:
                         await client.set_leverage(DEFAULT_MANUAL_LEVERAGE, ccxt_symbol, fallback_params)
+                        self._prepared_leverage_settings.add(leverage_key)
                         self._emit_log(
                             log_cb,
                             "warn",
@@ -8289,10 +8813,22 @@ class ManualTradeManager:
                         },
                     )
         if exchange == "bitget":
-            params["posSide"] = "net"
-            params["positionSide"] = "net"
-            if leg_margin_mode in ("isolated", "cross"):
-                params["marginMode"] = leg_margin_mode
+            if bitget_uta_enabled():
+                params = _bitget_params(params)
+                if leg_margin_mode in ("isolated", "cross"):
+                    params["marginMode"] = "isolated" if leg_margin_mode == "isolated" else "crossed"
+                hedged = await self._resolve_bitget_hedged(client)
+                if hedged is True:
+                    params["hedged"] = True
+                    params["posSide"] = bitget_position_side(
+                        str(leg.get("side") or ""),
+                        reduce_only=reduce_only,
+                    )
+            else:
+                params["posSide"] = "net"
+                params["positionSide"] = "net"
+                if leg_margin_mode in ("isolated", "cross"):
+                    params["marginMode"] = leg_margin_mode
         if exchange == "kucoin":
             kucoin_margin_mode = str(leg_margin_mode or "isolated").strip().upper()
             if kucoin_margin_mode:
@@ -8362,7 +8898,7 @@ class ManualTradeManager:
             }
         except Exception as exc:  # pylint: disable=broad-except
             message = str(exc)
-            if exchange == "bitget" and "40774" in message:
+            if exchange == "bitget" and not bitget_uta_enabled() and "40774" in message:
                 retry_params = dict(params)
                 if params.get("posSide") == "net":
                     retry_params.pop("posSide", None)
@@ -8493,7 +9029,7 @@ class ManualTradeManager:
             return cached[0]
         hedged: bool | None = None
         try:
-            positions = await client.fetch_positions()
+            positions = await _fetch_positions_compat(client, "bitget")
         except Exception:  # pylint: disable=broad-except
             positions = []
         for pos in positions or []:
@@ -8569,6 +9105,8 @@ class ManualTradeManager:
                     except Exception:
                         pass
                 raise
+        if exchange == "bitget":
+            return await client.fetch_order(order_id, ccxt_symbol, _bitget_params({}))
         return await client.fetch_order(order_id, ccxt_symbol)
 
     async def _wait_for_order(
@@ -8618,7 +9156,8 @@ class ManualTradeManager:
         # timeout, attempt cancel
         if use_deadline:
             try:
-                await client.cancel_order(order_id, ccxt_symbol)
+                cancel_params = _bitget_params({}) if exchange == "bitget" else {}
+                await client.cancel_order(order_id, ccxt_symbol, cancel_params)
             except Exception:  # pylint: disable=broad-except
                 pass
         if last_fill > 0:
@@ -8652,6 +9191,7 @@ class ManualTradeManager:
             if allow_trades_fallback:
                 fallback = await self._recover_filled_from_trades(
                     client,
+                    exchange,
                     ccxt_symbol,
                     order_id,
                     contract_size,
@@ -8677,6 +9217,7 @@ class ManualTradeManager:
             if allow_trades_fallback:
                 fallback = await self._recover_filled_from_trades(
                     client,
+                    exchange,
                     ccxt_symbol,
                     order_id,
                     contract_size,
@@ -8716,13 +9257,15 @@ class ManualTradeManager:
         if not ccxt_symbol:
             return
         try:
-            await client.cancel_order(order_id, ccxt_symbol)
+            cancel_params = _bitget_params({}) if exchange == "bitget" else {}
+            await client.cancel_order(order_id, ccxt_symbol, cancel_params)
         except Exception:  # pylint: disable=broad-except
             return
 
     async def _recover_filled_from_trades(
         self,
         client: Any,
+        exchange: str,
         ccxt_symbol: str,
         order_id: str,
         contract_size: float | None,
@@ -8730,8 +9273,11 @@ class ManualTradeManager:
         """Best-effort fill recovery via trades when fetch_order is unavailable."""
         if not hasattr(client, "fetch_my_trades"):
             return None
+        params = {"order": order_id}
+        if exchange == "bitget":
+            params = _bitget_params(params)
         try:
-            trades = await client.fetch_my_trades(ccxt_symbol, None, None, {"order": order_id})
+            trades = await client.fetch_my_trades(ccxt_symbol, None, None, params)
         except Exception:  # pylint: disable=broad-except
             return None
         if not trades:
@@ -8844,7 +9390,8 @@ class ManualTradeManager:
                             },
                         )
                         try:
-                            await client.cancel_order(order_id, ccxt_symbol)
+                            cancel_params = _bitget_params({}) if exchange == "bitget" else {}
+                            await client.cancel_order(order_id, ccxt_symbol, cancel_params)
                         except Exception:  # pylint: disable=broad-except
                             pass
                         try:
@@ -8863,7 +9410,8 @@ class ManualTradeManager:
             await asyncio.sleep(check_interval)
         if use_deadline and cancel_on_timeout:
             try:
-                await client.cancel_order(order_id, ccxt_symbol)
+                cancel_params = _bitget_params({}) if exchange == "bitget" else {}
+                await client.cancel_order(order_id, ccxt_symbol, cancel_params)
             except Exception:  # pylint: disable=broad-except
                 pass
             try:
@@ -9634,12 +10182,18 @@ class ManualTradeManager:
             try:
                 await client.load_markets()
             except Exception:  # pylint: disable=broad-except
+                if str(getattr(client, "id", "") or "").lower() == "gate":
+                    return await self._resolve_gate_market_symbol(client, symbol, ccxt_symbol)
                 return None
             markets = getattr(client, "markets", None) or {}
         exact_market = markets.get(ccxt_symbol) if isinstance(markets, dict) else None
         if isinstance(exact_market, dict):
             market_type = str(exact_market.get("type") or "").lower()
             if exact_market.get("swap") or exact_market.get("future") or market_type in ("swap", "future"):
+                if str(getattr(client, "id", "") or "").lower() == "gate":
+                    refreshed = await self._resolve_gate_market_symbol(client, symbol, ccxt_symbol)
+                    if refreshed:
+                        return refreshed
                 return exact_market.get("symbol") or ccxt_symbol
         base = None
         quote = None
@@ -9656,11 +10210,70 @@ class ManualTradeManager:
                     continue
                 market_type = str(market.get("type") or "").lower()
                 if market.get("swap") or market.get("future") or market_type in ("swap", "future"):
+                    if str(getattr(client, "id", "") or "").lower() == "gate":
+                        refreshed = await self._resolve_gate_market_symbol(client, symbol, ccxt_symbol)
+                        if refreshed:
+                            return refreshed
                     return market.get("symbol") or ccxt_symbol
             for market in markets.values():
                 if market.get("base") == base and market.get("quote") == quote:
                     break
+        if str(getattr(client, "id", "") or "").lower() == "gate":
+            return await self._resolve_gate_market_symbol(client, symbol, ccxt_symbol)
         return None
+
+    async def _resolve_gate_market_symbol(
+        self,
+        client: Any,
+        symbol: str,
+        ccxt_symbol: str,
+    ) -> str | None:
+        contract_id = _gate_contract_id(symbol or ccxt_symbol)
+        if not contract_id:
+            return None
+        try:
+            fetch = getattr(client, "fetch", None)
+            if callable(fetch):
+                response = await fetch(
+                    f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{contract_id}",
+                    "GET",
+                    {"X-Gate-Size-Decimal": "1"},
+                )
+            else:
+                response = await client.publicFuturesGetSettleContractsContract(
+                    {"settle": "usdt", "contract": contract_id}
+                )
+        except Exception:  # pylint: disable=broad-except
+            try:
+                response = await client.publicFuturesGetSettleContractsContract(
+                    {"settle": "usdt", "contract": contract_id}
+                )
+            except Exception:  # pylint: disable=broad-except
+                return None
+        if not isinstance(response, Mapping):
+            return None
+        market = _gate_market_from_contract(response)
+        if not market:
+            return None
+        symbol_key = str(market.get("symbol") or ccxt_symbol)
+        market["symbol"] = symbol_key
+        markets = getattr(client, "markets", None)
+        if not isinstance(markets, dict):
+            client.markets = {}
+            markets = client.markets
+        markets[symbol_key] = market
+        markets_by_id = getattr(client, "markets_by_id", None)
+        if not isinstance(markets_by_id, dict):
+            client.markets_by_id = {}
+            markets_by_id = client.markets_by_id
+        markets_by_id[str(market.get("id"))] = [market]
+        symbols = getattr(client, "symbols", None)
+        if not isinstance(symbols, list):
+            client.symbols = []
+            symbols = client.symbols
+        if symbol_key not in symbols:
+            symbols.append(symbol_key)
+        return symbol_key
 
     def _extract_market_constraints(self, client: Any, ccxt_symbol: str) -> dict[str, float | None]:
         market = None
@@ -9709,8 +10322,9 @@ class ManualTradeManager:
         if price_max is None:
             price_max = _safe_float(info.get("maxPrice"))
         precision = market.get("precision") or {}
-        amount_step = _precision_to_step(precision.get("amount"))
-        price_step = _precision_to_step(precision.get("price"))
+        precision_mode = getattr(client, "precisionMode", None)
+        amount_step = _precision_to_step(precision.get("amount"), precision_mode)
+        price_step = _precision_to_step(precision.get("price"), precision_mode)
         filter_amount_step = _market_filter_value(market, "LOT_SIZE", "stepSize", "qtyStep")
         filter_market_amount_step = _market_filter_value(market, "MARKET_LOT_SIZE", "stepSize", "qtyStep")
         filter_price_step = _market_filter_value(market, "PRICE_FILTER", "tickSize")
@@ -9738,7 +10352,19 @@ class ManualTradeManager:
             min_notional = filter_min_notional
         contract_size = _safe_float(market.get("contractSize"))
         min_qty = raw_min_qty
+        min_qty_contracts_effective = raw_min_qty
         if contract_size and contract_size > 0:
+            is_contract_market = bool(
+                market.get("contract")
+                or market.get("swap")
+                or market.get("future")
+                or str(market.get("type") or "").lower() in ("swap", "future")
+            )
+            if is_contract_market and (min_qty_contracts_effective is None or min_qty_contracts_effective <= 0):
+                min_qty_contracts_effective = 1.0
+                if amount_step is None or amount_step <= 0 or amount_step < 1.0:
+                    amount_step = 1.0
+            min_qty = min_qty_contracts_effective
             if min_qty is not None:
                 min_qty = min_qty * contract_size
             if amount_step is not None:
@@ -9752,11 +10378,14 @@ class ManualTradeManager:
             "price_max": price_max,
             "contract_size": contract_size,
             "min_qty_contracts": raw_min_qty,
+            "min_qty_contracts_effective": min_qty_contracts_effective,
         }
 
     def _collect_action_errors(self, actions: Iterable[Mapping[str, Any]]) -> list[str]:
         errors: list[str] = []
         for action in actions:
+            if action.get("handled_error"):
+                continue
             status = str(action.get("status") or "").lower()
             if status != "error":
                 continue
@@ -9807,9 +10436,9 @@ class ManualTradeManager:
 
         async def _fetch_positions_once() -> Any:
             try:
-                return await client.fetch_positions([ccxt_symbol])
+                return await _fetch_positions_compat(client, exchange, [ccxt_symbol])
             except Exception:
-                return await client.fetch_positions()
+                return await _fetch_positions_compat(client, exchange)
 
         try:
             positions = await _fetch_positions_once()
@@ -10902,6 +11531,18 @@ class ManualTradeManager:
         if min_liq and min_liq < 20_000:
             return "limit-first-expensive"
         return "limit-first-expensive"
+
+    def _plan_with_runtime_errors(
+        self,
+        plan: Mapping[str, Any],
+        errors: Iterable[str],
+    ) -> dict[str, Any]:
+        result = dict(plan)
+        result["dry_run"] = False
+        result["errors"] = list(errors)
+        result["warnings"] = list(plan.get("warnings") or [])
+        result["generated_at"] = datetime.now(timezone.utc).isoformat()
+        return result
 
     def _plan_response(
         self,

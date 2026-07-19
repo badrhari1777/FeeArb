@@ -9,9 +9,10 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from config import BASE_DIR, STATE_DIR
+from utils.logging import redact_sensitive_text
 from utils.notifications import NotificationRouter
 
 try:
@@ -32,6 +33,7 @@ SUMMARY_SLOT_RETENTION_SEC = 72 * 3600
 MARGIN_ADD_TRIGGER_BUFFER_PCT = 0.27
 MARGIN_TARGET_BUFFER_PCT = 0.30
 MARGIN_REDUCE_TRIGGER_BUFFER_PCT = 0.33
+BITGET_ACCOUNT_MODE_ENV = "BITGET_ACCOUNT_MODE"
 EXCHANGE_ABBR: dict[str, str] = {
     "binance": "BN",
     "okx": "OK",
@@ -196,7 +198,14 @@ def normalize_symbol(symbol: str | None) -> str:
     for char in symbol.upper():
         if char.isalnum():
             cleaned.append(char)
-    return "".join(cleaned)
+    normalized = "".join(cleaned)
+    # CCXT perpetual symbols such as BASE/USDT:USDT otherwise collapse to
+    # BASEUSDTUSDT. Keep one settle suffix at the normalization boundary.
+    for settle in ("USDT", "USDC", "USD"):
+        duplicated = settle + settle
+        while normalized.endswith(duplicated):
+            normalized = normalized[: -len(settle)]
+    return normalized
 
 
 def _dedupe_settle(symbol: str | None) -> str:
@@ -220,6 +229,48 @@ def _ccxt_perp_symbol(symbol: str | None) -> str:
     return f"{normalized}/USDT:USDT"
 
 
+def bitget_uta_enabled() -> bool:
+    """Return whether Bitget private calls should use Unified Trading Account endpoints."""
+    mode = os.getenv(BITGET_ACCOUNT_MODE_ENV, "uta").strip().lower()
+    return mode not in {"classic", "mix", "legacy", "false", "0", "off"}
+
+
+def bitget_private_params(params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    result = dict(params or {})
+    if bitget_uta_enabled():
+        result["uta"] = True
+    return result
+
+
+def bitget_position_side(order_side: str | None, *, reduce_only: bool = False) -> str:
+    side = str(order_side or "").strip().lower()
+    if reduce_only:
+        return "short" if side == "buy" else "long"
+    return "long" if side == "buy" else "short"
+
+
+def _first_mapping(items: Any, *, key: str, value: str) -> Mapping[str, Any]:
+    if not isinstance(items, list):
+        return {}
+    expected = str(value or "").strip().upper()
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get(key) or "").strip().upper() == expected:
+            return item
+    return {}
+
+
+def _filter_markets_with_ids(markets: Any) -> Any:
+    if not isinstance(markets, list):
+        return markets
+    return [
+        market
+        for market in markets
+        if not isinstance(market, Mapping) or market.get("id") not in (None, "")
+    ]
+
+
 class ExchangeGateway:
     """Thin wrapper around a ccxt client with exchange-specific defaults."""
 
@@ -233,6 +284,7 @@ class ExchangeGateway:
         self._cred_signature: tuple[str, str, str] | None = None
         self._unavailable_reason: str | None = None
         self._client = None
+        self._client_lock = asyncio.Lock()
         self._client_needs_close = False
         self._cycles_open = 0
         self.refresh_credentials(force_env=True)
@@ -261,6 +313,14 @@ class ExchangeGateway:
             config["password"] = self.password
         try:
             client = exchange_cls(config)
+            if self.slug == "okx" and hasattr(client, "fetch_markets"):
+                original_fetch_markets = client.fetch_markets
+
+                async def _fetch_markets_without_invalid_ids(params=None):
+                    markets = await original_fetch_markets(params or {})
+                    return _filter_markets_with_ids(markets)
+
+                client.fetch_markets = _fetch_markets_without_invalid_ids
             if self.slug in {"mexc", "bingx", "binance", "kucoin"}:
                 # Align timestamps with server to avoid signature/recvWindow drift.
                 try:
@@ -359,23 +419,24 @@ class ExchangeGateway:
         return self.slug == "mexc"
 
     async def ensure_client(self) -> None:
-        if not self.has_credentials:
-            if self._client:
+        async with self._client_lock:
+            if not self.has_credentials:
+                if self._client:
+                    await self._client.close()
+                self._client = None
+                return
+            if self._client_needs_close and self._client:
                 await self._client.close()
-            self._client = None
-            return
-        if self._client_needs_close and self._client:
-            await self._client.close()
-            self._client = None
-            self._client_needs_close = False
-        if self._client is None:
-            self._client = await self._build_client()
-            if self._client is None and self._unavailable_reason is None:
-                self._unavailable_reason = "Failed to initialise ccxt client"
+                self._client = None
+                self._client_needs_close = False
+            if self._client is None:
+                self._client = await self._build_client()
+                if self._client is None and self._unavailable_reason is None:
+                    self._unavailable_reason = "Failed to initialise ccxt client"
+                else:
+                    self._cycles_open = 0
             else:
-                self._cycles_open = 0
-        else:
-            self._cycles_open += 1
+                self._cycles_open += 1
 
     def _is_time_sync_error(self, exc: Exception) -> bool:
         message = str(exc).lower()
@@ -532,6 +593,76 @@ class ExchangeGateway:
             "timestamp": _ts_to_iso(info_obj.get("update_time")),
         }
 
+    async def _fetch_bitget_uta_balance(self) -> dict[str, Any]:
+        if not self.client:
+            raise RuntimeError(self._unavailable_reason or "exchange client unavailable")
+        if not hasattr(self.client, "privateUtaGetV3AccountAssets"):
+            raise RuntimeError("bitget_uta_balance_unsupported")
+
+        async def _fetch() -> dict[str, Any]:
+            return await self.client.privateUtaGetV3AccountAssets({})  # type: ignore[attr-defined]
+
+        payload = await self._call_with_time_sync_retry(
+            "privateUtaGetV3AccountAssets",
+            _fetch,
+        )
+        data = payload.get("data") if isinstance(payload, Mapping) else {}
+        info_obj = data if isinstance(data, Mapping) else {}
+        assets = info_obj.get("assets") if isinstance(info_obj, Mapping) else []
+        asset = self.spec.settle_currency.upper()
+        asset_row = _first_mapping(assets, key="coin", value=asset)
+        total_value = (
+            _safe_float(asset_row.get("balance"))
+            or _safe_float(asset_row.get("equity"))
+            or _safe_float(asset_row.get("usdValue"))
+            or _safe_float(info_obj.get("usdtEquity"))
+            or _safe_float(info_obj.get("effEquity"))
+            or _safe_float(info_obj.get("accountEquity"))
+        )
+        free_value = _safe_float(asset_row.get("available"))
+        used_value = _safe_float(asset_row.get("locked"))
+        debt = _safe_float(asset_row.get("debt"))
+        if used_value is None and debt is not None:
+            used_value = debt
+        elif used_value is not None and debt is not None:
+            used_value += debt
+        if used_value is None and total_value is not None and free_value is not None:
+            used_value = max(0.0, float(total_value) - float(free_value))
+        unrealized = (
+            _safe_float(info_obj.get("usdtUnrealisedPnl"))
+            or _safe_float(info_obj.get("unrealisedPnl"))
+            or _safe_float(info_obj.get("btcUnrealizedPnl"))
+        )
+        margin_ratio = _safe_float(info_obj.get("mgnRatio"))
+        initial_margin = _safe_float(info_obj.get("imr"))
+        maintenance_margin = _safe_float(info_obj.get("mmr"))
+        equity = (
+            _safe_float(asset_row.get("equity"))
+            or _safe_float(info_obj.get("usdtEquity"))
+            or _safe_float(info_obj.get("accountEquity"))
+            or total_value
+        )
+        buffer_pct = None
+        try:
+            if total_value and free_value is not None:
+                buffer_pct = (float(free_value) / float(total_value)) * 100.0
+        except Exception:
+            buffer_pct = None
+        return {
+            "exchange": self.slug,
+            "asset": asset,
+            "total": total_value,
+            "available": free_value,
+            "used": used_value,
+            "unrealized_pnl": unrealized,
+            "margin_ratio": margin_ratio,
+            "equity": equity,
+            "buffer_pct": buffer_pct,
+            "initial_margin": initial_margin,
+            "maintenance_margin": maintenance_margin,
+            "timestamp": _ts_to_iso((payload or {}).get("requestTime") if isinstance(payload, Mapping) else None),
+        }
+
     async def _fetch_gate_positions(self) -> list[dict[str, Any]]:
         if not self.client:
             raise RuntimeError(self._unavailable_reason or "exchange client unavailable")
@@ -611,7 +742,11 @@ class ExchangeGateway:
             raise RuntimeError(self._unavailable_reason or "exchange client unavailable")
         if self.slug == "gate":
             return await self._fetch_gate_balance()
+        if self.slug == "bitget" and bitget_uta_enabled():
+            return await self._fetch_bitget_uta_balance()
         params = dict(self.spec.balance_params)
+        if self.slug == "bitget":
+            params = bitget_private_params(params)
         balance = await self._call_with_time_sync_retry(
             "fetch_balance",
             lambda: self.client.fetch_balance(params=params),
@@ -700,6 +835,8 @@ class ExchangeGateway:
         if self.slug == "gate":
             return await self._fetch_gate_positions()
         params = dict(self.spec.position_params)
+        if self.slug == "bitget":
+            params = bitget_private_params(params)
         async def _fetch_positions() -> list[dict[str, Any]]:
             try:
                 return await self.client.fetch_positions(params=params)  # type: ignore[attr-defined]
@@ -895,11 +1032,21 @@ class AccountMonitor:
         summary_interval: int = 1800,
         on_margin_adjust: Callable[[list[dict[str, Any]]], Awaitable[None] | None] | None = None,
         notifier: NotificationRouter | None = None,
+        enabled_exchanges: Iterable[str] | None = None,
     ) -> None:
         self._interval = max(30, refresh_interval)
         self._summary_interval = max(30, summary_interval)
         self._on_margin_adjust = on_margin_adjust
         self._gateways = {spec.slug: ExchangeGateway(spec) for spec in EXCHANGE_SPECS}
+        self._enabled_exchanges: set[str] | None = (
+            {
+                str(exchange).strip().lower()
+                for exchange in enabled_exchanges
+                if str(exchange).strip()
+            }
+            if enabled_exchanges is not None
+            else None
+        )
         self._lock = asyncio.Lock()
         self._balances: list[dict[str, Any]] = []
         self._positions: list[dict[str, Any]] = []
@@ -933,6 +1080,7 @@ class AccountMonitor:
         self._missing_stop_alerts_enabled = True
         self._active_position_alerts: Set[tuple[str, str, str]] = set()
         self._last_position_alert_sent: dict[tuple[str, str, str], float] = {}
+        self._last_refresh_error_log: dict[str, tuple[str, float]] = {}
         self._summary_slot_marker_dir.mkdir(parents=True, exist_ok=True)
         atexit.register(self._sync_close_gateways)
 
@@ -987,6 +1135,18 @@ class AccountMonitor:
     def update_summary_interval(self, seconds: int) -> None:
         self._summary_interval = max(30, int(seconds))
         self._last_summary_slot = None
+
+    def update_enabled_exchanges(self, exchanges: Iterable[str] | None) -> None:
+        """Limit account polling to configured venues; ``None`` keeps legacy all-venue mode."""
+        self._enabled_exchanges = (
+            {
+                str(exchange).strip().lower()
+                for exchange in exchanges
+                if str(exchange).strip()
+            }
+            if exchanges is not None
+            else None
+        )
 
     def update_alert_settings(
         self,
@@ -1151,32 +1311,90 @@ class AccountMonitor:
                     entry["status"] = "unavailable"
                     entry["error"] = gateway.unavailable_reason or "client unavailable"
                     return
-                balance = await asyncio.wait_for(gateway.fetch_balance(), timeout=15.0)
-                if not balance.get("timestamp"):
-                    # Ensure UI shows when this snapshot was taken even if the exchange omits a timestamp.
-                    balance["timestamp"] = timestamp
-                positions_result = await _fetch_positions_with_retry(gateway)
-                balances.append(balance)
-                positions.extend(positions_result)
-                entry["status"] = "ok"
-                entry["message"] = "Credentials verified"
+                balance_error: str | None = None
+                positions_error: str | None = None
+                positions_result: list[dict[str, Any]] = []
+                positions_fetch_ok = False
+                balance_ok = False
+                try:
+                    balance = await asyncio.wait_for(gateway.fetch_balance(), timeout=15.0)
+                    if not balance.get("timestamp"):
+                        # Ensure UI shows when this snapshot was taken even if the exchange omits a timestamp.
+                        balance["timestamp"] = timestamp
+                    balances.append(balance)
+                    balance_ok = True
+                except Exception as exc:  # pylint: disable=broad-except
+                    balance_error = redact_sensitive_text(exc)
+                try:
+                    positions_result = await _fetch_positions_with_retry(gateway)
+                    positions.extend(positions_result)
+                    positions_fetch_ok = True
+                except Exception as exc:  # pylint: disable=broad-except
+                    positions_error = redact_sensitive_text(exc)
                 entry["positions_count"] = len(positions_result)
-                refreshed = timestamp
+                entry["positions_fetch_ok"] = positions_fetch_ok
+                if balance_error or positions_error:
+                    entry["status"] = "partial" if positions_result else "error"
+                    if balance_error:
+                        entry["balance_error"] = balance_error
+                        entry["error"] = balance_error
+                    if positions_error:
+                        entry["positions_error"] = positions_error
+                        entry["error"] = positions_error
+                    error_fingerprint = positions_error or balance_error or "account_partial"
+                    if (
+                        error_fingerprint
+                        and ("10072" in error_fingerprint or "api key info invalid" in error_fingerprint.lower())
+                    ):
+                        error_fingerprint = "auth_error:10072"
+                    previous_error, previous_ts = self._last_refresh_error_log.get(slug, ("", 0.0))
+                    now_ts = time.time()
+                    if error_fingerprint != previous_error or (now_ts - previous_ts) >= 900.0:
+                        logger.warning(
+                            "%s: account refresh partial/error balance=%s positions=%s",
+                            slug,
+                            balance_error or "ok",
+                            positions_error or "ok",
+                        )
+                        self._last_refresh_error_log[slug] = (error_fingerprint or "", now_ts)
+                else:
+                    entry["status"] = "ok"
+                    entry["message"] = "Credentials verified"
+                if balance_ok or positions_result:
+                    refreshed = timestamp
             except Exception as exc:  # pylint: disable=broad-except
+                safe_error = redact_sensitive_text(exc)
                 entry["status"] = "error"
-                entry["error"] = str(exc)
-                entry["positions_error"] = str(exc)
-                logger.warning("%s: account refresh failed: %s", slug, exc)
+                entry["error"] = safe_error
+                entry["positions_error"] = safe_error
+                error_fingerprint = safe_error
+                if "10072" in safe_error or "api key info invalid" in safe_error.lower():
+                    error_fingerprint = "auth_error:10072"
+                previous_error, previous_ts = self._last_refresh_error_log.get(slug, ("", 0.0))
+                now_ts = time.time()
+                if error_fingerprint != previous_error or (now_ts - previous_ts) >= 900.0:
+                    logger.warning("%s: account refresh failed: %s", slug, safe_error)
+                    self._last_refresh_error_log[slug] = (error_fingerprint, now_ts)
+            finally:
+                if gateway.requires_cycle_close():
+                    await gateway.close()
             status_entries.append(entry)
 
         tasks = []
         for slug, gateway in self._gateways.items():
+            if self._enabled_exchanges is not None and slug not in self._enabled_exchanges:
+                continue
             coro = _collect_exchange(slug, gateway)
             tasks.append(asyncio.create_task(coro))
 
         # Execute all exchanges concurrently; swallow per-exchange timeouts to keep others responsive.
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        for slug, result in zip(self._gateways.keys(), results):
+        enabled_slugs = [
+            slug
+            for slug in self._gateways
+            if self._enabled_exchanges is None or slug in self._enabled_exchanges
+        ]
+        for slug, result in zip(enabled_slugs, results):
             if isinstance(result, Exception):
                 status_entries.append(
                     {
@@ -1764,7 +1982,7 @@ class AccountMonitor:
                     else:
                         detail = reduce_action.get("error") or reduce_action.get("reason") or status
                         if status in ("disabled", "cooldown", "skip", "no_action"):
-                            logger.info(
+                            logger.debug(
                                 "%s %s %s margin reduce skipped: %s",
                                 exchange,
                                 symbol,
@@ -1794,7 +2012,7 @@ class AccountMonitor:
                     )
                 else:
                     logger.info("Isolated margin check ok: positions=%s", total_isolated)
-            else:
+            elif add_ok or add_fail or reduce_ok or reduce_fail:
                 logger.info(
                     "Isolated margin policy: positions=%s below_add=%s above_reduce=%s add_ok=%s add_fail=%s reduce_ok=%s reduce_fail=%s",
                     total_isolated,
@@ -1804,6 +2022,13 @@ class AccountMonitor:
                     add_fail,
                     reduce_ok,
                     reduce_fail,
+                )
+            else:
+                logger.debug(
+                    "Isolated margin policy: positions=%s below_add=%s above_reduce=%s",
+                    total_isolated,
+                    below_add_trigger,
+                    above_reduce_trigger,
                 )
 
         async with self._alert_lock:
@@ -2044,8 +2269,10 @@ class AccountMonitor:
                 pos_side = side
             if pos_side:
                 params["posSide"] = pos_side
-        if exchange == "bitget" and side:
-            params["holdSide"] = side
+        if exchange == "bitget":
+            params = bitget_private_params(params)
+            if side:
+                params["holdSide"] = side
         if exchange == "bingx":
             raw = position.get("raw") or {}
             info = raw.get("info") if isinstance(raw, dict) else None
@@ -2306,6 +2533,81 @@ class AccountMonitor:
             request.update(params)
         return await client.privateFuturesPostSettleDualCompPositionsContractMargin(request)
 
+    @staticmethod
+    def _gate_contract_from_position(
+        symbol: str,
+        position: Mapping[str, Any],
+        market: Mapping[str, Any] | None = None,
+    ) -> str | None:
+        if isinstance(market, Mapping):
+            market_id = market.get("id")
+            if market_id:
+                return str(market_id)
+        raw = position.get("raw") if isinstance(position, Mapping) else None
+        info = raw.get("info") if isinstance(raw, Mapping) else None
+        candidates = [
+            position.get("exchange_symbol"),
+            position.get("contract"),
+            position.get("symbol_normalized"),
+            info.get("contract") if isinstance(info, Mapping) else None,
+            info.get("id") if isinstance(info, Mapping) else None,
+            raw.get("contract") if isinstance(raw, Mapping) else None,
+            raw.get("id") if isinstance(raw, Mapping) else None,
+            symbol,
+        ]
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if not text:
+                continue
+            if "_" in text and "/" not in text and ":" not in text:
+                return text.upper()
+            normalized = normalize_symbol(text)
+            for settle in ("USDT", "USDC", "USD"):
+                if normalized.endswith(settle):
+                    base = normalized[: -len(settle)]
+                    if base:
+                        return f"{base}_{settle}"
+        return None
+
+    @staticmethod
+    def _gate_settle_from_contract(contract: str | None, market: Mapping[str, Any] | None = None) -> str:
+        if isinstance(market, Mapping):
+            settle_value = market.get("settle") or market.get("settleId")
+            if settle_value:
+                return str(settle_value).lower()
+        normalized = str(contract or "").upper().strip()
+        if normalized.endswith("_USD") or normalized.endswith("USD"):
+            return "btc"
+        return "usdt"
+
+    async def _gate_update_margin_single(
+        self,
+        client: Any,
+        symbol: str,
+        position: Mapping[str, Any],
+        signed_change: float,
+        params: Mapping[str, Any],
+        market_hint: Mapping[str, Any] | None = None,
+    ) -> Any:
+        if not hasattr(client, "privateFuturesPostSettlePositionsContractMargin"):
+            raise RuntimeError("gate_single_margin_unsupported")
+        contract = self._gate_contract_from_position(symbol, position, market_hint)
+        if not contract:
+            raise RuntimeError("gate_contract_unavailable")
+        change_value = (
+            client.number_to_string(signed_change)
+            if hasattr(client, "number_to_string")
+            else str(signed_change)
+        )
+        request: dict[str, Any] = {
+            "settle": self._gate_settle_from_contract(contract, market_hint),
+            "contract": contract,
+            "change": change_value,
+        }
+        if isinstance(params, Mapping):
+            request.update(params)
+        return await client.privateFuturesPostSettlePositionsContractMargin(request)
+
     async def _gate_modify_margin(
         self,
         client: Any,
@@ -2325,6 +2627,15 @@ class AccountMonitor:
                 market_hint=market,
             )
         try:
+            if hasattr(client, "privateFuturesPostSettlePositionsContractMargin"):
+                return await self._gate_update_margin_single(
+                    client=client,
+                    symbol=symbol,
+                    position=position,
+                    signed_change=normalized_change,
+                    params=params,
+                    market_hint=market,
+                )
             if normalized_change >= 0:
                 if not hasattr(client, "add_margin"):
                     raise RuntimeError("add_margin_unsupported")
@@ -2379,6 +2690,8 @@ class AccountMonitor:
                     signed_amount=amount_value,
                     params=params,
                 )
+            if exchange == "bitget" and bitget_uta_enabled():
+                raise RuntimeError("bitget_uta_margin_unsupported")
             if not hasattr(client, "add_margin"):
                 raise RuntimeError("add_margin_unsupported")
             return await client.add_margin(symbol, amount_value, params)
@@ -2396,6 +2709,8 @@ class AccountMonitor:
                 )
             if exchange == "kucoin":
                 return await self._kucoin_withdraw_margin(client, symbol, amount_value)
+            if exchange == "bitget" and bitget_uta_enabled():
+                raise RuntimeError("bitget_uta_margin_unsupported")
             if not hasattr(client, "reduce_margin"):
                 raise RuntimeError("reduce_margin_unsupported")
             reduce_amount = -amount_value if exchange == "bitget" else amount_value
@@ -2504,7 +2819,7 @@ class AccountMonitor:
                 target = self._target_leverage
                 if target and (leverage is None or abs(leverage - target) > 0.05):
                     if exchange == "binance":
-                        logger.info("%s %s %s leverage enforce skipped (position open)", exchange, symbol, side)
+                        logger.debug("%s %s %s leverage enforce skipped (position open)", exchange, symbol, side)
                         continue
                     key = (exchange, symbol, side, "leverage")
                     if self._margin_enforce_ready(key):
@@ -2731,6 +3046,8 @@ class AccountMonitor:
         if mode in ("isolated", "cross"):
             if exchange == "okx":
                 params["tdMode"] = mode
+            elif exchange == "bitget" and bitget_uta_enabled():
+                params["marginMode"] = "isolated" if mode == "isolated" else "crossed"
             else:
                 params["marginMode"] = mode
         if exchange == "bingx":

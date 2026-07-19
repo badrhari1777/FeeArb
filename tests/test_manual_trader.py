@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import AsyncMock
 
 from execution.manual import (
     ManualTradeManager,
     OrderBookStats,
+    _cap_auto_chunk_by_notional,
     _cap_qty_to_absolute_target,
     _cap_qty_to_target,
     _choose_chunk_qty,
@@ -13,9 +15,12 @@ from execution.manual import (
     _is_min_order_size_error,
     _min_qty_required,
     _normalize_submit_values,
+    _pending_hedge_order_qty,
+    _position_delta_for_leg,
     _precision_to_step,
     _round_to_step,
     _symbol_matches,
+    _trigger_wait_sec,
     estimate_fill,
     max_qty_for_slippage,
     orderbook_stats,
@@ -78,6 +83,11 @@ class ManualTradeHelpersTestCase(unittest.TestCase):
         self.assertEqual(suggestion["reason"], "lower_venue_tier")
         self.assertEqual(suggestion["venue_tier"], {"long": 1, "short": 3})
 
+    def test_position_delta_treats_missing_quantities_as_zero(self) -> None:
+        self.assertEqual(_position_delta_for_leg(None, 5.0, {"reduce_only": False}), 5.0)
+        self.assertEqual(_position_delta_for_leg(None, 5.0, {"reduce_only": True}), 0.0)
+        self.assertEqual(_position_delta_for_leg(5.0, None, {"reduce_only": True}), 5.0)
+
     def test_venue_liquidity_tier_defaults(self) -> None:
         self.assertEqual(venue_liquidity_tier("binance"), 1)
         self.assertEqual(venue_liquidity_tier("okx"), 2)
@@ -117,6 +127,31 @@ class ManualTradeHelpersTestCase(unittest.TestCase):
         self.assertTrue(manager._auto_exit_market_fallback_allowed(payload, "binance"))
         self.assertTrue(manager._auto_exit_market_fallback_allowed(payload, "okx"))
         self.assertFalse(manager._auto_exit_market_fallback_allowed(payload, "gate"))
+
+    def test_auto_exit_final_reconcile_guard_allows_existing_fill_exposure(self) -> None:
+        manager = ManualTradeManager()
+        payload = {"auto_exit_agent": True}
+
+        self.assertTrue(
+            manager._auto_exit_final_reconcile_blocked(
+                payload,
+                "gate",
+                primary_delta=0.0,
+                hedge_delta=0.0,
+                primary_filled_total=0.0,
+                hedge_filled_total=0.0,
+            )
+        )
+        self.assertFalse(
+            manager._auto_exit_final_reconcile_blocked(
+                payload,
+                "gate",
+                primary_delta=100.0,
+                hedge_delta=0.0,
+                primary_filled_total=100.0,
+                hedge_filled_total=0.0,
+            )
+        )
 
     def test_auto_exit_market_fallback_respects_notional_cap(self) -> None:
         manager = ManualTradeManager()
@@ -174,6 +209,22 @@ class ManualTradeHelpersTestCase(unittest.TestCase):
         required = _min_qty_required(min_qty=0.5, min_notional=10.0, price=4.0, amount_step=0.1)
         self.assertAlmostEqual(required, 2.5)
 
+    def test_pending_hedge_qty_uses_minimum_as_floor_not_lot_multiple(self) -> None:
+        qty = _pending_hedge_order_qty(
+            137.0,
+            min_qty_required=99.8,
+            amount_step=0.1,
+        )
+        self.assertAlmostEqual(qty, 137.0)
+
+    def test_pending_hedge_qty_rejects_below_minimum_after_step_rounding(self) -> None:
+        qty = _pending_hedge_order_qty(
+            99.74,
+            min_qty_required=99.8,
+            amount_step=0.1,
+        )
+        self.assertEqual(qty, 0.0)
+
     def test_choose_chunk_qty_below_min(self) -> None:
         chunk, warnings = _choose_chunk_qty(
             remaining=0.5,
@@ -184,6 +235,45 @@ class ManualTradeHelpersTestCase(unittest.TestCase):
         )
         self.assertIsNone(chunk)
         self.assertTrue(warnings)
+
+    def test_choose_chunk_qty_caps_requested_target_to_live_liquidity(self) -> None:
+        chunk, warnings = _choose_chunk_qty(
+            remaining=5000.0,
+            requested_qty=5000.0,
+            min_chunk=10.0,
+            max_chunk=150.0,
+            amount_step=1.0,
+        )
+        self.assertEqual(chunk, 150.0)
+        self.assertTrue(any("slippage cap" in warning for warning in warnings))
+
+    def test_auto_chunk_notional_cap_limits_lower_tier_pair_without_explicit_chunk(self) -> None:
+        capped, cap_notional = _cap_auto_chunk_by_notional(
+            requested_qty=None,
+            chunk_notional=None,
+            max_chunk=130_000.0,
+            mid_price=0.028,
+            legs=[{"exchange": "binance"}, {"exchange": "kucoin"}],
+        )
+
+        self.assertEqual(cap_notional, 250.0)
+        self.assertAlmostEqual(capped or 0.0, 250.0 / 0.028)
+
+    def test_auto_chunk_notional_cap_does_not_override_explicit_chunk(self) -> None:
+        capped, cap_notional = _cap_auto_chunk_by_notional(
+            requested_qty=50_000.0,
+            chunk_notional=None,
+            max_chunk=130_000.0,
+            mid_price=0.028,
+            legs=[{"exchange": "binance"}, {"exchange": "kucoin"}],
+        )
+
+        self.assertEqual(capped, 130_000.0)
+        self.assertIsNone(cap_notional)
+
+    def test_trigger_wait_is_bounded_by_runtime_and_server_default(self) -> None:
+        self.assertEqual(_trigger_wait_sec({}, 180), 30.0)
+        self.assertEqual(_trigger_wait_sec({"trigger_wait_sec": 60}, 20), 20.0)
 
     def test_normalize_submit_values_rounds_limit_price_to_tick(self) -> None:
         qty, price, error = _normalize_submit_values(
@@ -250,6 +340,272 @@ class ManualTradeHelpersTestCase(unittest.TestCase):
         self.assertTrue(_symbol_matches("FLOWUSDT", "FLOWUSDTUSDT"))
         self.assertTrue(_symbol_matches("FLOWUSDT", "FLOW-USDT-SWAP"))
         self.assertFalse(_symbol_matches("FLOWUSDT", "FLOWUSDC"))
+        self.assertTrue(_symbol_matches("H", "H/USDT:USDT"))
+        self.assertFalse(_symbol_matches("H", "HOME/USDT:USDT"))
+
+    def test_build_plan_rejects_reversed_spread_range_before_market_access(self) -> None:
+        manager = ManualTradeManager()
+        result = asyncio.run(
+            manager._build_plan(
+                {
+                    "symbol": "H",
+                    "qty": 1000.0,
+                    "long_exchange": "kucoin",
+                    "short_exchange": "bybit",
+                    "spread_min_pct": -10.0,
+                    "spread_max_pct": -100.0,
+                    "dry_run": True,
+                },
+                action="exit",
+            )
+        )
+        self.assertIn(
+            "spread_min_pct must be less than or equal to spread_max_pct.",
+            result.get("errors") or [],
+        )
+
+    def test_build_exit_plan_uses_position_margin_mode_when_payload_unset(self) -> None:
+        manager = ManualTradeManager()
+        result = asyncio.run(
+            manager._build_plan(
+                {
+                    "symbol": "SLX",
+                    "qty": 1000.0,
+                    "long_exchange": "kucoin",
+                    "short_exchange": "binance",
+                    "spread_min_pct": 1.0,
+                    "spread_max_pct": -1.0,
+                    "dry_run": True,
+                },
+                action="exit",
+                positions=[
+                    {
+                        "exchange": "kucoin",
+                        "symbol": "SLX/USDT:USDT",
+                        "side": "long",
+                        "coin_qty": 1000.0,
+                        "marginMode": "CROSS",
+                    },
+                    {
+                        "exchange": "binance",
+                        "symbol": "SLX/USDT:USDT",
+                        "side": "short",
+                        "coin_qty": 1000.0,
+                        "marginMode": "ISOLATED",
+                    },
+                ],
+            )
+        )
+
+        legs = {leg["exchange"]: leg for leg in result.get("legs") or []}
+        self.assertEqual(legs["kucoin"].get("margin_mode"), "cross")
+        self.assertEqual(legs["binance"].get("margin_mode"), "isolated")
+
+    def test_gate_resolve_market_symbol_falls_back_to_single_contract(self) -> None:
+        class FakeGateClient:
+            id = "gate"
+            markets = None
+            markets_by_id = None
+            symbols = None
+
+            async def load_markets(self):
+                raise TimeoutError("gate markets timeout")
+
+            async def publicFuturesGetSettleContractsContract(self, params):
+                self.contract_params = params
+                return {
+                    "name": "H_USDT",
+                    "status": "trading",
+                    "in_delisting": False,
+                    "quanto_multiplier": "10",
+                    "order_size_min": 1,
+                    "order_size_max": 300000,
+                    "order_price_round": "0.00001",
+                    "leverage_min": "1",
+                    "leverage_max": "10",
+                }
+
+        manager = ManualTradeManager()
+        client = FakeGateClient()
+
+        resolved = asyncio.run(manager._resolve_market_symbol(client, "H"))
+
+        self.assertEqual(resolved, "H/USDT:USDT")
+        self.assertEqual(client.contract_params, {"settle": "usdt", "contract": "H_USDT"})
+        self.assertIn("H/USDT:USDT", client.markets)
+        self.assertEqual(client.markets["H/USDT:USDT"]["contractSize"], 10.0)
+        self.assertEqual(client.markets_by_id["H_USDT"][0]["symbol"], "H/USDT:USDT")
+
+    def test_gate_decimal_contract_fallback_preserves_fractional_contract_step(self) -> None:
+        class FakeGateClient:
+            id = "gate"
+            precisionMode = 4
+            markets = None
+            markets_by_id = None
+            symbols = None
+
+            async def load_markets(self):
+                raise TimeoutError("gate markets timeout")
+
+            async def fetch(self, url, method="GET", headers=None, body=None):  # noqa: D401, ARG002
+                self.fetch_call = {"url": url, "headers": headers}
+                return {
+                    "name": "LAB_USDT",
+                    "status": "trading",
+                    "in_delisting": False,
+                    "enable_decimal": True,
+                    "quanto_multiplier": "100",
+                    "order_size_min": "0.1",
+                    "order_size_max": "1200",
+                    "order_price_round": "0.00001",
+                    "leverage_min": "1",
+                    "leverage_max": "20",
+                }
+
+        manager = ManualTradeManager()
+        client = FakeGateClient()
+
+        resolved = asyncio.run(manager._resolve_market_symbol(client, "LAB"))
+        constraints = manager._extract_market_constraints(client, resolved or "")
+
+        self.assertEqual(resolved, "LAB/USDT:USDT")
+        self.assertEqual(client.fetch_call["headers"], {"X-Gate-Size-Decimal": "1"})
+        self.assertEqual(client.markets["LAB/USDT:USDT"]["precision"]["amount"], 0.1)
+        self.assertAlmostEqual(constraints["min_qty"] or 0.0, 10.0)
+        self.assertAlmostEqual(constraints["amount_step"] or 0.0, 10.0)
+
+    def test_contract_market_zero_min_qty_defaults_to_one_contract(self) -> None:
+        class FakeGateClient:
+            id = "gate"
+            precisionMode = 4
+            markets = {
+                "LAB/USDT:USDT": {
+                    "id": "LAB_USDT",
+                    "symbol": "LAB/USDT:USDT",
+                    "type": "swap",
+                    "swap": True,
+                    "contract": True,
+                    "contractSize": 100.0,
+                    "precision": {"amount": 0.1, "price": 0.00001},
+                    "limits": {
+                        "amount": {"min": 0.0, "max": 1200.0},
+                        "price": {"min": 0.00001, "max": None},
+                        "cost": {"min": None, "max": None},
+                    },
+                    "info": {},
+                }
+            }
+
+        constraints = ManualTradeManager()._extract_market_constraints(FakeGateClient(), "LAB/USDT:USDT")
+
+        self.assertAlmostEqual(constraints["min_qty"] or 0.0, 100.0)
+        self.assertAlmostEqual(constraints["amount_step"] or 0.0, 100.0)
+        self.assertAlmostEqual(constraints["min_qty_contracts_effective"] or 0.0, 1.0)
+
+    def test_build_plan_allows_grid_to_split_liquidity_limited_target(self) -> None:
+        manager = ManualTradeManager()
+        manager._ensure_client = AsyncMock(return_value=object())
+        manager._resolve_market_symbol = AsyncMock(return_value="H/USDT:USDT")
+        manager._fetch_orderbook = AsyncMock(
+            return_value={
+                "bids": [[0.25, 100.0]],
+                "asks": [[0.251, 100.0]],
+                "source": "test",
+            }
+        )
+        manager._extract_market_constraints = lambda *_args, **_kwargs: {
+            "min_qty": 10.0,
+            "min_notional": None,
+            "amount_step": 10.0,
+            "price_step": 0.0001,
+            "contract_size": 1.0,
+        }
+        manager._fetch_funding_meta = AsyncMock(return_value={})
+
+        result = asyncio.run(
+            manager._build_plan(
+                {
+                    "symbol": "HUSDT",
+                    "qty": 1250.0,
+                    "long_exchange": "kucoin",
+                    "short_exchange": "bybit",
+                    "max_slippage_bps": 16.0,
+                    "use_orderbook_check": True,
+                    "allow_liquidity_chunking": True,
+                    "dry_run": False,
+                },
+                action="enter",
+            )
+        )
+
+        self.assertEqual(result.get("errors"), [])
+        self.assertTrue(
+            any(
+                "insufficient liquidity for qty 1250" in warning
+                for warning in (result.get("warnings") or [])
+            )
+        )
+        self.assertAlmostEqual(result["recommended_chunk_qty"], 100.0)
+
+    def test_enter_balance_precheck_preserves_plan_diagnostics(self) -> None:
+        manager = ManualTradeManager()
+        plan = {
+            "dry_run": False,
+            "action": "enter",
+            "symbol": "H",
+            "qty": 7000.0,
+            "mode": "smart-enter",
+            "legs": [
+                {"label": "long", "exchange": "bybit", "side": "buy"},
+                {"label": "short", "exchange": "binance", "side": "sell"},
+            ],
+            "stats": {
+                "bybit": {"best_bid": 0.292, "best_ask": 0.293, "min_liquidity_top3": 10000.0},
+                "binance": {"best_bid": 0.289, "best_ask": 0.29, "min_liquidity_top3": 12000.0},
+            },
+            "slippage": {
+                "bybit": {"expected_slippage_bps": 1.0, "filled_qty": 7000.0, "remaining_qty": 0.0},
+                "binance": {"expected_slippage_bps": 1.5, "filled_qty": 7000.0, "remaining_qty": 0.0},
+            },
+            "market_constraints": {
+                "bybit": {"min_qty_required": 18.0, "amount_step": 1.0},
+                "binance": {"min_qty_required": 18.0, "amount_step": 1.0},
+            },
+            "errors": [],
+            "warnings": ["force_chunk_qty is treated as a requested target and remains capped by live liquidity."],
+            "generated_at": "test",
+        }
+        manager._fetch_positions_with_retry = AsyncMock(return_value=([], []))
+        manager._build_plan = AsyncMock(return_value=plan)
+        manager._fetch_balances_with_retry = AsyncMock(
+            return_value=(
+                {
+                    "bybit": {"available": 5455.0},
+                    "binance": {"available": 0.0},
+                },
+                [],
+            )
+        )
+        manager._fetch_mark_prices_with_retry = AsyncMock(
+            return_value=({"bybit": 0.292, "binance": 0.289}, [])
+        )
+
+        result = asyncio.run(
+            manager.enter(
+                {
+                    "symbol": "H",
+                    "qty": 7000.0,
+                    "long_exchange": "bybit",
+                    "short_exchange": "binance",
+                    "mode": "smart-enter",
+                }
+            )
+        )
+
+        self.assertIn("binance: insufficient balance for min qty 18", result["errors"][0])
+        self.assertEqual(result["stats"]["bybit"]["best_bid"], 0.292)
+        self.assertEqual(result["slippage"]["binance"]["filled_qty"], 7000.0)
+        self.assertEqual(result["warnings"], plan["warnings"])
 
     def test_sum_position_qty_normalizes_side_aliases(self) -> None:
         manager = ManualTradeManager()
@@ -285,13 +641,13 @@ class _FakeBinanceClient:
         self.cancel_all_calls: list[str] = []
         self.cancel_order_calls: list[str] = []
 
-    async def cancel_all_orders(self, symbol: str) -> None:
+    async def cancel_all_orders(self, symbol: str, params: dict | None = None) -> None:  # noqa: ARG002
         self.cancel_all_calls.append(symbol)
 
-    async def fetch_open_orders(self, symbol: str):  # noqa: ARG002
+    async def fetch_open_orders(self, symbol: str, params: dict | None = None):  # noqa: ARG002
         return []
 
-    async def cancel_order(self, order_id: str, symbol: str) -> None:  # noqa: ARG002
+    async def cancel_order(self, order_id: str, symbol: str, params: dict | None = None) -> None:  # noqa: ARG002
         self.cancel_order_calls.append(str(order_id))
 
     async def request(self, path: str, api: str, method: str, params: dict):  # noqa: ARG002
@@ -340,6 +696,64 @@ class ManualTradeBinanceCancelTestCase(unittest.TestCase):
         )
 
         self.assertFalse(ok)
+
+
+class _FakeBitgetCancelClient:
+    def __init__(self, *, fail_cancel_all: bool = False) -> None:
+        self.fail_cancel_all = fail_cancel_all
+        self.cancel_all_calls: list[tuple[str, dict]] = []
+        self.fetch_open_calls: list[tuple[str, dict]] = []
+        self.cancel_order_calls: list[tuple[str, str, dict]] = []
+
+    async def cancel_all_orders(self, symbol: str, params: dict | None = None) -> None:
+        self.cancel_all_calls.append((symbol, dict(params or {})))
+        if self.fail_cancel_all:
+            raise RuntimeError("cancel_all_failed")
+
+    async def fetch_open_orders(self, symbol: str, params: dict | None = None):
+        self.fetch_open_calls.append((symbol, dict(params or {})))
+        return [{"id": "order-1"}]
+
+    async def cancel_order(self, order_id: str, symbol: str, params: dict | None = None) -> None:
+        self.cancel_order_calls.append((order_id, symbol, dict(params or {})))
+
+
+class ManualTradeBitgetUtaCancelTestCase(unittest.TestCase):
+    def test_cancel_open_orders_uses_uta_cancel_all(self) -> None:
+        manager = ManualTradeManager()
+        client = _FakeBitgetCancelClient()
+
+        ok = asyncio.run(
+            manager._cancel_open_orders_for_symbol(
+                client,
+                exchange="bitget",
+                symbol="BTC",
+                ccxt_symbol="BTC/USDT:USDT",
+            )
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(client.cancel_all_calls, [("BTC/USDT:USDT", {"uta": True})])
+        self.assertEqual(client.fetch_open_calls, [])
+        self.assertEqual(client.cancel_order_calls, [])
+
+    def test_cancel_open_orders_fallback_uses_uta_fetch_and_cancel(self) -> None:
+        manager = ManualTradeManager()
+        client = _FakeBitgetCancelClient(fail_cancel_all=True)
+
+        ok = asyncio.run(
+            manager._cancel_open_orders_for_symbol(
+                client,
+                exchange="bitget",
+                symbol="BTC",
+                ccxt_symbol="BTC/USDT:USDT",
+            )
+        )
+
+        self.assertTrue(ok)
+        self.assertEqual(client.cancel_all_calls, [("BTC/USDT:USDT", {"uta": True})])
+        self.assertEqual(client.fetch_open_calls, [("BTC/USDT:USDT", {"uta": True})])
+        self.assertEqual(client.cancel_order_calls, [("order-1", "BTC/USDT:USDT", {"uta": True})])
 
 
 class _BinanceLeverageClient:
@@ -869,6 +1283,9 @@ class _FastExitForceFinalizeManager(ManualTradeManager):
     async def _ensure_ws_orders(self, exchanges, contract_sizes=None, symbol=None, log_cb=None):  # noqa: D401, ARG002
         return None
 
+    async def _ensure_ws_positions(self, exchanges, contract_sizes=None):  # noqa: D401, ARG002
+        return None
+
     async def _fetch_positions_with_retry(self, exchanges, symbol, log_cb=None):  # noqa: D401, ARG002
         return (
             [
@@ -1091,6 +1508,63 @@ class _SubmitOrderManager(ManualTradeManager):
         return True
 
 
+class _GateDecimalSubmitClient:
+    id = "gate"
+    precisionMode = 4
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.markets = {
+            "LAB/USDT:USDT": {
+                "precision": {"amount": 0.1, "price": 0.00001},
+                "limits": {
+                    "amount": {"min": 0.1, "max": 1200.0},
+                    "cost": {"min": None},
+                    "price": {"min": 0.00001, "max": None},
+                },
+                "contractSize": 100.0,
+                "info": {"enable_decimal": True},
+            }
+        }
+
+    def amount_to_precision(self, symbol, value):  # noqa: D401, ARG002
+        return f"{float(value):.10f}".rstrip("0").rstrip(".")
+
+    def price_to_precision(self, symbol, value):  # noqa: D401, ARG002
+        return f"{float(value):.5f}"
+
+    async def create_order(self, symbol, order_type, side, amount, price=None, params=None):  # noqa: D401
+        self.calls.append(
+            {
+                "symbol": symbol,
+                "order_type": order_type,
+                "side": side,
+                "amount": amount,
+                "price": price,
+                "params": params,
+            }
+        )
+        return {"id": "GATE-1", "filled": 0.0, "average": None, "status": "open"}
+
+    async def fetch_positions(self, symbols=None):  # noqa: D401, ARG002
+        return []
+
+
+class _GateDecimalSubmitManager(ManualTradeManager):
+    def __init__(self, client) -> None:
+        super().__init__()
+        self._client = client
+
+    async def _ensure_client(self, exchange, errors):  # noqa: D401, ARG002
+        return self._client
+
+    async def _resolve_market_symbol(self, client, symbol):  # noqa: D401, ARG002
+        return "LAB/USDT:USDT"
+
+    async def _ensure_ws_orders_recovered(self, exchange, reason="submit", log_cb=None):  # noqa: D401, ARG002
+        return True
+
+
 class _SmartEnterPartialExposureManager(ManualTradeManager):
     async def _ensure_ws_positions(self, exchanges, contract_sizes=None):  # noqa: D401, ARG002
         return None
@@ -1118,13 +1592,6 @@ class _SmartEnterPartialExposureManager(ManualTradeManager):
                     "exchange": "binance",
                     "symbol": f"{symbol}/USDT:USDT",
                     "side": "long",
-                    "coin_qty": 1.0,
-                    "mark_price": 100.0,
-                },
-                {
-                    "exchange": "okx",
-                    "symbol": f"{symbol}/USDT:USDT",
-                    "side": "short",
                     "coin_qty": 1.0,
                     "mark_price": 100.0,
                 },
@@ -1240,6 +1707,21 @@ class _SmartEnterPartialExposureManager(ManualTradeManager):
     async def _cancel_order(self, leg, symbol, order_id):  # noqa: D401, ARG002
         return {"exchange": leg["exchange"], "status": "canceled", "order_id": order_id}
 
+    async def _place_market(self, leg, symbol, qty, payload, *, reason, log_cb=None):  # noqa: D401, ARG002
+        return {
+            "exchange": leg["exchange"],
+            "status": "error",
+            "error": "reconcile_failed",
+            "filled_qty": 0.0,
+        }
+
+
+class _SmartEnterNoneStartQtyManager(_SmartEnterPartialExposureManager):
+    def _sum_position_qty(self, positions, *, exchange, side, symbol):  # noqa: D401, ARG002
+        if not positions:
+            return None
+        return super()._sum_position_qty(positions, exchange=exchange, side=side, symbol=symbol)
+
 
 class ManualTradeSubmitOrderValidationTestCase(unittest.TestCase):
     def test_submit_order_rounds_price_to_tick_before_create(self) -> None:
@@ -1261,6 +1743,27 @@ class ManualTradeSubmitOrderValidationTestCase(unittest.TestCase):
         self.assertEqual(result.get("status"), "submitted")
         self.assertEqual(len(client.calls), 1)
         self.assertAlmostEqual(float(client.calls[0]["price"]), 0.636)
+
+    def test_submit_order_preserves_gate_decimal_contract_amount(self) -> None:
+        client = _GateDecimalSubmitClient()
+        manager = _GateDecimalSubmitManager(client)
+
+        result = asyncio.run(
+            manager._submit_order(
+                {"exchange": "gate", "side": "buy"},
+                "LAB",
+                120.0,
+                "limit",
+                price=14.81869,
+                reduce_only=False,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(result.get("status"), "submitted")
+        self.assertEqual(len(client.calls), 1)
+        self.assertAlmostEqual(float(client.calls[0]["amount"]), 1.2)
+        self.assertAlmostEqual(float(result.get("qty_contracts") or 0.0), 1.2)
 
     def test_submit_order_prefers_binance_price_filter_tick_size(self) -> None:
         client = _SubmitOrderClient()
@@ -1415,6 +1918,20 @@ class ManualTradeSubmitOrderValidationTestCase(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("partial_fill_exposure", errors[0])
 
+    def test_collect_action_errors_skips_reconciled_transient_error(self) -> None:
+        manager = ManualTradeManager()
+        errors = manager._collect_action_errors(
+            [
+                {
+                    "exchange": "gate",
+                    "status": "error",
+                    "error": "temporary submit failure",
+                    "handled_error": "final_reconcile",
+                }
+            ]
+        )
+        self.assertEqual(errors, [])
+
     def test_smart_enter_returns_partial_fill_risk_flag_when_hedge_fails(self) -> None:
         manager = _SmartEnterPartialExposureManager()
         result = asyncio.run(
@@ -1445,8 +1962,9 @@ class ManualTradeSubmitOrderValidationTestCase(unittest.TestCase):
             for action in (result.get("actions") or [])
             if action.get("exchange") == "okx" and action.get("status") == "error"
         ]
-        self.assertEqual(len(hedge_errors), 1)
-        self.assertEqual(hedge_errors[0].get("risk_state"), "partial_fill_exposure")
+        self.assertTrue(
+            any(action.get("risk_state") == "partial_fill_exposure" for action in hedge_errors)
+        )
 
     def test_smart_enter_uses_auto_hint_suggested_leg_as_primary(self) -> None:
         manager = _SmartEnterPartialExposureManager()
@@ -1473,6 +1991,30 @@ class ManualTradeSubmitOrderValidationTestCase(unittest.TestCase):
         actions = result.get("actions") or []
         self.assertTrue(actions)
         self.assertEqual(actions[0].get("exchange"), "okx")
+
+    def test_smart_enter_treats_missing_start_position_qty_as_zero(self) -> None:
+        manager = _SmartEnterNoneStartQtyManager()
+        result = asyncio.run(
+            manager._execute_smart_enter(
+                {
+                    "action": "enter",
+                    "symbol": "SIREN",
+                    "qty": 1.0,
+                    "legs": [
+                        {"exchange": "binance", "side": "buy", "label": "long", "reduce_only": False},
+                        {"exchange": "okx", "side": "sell", "label": "short", "reduce_only": False},
+                    ],
+                    "market_constraints": {
+                        "binance": {"amount_step": 0.1, "min_qty_required": 0.1, "price_step": 0.1},
+                        "okx": {"amount_step": 0.1, "min_qty_required": 0.1, "price_step": 0.1},
+                    },
+                },
+                {"verbose_logs": False},
+            )
+        )
+
+        self.assertEqual(result.get("mode"), "smart-enter")
+        self.assertIn("partial_fill_exposure", result.get("risk_flags") or [])
 
 
 class ManualTradeExitDustTestCase(unittest.TestCase):
@@ -1668,6 +2210,39 @@ class ManualTradeForcedFinalizeTestCase(unittest.TestCase):
         self.assertEqual(manager.market_calls, [])
         self.assertEqual(manager.finalize_calls, 0)
 
+    def test_smart_exit_plain_stop_skips_force_finalize(self) -> None:
+        manager = _FastExitForceFinalizeManager(
+            force_finalize=False,
+            end_positions=[
+                {"exchange": "binance", "symbol": "BTC/USDT:USDT", "side": "long", "coin_qty": 5.0},
+                {"exchange": "okx", "symbol": "BTC/USDT:USDT", "side": "short", "coin_qty": 10.0},
+            ],
+        )
+
+        result = asyncio.run(
+            manager._execute_smart_exit(
+                {
+                    "action": "exit",
+                    "symbol": "BTC",
+                    "qty": 10.0,
+                    "legs": [
+                        {"exchange": "binance", "side": "sell", "label": "long", "reduce_only": True},
+                        {"exchange": "okx", "side": "buy", "label": "short", "reduce_only": True},
+                    ],
+                    "market_constraints": {
+                        "binance": {"amount_step": 0.1, "min_qty_required": 0.1},
+                        "okx": {"amount_step": 0.1, "min_qty_required": 0.1},
+                    },
+                },
+                {"qty": 10.0, "max_runtime_sec": 60},
+            )
+        )
+
+        self.assertEqual(result.get("mode"), "smart-exit")
+        self.assertIn("stopped_by_user", result.get("warnings") or [])
+        self.assertEqual(manager.market_calls, [])
+        self.assertEqual(manager.finalize_calls, 0)
+
 
 class ManualTradeOrphanCleanupTestCase(unittest.TestCase):
     def test_orphan_cleanup_non_panic_uses_rebalance_path(self) -> None:
@@ -1759,6 +2334,95 @@ class ManualTradeOrphanCleanupTestCase(unittest.TestCase):
 
         self.assertIn("orphan_cleanup_residual", result.get("risk_flags") or [])
         self.assertTrue(any("orphan residual" in item for item in (result.get("warnings") or [])))
+
+
+class ProtectivePreflightTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_agent_rebalance_submits_limit_order(self) -> None:
+        manager = ManualTradeManager()
+        manager._snapshot_legs = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "errors": [],
+                "constraints": {
+                    "binance": {
+                        "min_qty": 1.0,
+                        "min_notional": 5.0,
+                        "amount_step": 1.0,
+                        "price_step": 0.00001,
+                    }
+                },
+                "stats": {
+                    "binance": OrderBookStats(
+                        best_bid=0.25701,
+                        best_ask=0.25702,
+                        spread=0.00001,
+                        mid=0.257015,
+                        bid_liquidity_top3=1000.0,
+                        ask_liquidity_top3=1000.0,
+                        min_liquidity_top3=1000.0,
+                    )
+                },
+                "mid_price": 0.257015,
+                "max_qty_by_exchange": {"binance": 1000.0},
+                "orderbooks": {},
+            }
+        )
+        manager._place_limit_at_agent = AsyncMock(  # type: ignore[method-assign]
+            return_value={"status": "filled", "filled_qty": 30.0, "order_id": "limit1"}
+        )
+        manager._place_market = AsyncMock()  # type: ignore[method-assign]
+
+        result = await manager.agent_rebalance(
+            exchange="binance",
+            symbol="HUSDT",
+            side="buy",
+            qty_base=30.0,
+            max_slippage_bps=16.0,
+        )
+
+        self.assertEqual(result["status"], "filled")
+        self.assertAlmostEqual(result["filled_qty"], 30.0)
+        manager._place_limit_at_agent.assert_awaited_once()
+        manager._place_market.assert_not_awaited()
+
+    async def test_analyze_rebalance_returns_market_minimums_without_orders(self) -> None:
+        manager = ManualTradeManager()
+        manager._snapshot_legs = AsyncMock(  # type: ignore[method-assign]
+            return_value={
+                "errors": [],
+                "constraints": {
+                    "okx": {
+                        "min_qty": 0.01,
+                        "min_notional": 10.0,
+                        "amount_step": 0.01,
+                    }
+                },
+                "stats": {
+                    "okx": OrderBookStats(
+                        best_bid=99.0,
+                        best_ask=101.0,
+                        spread=2.0,
+                        mid=100.0,
+                        bid_liquidity_top3=1000.0,
+                        ask_liquidity_top3=1000.0,
+                        min_liquidity_top3=1000.0,
+                    )
+                },
+                "mid_price": 100.0,
+                "max_qty_by_exchange": {"okx": 5.0},
+                "orderbook_sources": {"okx": "ws"},
+            }
+        )
+
+        result = await manager.analyze_rebalance(
+            exchange="okx",
+            symbol="BTCUSDT",
+            side="buy",
+            qty_base=1.0,
+        )
+
+        self.assertEqual(result["errors"], [])
+        self.assertAlmostEqual(float(result["min_qty_required"]), 0.1)
+        self.assertEqual(result["orderbook_source"], "ws")
 
 
 if __name__ == "__main__":

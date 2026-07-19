@@ -194,3 +194,30 @@ P3: SQLite / Review UI
 Operational Notes
 - `JSONL` is intended to be durable across backend restarts.
 - `AGENTS.md` should remain concise; do not copy the entire phase history there.
+
+Implementation Update: 2026-06-14
+- Double-settle symbols are normalized centrally, so `ESPORTS/USDT:USDT` and
+  legacy `ESPORTSUSDTUSDT` both resolve to `ESPORTSUSDT`.
+- Auto-exit-derived hedge clusters now require an enabled rule, a valid position
+  signature, and at least one currently visible expected leg. Owner metadata is
+  carried into the derived cluster.
+- De-risk history now rotates at `256 MB` with three backups. Stable cycles use
+  a `60 sec` heartbeat, while identical state events use a `15 min` heartbeat.
+- Disabled rebalance and margin reduction now persist real Shadow candidates in
+  `logs/protective_shadow_history.jsonl`; no order is placed by these Shadow
+  paths.
+- De-risk and orphan actions require market-constraint preflight. Residual
+  classification now uses min qty, min notional and amount step when available.
+- Candidate execution is blocked above `derisk_max_candidate_score` (default
+  `0.25`). Preflight is cached for `60 sec` by default.
+- Protective scheduling now runs through the shared Auto Agent worker in this
+  order: orphan/panic/stress de-risk, legacy auto exit, ladder strategies, Grid.
+- Auto margin reduction is disabled by default consistently in backend and UI.
+- Controlled rollout instructions are in
+  `instructions/10_ЗАЩИТНЫЕ_СТРАТЕГИИ_SHADOW_И_SMALL_VOLUME.md`.
+- The old `11.21 GB` history was retired on `2026-06-14 08:13 UTC`. A 5000-row
+  tail remains at
+  `logs/archive/derisk_history_pre_hardening_tail_20260614.jsonl`; the active
+  `logs/derisk_history.jsonl` now contains only post-hardening telemetry.
+- Plain execution stop now skips all smart-exit final reconcile and dust cleanup.
+  Only an explicit `force_finalize=true` stop may rebalance a lagging leg.

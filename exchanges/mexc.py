@@ -9,6 +9,7 @@ import os
 import time
 from pathlib import Path
 from typing import Iterable, List
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import aiohttp
@@ -309,16 +310,28 @@ class MexcAdapter(ExchangeAdapter):
         exch_symbol = self.map_symbol(symbol) or symbol
 
         def _fetch() -> list[dict]:
-            url = f"https://contract.mexc.com/api/v1/contract/funding_rate/history/" + exch_symbol
+            url = "https://contract.mexc.com/api/v1/contract/funding_rate/history?" + urlencode(
+                {
+                    "symbol": exch_symbol,
+                    "page_num": 1,
+                    "page_size": max(1, min(1000, int(limit or 200))),
+                }
+            )
             try:
                 payload = _get_json(url)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.debug("MEXC funding history fetch failed for %s: %s", exch_symbol, exc)
                 return []
             data = payload.get("data") or []
+            if isinstance(data, dict):
+                data = data.get("resultList") or data.get("result") or data.get("list") or []
             out: list[dict] = []
             for item in data[:limit]:
-                ts_ms = parse_timestamp_ms(item.get("timestamp") or item.get("time"))
+                ts_ms = parse_timestamp_ms(
+                    item.get("settleTime")
+                    or item.get("timestamp")
+                    or item.get("time")
+                )
                 out.append(
                     {
                         "ts_ms": ts_ms or 0,

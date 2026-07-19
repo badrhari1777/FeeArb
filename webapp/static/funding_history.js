@@ -161,8 +161,9 @@
   function renderBest(payload) {
     var best = payload.best_by_window || {};
     var rows = [];
-    for (var i = 0; i < windows.length; i += 1) {
-      var label = windows[i].label;
+    var bestWindows = [{ hours: 'next', label: 'next' }].concat(windows);
+    for (var i = 0; i < bestWindows.length; i += 1) {
+      var label = bestWindows[i].label;
       var row = best[label];
       if (!row) {
         rows.push('<tr><td>' + escapeHtml(label) + '</td><td colspan="6" class="muted">No complete pair data</td></tr>');
@@ -175,7 +176,7 @@
         '<td class="' + toneClass(row.net_pct) + '">' + fmtPct(row.net_pct, 4) + '</td>' +
         '<td class="' + toneClass(row.usd_per_1000_notional) + '">' + fmtUsd(row.usd_per_1000_notional) + '</td>' +
         '<td class="' + toneClass(row.annualized_pct) + '">' + fmtPct(row.annualized_pct, 2) + '</td>' +
-        '<td>' + fmtNumber(row.coverage_pct, 1) + '%</td>' +
+        '<td>' + fmtNumber(row.coverage_pct, 1) + '%' + (row.net_hourly_bps !== undefined ? '<span class="cell-note">' + fmtNumber(row.net_hourly_bps, 3) + ' bps/h</span>' : '') + '</td>' +
         '<td>' + escapeHtml(row.verdict || row.status || '-') + '</td>' +
         '</tr>'
       );
@@ -186,7 +187,7 @@
   function renderExchanges(payload) {
     var rows = payload.exchanges || [];
     if (!rows.length) {
-      el.exchangeBody.innerHTML = '<tr><td colspan="8" class="muted">No exchange data.</td></tr>';
+      el.exchangeBody.innerHTML = '<tr><td colspan="10" class="muted">No exchange data.</td></tr>';
       return;
     }
     el.exchangeBody.innerHTML = rows.map(function (row) {
@@ -204,9 +205,11 @@
         '<td>' + escapeHtml(row.exchange_symbol || row.symbol || '-') + '</td>' +
         '<td>' + escapeHtml(row.status || '-') + '</td>' +
         '<td class="' + toneClass(row.latest_funding_bps) + '">' + fmtPercentFromBps(row.latest_funding_bps) + '</td>' +
-        '<td>' + fmtNumber(row.funding_interval_hours_resolved, 2) + 'h</td>' +
+        '<td class="' + toneClass(row.next_funding_bps) + '">' + fmtPercentFromBps(row.next_funding_bps) + '<span class="cell-note">' + escapeHtml(row.next_funding_source || '-') + '</span></td>' +
+        '<td>' + fmtNumber(row.funding_interval_hours_resolved, 2) + 'h<span class="cell-note">' + fmtNumber(row.latest_funding_hourly_bps, 3) + ' bps/h</span></td>' +
         '<td>' + escapeHtml((row.funding_history || []).length) + '</td>' +
         '<td>' + fmtSlotTime(latest.slot_time_utc || latest.time_utc || latest.ts_ms) + '</td>' +
+        '<td>' + fmtSlotTime(row.next_funding_time) + '</td>' +
         '<td>' + escapeHtml(notes.join('; ') || '-') + '</td>' +
         '</tr>'
       );
@@ -214,7 +217,7 @@
   }
 
   function renderPairs(payload) {
-    var rows = payload.pair_windows || [];
+    var rows = (payload.next_funding_windows || []).concat(payload.pair_windows || []);
     if (!rows.length) {
       el.pairBody.innerHTML = '<tr><td colspan="9" class="muted">No pair calculations.</td></tr>';
       return;
@@ -230,7 +233,7 @@
         '<td class="' + toneClass(row.usd_per_1000_notional) + '">' + fmtUsd(row.usd_per_1000_notional) + '</td>' +
         '<td class="' + toneClass(row.annualized_pct) + '">' + fmtPct(row.annualized_pct, 2) + '</td>' +
         '<td>' + fmtNumber(row.coverage_pct, 1) + '%</td>' +
-        '<td>' + escapeHtml(row.status || '-') + '</td>' +
+        '<td>' + escapeHtml(row.status || '-') + (row.net_hourly_bps !== undefined ? '<span class="cell-note">' + fmtNumber(row.net_hourly_bps, 3) + ' bps/h</span>' : '') + '</td>' +
         '</tr>'
       );
     }).join('');

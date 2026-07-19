@@ -9,7 +9,235 @@ import types
 from unittest.mock import AsyncMock
 
 import execution.accounts as accounts_module
-from execution.accounts import AccountMonitor, ExchangeGateway, EXCHANGE_SPECS, _extract_leverage
+from execution.accounts import (
+    AccountMonitor,
+    ExchangeGateway,
+    EXCHANGE_SPECS,
+    _extract_leverage,
+    _filter_markets_with_ids,
+)
+
+
+class ExchangeGatewayMarketFilterTestCase(unittest.TestCase):
+    def test_filter_markets_removes_missing_ids(self) -> None:
+        markets = _filter_markets_with_ids(
+            [
+                {"id": "BTC-USDT-SWAP", "symbol": "BTC/USDT:USDT"},
+                {"id": None, "symbol": "BROKEN"},
+                {"symbol": "ALSO-BROKEN"},
+            ]
+        )
+        self.assertEqual(markets, [{"id": "BTC-USDT-SWAP", "symbol": "BTC/USDT:USDT"}])
+
+    def test_concurrent_ensure_client_builds_once(self) -> None:
+        gateway = ExchangeGateway(EXCHANGE_SPECS[0])
+        gateway.api_key = "key"
+        gateway.api_secret = "secret"
+        gateway._cred_signature = ("key", "secret", "")  # type: ignore[attr-defined]
+        builds = 0
+
+        class _Client:
+            async def close(self) -> None:
+                return None
+
+        async def _build_client():
+            nonlocal builds
+            builds += 1
+            await asyncio.sleep(0.01)
+            return _Client()
+
+        gateway._build_client = _build_client  # type: ignore[method-assign]
+
+        async def _run() -> None:
+            await asyncio.gather(
+                gateway.ensure_client(),
+                gateway.ensure_client(),
+                gateway.ensure_client(),
+            )
+            await gateway.close()
+
+        asyncio.run(_run())
+        self.assertEqual(builds, 1)
+
+
+class _FakeBitgetUtaClient:
+    def __init__(self) -> None:
+        self.balance_params: list[dict] = []
+        self.uta_account_calls: list[dict] = []
+        self.positions_params: list[dict] = []
+
+    async def fetch_balance(self, params: dict | None = None) -> dict:
+        self.balance_params.append(dict(params or {}))
+        return {
+            "USDT": {"free": 42.0, "used": 8.0, "total": 50.0},
+            "free": {"USDT": 42.0},
+            "used": {"USDT": 8.0},
+            "total": {"USDT": 50.0},
+            "info": {"mgnRatio": "0.16", "imr": "8", "mmr": "1"},
+        }
+
+    async def privateUtaGetV3AccountAssets(self, params: dict | None = None) -> dict:
+        self.uta_account_calls.append(dict(params or {}))
+        return {
+            "requestTime": "1782235598649",
+            "data": {
+                "accountEquity": "50",
+                "usdtEquity": "50",
+                "unrealisedPnl": "1.5",
+                "imr": "8",
+                "mmr": "1",
+                "mgnRatio": "0.16",
+                "assets": [
+                    {
+                        "coin": "USDT",
+                        "equity": "50",
+                        "usdValue": "50",
+                        "balance": "50",
+                        "available": "42",
+                        "debt": "0",
+                        "locked": "8",
+                    }
+                ],
+            },
+        }
+
+    async def fetch_positions(self, params: dict | None = None) -> list[dict]:
+        self.positions_params.append(dict(params or {}))
+        return [
+            {
+                "symbol": "BTC/USDT:USDT",
+                "contracts": 0.001,
+                "contractSize": 1.0,
+                "side": "long",
+                "entryPrice": 100000.0,
+                "markPrice": 101000.0,
+                "leverage": 1,
+                "liquidationPrice": 50000.0,
+                "marginMode": "cross",
+                "initialMargin": 100.0,
+                "maintenanceMargin": 1.0,
+                "unrealizedPnl": 1.0,
+                "info": {"symbol": "BTCUSDT", "posSide": "long", "holdMode": "hedge_mode"},
+            }
+        ]
+
+
+class ExchangeGatewayBitgetUtaTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_bitget_balance_uses_uta_private_params_by_default(self) -> None:
+        spec = next(item for item in EXCHANGE_SPECS if item.slug == "bitget")
+        gateway = ExchangeGateway(spec)
+        gateway._client = _FakeBitgetUtaClient()
+        gateway._unavailable_reason = None
+
+        balance = await gateway.fetch_balance()
+
+        self.assertEqual(balance.get("exchange"), "bitget")
+        self.assertEqual(balance.get("available"), 42.0)
+        self.assertEqual(balance.get("total"), 50.0)
+        self.assertEqual(balance.get("used"), 8.0)
+        self.assertEqual(balance.get("initial_margin"), 8.0)
+        self.assertEqual(balance.get("maintenance_margin"), 1.0)
+        self.assertEqual(gateway.client.uta_account_calls, [{}])  # type: ignore[union-attr]
+        self.assertEqual(gateway.client.balance_params, [])  # type: ignore[union-attr]
+
+    async def test_bitget_positions_use_uta_private_params_by_default(self) -> None:
+        spec = next(item for item in EXCHANGE_SPECS if item.slug == "bitget")
+        gateway = ExchangeGateway(spec)
+        gateway._client = _FakeBitgetUtaClient()
+        gateway._unavailable_reason = None
+
+        positions = await gateway.fetch_positions()
+
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0].get("symbol_normalized"), "BTCUSDT")
+        self.assertEqual(gateway.client.positions_params, [{"type": "swap", "uta": True}])  # type: ignore[union-attr]
+
+
+class _PartialCollectGateway:
+    has_credentials = True
+    available = True
+    unavailable_reason = None
+
+    async def refresh_credentials_async(self, *, force_env: bool = False) -> None:  # noqa: ARG002
+        return None
+
+    async def ensure_client(self) -> None:
+        return None
+
+    async def fetch_balance(self) -> dict:
+        raise RuntimeError("bitget {\"code\":\"40014\",\"msg\":\"Incorrect permissions, need UTA manage read\"}")
+
+    async def fetch_positions(self) -> list[dict]:
+        return [
+            {
+                "exchange": "bitget",
+                "symbol": "BTC/USDT:USDT",
+                "side": "long",
+                "coin_qty": 0.001,
+            }
+        ]
+
+    def requires_cycle_close(self) -> bool:
+        return False
+
+    async def close(self) -> None:
+        return None
+
+
+class AccountMonitorPartialCollectTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_balance_error_does_not_drop_positions(self) -> None:
+        monitor = AccountMonitor(refresh_interval=60, summary_interval=60)
+        monitor._gateways = {"bitget": _PartialCollectGateway()}  # type: ignore[assignment]
+
+        balances, positions, status, refreshed = await monitor._collect_all(force_env=True)
+
+        self.assertEqual(balances, [])
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(refreshed is not None, True)
+        self.assertEqual(status[0]["exchange"], "bitget")
+        self.assertEqual(status[0]["status"], "partial")
+        self.assertTrue(status[0]["positions_fetch_ok"])
+        self.assertIn("UTA manage read", status[0]["balance_error"])
+
+    async def test_disabled_exchange_is_not_polled(self) -> None:
+        enabled_gateway = _PartialCollectGateway()
+        disabled_gateway = _PartialCollectGateway()
+        monitor = AccountMonitor(
+            refresh_interval=60,
+            summary_interval=60,
+            enabled_exchanges={"bitget"},
+        )
+        monitor._gateways = {  # type: ignore[assignment]
+            "bitget": enabled_gateway,
+            "mexc": disabled_gateway,
+        }
+
+        _balances, positions, status, _refreshed = await monitor._collect_all(force_env=True)
+
+        self.assertEqual(len(positions), 1)
+        self.assertEqual([item["exchange"] for item in status], ["bitget"])
+
+
+class BalanceStatusRowsTestCase(unittest.TestCase):
+    def test_missing_balance_gets_diagnostic_row_from_status(self) -> None:
+        from webapp.services import DataService  # pylint: disable=import-outside-toplevel
+
+        rows = DataService._balances_with_status_rows(
+            [],
+            [
+                {
+                    "exchange": "bitget",
+                    "status": "partial",
+                    "balance_error": "need UTA manage read",
+                    "checked_at": "2026-06-23T00:00:00+00:00",
+                }
+            ],
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["exchange"], "bitget")
+        self.assertEqual(rows[0]["status"], "partial")
+        self.assertEqual(rows[0]["error"], "need UTA manage read")
 
 
 class AccountMonitorMarginUsedTestCase(unittest.TestCase):
@@ -231,6 +459,16 @@ class AccountMonitorSummaryTestCase(unittest.TestCase):
         self.assertIn("RIVERUSDT", text)
         self.assertNotIn("RIVERUSDTUSDT", text)
 
+    def test_normalize_symbol_dedupes_ccxt_perpetual_settle_suffix(self) -> None:
+        self.assertEqual(
+            accounts_module.normalize_symbol("ESPORTS/USDT:USDT"),
+            "ESPORTSUSDT",
+        )
+        self.assertEqual(
+            accounts_module.normalize_symbol("ESPORTSUSDTUSDT"),
+            "ESPORTSUSDT",
+        )
+
     def test_summary_slot_claim_dedupes_with_sent_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             self.monitor._summary_slot_marker_dir = Path(tmpdir)
@@ -447,6 +685,43 @@ class _FakeGateway:
         return None
 
 
+class _DirectGateMarginClient:
+    def __init__(self) -> None:
+        self.futures_margin_calls: list[dict] = []
+        self.add_margin_calls: list[tuple[str, float, dict]] = []
+
+    async def load_markets(self) -> dict:
+        raise RuntimeError("gate GET https://api.gateio.ws/api/v4/spot/currencies timeout")
+
+    def number_to_string(self, value: float) -> str:
+        return f"{float(value):.8f}".rstrip("0").rstrip(".")
+
+    async def add_margin(self, symbol: str, amount: float, params: dict) -> dict:
+        self.add_margin_calls.append((symbol, amount, dict(params)))
+        return {"status": "unexpected"}
+
+    async def privateFuturesPostSettlePositionsContractMargin(self, request: dict) -> dict:
+        self.futures_margin_calls.append(dict(request))
+        return {"status": "ok", "method": "single_margin"}
+
+
+class _DirectGateGateway:
+    def __init__(self, client: _DirectGateMarginClient) -> None:
+        self.client = client
+
+    async def refresh_credentials_async(self, force_env: bool = True) -> None:
+        _ = force_env
+
+    async def ensure_client(self) -> None:
+        return None
+
+    def map_symbol(self, symbol: str) -> str:
+        return symbol
+
+    async def close(self) -> None:
+        return None
+
+
 class AccountMonitorGateMarginTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_gate_dual_mode_add_uses_dual_endpoint(self) -> None:
         monitor = AccountMonitor(refresh_interval=60, summary_interval=60)
@@ -495,6 +770,29 @@ class AccountMonitorGateMarginTestCase(unittest.IsolatedAsyncioTestCase):
         request = client.dual_margin_calls[0]
         self.assertEqual(request.get("dual_side"), "dual_short")
         self.assertEqual(request.get("change"), "114.0661157")
+
+    async def test_gate_single_margin_uses_direct_futures_endpoint_when_markets_timeout(self) -> None:
+        monitor = AccountMonitor(refresh_interval=60, summary_interval=60)
+        client = _DirectGateMarginClient()
+        monitor._gateways = {"gate": _DirectGateGateway(client)}
+        position = {
+            "symbol": "H/USDT:USDT",
+            "exchange_symbol": "H_USDT",
+            "side": "long",
+            "raw": {"info": {"contract": "H_USDT", "mode": "single"}},
+        }
+        result = await monitor._modify_margin(
+            exchange="gate",
+            position=position,
+            amount=12.345678901,
+            action="add",
+        )
+        self.assertEqual(result.get("status"), "ok")
+        self.assertEqual(client.add_margin_calls, [])
+        self.assertEqual(
+            client.futures_margin_calls,
+            [{"settle": "usdt", "contract": "H_USDT", "change": "12.3456789"}],
+        )
 
 
 class _FakeOkxClient:

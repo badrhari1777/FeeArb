@@ -114,7 +114,7 @@ class AppSettings:
             "notification_primary_channel": "ntfy",
             "notification_fallback_channel": "telegram",
             "auto_margin_enabled": True,
-            "auto_margin_reduce_enabled": True,
+            "auto_margin_reduce_enabled": False,
             "enforce_isolated_margin": True,
             "enforce_leverage": True,
             "target_leverage": 3.0,
@@ -158,6 +158,8 @@ class AppSettings:
             "derisk_velocity_trigger_bps": 120.0,
             "derisk_qty_tolerance_pct": 0.10,
             "derisk_max_single_action_notional_usd": 500.0,
+            "derisk_max_candidate_score": 0.25,
+            "derisk_preflight_ttl_sec": 60,
             "derisk_market_cleanup_only_in_emergency": True,
             "derisk_dust_notional_usd": 10.0,
         }
@@ -296,7 +298,7 @@ class AppSettings:
             "notification_primary_channel": "ntfy",
             "notification_fallback_channel": "telegram",
             "auto_margin_enabled": True,
-            "auto_margin_reduce_enabled": True,
+            "auto_margin_reduce_enabled": False,
             "enforce_isolated_margin": True,
             "enforce_leverage": True,
             "target_leverage": 3.0,
@@ -340,6 +342,8 @@ class AppSettings:
             "derisk_velocity_trigger_bps": 120.0,
             "derisk_qty_tolerance_pct": 0.10,
             "derisk_max_single_action_notional_usd": 500.0,
+            "derisk_max_candidate_score": 0.25,
+            "derisk_preflight_ttl_sec": 60,
             "derisk_market_cleanup_only_in_emergency": True,
             "derisk_dust_notional_usd": 10.0,
         }
@@ -476,6 +480,10 @@ class AppSettings:
                 raise ValueError("derisk_confirm_cycles must be >= 1.")
             if int(protective.get("derisk_failure_block_count", 2) or 0) < 1:
                 raise ValueError("derisk_failure_block_count must be >= 1.")
+            if float(protective.get("derisk_max_candidate_score", 0.25)) < 0:
+                raise ValueError("derisk_max_candidate_score must be >= 0.")
+            if int(protective.get("derisk_preflight_ttl_sec", 60) or 0) < 1:
+                raise ValueError("derisk_preflight_ttl_sec must be >= 1.")
             primary_channel = str(protective.get("notification_primary_channel", "telegram") or "").strip().lower()
             if primary_channel not in {"telegram", "pushbullet", "ntfy"}:
                 raise ValueError("notification_primary_channel must be telegram, pushbullet, or ntfy.")

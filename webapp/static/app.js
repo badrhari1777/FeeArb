@@ -19,7 +19,7 @@
     notification_primary_channel: 'ntfy',
     notification_fallback_channel: 'telegram',
     auto_margin_enabled: true,
-    auto_margin_reduce_enabled: true,
+    auto_margin_reduce_enabled: false,
     enforce_isolated_margin: true,
     enforce_leverage: true,
     target_leverage: 3,
@@ -51,7 +51,9 @@
     derisk_qty_tolerance_pct: 0.1,
     derisk_max_single_action_notional_usd: 500,
     derisk_market_cleanup_only_in_emergency: true,
-    derisk_dust_notional_usd: 10
+    derisk_dust_notional_usd: 10,
+    derisk_max_candidate_score: 0.25,
+    derisk_preflight_ttl_sec: 60
   };
 
   var manualDefaults = {
@@ -129,7 +131,7 @@
   };
 
   var defaultAutoArb = {
-    mode: 'shadow_and_restricted_live',
+    mode: 'live',
     live_limits: {},
     rules: []
   };
@@ -177,6 +179,7 @@
     logPath: null,
     lastFetched: 0
   };
+  var activePositionActions = {};
   var staleAutoExitExecIds = {};
   var autoExitExecTimer = null;
   var autoAgentContext = null;
@@ -242,6 +245,8 @@
     deriskQtyTolerance: document.getElementById('derisk-qty-tolerance'),
     deriskMaxActionNotional: document.getElementById('derisk-max-action-notional'),
     deriskDustNotional: document.getElementById('derisk-dust-notional'),
+    deriskMaxCandidateScore: document.getElementById('derisk-max-candidate-score'),
+    deriskPreflightTtl: document.getElementById('derisk-preflight-ttl'),
     deriskMarketCleanupOnlyEmergency: document.getElementById('derisk-market-cleanup-only-emergency'),
     autoExitRuntimeInput: document.getElementById('auto-exit-runtime'),
     autoExitCooldownInput: document.getElementById('auto-exit-cooldown'),
@@ -1069,6 +1074,8 @@
       var marginRatioText = typeof row.margin_ratio === 'number' ? formatNumber(row.margin_ratio, 4) : '-';
       var equityText = typeof row.equity === 'number' ? formatNumber(row.equity, 2) : '-';
       var bufferText = typeof row.buffer_pct === 'number' ? formatNumber(row.buffer_pct, 2) + '%' : '-';
+      var statusText = row.status || 'ok';
+      var noteText = row.error || row.message || '-';
       html += '<tr>' +
         '<td>' + escapeHtml(row.exchange || '-') + '</td>' +
         '<td>' + escapeHtml(row.asset || '-') + '</td>' +
@@ -1078,11 +1085,13 @@
         '<td>' + marginRatioText + '</td>' +
         '<td>' + equityText + '</td>' +
         '<td>' + bufferText + '</td>' +
+        '<td>' + escapeHtml(statusText) + '</td>' +
+        '<td>' + escapeHtml(noteText) + '</td>' +
         '<td>' + escapeHtml(formatDate(row.timestamp)) + '</td>' +
       '</tr>';
     }
     if (!html) {
-      html = '<tr><td colspan="9" class="muted">Balances will appear after the first refresh.</td></tr>';
+      html = '<tr><td colspan="11" class="muted">Balances will appear after the first refresh.</td></tr>';
     }
     elements.accountBalanceTable.innerHTML = html;
   }
@@ -1411,6 +1420,17 @@
     return rules && rules.hasOwnProperty(key) ? rules[key] : null;
   }
 
+  function activeAutoExitRulesForSymbol(symbol) {
+    var symbolKey = String(symbol || '').toUpperCase();
+    var rules = (globalState.auto_exit && globalState.auto_exit.rules) ? globalState.auto_exit.rules : {};
+    return Object.keys(rules || {}).map(function (key) {
+      return { key: key, rule: rules[key] };
+    }).filter(function (item) {
+      var rule = item.rule || {};
+      return String(rule.symbol || '').toUpperCase() === symbolKey && (rule.enabled || rule.v1_enabled);
+    });
+  }
+
   function autoExitLiveSpreadFor(symbol, longExchange, shortExchange) {
     var key = autoExitKey(symbol, longExchange, shortExchange);
     if (!key) {
@@ -1569,6 +1589,14 @@
         var ruleShort = isMultileg ? 'multileg' : shortEx;
         if (hasBothSides && ruleLong && ruleShort) {
           var rule = autoExitRuleFor(row.symbol, ruleLong, ruleShort);
+          var symbolRules = activeAutoExitRulesForSymbol(row.symbol);
+          var displayedStoredRule = false;
+          if ((!rule || (!rule.enabled && !rule.v1_enabled)) && symbolRules.length) {
+            rule = symbolRules[0].rule;
+            ruleLong = rule.long_exchange;
+            ruleShort = rule.short_exchange;
+            displayedStoredRule = true;
+          }
           var spreadEnabled = rule && rule.enabled;
           var v1Enabled = rule && rule.v1_enabled;
           var targetVal = rule && rule.target_spread_pct !== undefined && rule.target_spread_pct !== null
@@ -1598,7 +1626,9 @@
             escapeHtml(exitPercent) + '" data-key="' + escapeHtml(key) + '" data-symbol="' +
             escapeHtml(row.symbol || '') + '" data-long="' + escapeHtml(ruleLong) + '" data-short="' + escapeHtml(ruleShort) + '" />';
           autoExitToggle = spreadCheckbox + ' ' + v1Checkbox + ' ' + percentSelect + ' <span class="muted">once</span>' +
-            (isMultileg ? ' <span class="muted">multi-leg</span>' : '');
+            (isMultileg ? ' <span class="muted">multi-leg</span>' : '') +
+            (displayedStoredRule ? ' <span class="muted">stored ' + escapeHtml(ruleLong + '/' + ruleShort) + '</span>' : '') +
+            (symbolRules.length > 1 ? ' <span class="muted">' + symbolRules.length + ' active rules</span>' : '');
           var linkedExitStrategies = ((globalState.auto_strategies || {}).strategies || []).filter(function (strategy) {
             return strategy.enabled && strategy.type === 'exit_ladder' &&
               String(strategy.symbol || '').toUpperCase() === String(row.symbol || '').toUpperCase();
@@ -1608,12 +1638,16 @@
               escapeHtml(linkedExitStrategies.length) + '</a>';
           }
           autoExitTarget = input;
+          var actionLongExchange = (isMultileg ? (row.selected_long_exchange || '') : longEx) || '';
+          var actionShortExchange = (isMultileg ? (row.selected_short_exchange || '') : shortEx) || '';
+          var actionRunning = !!activePositionActions[positionActionKey(row.symbol || '', actionLongExchange, actionShortExchange)];
           positionAction = '<div class="position-action-controls" data-symbol="' + escapeHtml(row.symbol || '') +
-            '" data-long="' + escapeHtml((isMultileg ? (row.selected_long_exchange || '') : longEx) || '') +
-            '" data-short="' + escapeHtml((isMultileg ? (row.selected_short_exchange || '') : shortEx) || '') + '">' +
+            '" data-long="' + escapeHtml(actionLongExchange) +
+            '" data-short="' + escapeHtml(actionShortExchange) + '">' +
             '<input type="number" min="1" max="100" step="1" value="100" class="position-action-percent" title="Percent of hedged coin quantity" />' +
-            '<button type="button" class="position-action-btn" data-action="add">Add</button>' +
-            '<button type="button" class="position-action-btn" data-action="exit">Exit</button></div>';
+            '<button type="button" class="position-action-btn" data-action="add"' + (actionRunning ? ' disabled' : '') + '>Add</button>' +
+            '<button type="button" class="position-action-btn" data-action="exit"' + (actionRunning ? ' disabled' : '') + '>Exit</button>' +
+            (actionRunning ? '<span class="muted">running</span>' : '') + '</div>';
         } else {
           autoExitToggle = '<span class="muted">one-side</span>';
           autoExitTarget = '<span class="muted">n/a</span>';
@@ -2217,11 +2251,71 @@
       elements.gridStrategiesList.innerHTML = '<p class="muted">No grid strategies.</p>';
       return;
     }
+    function levelByNumber(rule, levelNumber) {
+      var levels = Array.isArray(rule.levels) ? rule.levels : [];
+      for (var i = 0; i < levels.length; i += 1) {
+        if (Number(levels[i].level) === Number(levelNumber)) {
+          return levels[i];
+        }
+      }
+      return null;
+    }
+    function formatSpreadTarget(value, prefix) {
+      if (value === null || value === undefined || isNaN(parseFloat(value))) {
+        return '-';
+      }
+      return prefix + ' ' + formatNumber(value, 3) + '%';
+    }
+    function gridActionText(rule, level, action) {
+      var levelCount = Number(rule.level_count || 0);
+      var pending = rule.pending_transition || null;
+      if (pending && pending.action === action) {
+        var pendingTo = Number(pending.to_level || 0);
+        var pendingRemaining = formatTrimmedNumber(pending.remaining_qty || 0, 8);
+        var pendingLevel = levelByNumber(rule, action === 'enter' ? pendingTo : Number(pending.from_level || 0));
+        var pendingSpread = pendingLevel
+          ? (action === 'enter'
+            ? formatSpreadTarget(pendingLevel.entry_spread_pct, '<=')
+            : formatSpreadTarget(pendingLevel.exit_spread_pct, '>='))
+          : '-';
+        return 'добить ' + pendingRemaining + ' H -> уровень ' + pendingTo + ' @ ' + pendingSpread;
+      }
+      if (action === 'enter') {
+        if (level >= levelCount) {
+          return 'максимум достигнут';
+        }
+        var nextLevel = level + 1;
+        var next = levelByNumber(rule, nextLevel);
+        if (!next) {
+          return '-';
+        }
+        return '+' + formatTrimmedNumber(next.qty || 0, 8) + ' H -> уровень ' +
+          nextLevel + ' @ ' + formatSpreadTarget(next.entry_spread_pct, '<=');
+      }
+      if (level <= 0) {
+        return 'позиции нет';
+      }
+      var current = levelByNumber(rule, level);
+      if (!current) {
+        return '-';
+      }
+      return '-' + formatTrimmedNumber(current.qty || 0, 8) + ' H -> уровень ' +
+        (level - 1) + ' @ ' + formatSpreadTarget(current.exit_spread_pct, '>=');
+    }
     elements.gridStrategiesList.innerHTML = rules.map(function (rule) {
       var mode = rule.mode || 'shadow';
-      var level = mode === 'live' ? (rule.live_level || 0) : (rule.shadow_level || 0);
+      var level = Number(mode === 'live' ? (rule.live_level || 0) : (rule.shadow_level || 0));
       var qty = mode === 'live' ? (rule.actual_hedged_qty || 0) : (rule.shadow_qty || 0);
       var waitingText = level === 0 ? 'waiting first entry' : 'managing real/planned position';
+      var levelCount = Number(rule.level_count || 0);
+      var rangeText = formatNumber(rule.range_start_pct, 2) + '% … ' +
+        formatNumber(rule.range_end_pct, 2) + '%';
+      var maxQtyText = formatTrimmedNumber(rule.max_qty || 0, 8) + ' H';
+      var stepText = formatNumber(rule.exit_gap_pct, 3) + '%';
+      var marketText = 'entry ' + formatNumber(rule.live_entry_spread_pct, 3) +
+        '% / exit ' + formatNumber(rule.live_exit_spread_pct, 3) + '%';
+      var nextEntry = gridActionText(rule, level, 'enter');
+      var nextExit = gridActionText(rule, level, 'exit');
       return '<article class="auto-arb-rule-card">' +
         '<div class="auto-arb-rule-head">' +
           '<div><strong>' + escapeHtml(rule.symbol || '-') + '</strong>' +
@@ -2231,13 +2325,18 @@
           escapeHtml(mode.toUpperCase()) + '</span>' +
         '</div>' +
         '<div class="auto-arb-metrics">' +
-          '<div><span>Grid level</span><strong>' + escapeHtml(level) + ' / ' +
-          escapeHtml(rule.level_count || 0) + '</strong></div>' +
-          '<div><span>Hedged qty</span><strong>' + formatTrimmedNumber(qty, 8) + '</strong></div>' +
-          '<div><span>Status</span><strong>' + escapeHtml(rule.status || waitingText) + '</strong></div>' +
-          '<div><span>Entry / Exit spread</span><strong>' +
-          formatNumber(rule.live_entry_spread_pct, 3) + '% / ' +
-          formatNumber(rule.live_exit_spread_pct, 3) + '%</strong></div>' +
+          '<div><span>Уровень</span><strong>' + escapeHtml(level) + ' / ' +
+          escapeHtml(levelCount) + '</strong></div>' +
+          '<div><span>Позиция / максимум</span><strong>' +
+          formatTrimmedNumber(qty, 8) + ' / ' + escapeHtml(maxQtyText) + '</strong></div>' +
+          '<div><span>Диапазон входа</span><strong>' + escapeHtml(rangeText) + '</strong></div>' +
+          '<div><span>Шаг / exit gap</span><strong>' + escapeHtml(stepText) + '</strong></div>' +
+          '<div><span>Рынок сейчас</span><strong>' + escapeHtml(marketText) + '</strong></div>' +
+          '<div><span>Статус</span><strong>' + escapeHtml(rule.status || waitingText) + '</strong></div>' +
+        '</div>' +
+        '<div class="auto-arb-next-actions">' +
+          '<div><span>Следующий вход</span><strong>' + escapeHtml(nextEntry) + '</strong></div>' +
+          '<div><span>Ближайший выход</span><strong>' + escapeHtml(nextExit) + '</strong></div>' +
         '</div>' +
         '<div class="cell-note">' + escapeHtml(waitingText) +
         (rule.blocked_reason ? ' · ' + escapeHtml(rule.blocked_reason) : '') + '</div>' +
@@ -2679,7 +2778,7 @@
       notification_primary_channel: elements.notificationPrimary ? String(elements.notificationPrimary.value || 'ntfy') : 'ntfy',
       notification_fallback_channel: elements.notificationFallback ? String(elements.notificationFallback.value || 'telegram') : 'telegram',
       auto_margin_enabled: elements.autoMarginAdd ? !!elements.autoMarginAdd.checked : true,
-      auto_margin_reduce_enabled: elements.autoMarginReduce ? !!elements.autoMarginReduce.checked : true,
+      auto_margin_reduce_enabled: elements.autoMarginReduce ? !!elements.autoMarginReduce.checked : false,
       enforce_isolated_margin: elements.enforceIsolatedMargin ? !!elements.enforceIsolatedMargin.checked : true,
       enforce_leverage: elements.enforceLeverage ? !!elements.enforceLeverage.checked : true,
       target_leverage: elements.targetLeverage ? parseFloat(elements.targetLeverage.value) || 3 : 3,
@@ -2711,7 +2810,9 @@
       derisk_qty_tolerance_pct: elements.deriskQtyTolerance ? parseFloat(elements.deriskQtyTolerance.value) || 0.1 : 0.1,
       derisk_max_single_action_notional_usd: elements.deriskMaxActionNotional ? parseFloat(elements.deriskMaxActionNotional.value) || 500 : 500,
       derisk_market_cleanup_only_in_emergency: elements.deriskMarketCleanupOnlyEmergency ? !!elements.deriskMarketCleanupOnlyEmergency.checked : true,
-      derisk_dust_notional_usd: elements.deriskDustNotional ? parseFloat(elements.deriskDustNotional.value) || 10 : 10
+      derisk_dust_notional_usd: elements.deriskDustNotional ? parseFloat(elements.deriskDustNotional.value) || 10 : 10,
+      derisk_max_candidate_score: elements.deriskMaxCandidateScore && elements.deriskMaxCandidateScore.value !== '' ? parseFloat(elements.deriskMaxCandidateScore.value) : 0.25,
+      derisk_preflight_ttl_sec: elements.deriskPreflightTtl ? parseInt(elements.deriskPreflightTtl.value, 10) || 60 : 60
     };
     var manual = clone((globalState.settings && globalState.settings.manual) ? globalState.settings.manual : defaultSettings.manual) || {};
     manual.auto_exit_policy = mergeAutoExitPolicy({
@@ -2903,7 +3004,7 @@
       elements.autoMarginAdd.checked = protective.hasOwnProperty('auto_margin_enabled') ? !!protective.auto_margin_enabled : true;
     }
     if (elements.autoMarginReduce) {
-      elements.autoMarginReduce.checked = protective.hasOwnProperty('auto_margin_reduce_enabled') ? !!protective.auto_margin_reduce_enabled : true;
+      elements.autoMarginReduce.checked = protective.hasOwnProperty('auto_margin_reduce_enabled') ? !!protective.auto_margin_reduce_enabled : false;
     }
     if (elements.enforceIsolatedMargin) {
       elements.enforceIsolatedMargin.checked = protective.hasOwnProperty('enforce_isolated_margin') ? !!protective.enforce_isolated_margin : true;
@@ -3000,6 +3101,12 @@
     }
     if (elements.deriskDustNotional) {
       elements.deriskDustNotional.value = protective.derisk_dust_notional_usd !== undefined ? protective.derisk_dust_notional_usd : 10;
+    }
+    if (elements.deriskMaxCandidateScore) {
+      elements.deriskMaxCandidateScore.value = protective.derisk_max_candidate_score !== undefined ? protective.derisk_max_candidate_score : 0.25;
+    }
+    if (elements.deriskPreflightTtl) {
+      elements.deriskPreflightTtl.value = protective.derisk_preflight_ttl_sec !== undefined ? protective.derisk_preflight_ttl_sec : 60;
     }
     if (elements.deriskMarketCleanupOnlyEmergency) {
       elements.deriskMarketCleanupOnlyEmergency.checked = protective.hasOwnProperty('derisk_market_cleanup_only_in_emergency')
@@ -3172,16 +3279,68 @@
       payload.async_run = true;
       target.disabled = true;
       request('POST', '/api/position/action', payload, function (executeErr, result) {
-        target.disabled = false;
         if (executeErr) {
+          target.disabled = false;
           renderMessages(['Position action failed: ' + (executeErr.detail || executeErr.message)]);
+          return;
+        }
+        var executeErrors = result && Array.isArray(result.errors) ? result.errors : [];
+        if (executeErrors.length) {
+          target.disabled = false;
+          renderMessages(['Position action failed: ' + executeErrors.join('; ')]);
           return;
         }
         var execId = result && result.execution_id;
         renderMessages([verb + ' started for ' + payload.symbol + ' at ' + payload.percent + '%' +
           (execId ? ' | execution=' + execId : '')]);
-        window.setTimeout(function () { pollSnapshot(true); }, 1000);
+        if (execId) {
+          var actionKey = positionActionKey(payload.symbol, payload.long_exchange, payload.short_exchange);
+          activePositionActions[actionKey] = execId;
+          renderSymbolPositions(globalState.accounts.positions_by_symbol || []);
+          pollPositionActionExecution(execId, payload.symbol, verb, target, actionKey);
+        } else {
+          target.disabled = false;
+          pollSnapshot(true);
+        }
       });
+    });
+  }
+
+  function positionActionKey(symbol, longExchange, shortExchange) {
+    return String(symbol || '').toUpperCase() + '|' +
+      String(longExchange || '').toLowerCase() + '|' +
+      String(shortExchange || '').toLowerCase();
+  }
+
+  function pollPositionActionExecution(execId, symbol, verb, button, actionKey) {
+    request('GET', '/api/manual/exec/' + encodeURIComponent(execId), null, function (err, data) {
+      if (err) {
+        delete activePositionActions[actionKey];
+        if (button) {
+          button.disabled = false;
+        }
+        renderSymbolPositions(globalState.accounts.positions_by_symbol || []);
+        renderMessages([verb + ' status failed for ' + symbol + ': ' + (err.detail || err.message)]);
+        return;
+      }
+      if (data && data.status === 'running') {
+        window.setTimeout(function () {
+          pollPositionActionExecution(execId, symbol, verb, button, actionKey);
+        }, 1500);
+        return;
+      }
+      delete activePositionActions[actionKey];
+      if (button) {
+        button.disabled = false;
+      }
+      var resultErrors = data && data.result && Array.isArray(data.result.errors) ? data.result.errors : [];
+      if (data && data.status === 'completed' && !resultErrors.length) {
+        renderMessages([verb + ' completed for ' + symbol + ' | execution=' + execId]);
+      } else {
+        var detail = resultErrors.length ? resultErrors.join('; ') : ((data && data.error) || (data && data.status) || 'unknown error');
+        renderMessages([verb + ' failed for ' + symbol + ': ' + detail + ' | execution=' + execId]);
+      }
+      pollSnapshot(true);
     });
   }
 

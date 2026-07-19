@@ -22,7 +22,7 @@ class ManualStreamSymbolTestCase(unittest.TestCase):
         self.assertEqual(_normalize_bitget_symbol(raw), "BTCUSDT")
         self.assertEqual(_normalize_okx_symbol(raw), "BTC-USDT-SWAP")
         self.assertEqual(_normalize_gate_symbol(raw), "BTC_USDT")
-        self.assertEqual(_normalize_kucoin_symbol(raw), "BTCUSDTM")
+        self.assertEqual(_normalize_kucoin_symbol(raw), "XBTUSDTM")
 
     def test_plain_symbol_normalization(self) -> None:
         raw = "ETHUSDT"

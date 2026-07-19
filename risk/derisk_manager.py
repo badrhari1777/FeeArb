@@ -33,6 +33,8 @@ def issue_kind(message: Any) -> str | None:
         or "authenticationerror" in lower
         or "retcode\":33004" in lower
         or "api key has expired" in lower
+        or "api key info invalid" in lower
+        or "\"code\":10072" in lower
     ):
         return "auth_error"
     if "rate limit" in lower or "too many requests" in lower:
@@ -120,21 +122,37 @@ def normalize_hedge_cluster_config(payload: Mapping[str, Any] | None) -> dict[st
 def derive_cluster_rules(
     explicit_rules: Mapping[str, Any] | None,
     auto_exit_rules: Mapping[str, Any] | None,
+    *,
+    active_position_legs: set[tuple[str, str, str]] | None = None,
 ) -> dict[str, Any]:
     result = dict((explicit_rules or {}).get("rules") or {})
-    for _key, raw_rule in dict(auto_exit_rules or {}).items():
-        if not isinstance(raw_rule, Mapping):
+    legs_by_symbol: dict[str, dict[str, set[str]]] = {}
+    for symbol, exchange, side in active_position_legs or set():
+        normalized_symbol = normalize_symbol(symbol)
+        normalized_exchange = normalize_exchange_name(exchange)
+        normalized_side = str(side or "").strip().lower()
+        if not normalized_symbol or not normalized_exchange or normalized_side not in {"long", "short"}:
             continue
-        symbol = normalize_symbol(raw_rule.get("symbol"))
-        long_exchange = normalize_exchange_name(str(raw_rule.get("long_exchange") or ""))
-        short_exchange = normalize_exchange_name(str(raw_rule.get("short_exchange") or ""))
-        if not symbol or not long_exchange or not short_exchange:
-            continue
-        if long_exchange == "multileg" or short_exchange == "multileg":
-            continue
+        legs_by_symbol.setdefault(normalized_symbol, {"long": set(), "short": set()})[
+            normalized_side
+        ].add(normalized_exchange)
+
+    def _add_position_pair(
+        *,
+        symbol: str,
+        long_exchange: str,
+        short_exchange: str,
+        source: str,
+        owner_type: str,
+        owner_key: str | None = None,
+        owner_generation: int = 0,
+        position_signature: Mapping[str, Any] | None = None,
+        signature_status: Any = None,
+        updated_at: Any = None,
+    ) -> None:
         key = hedged_pair_key(symbol, long_exchange, short_exchange)
         if key in result:
-            continue
+            return
         result[key] = {
             "kind": "hedged_pair",
             "symbol": symbol,
@@ -143,9 +161,79 @@ def derive_cluster_rules(
             "enabled": True,
             "qty_tolerance_pct": 0.1,
             "rehedge_allowed": False,
-            "source": "auto_exit",
-            "updated_at": raw_rule.get("updated_at"),
+            "source": source,
+            "updated_at": updated_at,
+            "owner_type": owner_type,
+            "owner_key": owner_key,
+            "owner_generation": int(owner_generation or 0),
+            "position_signature": dict(position_signature or {}),
+            "signature_status": signature_status,
         }
+
+    for _key, raw_rule in dict(auto_exit_rules or {}).items():
+        if not isinstance(raw_rule, Mapping):
+            continue
+        if not bool(raw_rule.get("enabled")) and not bool(raw_rule.get("v1_enabled")):
+            continue
+        position_signature = raw_rule.get("position_signature")
+        if not isinstance(position_signature, Mapping):
+            continue
+        signature_status = str(raw_rule.get("signature_status") or "").strip().lower()
+        if signature_status in {"binding_position_missing", "one_shot_completed"}:
+            continue
+        symbol = normalize_symbol(raw_rule.get("symbol"))
+        long_exchange = normalize_exchange_name(str(raw_rule.get("long_exchange") or ""))
+        short_exchange = normalize_exchange_name(str(raw_rule.get("short_exchange") or ""))
+        if not symbol or not long_exchange or not short_exchange:
+            continue
+        if long_exchange == "multileg" or short_exchange == "multileg":
+            visible = legs_by_symbol.get(symbol) or {}
+            visible_longs = sorted(visible.get("long") or [])
+            visible_shorts = sorted(visible.get("short") or [])
+            if len(visible_longs) == 1 and len(visible_shorts) == 1:
+                _add_position_pair(
+                    symbol=symbol,
+                    long_exchange=visible_longs[0],
+                    short_exchange=visible_shorts[0],
+                    source="auto_exit_multileg_live",
+                    owner_type="auto_exit",
+                    owner_key=str(_key),
+                    owner_generation=int(raw_rule.get("rule_generation") or 0),
+                    position_signature=position_signature,
+                    signature_status=raw_rule.get("signature_status"),
+                    updated_at=raw_rule.get("updated_at"),
+                )
+            continue
+        if active_position_legs is not None and not (
+            (symbol, long_exchange, "long") in active_position_legs
+            or (symbol, short_exchange, "short") in active_position_legs
+        ):
+            continue
+        _add_position_pair(
+            symbol=symbol,
+            long_exchange=long_exchange,
+            short_exchange=short_exchange,
+            source="auto_exit",
+            owner_type="auto_exit",
+            owner_key=str(_key),
+            owner_generation=int(raw_rule.get("rule_generation") or 0),
+            position_signature=position_signature,
+            signature_status=raw_rule.get("signature_status"),
+            updated_at=raw_rule.get("updated_at"),
+        )
+
+    for symbol, visible in legs_by_symbol.items():
+        visible_longs = sorted(visible.get("long") or [])
+        visible_shorts = sorted(visible.get("short") or [])
+        if len(visible_longs) != 1 or len(visible_shorts) != 1:
+            continue
+        _add_position_pair(
+            symbol=symbol,
+            long_exchange=visible_longs[0],
+            short_exchange=visible_shorts[0],
+            source="live_positions",
+            owner_type="positions",
+        )
     return {"rules": result}
 
 
@@ -243,6 +331,17 @@ def exchange_stress_state(
     total = _safe_float(balance.get("total")) or 0.0
     used = _safe_float(balance.get("used")) or 0.0
     available = _safe_float(balance.get("available")) or 0.0
+    if total <= 0 and used <= 0 and available <= 0:
+        return {
+            "status": "ok",
+            "total_usd": 0.0,
+            "used_usd": 0.0,
+            "available_usd": 0.0,
+            "buffer_pct": None,
+            "target_free_usd": 0.0,
+            "deficit_usd": 0.0,
+            "stress_score": 0.0,
+        }
     target_free_usd = max(float(min_free_balance_abs), float(used) * float(target_buffer_pct))
     deficit_usd = max(0.0, float(target_free_usd) - float(available))
     buffer_pct = _safe_float(balance.get("buffer_pct"))
@@ -323,6 +422,17 @@ def derisk_candidate_score(
     pressure_credit = max(0.0, float(_safe_float(pressure_credit_usd) or 0.0))
     numerator = close_cost + positive_funding - negative_funding_credit - pressure_credit
     return float(numerator) / max(float(relief), 1e-9)
+
+
+def derisk_score_allowed(
+    candidate_score: float | None,
+    max_candidate_score: float | None,
+) -> bool:
+    score = _safe_float(candidate_score)
+    ceiling = _safe_float(max_candidate_score)
+    if score is None or ceiling is None:
+        return False
+    return float(score) <= float(ceiling)
 
 
 def qty_mismatch_ratio(long_qty: float | None, short_qty: float | None) -> float | None:

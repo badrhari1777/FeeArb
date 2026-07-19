@@ -117,7 +117,7 @@
       <a class="button" href="/manual">Manual trading</a>
       <a class="button" href="/strategies">Strategies</a>
       <a class="button" href="/funding-history">Funding history</a>
-      <a class="button" href="/mobile">Mobile UI</a>
+      <a class="button" href="/pump-short-lab">Pump Short Lab</a>
       <p class="hint">UI refresh: {{ refresh_interval }} s | Parser: {{ parser_interval }} s | Exchange poll: {{ exchange_interval }} s | Account refresh: {{ account_interval }} s | Positions market: {{ positions_market_interval }} s</p>
     </div>
   </header>
@@ -353,7 +353,7 @@
             Auto add margin (isolated)
           </label>
           <label class="settings-checkbox">
-            <input type="checkbox" id="auto-margin-reduce" {% if settings.get('protective', {}).get('auto_margin_reduce_enabled', True) %}checked{% endif %} />
+            <input type="checkbox" id="auto-margin-reduce" {% if settings.get('protective', {}).get('auto_margin_reduce_enabled', False) %}checked{% endif %} />
             Auto reduce margin (isolated)
           </label>
           <label class="settings-checkbox">
@@ -458,6 +458,14 @@
             <label>
               Dust notional (USDT)
               <input type="number" id="derisk-dust-notional" step="1" min="0" value="{{ settings.get('protective', {}).get('derisk_dust_notional_usd', 10.0) }}" />
+            </label>
+            <label>
+              Max candidate score
+              <input type="number" id="derisk-max-candidate-score" step="0.01" min="0" value="{{ settings.get('protective', {}).get('derisk_max_candidate_score', 0.25) }}" />
+            </label>
+            <label>
+              Preflight cache (sec)
+              <input type="number" id="derisk-preflight-ttl" step="1" min="1" value="{{ settings.get('protective', {}).get('derisk_preflight_ttl_sec', 60) }}" />
             </label>
           </div>
           <p class="settings-note muted">Emergency de-risk only acts on confirmed hedged clusters. If exchange API health is stale/auth-failed, orphan detection is blocked and only diagnostics/logs update.</p>
@@ -706,6 +714,8 @@
             <th>Margin Ratio</th>
             <th>Equity</th>
             <th>Buffer %</th>
+            <th>Status</th>
+            <th>Note</th>
             <th>Updated</th>
           </tr>
         </thead>
@@ -738,11 +748,13 @@
                   -
                 {% endif %}
                 </td>
+                <td>{{ row.status or "ok" }}</td>
+                <td>{{ row.error or "-" }}</td>
                 <td>{{ row.timestamp or "-" }}</td>
             </tr>
           {% endfor %}
           {% if account_balance_rows | length == 0 %}
-            <tr><td colspan="9" class="muted">Balances will appear after the first refresh.</td></tr>
+            <tr><td colspan="11" class="muted">Balances will appear after the first refresh.</td></tr>
           {% endif %}
         </tbody>
       </table>

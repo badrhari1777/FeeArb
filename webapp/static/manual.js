@@ -534,6 +534,90 @@
     toggleScope('manual-scope-roll', showRoll);
     toggleScope('manual-scope-market', showMarket);
     toggleScope('manual-scope-exit', showExit);
+    updateSpreadTriggerControl();
+  }
+
+  function updateSpreadTriggerControl() {
+    var action = currentAction();
+    var operatorEl = document.getElementById('manual-trigger-operator');
+    var valueEl = document.getElementById('manual-trigger-spread');
+    var hintEl = document.getElementById('manual-trigger-hint');
+    if (!operatorEl) {
+      return;
+    }
+    if (action === 'enter') {
+      operatorEl.value = 'lte';
+      operatorEl.disabled = true;
+    } else if (action === 'exit') {
+      operatorEl.value = 'gte';
+      operatorEl.disabled = true;
+    } else {
+      operatorEl.disabled = false;
+    }
+    if (hintEl) {
+      var target = valueEl && String(valueEl.value || '').trim() ? valueEl.value + '%' : 'the target';
+      var sign = operatorEl.value === 'gte' ? 'at or above' : 'at or below';
+      hintEl.textContent = action.charAt(0).toUpperCase() + action.slice(1) +
+        ' starts when spread is ' + sign + ' ' + target + '.';
+    }
+  }
+
+  function organizeManualForm() {
+    var form = document.getElementById('manual-form');
+    if (!form || form.dataset.organized === '1') {
+      return;
+    }
+    form.dataset.organized = '1';
+    var children = Array.prototype.slice.call(form.children);
+    var core = document.createElement('div');
+    core.className = 'manual-fields manual-fields--core';
+    var advanced = createSettingsGroup('Execution settings');
+    var exchange = createSettingsGroup('Exchange and WS settings');
+    var essentialIds = {
+      'manual-action': true,
+      'manual-symbol': true,
+      'manual-qty': true,
+      'manual-long-exchange': true,
+      'manual-short-exchange': true,
+      'manual-side': true,
+      'manual-from-exchange': true,
+      'manual-to-exchange': true,
+      'manual-mode': true,
+      'manual-roll-mode': true,
+      'manual-trigger-operator': true,
+      'manual-trigger-spread': true,
+      'manual-chunk-qty': true
+    };
+
+    children.forEach(function (node) {
+      var input = node.querySelector ? node.querySelector('input, select, button') : null;
+      var id = input ? input.id : node.id;
+      if (node.classList && node.classList.contains('settings-intervals')) {
+        core.appendChild(node);
+      } else if ((id && id.indexOf('manual-ws-') === 0) || node.id === 'manual-ws-health-label') {
+        exchange.body.appendChild(node);
+      } else if (essentialIds[id]) {
+        core.appendChild(node);
+      } else {
+        advanced.body.appendChild(node);
+      }
+    });
+    form.appendChild(core);
+    form.appendChild(advanced.details);
+    form.appendChild(exchange.details);
+    form.classList.add('manual-form--organized');
+
+    function createSettingsGroup(title) {
+      var details = document.createElement('details');
+      details.className = 'manual-settings-group';
+      var summary = document.createElement('summary');
+      summary.textContent = title;
+      var body = document.createElement('div');
+      body.className = 'manual-fields manual-settings-group__body';
+      details.appendChild(summary);
+      details.appendChild(body);
+      return { details: details, body: body };
+    }
   }
 
   function toggleScope(className, show) {
@@ -692,15 +776,24 @@
         wsHealth[exchange] = cfg;
       }
     }
+    var action = currentAction();
+    var triggerSpread = parseOptionalNumber(getValue('trigger-spread'));
+    var triggerOperator = getValue('trigger-operator');
+    if (action === 'enter') {
+      triggerOperator = 'lte';
+    } else if (action === 'exit') {
+      triggerOperator = 'gte';
+    }
     return {
       symbol: (getValue('symbol') || '').trim().toUpperCase(),
       qty: parseOptionalNumber(getValue('qty')),
       mode: getValue('mode'),
       max_slippage_bps: parseOptionalNumber(getValue('slippage')) || 0,
-      spread_min_pct: parseOptionalNumber(getValue('spread-min')),
-      spread_max_pct: parseOptionalNumber(getValue('spread-max')),
+      spread_min_pct: triggerSpread !== null && triggerOperator === 'gte' ? triggerSpread : null,
+      spread_max_pct: triggerSpread !== null && triggerOperator === 'lte' ? triggerSpread : null,
       timeout_sec: parseOptionalNumber(getValue('timeout')),
       max_runtime_sec: parseOptionalNumber(getValue('runtime')),
+      trigger_wait_sec: parseOptionalNumber(getValue('trigger-wait')),
       reprice_sec: parseOptionalNumber(getValue('reprice')),
       chunk_qty: parseOptionalNumber(getValue('chunk-qty')),
       chunk_notional: parseOptionalNumber(getValue('chunk-notional')),
@@ -803,6 +896,11 @@
           setStatus(statusEl, err.message, 'error');
           return;
         }
+        if (data && data.errors && data.errors.length) {
+          planEl.textContent = formatPlan(data);
+          setStatus(statusEl, (dryRun ? 'Dry-run failed: ' : 'Execution failed: ') + data.errors.join('; '), 'error');
+          return;
+        }
         if (!dryRun && data && data.execution_id) {
           currentExecId = data.execution_id;
           setStopEnabled(true);
@@ -877,11 +975,28 @@
     if (modeEl) {
       modeEl.addEventListener('change', toggleActionFields);
     }
+    var triggerOperator = document.getElementById('manual-trigger-operator');
+    var triggerSpread = document.getElementById('manual-trigger-spread');
+    if (triggerOperator) {
+      triggerOperator.addEventListener('change', updateSpreadTriggerControl);
+    }
+    if (triggerSpread) {
+      triggerSpread.addEventListener('input', updateSpreadTriggerControl);
+    }
     toggleActionFields();
   }
 
   function init() {
+    organizeManualForm();
     applyFormPrefs('manual');
+    var runtimeEl = document.getElementById('manual-runtime');
+    if (runtimeEl && parseInt(runtimeEl.value, 10) > 600) {
+      runtimeEl.value = '180';
+    }
+    var triggerWaitEl = document.getElementById('manual-trigger-wait');
+    if (triggerWaitEl && parseInt(triggerWaitEl.value, 10) > 60) {
+      triggerWaitEl.value = '30';
+    }
     bindManual();
     bindFormPersistence('manual');
     applyLivePrefs('manual');
@@ -976,7 +1091,7 @@
       if (targetId === (prefix + '-from-exchange') || targetId === (prefix + '-to-exchange')) {
         return true;
       }
-      if (targetId === (prefix + '-spread-min') || targetId === (prefix + '-spread-max')) {
+      if (targetId === (prefix + '-trigger-operator') || targetId === (prefix + '-trigger-spread')) {
         return true;
       }
       if (targetId === (prefix + '-live-orderbook') || targetId === (prefix + '-live-depth')) {
