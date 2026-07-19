@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Pump Short | FeeArb</title>
+  {% set rp = request.scope.get('root_path', '') %}
+  <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
+  <script>
+    window.__ROOT_PATH__ = "{{ rp }}";
+    window.__PUMP_SHORT_DASHBOARD_INITIAL__ = {{ initial | tojson | safe }};
+  </script>
+  <script defer src="{{ rp }}/static/pump_short.js?v={{ static_version }}"></script>
+</head>
+<body class="page page--pump-short-dashboard">
+  <header class="masthead">
+    <div>
+      <p class="back-link"><a href="/">Back to dashboard</a></p>
+      <h1>Pump Short</h1>
+      <p class="subtitle">Bybit shadow operator console</p>
+    </div>
+    <div class="status-block">
+      <dl>
+        <div><dt>Shadow</dt><dd><span id="psd-shadow-pill" class="status-pill status-pill--idle">idle</span></dd></div>
+        <div><dt>Schedule</dt><dd id="psd-schedule-status">idle</dd></div>
+        <div><dt>Open</dt><dd id="psd-open-count">0 / 3</dd></div>
+        <div><dt>Capital</dt><dd id="psd-capital-head">$0 left</dd></div>
+      </dl>
+    </div>
+  </header>
+
+  <main class="content content--dense">
+    <section class="pump-dashboard-band" id="psd-capital-band">
+      <div class="pump-dashboard-stat">
+        <span>Initial capital</span>
+        <strong id="psd-initial-capital">$0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Free capital</span>
+        <strong id="psd-free-capital">$0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Used margin</span>
+        <strong id="psd-used-margin">$0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Current top-up</span>
+        <strong id="psd-current-topup">$0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Peak top-up</span>
+        <strong id="psd-peak-topup">$0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Unrealized PnL</span>
+        <strong id="psd-unrealized">$0</strong>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Shadow Control</h2>
+        <div class="panel-actions">
+          <button type="button" class="button" id="psd-run-scan">Run scan</button>
+          <button type="button" class="button button--ghost" id="psd-start-schedule">Start schedule</button>
+          <button type="button" class="button button--danger" id="psd-stop-schedule">Stop schedule</button>
+          <button type="button" class="button button--ghost" id="psd-refresh">Refresh</button>
+          <a class="button button--ghost" href="/pump-short-strategies">Strategies</a>
+          <a class="button button--ghost" href="/pump-short-lab">Lab</a>
+        </div>
+      </div>
+      <form class="research-form" id="psd-control-form">
+        <label>
+          Max symbols
+          <input id="psd-max-symbols" type="number" min="1" max="1000" step="1" value="50" />
+        </label>
+        <label>
+          Recent pump hours
+          <input id="psd-recent-hours" type="number" min="24" max="720" step="24" value="168" />
+        </label>
+        <label>
+          Interval sec
+          <input id="psd-interval-sec" type="number" min="60" max="86400" step="60" value="3600" />
+        </label>
+        <label>
+          Symbols
+          <input id="psd-symbols" type="text" placeholder="EVAAUSDT,LABUSDT" autocomplete="off" />
+        </label>
+        <span id="psd-control-status" class="settings-status"></span>
+      </form>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Strategy</h2>
+        <span class="hint" id="psd-last-update">-</span>
+      </div>
+      <div class="pump-strategy-grid">
+        <div><span>Venue</span><strong id="psd-strategy-venue">bybit</strong></div>
+        <div><span>Entry</span><strong id="psd-strategy-entry">pb20</strong></div>
+        <div><span>Funding</span><strong id="psd-strategy-funding">24h &gt; -0.5%</strong></div>
+        <div><span>TP / hold</span><strong id="psd-strategy-exit">TP25 / 168h</strong></div>
+        <div><span>Steps</span><strong id="psd-strategy-steps">4 x 50%</strong></div>
+        <div><span>Step notional</span><strong id="psd-step-notional">$0</strong></div>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Open Shadow Positions</h2>
+        <span class="hint" id="psd-open-note">No open positions</span>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Status</th>
+              <th>Steps</th>
+              <th>Entry / Current / Avg</th>
+              <th>Target</th>
+              <th>Margin</th>
+              <th>Notional</th>
+              <th>PnL</th>
+              <th>Top-up</th>
+              <th>Funding/OI</th>
+              <th>Age</th>
+            </tr>
+          </thead>
+          <tbody id="psd-open-body">
+            <tr><td colspan="11" class="muted">No open shadow positions.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Latest Signals</h2>
+        <span class="hint" id="psd-signal-counts">0 candidates</span>
+      </div>
+      <div class="pump-signal-columns">
+        <div>
+          <h3>Entry candidates</h3>
+          <div class="table-wrapper">
+            <table class="table table--compact">
+              <thead><tr><th>Symbol</th><th>Pump</th><th>Pullback</th><th>Funding</th><th>Reason</th></tr></thead>
+              <tbody id="psd-candidates-body"><tr><td colspan="5" class="muted">No candidates.</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <h3>Watch</h3>
+          <div class="table-wrapper">
+            <table class="table table--compact">
+              <thead><tr><th>Symbol</th><th>Status</th><th>Pullback</th><th>OI</th><th>Reason</th></tr></thead>
+              <tbody id="psd-watch-body"><tr><td colspan="5" class="muted">No watch rows.</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <h3>Blocked</h3>
+          <div class="table-wrapper">
+            <table class="table table--compact">
+              <thead><tr><th>Symbol</th><th>Status</th><th>Funding</th><th>OI</th><th>Reason</th></tr></thead>
+              <tbody id="psd-blocked-body"><tr><td colspan="5" class="muted">No blocked rows.</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Recent Closed</h2>
+        <span class="hint" id="psd-closed-count">0 closed</span>
+      </div>
+      <div class="table-wrapper">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Exit</th>
+              <th>Combined %</th>
+              <th>Realized $</th>
+              <th>MFE / MAE</th>
+              <th>Closed</th>
+            </tr>
+          </thead>
+          <tbody id="psd-closed-body">
+            <tr><td colspan="6" class="muted">No closed positions.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

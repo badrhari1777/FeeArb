@@ -1,0 +1,143 @@
+# Защитные стратегии: Shadow и small-volume Live
+
+## Назначение
+
+Эта инструкция задает безопасный порядок проверки:
+
+- auto rebalance;
+- auto margin reduce;
+- orphan cleanup;
+- emergency de-risk.
+
+Orphan и de-risk проверяются раздельно. Одновременный первый Live-прогон запрещен.
+
+## Базовое безопасное состояние
+
+Перед наблюдением и после каждого Live-теста:
+
+- `Auto reduce margin` выключен;
+- `Auto rebalance legs` выключен;
+- `Enable emergency de-risk` выключен;
+- `Shadow mode only` включен;
+- `Orphan detection / cleanup` может оставаться включенным для диагностики;
+- нет активного Manual/Auto Agent исполнения.
+
+При выключенных Live-переключателях rebalance и margin reduce продолжают писать
+Shadow-рекомендации в `logs/protective_shadow_history.jsonl`. Заявки при этом не
+отправляются.
+
+## Проверка Shadow после рестарта
+
+1. Убедиться, что новые символы не содержат `USDTUSDT`.
+2. Проверить `Hedge Clusters`: выключенные, устаревшие и не привязанные к
+   текущим позициям auto-exit правила не должны считаться активными кластерами.
+3. Проверить `Emergency De-Risk Diagnostics`:
+   - отсутствующие старые позиции не должны доминировать в каждом цикле;
+   - `score_eligible=false`, если score выше `Max candidate score`;
+   - Live-кандидат должен иметь успешный market preflight.
+4. Проверить `logs/protective_shadow_history.jsonl`:
+   - `rebalance_candidate` содержит планируемую сторону и qty;
+   - `margin_reduce_candidate` содержит сумму reduction и buffer;
+   - одинаковое состояние не повторяется чаще heartbeat.
+5. Проверить rotation `logs/derisk_history*.jsonl`. Активный файл ограничен
+   `256 MB`, сохраняются три предыдущих файла.
+
+Рекомендуемое наблюдение до первого Live: не менее 30 минут при наличии реальных
+позиций и хотя бы одного Shadow-кандидата.
+
+## Общие ограничения small-volume
+
+- `Max single action`: сначала `10-25 USDT`.
+- `Max candidate score`: `0.25` или строже.
+- `Preflight cache`: `60 sec`.
+- Market cleanup оставлять только для panic.
+- Перед стартом проверить min qty, min notional, amount step и ожидаемый residual.
+- После исполнения сверить обе биржи по свежим positions, а не только статус
+  execution.
+- При auth/stale/conflict/preflight error Live не продолжать.
+
+## Тест 1: Orphan cleanup
+
+1. Оставить emergency de-risk выключенным до создания контролируемой ситуации.
+2. Использовать только заранее выбранный символ и минимально допустимый биржей
+   объем.
+3. Убедиться в Shadow, что состояние подтверждено как orphan несколько циклов,
+   exchange health здоров, конфликтов ownership нет, preflight успешен.
+4. Включить emergency de-risk в Live только на время теста, сохранив
+   `Orphan detection / cleanup`.
+5. Наблюдать один execution. Не запускать параллельно ручной exit/entry.
+6. Сразу после результата выключить emergency de-risk.
+7. Проверить:
+   - закрыта только лишняя нога или qty mismatch;
+   - парная нога не увеличена;
+   - residual равен нулю либо классифицирован как допустимая dust;
+   - outcome и execution log содержат фактический результат.
+
+## Тест 2: Emergency de-risk
+
+Проводить только после успешного отдельного orphan-теста.
+
+1. Не создавать orphan и убедиться, что обе ноги текущего кластера видны.
+2. Выбрать небольшую хеджированную позицию.
+3. Установить `Max single action` `10-25 USDT`.
+4. Проверить, что выбранный кандидат:
+   - имеет статус `stress` или `panic`;
+   - проходит score ceiling;
+   - проходит market/dust preflight;
+   - не имеет ownership conflict.
+5. На время одного действия выключить `Orphan detection / cleanup`, затем
+   включить emergency de-risk и снять `Shadow mode only`.
+6. После запуска одного execution сразу вернуть Shadow или выключить de-risk.
+7. Проверить:
+   - обе ноги уменьшены на согласованный coin qty;
+   - использована меньшая доступная хеджированная нога;
+   - отсутствует flip позиции;
+   - фактическое проскальзывание и residual допустимы;
+   - margin buffer действительно улучшился.
+
+## Критерии немедленной остановки
+
+- выбран не тот символ или cluster owner;
+- одна из бирж стала stale/auth-failed;
+- preflight сменился на blocked;
+- execution пытается превысить action cap;
+- qty ног расходится после чанка;
+- появился неизвестный residual;
+- worker запустил второе действие до reconciliation первого.
+
+До отдельного согласования Live-переключатели не оставлять включенными после
+теста.
+
+## Новая эпоха логов
+
+С `2026-06-14 08:13 UTC` `logs/derisk_history.jsonl` ведется заново после
+очистки старого журнала размером `11.21 GB`. Последние `5000` старых записей
+сохранены в:
+
+```text
+logs/archive/derisk_history_pre_hardening_tail_20260614.jsonl
+```
+
+Следующий анализ de-risk должен по умолчанию использовать записи начиная с этой
+даты. Старую выборку использовать только для исторического сравнения.
+
+Обычная остановка Manual/Auto execution (`force_finalize=false`) теперь отменяет
+активную заявку и полностью пропускает final reconcile/dust cleanup. Режим
+`force_finalize=true` остается только для явно аварийного preemption.
+
+## Проверка после исправления журналов 2026-06-14
+
+- `app.log` ротируется при `100 MB`, сохраняются пять предыдущих файлов.
+- Подписи, API keys и tokens маскируются перед записью в файл.
+- Старый `app.log` размером `4.33 GB` удален; последние `20000` строк сохранены в
+  `logs/archive/app_pre_rotation_tail_20260614.log`.
+- Повторяющаяся MEXC ошибка `10072` пишется не чаще одного раза в 15 минут.
+- Пустой счет без позиций и средств не считается состоянием stress.
+- Stale multileg auto-exit не скрывает текущую однозначную пару от de-risk.
+- Qty mismatch должен перейти `suspected_orphan -> confirmed_orphan` после
+  `derisk_confirm_cycles`, а не оставаться на первом цикле.
+- На контрольном запуске `HUSDT|kucoin|binance` был подтвержден как orphan,
+  market preflight прошел, но ордера не отправлялись: Live de-risk был выключен,
+  Shadow mode включен.
+- После чистого рестарта не было `Unclosed client session`, protective mismatch
+  или OKX `str/NoneType`; единственное предупреждение было о неверном MEXC API key.

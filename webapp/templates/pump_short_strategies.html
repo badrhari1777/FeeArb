@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Pump Short Strategies | FeeArb</title>
+  {% set rp = request.scope.get('root_path', '') %}
+  <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
+  <script>
+    window.__ROOT_PATH__ = "{{ rp }}";
+    window.__PUMP_SHORT_STRATEGIES_INITIAL__ = {{ initial | tojson | safe }};
+  </script>
+  <script defer src="{{ rp }}/static/pump_short_strategies.js?v={{ static_version }}"></script>
+</head>
+<body class="page page--pump-short-strategies">
+  <header class="masthead">
+    <div>
+      <p class="back-link"><a href="/">Back to dashboard</a></p>
+      <h1>Pump Short Strategies</h1>
+      <p class="subtitle">Multi-strategy shadow and paper monitor</p>
+    </div>
+    <div class="status-block">
+      <dl>
+        <div><dt>Shadow</dt><dd><span id="pss-shadow-pill" class="status-pill status-pill--idle">idle</span></dd></div>
+        <div><dt>Schedule</dt><dd id="pss-schedule-status">idle</dd></div>
+        <div><dt>Strategies</dt><dd id="pss-strategy-count">0</dd></div>
+        <div><dt>Audit</dt><dd id="pss-audit-status">-</dd></div>
+      </dl>
+    </div>
+  </header>
+
+  <main class="content content--dense">
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Shadow Control</h2>
+        <div class="panel-actions">
+          <button type="button" class="button" id="pss-run-scan">Run scan</button>
+          <button type="button" class="button button--ghost" id="pss-start-schedule">Start paper schedule</button>
+          <button type="button" class="button button--danger" id="pss-stop-schedule">Stop schedule</button>
+          <button type="button" class="button button--ghost" id="pss-refresh">Refresh</button>
+          <a class="button button--ghost" href="/pump-short">Operator</a>
+          <a class="button button--ghost" href="/pump-short-lab">Lab</a>
+        </div>
+      </div>
+      <form class="research-form" id="pss-control-form">
+        <label>
+          Max symbols
+          <input id="pss-max-symbols" type="number" min="1" max="1000" step="1" value="1000" />
+        </label>
+        <label>
+          Recent pump hours
+          <input id="pss-recent-hours" type="number" min="24" max="720" step="24" value="168" />
+        </label>
+        <label>
+          Interval sec
+          <input id="pss-interval-sec" type="number" min="60" max="86400" step="60" value="7200" />
+        </label>
+        <label>
+          Symbols
+          <input id="pss-symbols" type="text" placeholder="SIRENUSDT,EVAAUSDT" autocomplete="off" />
+        </label>
+        <span id="pss-control-status" class="settings-status"></span>
+      </form>
+    </section>
+
+    <section class="pump-dashboard-band" id="pss-overview-band">
+      <div class="pump-dashboard-stat">
+        <span>Rows seen</span>
+        <strong id="pss-rows-seen">0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Ready</span>
+        <strong id="pss-ready-total">0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Watch</span>
+        <strong id="pss-watch-total">0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Blocked</span>
+        <strong id="pss-blocked-total">0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Paper open</span>
+        <strong id="pss-legacy-open">0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Cycle equity</span>
+        <strong id="pss-cycle-equity">$0.00</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Cycle slots</span>
+        <strong id="pss-cycle-slots">0 / 0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Cycle top-up</span>
+        <strong id="pss-cycle-topup">$0.00</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Active 5m</span>
+        <strong id="pss-active-window-count">0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
+        <span>Updated</span>
+        <strong id="pss-updated">-</strong>
+      </div>
+    </section>
+
+    <section class="strategy-monitor-grid" id="pss-strategy-cards"></section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Active 5m Follow-up</h2>
+        <span class="hint" id="pss-active-window-note">No active windows</span>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Source</th>
+              <th>Trigger</th>
+              <th>Price / Return</th>
+              <th>Premium</th>
+              <th>OI</th>
+              <th>Volume</th>
+              <th>Long Probe</th>
+              <th>Data</th>
+            </tr>
+          </thead>
+          <tbody id="pss-active-window-body">
+            <tr><td colspan="9" class="muted">No active windows.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Cycle Paper Portfolio</h2>
+        <span class="hint" id="pss-cycle-note">No cycle paper positions</span>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>Side / Symbol</th>
+              <th>Status</th>
+              <th>Track</th>
+              <th>Legs</th>
+              <th>Entry / Current / Avg</th>
+              <th>Target / Stop</th>
+              <th>PnL</th>
+              <th>Top-up</th>
+              <th>Age</th>
+            </tr>
+          </thead>
+          <tbody id="pss-cycle-body">
+            <tr><td colspan="9" class="muted">No cycle paper positions.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Cycle Track Summary</h2>
+        <span class="hint" id="pss-cycle-track-note">No track summary</span>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>Track</th>
+              <th>Side</th>
+              <th>Positions</th>
+              <th>Win</th>
+              <th>Realized</th>
+              <th>Unrealized</th>
+              <th>Combined</th>
+              <th>Top-up</th>
+            </tr>
+          </thead>
+          <tbody id="pss-cycle-track-body">
+            <tr><td colspan="8" class="muted">No track summary.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Candidate Shadow Tracks</h2>
+        <span class="hint" id="pss-candidate-note">No candidate tracks</span>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>Track</th>
+              <th>Ready</th>
+              <th>Watch</th>
+              <th>Blocked</th>
+              <th>Paper</th>
+              <th>PnL</th>
+              <th>Top-up</th>
+              <th>Top Ready</th>
+              <th>Mode</th>
+            </tr>
+          </thead>
+          <tbody id="pss-candidate-body">
+            <tr><td colspan="9" class="muted">No candidate tracks.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Cycle Paper Events</h2>
+        <span class="hint" id="pss-cycle-events-note">No cycle paper events</span>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table table--compact">
+          <thead><tr><th>Time</th><th>Event</th><th>Side</th><th>Symbol</th><th>Details</th></tr></thead>
+          <tbody id="pss-cycle-events-body"><tr><td colspan="5" class="muted">No cycle paper events.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Paper Events</h2>
+        <span class="hint" id="pss-paper-events-note">No paper events</span>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table table--compact">
+          <thead><tr><th>Time</th><th>Event</th><th>Strategy</th><th>Symbol</th><th>Details</th></tr></thead>
+          <tbody id="pss-paper-events-body"><tr><td colspan="5" class="muted">No paper events.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Legacy Paper Positions</h2>
+        <span class="hint" id="pss-legacy-note">No legacy paper positions</span>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Status</th>
+              <th>Steps</th>
+              <th>Entry / Current / Avg</th>
+              <th>Target</th>
+              <th>PnL</th>
+              <th>Top-up</th>
+              <th>Funding/OI</th>
+              <th>Age</th>
+            </tr>
+          </thead>
+          <tbody id="pss-legacy-body">
+            <tr><td colspan="9" class="muted">No legacy paper positions.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Audit Log</h2>
+        <span class="hint" id="pss-audit-file">-</span>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table table--compact">
+          <thead><tr><th>Time</th><th>Key</th><th>Shadow</th><th>Strategies</th></tr></thead>
+          <tbody id="pss-audit-body"><tr><td colspan="4" class="muted">No audit rows.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

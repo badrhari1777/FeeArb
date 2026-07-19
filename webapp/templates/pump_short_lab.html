@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Pump Short Lab | FeeArb</title>
+  {% set rp = request.scope.get('root_path', '') %}
+  <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
+  <script>
+    window.__ROOT_PATH__ = "{{ rp }}";
+    window.__PUMP_SHORT_INITIAL__ = {{ initial | tojson | safe }};
+  </script>
+  <script defer src="{{ rp }}/static/pump_short_lab.js?v={{ static_version }}"></script>
+</head>
+<body class="page page--pump-short">
+  <header class="masthead">
+    <div>
+      <p class="back-link"><a href="/">Back to dashboard</a></p>
+      <h1>Pump Short Lab</h1>
+      <p class="subtitle">Bybit public-data collector for single-short research</p>
+    </div>
+    <div class="status-block">
+      <dl>
+        <div><dt>Status</dt><dd><span id="ps-status-pill" class="status-pill status-pill--idle">idle</span></dd></div>
+        <div><dt>Progress</dt><dd id="ps-progress-head">0 / 0</dd></div>
+        <div><dt>Current</dt><dd id="ps-current-head">-</dd></div>
+        <div><dt>Requests</dt><dd id="ps-requests-head">0</dd></div>
+        <div><dt>Last event</dt><dd id="ps-event-head">-</dd></div>
+      </dl>
+      <p class="hint">Default run is intentionally slow: one symbol at a time, with sleep between public requests.</p>
+    </div>
+  </header>
+
+  <main class="content">
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Run</h2>
+        <div class="panel-actions">
+          <button type="button" class="button" id="ps-start">Start</button>
+          <button type="button" class="button button--ghost" id="ps-refresh">Refresh</button>
+          <button type="button" class="button button--danger" id="ps-stop">Stop after current symbol</button>
+        </div>
+      </div>
+      <form id="ps-form" class="research-form">
+        <label>
+          Lookback days
+          <input id="ps-lookback" type="number" min="1" max="90" step="1" value="30" />
+        </label>
+        <label>
+          Sleep per request, sec
+          <input id="ps-sleep" type="number" min="0.1" max="10" step="0.1" value="0.8" />
+        </label>
+        <label>
+          Max symbols
+          <input id="ps-max-symbols" type="number" min="1" max="1000" step="1" placeholder="all" />
+        </label>
+        <label>
+          Symbols
+          <input id="ps-symbols" type="text" placeholder="ARXUSDT,REUSDT or empty for all" autocomplete="off" />
+        </label>
+        <label class="settings-checkbox">
+          <input id="ps-newest-first" type="checkbox" checked />
+          Newest listings first
+        </label>
+        <label class="settings-checkbox">
+          <input id="ps-resume" type="checkbox" checked />
+          Resume from done_symbols.txt
+        </label>
+        <span id="ps-form-status" class="settings-status"></span>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Progress</h2>
+      <div class="research-progress">
+        <div class="research-progress__bar"><div id="ps-progress-bar"></div></div>
+        <div class="research-progress__stats">
+          <span>Collected: <strong id="ps-collected">0</strong></span>
+          <span>Skipped: <strong id="ps-skipped">0</strong></span>
+          <span>Failed: <strong id="ps-failed">0</strong></span>
+          <span>Total: <strong id="ps-total">0</strong></span>
+        </div>
+      </div>
+      <pre class="code-block code-block--wrap" id="ps-run-meta">No run yet.</pre>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Shadow scanner</h2>
+        <div class="panel-actions">
+          <button type="button" class="button" id="ps-shadow-start">Run shadow scan</button>
+          <button type="button" class="button button--ghost" id="ps-shadow-refresh">Refresh</button>
+        </div>
+      </div>
+      <form id="ps-shadow-form" class="research-form">
+        <label>
+          Lookback days
+          <input id="ps-shadow-lookback" type="number" min="2" max="30" step="1" value="14" />
+        </label>
+        <label>
+          Recent event hours
+          <input id="ps-shadow-recent-hours" type="number" min="24" max="720" step="24" value="168" />
+        </label>
+        <label>
+          Sleep per request, sec
+          <input id="ps-shadow-sleep" type="number" min="0.1" max="10" step="0.1" value="0.8" />
+        </label>
+        <label>
+          Max symbols
+          <input id="ps-shadow-max-symbols" type="number" min="1" max="1000" step="1" value="50" />
+        </label>
+        <label>
+          Schedule interval, sec
+          <input id="ps-shadow-interval" type="number" min="60" max="86400" step="60" value="3600" />
+        </label>
+        <label>
+          Symbols
+          <input id="ps-shadow-symbols" type="text" placeholder="HUSDT,RAVEUSDT or empty for newest" autocomplete="off" />
+        </label>
+        <label class="settings-checkbox">
+          <input id="ps-shadow-run-now" type="checkbox" checked />
+          Run immediately after schedule start
+        </label>
+        <span id="ps-shadow-form-status" class="settings-status"></span>
+      </form>
+      <div class="panel-actions panel-actions--inline">
+        <button type="button" class="button" id="ps-shadow-schedule-start">Start schedule</button>
+        <button type="button" class="button button--danger" id="ps-shadow-schedule-stop">Stop schedule</button>
+      </div>
+      <div class="scope-grid">
+        <div>
+          <h3>Status</h3>
+          <pre class="code-block code-block--wrap" id="ps-shadow-meta">No shadow scan yet.</pre>
+        </div>
+        <div>
+          <h3>Schedule</h3>
+          <pre class="code-block code-block--wrap" id="ps-shadow-schedule-meta">No schedule yet.</pre>
+        </div>
+        <div>
+          <h3>Shadow files</h3>
+          <div id="ps-shadow-files" class="log-box log-box--compact">No shadow files yet.</div>
+        </div>
+      </div>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Symbol</th>
+              <th>Profile</th>
+              <th>Entry</th>
+              <th>Exit</th>
+              <th>Pump %</th>
+              <th>Pullback %</th>
+              <th>OI 24h %</th>
+              <th>Long ratio</th>
+              <th>Funding 24h %</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="ps-shadow-body">
+            <tr><td colspan="11" class="muted">No shadow scan rows yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3>Paper positions</h3>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Symbol</th>
+              <th>Profile</th>
+              <th>Entry</th>
+              <th>Exit</th>
+              <th>Entry price</th>
+              <th>Current</th>
+              <th>Remain</th>
+              <th>Realized %</th>
+              <th>Unrealized %</th>
+              <th>Combined %</th>
+              <th>MFE / MAE</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="ps-paper-body">
+            <tr><td colspan="13" class="muted">No paper positions yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Collection scope</h2>
+      <div class="scope-grid">
+        <div>
+          <h3>Per symbol</h3>
+          <ul class="compact-list">
+            <li>Bybit USDT linear perpetual metadata: launch time, funding interval, caps/floors, min qty/notional, max leverage.</li>
+            <li>1h candles for the selected lookback window.</li>
+            <li>Funding history for the same window.</li>
+            <li>1h open interest history.</li>
+            <li>1h account long/short ratio.</li>
+          </ul>
+        </div>
+        <div>
+          <h3>Derived fields</h3>
+          <ul class="compact-list">
+            <li>Returns over 24h, 3d, 7d, and 14d.</li>
+            <li>Drawdown from lookback high and high from first close.</li>
+            <li>Funding sums over 24h, 3d, and 7d.</li>
+            <li>OI change over 4h and 24h.</li>
+            <li>Preliminary pump score, continuation risk score, and candidate tier.</li>
+          </ul>
+        </div>
+      </div>
+      <p class="hint">These tiers are research labels only. They are not live entry or exit criteria.</p>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Analysis</h2>
+        <span class="hint">Read-only view of the latest generated reports</span>
+      </div>
+      <div class="scope-grid">
+        <div>
+          <h3>Report metadata</h3>
+          <pre class="code-block code-block--wrap" id="ps-analysis-meta">No analysis report yet.</pre>
+        </div>
+        <div>
+          <h3>Analysis files</h3>
+          <div id="ps-analysis-files" class="log-box log-box--compact">No analysis files yet.</div>
+        </div>
+      </div>
+      <h3>Behavior regime recommendations</h3>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Funding regime</th>
+              <th>OI regime</th>
+              <th>Rank</th>
+              <th>Entry</th>
+              <th>Exit</th>
+              <th>N</th>
+              <th>Score</th>
+              <th>Win %</th>
+              <th>Avg %</th>
+              <th>Med %</th>
+              <th>P90 MAE</th>
+              <th>Note</th>
+            </tr>
+          </thead>
+          <tbody id="ps-behavior-recommendation-body">
+            <tr><td colspan="12" class="muted">No behavior-regime recommendations yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3>Candidate profiles</h3>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Profile</th>
+              <th>Rank</th>
+              <th>Entry</th>
+              <th>Exit</th>
+              <th>N</th>
+              <th>Score</th>
+              <th>Win %</th>
+              <th>Avg %</th>
+              <th>Med %</th>
+              <th>P90 MAE</th>
+              <th>Anti-overfit</th>
+              <th>Note</th>
+            </tr>
+          </thead>
+          <tbody id="ps-candidate-profile-body">
+            <tr><td colspan="12" class="muted">No candidate profiles yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3>Anti-overfit report</h3>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Entry</th>
+              <th>Exit</th>
+              <th>Score</th>
+              <th>Time test avg</th>
+              <th>Time test med</th>
+              <th>Time p90 MAE</th>
+              <th>Holdout avg</th>
+              <th>Holdout p90 MAE</th>
+              <th>Top symbol %</th>
+              <th>Best / worst symbol</th>
+            </tr>
+          </thead>
+          <tbody id="ps-anti-overfit-body">
+            <tr><td colspan="11" class="muted">No anti-overfit report yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3>Best rules</h3>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Entry</th>
+              <th>Exit</th>
+              <th>N</th>
+              <th>Score</th>
+              <th>Win %</th>
+              <th>Avg %</th>
+              <th>Med %</th>
+              <th>P90 MAE</th>
+              <th>Risk</th>
+            </tr>
+          </thead>
+          <tbody id="ps-best-rules-body">
+            <tr><td colspan="10" class="muted">No best-rules report yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <h3>Worst tails</h3>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Entry</th>
+              <th>Exit</th>
+              <th>Net %</th>
+              <th>MAE %</th>
+              <th>Pump %</th>
+              <th>OI 24h %</th>
+              <th>Long ratio</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="ps-worst-tail-body">
+            <tr><td colspan="9" class="muted">No worst-tail report yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Latest summaries</h2>
+      <div class="table-wrapper">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Age d</th>
+              <th>Hist h</th>
+              <th>Last</th>
+              <th>24h %</th>
+              <th>3d %</th>
+              <th>7d %</th>
+              <th>Funding 24h %</th>
+              <th>OI 24h %</th>
+              <th>Pump</th>
+              <th>Risk</th>
+              <th>Tier</th>
+            </tr>
+          </thead>
+          <tbody id="ps-summary-body">
+            <tr><td colspan="12" class="muted">No summaries yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Files and errors</h2>
+      <div class="scope-grid">
+        <div>
+          <h3>Output files</h3>
+          <div id="ps-files" class="log-box log-box--compact">No files yet.</div>
+        </div>
+        <div>
+          <h3>Recent errors</h3>
+          <div id="ps-errors" class="log-box log-box--compact">No errors.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
