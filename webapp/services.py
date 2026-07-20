@@ -18065,6 +18065,10 @@ class DataService:
                     ).get("trusted")
                 )
             }
+            # Gate's CCXT all-symbol conditional-order call currently fails
+            # during public market bootstrap. Keep targeted post-exit cleanup,
+            # but do not turn that unsupported global read into recurring noise.
+            healthy_exchanges &= {"binance", "bitget", "bybit", "kucoin", "okx"}
             if not healthy_exchanges:
                 return []
             discovery = await self._protective_manager.discover_open_protective_targets(
