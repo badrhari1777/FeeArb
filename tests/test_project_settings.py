@@ -594,7 +594,24 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result["position_action"]["action_qty"], 25000.0)
         self.assertEqual(captured["max_slippage_bps"], 8.0)
         self.assertTrue(captured["allow_liquidity_chunking"])
+        self.assertFalse(captured["exit_close_full_pair"])
         self.assertEqual(result["position_action"]["quantity_basis"], "min_long_short_coin_qty")
+
+        captured.clear()
+        await service.position_action(
+            {
+                "symbol": "LABUSDT",
+                "long_exchange": "binance",
+                "short_exchange": "kucoin",
+                "action": "exit",
+                "percent": 100,
+                "dry_run": True,
+                "async_run": False,
+            }
+        )
+        self.assertAlmostEqual(float(captured["qty"]), 100000.0)
+        self.assertTrue(captured["exit_close_full_pair"])
+        self.assertEqual(captured["exit_dust_max_legs"], 2)
 
         async def _manual_enter(payload):
             captured.clear()
@@ -689,6 +706,89 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
             if entry.get("event") == "summary"
         )
         self.assertEqual(summary["data"]["terminal_reason"], "runtime_ended_incomplete")
+
+    async def test_manual_exit_cleans_protection_only_through_verified_cleanup(self) -> None:
+        service = DataService(settings_manager=self.manager)
+        service._accounts = type(  # type: ignore[attr-defined]
+            "X",
+            (),
+            {"snapshot": lambda self=None: {"positions": []}},
+        )()
+
+        async def _manual_exit(payload, positions, **_kwargs):  # noqa: ARG001
+            return {
+                "dry_run": False,
+                "action": "exit",
+                "symbol": "SIRENUSDT",
+                "errors": [],
+                "warnings": [],
+                "actions": [],
+            }
+
+        service._manual.exit = _manual_exit  # type: ignore[method-assign]
+        cleanup = AsyncMock(
+            return_value=[
+                {
+                    "exchange": "kucoin",
+                    "symbol": "SIRENUSDT",
+                    "status": "cleanup_cancelled",
+                }
+            ]
+        )
+        service._cleanup_verified_orphan_protective_targets = cleanup  # type: ignore[method-assign]
+
+        result = await service.manual_exit(
+            {
+                "symbol": "SIRENUSDT",
+                "long_exchange": "bybit",
+                "short_exchange": "kucoin",
+                "qty": 100.0,
+                "dry_run": False,
+                "async_run": False,
+            }
+        )
+
+        cleanup.assert_awaited_once_with(
+            {("bybit", "SIRENUSDT"), ("kucoin", "SIRENUSDT")},
+            reason="manual_exit_completed",
+        )
+        self.assertEqual(result["protective_cleanup"][0]["status"], "cleanup_cancelled")
+
+    async def test_periodic_protective_sweep_uses_healthy_exchange_discovery(self) -> None:
+        service = DataService(settings_manager=self.manager)
+        service._accounts = type(  # type: ignore[attr-defined]
+            "X",
+            (),
+            {
+                "snapshot": lambda self=None: {
+                    "exchange_health": {
+                        "kucoin": {"health": "healthy"},
+                        "gate": {"health": "stale"},
+                    }
+                }
+            },
+        )()
+        discovery = AsyncMock(
+            return_value={
+                "targets": [{"exchange": "kucoin", "symbol": "GWEIUSDT"}],
+                "errors": [],
+            }
+        )
+        service._protective_manager.discover_open_protective_targets = discovery  # type: ignore[method-assign]
+        cleanup = AsyncMock(return_value=[{"status": "cleanup_cancelled"}])
+        service._cleanup_verified_orphan_protective_targets = cleanup  # type: ignore[method-assign]
+
+        result = await service._maybe_sweep_orphan_protective_orders(
+            reason="test",
+            force=True,
+        )
+
+        discovery.assert_awaited_once_with({"kucoin"})
+        cleanup.assert_awaited_once_with(
+            {("kucoin", "GWEIUSDT")},
+            reason="test",
+        )
+        self.assertEqual(result, [{"status": "cleanup_cancelled"}])
 
     async def test_mobile_manual_spread_roll_short_maps_buy_from_sell_to(self) -> None:
         service = DataService(settings_manager=self.manager)

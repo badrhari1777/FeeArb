@@ -2070,6 +2070,48 @@ class ManualTradeExitDustTestCase(unittest.TestCase):
         self.assertEqual(actions[0].get("exchange"), "binance")
         self.assertEqual(warnings, [])
 
+    def test_finalize_full_pair_exit_closes_tiny_preexisting_mismatch(self) -> None:
+        manager = _DustFinalizeManager(
+            positions=[
+                {
+                    "exchange": "bybit",
+                    "symbol": "SIREN/USDT:USDT",
+                    "side": "long",
+                    "coin_qty": 9.0,
+                    "mark_price": 0.032,
+                }
+            ]
+        )
+        legs = [
+            {"exchange": "bybit", "label": "long", "side": "sell", "reduce_only": True},
+            {"exchange": "kucoin", "label": "short", "side": "buy", "reduce_only": True},
+        ]
+        actions: list[dict[str, object]] = []
+        warnings: list[str] = []
+
+        asyncio.run(
+            manager._finalize_exit_dust(
+                symbol="SIREN",
+                legs=legs,
+                start_qty_by_exchange={"bybit": 59679.0, "kucoin": 59670.0},
+                requested_exit_qty=59670.0,
+                constraints={"bybit": {"amount_step": 1.0}},
+                payload={
+                    "exit_close_full_pair": True,
+                    "exit_dust_notional_usd": 10.0,
+                    "exit_dust_max_legs": 2,
+                },
+                actions=actions,
+                warnings=warnings,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(len(manager.market_calls), 1)
+        self.assertEqual(manager.market_calls[0]["exchange"], "bybit")
+        self.assertAlmostEqual(float(manager.market_calls[0]["qty"]), 9.0)
+        self.assertEqual(warnings, [])
+
     def test_finalize_exit_dust_non_closeable_warns(self) -> None:
         manager = _DustFinalizeManager(
             positions=[

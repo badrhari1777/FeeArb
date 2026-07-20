@@ -14,6 +14,15 @@ Order Fill Tracking (WS)
 Position Use (Entry/Exit)
 - Positions are fetched only at entry (start snapshot) and exit (final reconcile).
 - Final reconcile compares primary vs hedge deltas and uses market fallback when imbalance >= fallback_min.
+- A 100% pair exit targets zero on both legs. A pre-existing mismatch on the
+  larger leg is closed only when its residual is below the configured dust
+  notional or exchange minimum; a material orphan is not closed silently.
+- After execution, fresh trusted position scans gate per-exchange cancellation
+  of obsolete protective orders. A periodic 15-minute sweep applies the same
+  trusted-absence rule to protection left after direct exchange-side closes.
+- Sweep discovery filters by the returned exchange symbol and never treats an
+  explicitly non-reduce-only conditional entry as protective. Canonical and
+  venue IDs are resolved to a CCXT unified symbol before reading or cancelling.
 
 Smart (Limit) Mode
 - Execute one chunk at a time: primary leg fills -> hedge leg executes; next chunk waits for hedge (unless residual < fallback_min).

@@ -208,14 +208,17 @@ class ProtectiveOrderManager:
     async def _fetch_binance_open_algo_orders(
         self,
         gateway: ExchangeGateway,
-        symbol: str,
+        symbol: str | None,
     ) -> list[dict[str, Any]]:
-        exch_symbol = gateway.map_symbol(symbol) or symbol
+        params: dict[str, Any] = {}
+        if symbol:
+            exch_symbol = gateway.map_symbol(symbol) or symbol
+            params["symbol"] = exch_symbol
         payload = await self._binance_algo_request(
             gateway,
             method="GET",
             path="openAlgoOrders",
-            params={"symbol": exch_symbol},
+            params=params,
         )
         if isinstance(payload, list):
             return payload
@@ -419,6 +422,194 @@ class ProtectiveOrderManager:
                         logger.warning("Protective verify error: %s", result)
             return actions
 
+    async def discover_open_protective_targets(
+        self,
+        exchanges: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Discover symbols with open conditional protection without changing orders."""
+        requested = {
+            str(exchange or "").strip().lower()
+            for exchange in (exchanges or self._gateways.keys())
+            if str(exchange or "").strip()
+        }
+        targets: set[tuple[str, str]] = set()
+        errors: list[dict[str, str]] = []
+        async with self._lock:
+            for exchange in sorted(requested):
+                if exchange in self._blocked:
+                    continue
+                gateway = self._gateways.get(exchange)
+                if gateway is None:
+                    continue
+                try:
+                    await gateway.refresh_credentials_async()
+                    await gateway.ensure_client()
+                    if gateway.client is None:
+                        continue
+                    orders, fetch_errors = await self._fetch_all_open_protective_orders(gateway)
+                    if fetch_errors and not orders:
+                        errors.append(
+                            {
+                                "exchange": exchange,
+                                "error": "; ".join(fetch_errors),
+                            }
+                        )
+                    for order in orders:
+                        info = order.get("info") or {}
+                        if not isinstance(info, Mapping):
+                            info = {}
+                        otype = str(order.get("type") or info.get("type") or info.get("orderType") or "").lower()
+                        stop_px = _safe_float(
+                            order.get("stopPrice")
+                            or order.get("triggerPrice")
+                            or info.get("stopPrice")
+                            or info.get("triggerPrice")
+                            or info.get("triggerPx")
+                            or info.get("slTriggerPx")
+                        )
+                        take_px = _safe_float(
+                            order.get("takeProfitPrice")
+                            or info.get("takeProfitPrice")
+                            or info.get("tpTriggerPx")
+                        )
+                        if not self._is_protective_order(
+                            exchange,
+                            order,
+                            info,
+                            stop_px,
+                            take_px,
+                            otype,
+                        ):
+                            continue
+                        reduce_flag = (
+                            info.get("reduceOnly")
+                            if info.get("reduceOnly") is not None
+                            else info.get("reduce_only")
+                        )
+                        if reduce_flag is None:
+                            reduce_flag = order.get("reduceOnly")
+                        if (
+                            reduce_flag is not None
+                            and str(reduce_flag).strip().lower() in {"false", "0", "no"}
+                            and exchange != "okx"
+                        ):
+                            # A conditional entry is not stale protection and
+                            # must never be picked up by the orphan sweep.
+                            continue
+                        symbol = (
+                            order.get("symbol")
+                            or info.get("symbol")
+                            or info.get("instId")
+                            or info.get("contract")
+                        )
+                        symbol_key = self._protective_symbol_key(symbol)
+                        if symbol_key:
+                            targets.add((exchange, symbol_key))
+                except Exception as exc:  # pylint: disable=broad-except
+                    errors.append({"exchange": exchange, "error": str(exc)})
+        return {
+            "targets": [
+                {"exchange": exchange, "symbol": symbol}
+                for exchange, symbol in sorted(targets)
+            ],
+            "errors": errors,
+        }
+
+    async def _fetch_all_open_protective_orders(
+        self,
+        gateway: ExchangeGateway,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Fetch regular and conditional open orders for an entire venue."""
+        orders: list[dict[str, Any]] = []
+        errors: list[str] = []
+
+        async def _fetch(params: Mapping[str, Any] | None = None) -> None:
+            try:
+                rows = await gateway.client.fetch_open_orders(  # type: ignore[union-attr]
+                    None,
+                    params=dict(params or {}),
+                )
+                orders.extend(row for row in (rows or []) if isinstance(row, dict))
+            except Exception as exc:  # pylint: disable=broad-except
+                errors.append(str(exc))
+
+        if gateway.slug == "binance":
+            options = getattr(gateway.client, "options", None)
+            if isinstance(options, dict):
+                options["warnOnFetchOpenOrdersWithoutSymbol"] = False
+
+        if gateway.slug == "kucoin":
+            await _fetch()
+            await _fetch({"stop": True})
+        elif gateway.slug == "bybit":
+            await _fetch()
+            await _fetch({"trigger": True})
+            await _fetch({"orderFilter": "tpslOrder"})
+        elif gateway.slug == "okx":
+            await _fetch()
+            await _fetch({"trigger": True})
+            await _fetch({"ordType": "conditional"})
+        elif gateway.slug == "gate":
+            await _fetch()
+            await _fetch({"trigger": True})
+        elif gateway.slug == "bitget":
+            await _fetch(bitget_private_params({}) if bitget_uta_enabled() else {})
+            plan_params = (
+                bitget_private_params({"trigger": True})
+                if bitget_uta_enabled()
+                else {"trigger": True, "planType": "profit_loss"}
+            )
+            await _fetch(plan_params)
+        else:
+            await _fetch()
+
+        if gateway.slug == "binance":
+            try:
+                algo_payload = await self._fetch_binance_open_algo_orders(gateway, None)
+                for item in algo_payload or []:
+                    if not isinstance(item, dict):
+                        continue
+                    info = dict(item)
+                    orders.append(
+                        {
+                            "id": str(
+                                info.get("algoId")
+                                or info.get("algoOrderId")
+                                or info.get("id")
+                                or ""
+                            ),
+                            "symbol": info.get("symbol"),
+                            "type": info.get("orderType") or info.get("type"),
+                            "side": str(info.get("side") or "").lower(),
+                            "amount": _safe_float(info.get("quantity") or info.get("origQty")),
+                            "stopPrice": _safe_float(
+                                info.get("triggerPrice") or info.get("stopPrice")
+                            ),
+                            "reduceOnly": info.get("reduceOnly"),
+                            "info": info,
+                        }
+                    )
+            except Exception as exc:  # pylint: disable=broad-except
+                errors.append(str(exc))
+
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for order in orders:
+            info = order.get("info") or {}
+            order_id = str(
+                order.get("id")
+                or (info.get("algoId") if isinstance(info, Mapping) else "")
+                or ""
+            )
+            symbol = str(order.get("symbol") or "")
+            key = (order_id, symbol)
+            if order_id and key in seen:
+                continue
+            if order_id:
+                seen.add(key)
+            deduped.append(order)
+        return deduped, errors
+
     async def cleanup_orphaned_protective_orders(
         self,
         exchange: str,
@@ -563,6 +754,7 @@ class ProtectiveOrderManager:
     ) -> list[str]:
         cancel_failures: list[str] = []
         algo_ids = set(existing.get("algo_order_ids") or [])
+        exchange_symbol = await self._resolve_ccxt_symbol(gw, target.symbol)
         for oid in order_ids:
             try:
                 cancel_params = {}
@@ -588,7 +780,7 @@ class ProtectiveOrderManager:
                 await self._call_with_time_sync_retry(
                     gw,
                     "cancel_order",
-                    lambda: gw.client.cancel_order(oid, target.symbol, params=cancel_params),
+                    lambda: gw.client.cancel_order(oid, exchange_symbol, params=cancel_params),
                 )
             except Exception as exc:  # pragma: no cover - defensive
                 message = str(exc)
@@ -1293,6 +1485,41 @@ class ProtectiveOrderManager:
             "delta_take": take_delta,
         }
 
+    async def _resolve_ccxt_symbol(
+        self,
+        gateway: ExchangeGateway,
+        symbol: str,
+    ) -> str:
+        """Resolve an internal or venue id to the unified symbol CCXT expects."""
+        if "/" in str(symbol or ""):
+            return symbol
+        mapped = gateway.map_symbol(symbol) or symbol
+        if "/" in str(mapped):
+            return str(mapped)
+        client = gateway.client
+        markets: Mapping[str, Any] = {}
+        if client is not None:
+            try:
+                loaded = await client.load_markets()
+                if isinstance(loaded, Mapping):
+                    markets = loaded
+            except Exception:  # pragma: no cover - falls back to cached markets
+                cached = getattr(client, "markets", None)
+                if isinstance(cached, Mapping):
+                    markets = cached
+        target_key = self._protective_symbol_key(symbol)
+        for market in markets.values():
+            if not isinstance(market, Mapping):
+                continue
+            unified = str(market.get("symbol") or "")
+            venue_id = str(market.get("id") or "")
+            if target_key in {
+                self._protective_symbol_key(unified),
+                self._protective_symbol_key(venue_id),
+            }:
+                return unified or str(mapped)
+        return str(mapped)
+
     async def _fetch_existing(
         self,
         gateway: ExchangeGateway,
@@ -1318,17 +1545,18 @@ class ProtectiveOrderManager:
                 payload, ts = cached
                 if time.time() - ts <= self._existing_cache_ttl:
                     return self._clone_existing(payload)
+        exchange_symbol = await self._resolve_ccxt_symbol(gateway, symbol)
         orders: list[dict[str, Any]] = []
         try:
             # KuCoin stop orders live in a separate endpoint; fetch both.
             if gateway.slug == "kucoin":
-                default_orders = await gateway.client.fetch_open_orders(symbol)  # type: ignore[union-attr]
-                stop_orders = await gateway.client.fetch_open_orders(symbol, params={"stop": True})  # type: ignore[union-attr]
+                default_orders = await gateway.client.fetch_open_orders(exchange_symbol)  # type: ignore[union-attr]
+                stop_orders = await gateway.client.fetch_open_orders(exchange_symbol, params={"stop": True})  # type: ignore[union-attr]
                 orders = (default_orders or []) + (stop_orders or [])
             elif gateway.slug == "binance":
                 orders = []
                 try:
-                    orders += await gateway.client.fetch_open_orders(symbol)  # type: ignore[union-attr]
+                    orders += await gateway.client.fetch_open_orders(exchange_symbol)  # type: ignore[union-attr]
                 except Exception:
                     pass
                 try:
@@ -1372,20 +1600,20 @@ class ProtectiveOrderManager:
                 except Exception:
                     pass
             elif gateway.slug == "okx":
-                default_orders = await gateway.client.fetch_open_orders(symbol)  # type: ignore[union-attr]
+                default_orders = await gateway.client.fetch_open_orders(exchange_symbol)  # type: ignore[union-attr]
                 trigger_orders = await gateway.client.fetch_open_orders(  # type: ignore[union-attr]
-                    symbol,
+                    exchange_symbol,
                     params={"trigger": True},
                 )
                 conditional_orders = await gateway.client.fetch_open_orders(  # type: ignore[union-attr]
-                    symbol,
+                    exchange_symbol,
                     params={"ordType": "conditional"},
                 )
                 orders = (default_orders or []) + (trigger_orders or []) + (conditional_orders or [])
             elif gateway.slug == "gate":
-                default_orders = await gateway.client.fetch_open_orders(symbol)  # type: ignore[union-attr]
+                default_orders = await gateway.client.fetch_open_orders(exchange_symbol)  # type: ignore[union-attr]
                 trigger_orders = await gateway.client.fetch_open_orders(  # type: ignore[union-attr]
-                    symbol,
+                    exchange_symbol,
                     params={"trigger": True},
                 )
                 orders = (default_orders or []) + (trigger_orders or [])
@@ -1395,7 +1623,7 @@ class ProtectiveOrderManager:
                 try:
                     default_params = bitget_private_params({}) if bitget_uta_enabled() else {}
                     default_orders = await gateway.client.fetch_open_orders(  # type: ignore[union-attr]
-                        symbol,
+                        exchange_symbol,
                         params=default_params,
                     )
                 except Exception:
@@ -1407,7 +1635,7 @@ class ProtectiveOrderManager:
                         else {"trigger": True, "planType": "profit_loss"}
                     )
                     tpsl_orders = await gateway.client.fetch_open_orders(  # type: ignore[union-attr]
-                        symbol,
+                        exchange_symbol,
                         params=plan_params,
                     )
                 except Exception:
@@ -1416,22 +1644,22 @@ class ProtectiveOrderManager:
             elif gateway.slug == "bybit":
                 orders = []
                 try:
-                    orders += await gateway.client.fetch_open_orders(symbol)  # type: ignore[union-attr]
+                    orders += await gateway.client.fetch_open_orders(exchange_symbol)  # type: ignore[union-attr]
                 except Exception:
                     pass
                 try:
-                    orders += await gateway.client.fetch_open_orders(symbol, params={"trigger": True})  # type: ignore[union-attr]
+                    orders += await gateway.client.fetch_open_orders(exchange_symbol, params={"trigger": True})  # type: ignore[union-attr]
                 except Exception:
                     pass
                 try:
                     orders += await gateway.client.fetch_open_orders(  # type: ignore[union-attr]
-                        symbol,
+                        exchange_symbol,
                         params={"orderFilter": "tpslOrder"},
                     )
                 except Exception:
                     pass
             else:
-                orders = await gateway.client.fetch_open_orders(symbol)  # type: ignore[union-attr]
+                orders = await gateway.client.fetch_open_orders(exchange_symbol)  # type: ignore[union-attr]
         except Exception as exc:  # pylint: disable=broad-except
             logger.debug("%s fetch_open_orders failed for %s: %s", gateway.slug, symbol, exc)
             return {"order_ids": []}
@@ -1461,6 +1689,8 @@ class ProtectiveOrderManager:
             info = order.get("info") or {}
             if not isinstance(info, dict):
                 info = {}
+            if not self._order_matches_symbol(order, info, symbol):
+                continue
             otype = str(order.get("type") or info.get("type") or "").lower()
             trigger_info = info.get("trigger")
             if not isinstance(trigger_info, dict):
@@ -1536,9 +1766,22 @@ class ProtectiveOrderManager:
                     if stop_px is None and take_px is not None:
                         stop_px = take_px
                     take_px = None
-            reduce_flag = info.get("reduceOnly") or info.get("reduce_only") or order.get("reduceOnly")
+            reduce_flag = (
+                info.get("reduceOnly")
+                if info.get("reduceOnly") is not None
+                else info.get("reduce_only")
+            )
+            if reduce_flag is None:
+                reduce_flag = order.get("reduceOnly")
             is_protective = self._is_protective_order(gateway.slug, order, info, stop_px, take_px, otype)
             if not is_protective:
+                continue
+            if (
+                reduce_flag is not None
+                and str(reduce_flag).strip().lower() in {"false", "0", "no"}
+                and gateway.slug != "okx"
+            ):
+                # Non-reduce-only on non-OKX is an entry order, not protection.
                 continue
             oid = str(order.get("id") or "")
             if oid:
@@ -1557,9 +1800,6 @@ class ProtectiveOrderManager:
                         algo_order_ids.append(algo_id)
                     if algo_id not in order_ids:
                         order_ids.append(algo_id)
-            if reduce_flag is False and gateway.slug != "okx":
-                # Non-reduce-only on non-OKX is unlikely a protective order.
-                continue
             order_side = str(order.get("side") or "").lower()
             if order_side and order_side != expected_close_side:
                 invalid_side = True
@@ -1669,6 +1909,42 @@ class ProtectiveOrderManager:
             "algo_order_ids": list(payload.get("algo_order_ids") or []),
             "invalid_side": bool(payload.get("invalid_side")),
         }
+
+    @staticmethod
+    def _protective_symbol_key(value: Any) -> str:
+        key = normalize_symbol(str(value or ""))
+        if key.endswith("USDTM"):
+            key = key[:-1]
+        for suffix in ("SWAP", "PERP"):
+            if key.endswith(suffix):
+                key = key[: -len(suffix)]
+        return key
+
+    @classmethod
+    def _order_matches_symbol(
+        cls,
+        order: Mapping[str, Any],
+        info: Mapping[str, Any],
+        target_symbol: str,
+    ) -> bool:
+        """Filter venues such as KuCoin that ignore the requested stop-order symbol."""
+        target_key = cls._protective_symbol_key(target_symbol)
+        if not target_key:
+            return True
+        raw_symbols = (
+            order.get("symbol"),
+            info.get("symbol"),
+            info.get("instId"),
+            info.get("contract"),
+        )
+        order_keys = {
+            cls._protective_symbol_key(value)
+            for value in raw_symbols
+            if str(value or "").strip()
+        }
+        if not order_keys:
+            return True
+        return target_key in order_keys
 
     def _is_protective_order(
         self,

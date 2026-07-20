@@ -685,8 +685,140 @@ class _BitgetSyncGateway(_SyncGateway):
 class _KucoinSyncGateway(_SyncGateway):
     slug = "kucoin"
 
+    def map_symbol(self, symbol: str) -> str:
+        if symbol.endswith("USDT") and "/" not in symbol:
+            return f"{symbol[:-4]}/USDT:USDT"
+        return symbol
+
+
+class _KucoinRawIdGateway(_KucoinSyncGateway):
+    def map_symbol(self, symbol: str) -> str:
+        return "SIRENUSDTM" if symbol == "SIRENUSDT" else symbol
+
+
+class _KucoinMixedStopClient(_SyncClient):
+    def __init__(self, fail_ids: set[str] | None = None) -> None:
+        super().__init__(fail_ids)
+        self.fetch_symbols: list[str | None] = []
+
+    async def load_markets(self):
+        return {
+            "SIREN/USDT:USDT": {
+                "id": "SIRENUSDTM",
+                "symbol": "SIREN/USDT:USDT",
+            }
+        }
+
+    async def fetch_open_orders(self, _symbol=None, params: dict | None = None):
+        self.fetch_symbols.append(_symbol)
+        if not (params or {}).get("stop"):
+            return []
+        return [
+            {
+                "id": "siren-stop",
+                "symbol": "SIREN/USDT:USDT",
+                "type": "market",
+                "side": "sell",
+                "amount": 9.0,
+                "stopPrice": 0.018,
+                "reduceOnly": True,
+                "info": {"symbol": "SIRENUSDTM", "stop": "down"},
+            },
+            {
+                "id": "gwei-stop",
+                "symbol": "GWEI/USDT:USDT",
+                "type": "market",
+                "side": "sell",
+                "amount": 491.0,
+                "stopPrice": 0.02,
+                "reduceOnly": True,
+                "info": {"symbol": "GWEIUSDTM", "stop": "down"},
+            },
+            {
+                "id": "entry-trigger",
+                "symbol": "ENTRY/USDT:USDT",
+                "type": "stop_market",
+                "side": "buy",
+                "amount": 10.0,
+                "stopPrice": 1.25,
+                "reduceOnly": "false",
+                "info": {"symbol": "ENTRYUSDTM", "stop": "up"},
+            },
+        ]
+
 
 class StopManagerCancelSafetyTestCase(unittest.TestCase):
+    def test_kucoin_fetch_filters_stop_orders_when_endpoint_ignores_symbol(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        client = _KucoinMixedStopClient()
+        gateway = _KucoinSyncGateway(client)
+
+        async def _run() -> dict:
+            return await manager._fetch_existing(
+                gateway,
+                "SIRENUSDT",
+                None,
+                "long",
+                mark_price=0.03,
+                entry_price=0.028,
+                force_fetch=True,
+            )
+
+        existing = asyncio.run(_run())
+        self.assertEqual(existing.get("order_ids"), ["siren-stop"])
+        self.assertEqual(client.fetch_symbols, ["SIREN/USDT:USDT", "SIREN/USDT:USDT"])
+
+    def test_fetch_resolves_raw_venue_id_to_ccxt_symbol(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        client = _KucoinMixedStopClient()
+        gateway = _KucoinRawIdGateway(client)
+
+        existing = asyncio.run(
+            manager._fetch_existing(
+                gateway,
+                "SIRENUSDT",
+                None,
+                "long",
+                force_fetch=True,
+            )
+        )
+
+        self.assertEqual(existing.get("order_ids"), ["siren-stop"])
+        self.assertEqual(client.fetch_symbols, ["SIREN/USDT:USDT", "SIREN/USDT:USDT"])
+
+    def test_discovery_reports_each_protective_symbol(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        manager._gateways = {"kucoin": _KucoinSyncGateway(_KucoinMixedStopClient())}
+
+        discovery = asyncio.run(manager.discover_open_protective_targets({"kucoin"}))
+
+        self.assertEqual(
+            discovery.get("targets"),
+            [
+                {"exchange": "kucoin", "symbol": "GWEIUSDT"},
+                {"exchange": "kucoin", "symbol": "SIRENUSDT"},
+            ],
+        )
+        self.assertEqual(discovery.get("errors"), [])
+
+    def test_kucoin_cleanup_maps_symbol_for_cancel(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        client = _KucoinMixedStopClient()
+        manager._gateways = {"kucoin": _KucoinSyncGateway(client)}
+
+        asyncio.run(
+            manager.cleanup_orphaned_protective_orders(
+                "kucoin",
+                "SIRENUSDT",
+                sides=("long",),
+            )
+        )
+
+        self.assertEqual(
+            client.cancel_calls,
+            [("siren-stop", "SIREN/USDT:USDT", {"stop": True})],
+        )
+
     def test_cleanup_orphaned_protective_orders_cancels_existing_orders(self) -> None:
         manager = ProtectiveOrderManager(RiskConfig())
         client = _SyncClient()

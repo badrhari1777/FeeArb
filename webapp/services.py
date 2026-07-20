@@ -3387,6 +3387,9 @@ class DataService:
         self._last_protective: dict[tuple[str, str, str], dict[str, float | None]] = {}
         self._protective_interval = getattr(self._risk_config, "position_check_interval_sec", 180)
         self._protective_task: Optional[asyncio.Task] = None
+        self._protective_orphan_sweep_interval_sec = 15 * 60
+        self._protective_orphan_sweep_last_ts = 0.0
+        self._protective_orphan_sweep_inflight = False
         self._rebalance_prev_positions: dict[tuple[str, str, str], float] = {}
         self._rebalance_last: dict[tuple[str, str], float] = {}
         self._rebalance_blocked_exchanges: set[str] = {"mexc"}
@@ -7172,9 +7175,49 @@ class DataService:
         if payload.get("dry_run"):
             payload = dict(payload)
             payload.setdefault("constraints_exchanges", self._manual_pair_constraints(payload, action="exit"))
-        if payload.get("dry_run") or not payload.get("async_run"):
+        if payload.get("dry_run"):
             return await self._manual.exit(payload, positions)
+        if not payload.get("async_run"):
+            result = await self._manual.exit(payload, positions)
+            await self._cleanup_protective_after_exit(payload, result)
+            return result
         return await self._start_manual_run("exit", payload, positions)
+
+    async def _cleanup_protective_after_exit(
+        self,
+        payload: Mapping[str, Any],
+        result: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Remove exit-pair protection only where a fresh scan proves the leg is gone."""
+        symbol = normalize_symbol(
+            str(result.get("symbol") or payload.get("symbol") or "")
+        )
+        exchanges = {
+            normalize_exchange_name(str(payload.get(field) or ""))
+            for field in ("long_exchange", "short_exchange")
+        }
+        targets = {
+            (exchange, symbol)
+            for exchange in exchanges
+            if exchange and symbol
+        }
+        if not targets:
+            return []
+        try:
+            actions = await self._cleanup_verified_orphan_protective_targets(
+                targets,
+                reason="manual_exit_completed",
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning(
+                "protective cleanup after exit failed symbol=%s exchanges=%s: %s",
+                symbol,
+                sorted(exchanges),
+                exc,
+            )
+            return []
+        result["protective_cleanup"] = actions
+        return actions
 
     async def manual_orphan_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
         positions = self._accounts.snapshot().get("positions") or []
@@ -9875,6 +9918,8 @@ class DataService:
             "use_orderbook_check": True,
             "allow_liquidity_chunking": True,
             "fallback_to_market": False,
+            "exit_close_full_pair": bool(action == "exit" and float(percent) >= 100.0),
+            "exit_dust_max_legs": 2,
             "async_run": bool(async_run and not dry_run),
             "dry_run": dry_run,
             "long_exchange": long_exchange,
@@ -11378,6 +11423,27 @@ class DataService:
                     result = await self._manual.roll(payload, positions or [], log_cb=_log_cb, stop_cb=_stop_cb)
                 else:
                     result = {"errors": [f"unsupported manual action {action}"]}
+                if action == "exit" and isinstance(result, dict):
+                    cleanup_actions = await self._cleanup_protective_after_exit(payload, result)
+                    if cleanup_actions:
+                        _log_cb(
+                            {
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "event": "protective_cleanup",
+                                "message": "post-exit protective cleanup completed",
+                                "data": {
+                                    "actions": [
+                                        {
+                                            "exchange": item.get("exchange"),
+                                            "symbol": item.get("symbol"),
+                                            "status": item.get("status"),
+                                            "cancel_order_ids": item.get("cancel_order_ids"),
+                                        }
+                                        for item in cleanup_actions
+                                    ]
+                                },
+                            }
+                        )
                 run["result"] = result
                 result_warnings = [str(item) for item in (result.get("warnings") or [])]
                 remaining_qty = _safe_float(result.get("remaining_qty")) or 0.0
@@ -17952,6 +18018,69 @@ class DataService:
         )
         return actions
 
+    async def _maybe_sweep_orphan_protective_orders(
+        self,
+        *,
+        reason: str,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Discover protection with no position and remove it after trusted scans."""
+        protective = getattr(self._settings_manager.current, "protective", {}) or {}
+        if not bool(protective.get("orphan_cleanup_enabled", True)):
+            return []
+        now_ts = time.time()
+        if self._protective_orphan_sweep_inflight:
+            return []
+        if (
+            not force
+            and now_ts - float(self._protective_orphan_sweep_last_ts or 0.0)
+            < float(self._protective_orphan_sweep_interval_sec)
+        ):
+            return []
+        self._protective_orphan_sweep_inflight = True
+        self._protective_orphan_sweep_last_ts = now_ts
+        try:
+            snapshot = self._accounts.snapshot() or {}
+            exchange_health = snapshot.get("exchange_health") or {}
+            healthy_exchanges = {
+                normalize_exchange_name(str(exchange))
+                for exchange, health in (
+                    exchange_health.items()
+                    if isinstance(exchange_health, Mapping)
+                    else []
+                )
+                if str((health or {}).get("health") or "").lower() == "healthy"
+            }
+            if not healthy_exchanges:
+                healthy_exchanges = self._account_monitor_enabled_exchanges()
+            discovery = await self._protective_manager.discover_open_protective_targets(
+                healthy_exchanges
+            )
+            targets = {
+                (
+                    normalize_exchange_name(str(item.get("exchange") or "")),
+                    normalize_symbol(item.get("symbol")),
+                )
+                for item in (discovery.get("targets") or [])
+                if isinstance(item, Mapping)
+            }
+            targets = {
+                (exchange, symbol)
+                for exchange, symbol in targets
+                if exchange and symbol
+            }
+            errors = list(discovery.get("errors") or [])
+            if errors:
+                logger.warning("protective orphan discovery issues (%s): %s", reason, errors)
+            if not targets:
+                return []
+            return await self._cleanup_verified_orphan_protective_targets(
+                targets,
+                reason=reason,
+            )
+        finally:
+            self._protective_orphan_sweep_inflight = False
+
     async def _maybe_sync_protective_orders(
         self,
         *,
@@ -18139,6 +18268,13 @@ class DataService:
                 await self._maybe_rebalance_positions(positions)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.warning("Protective rebalance failed: %s", exc)
+        if not target_exchanges and not target_symbols and reason == "scheduler":
+            try:
+                await self._maybe_sweep_orphan_protective_orders(
+                    reason="protective_scheduler",
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Protective orphan sweep failed: %s", exc)
 
     async def analyze_symbol(
         self,

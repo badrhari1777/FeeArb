@@ -10518,6 +10518,7 @@ class ManualTradeManager:
         max_legs = int(_safe_float(payload.get("exit_dust_max_legs")) or 1)
         if max_legs <= 0:
             max_legs = 1
+        close_full_pair = bool(payload.get("exit_close_full_pair"))
 
         positions, pos_errors = await self._fetch_positions_for_symbol(
             exchanges=exchanges,
@@ -10574,7 +10575,16 @@ class ManualTradeManager:
             if not side:
                 continue
             start_qty = max(0.0, _safe_float(start_qty_by_exchange.get(exchange)) or 0.0)
-            target_end_qty = max(0.0, start_qty - requested_exit_qty)
+            # A 100% pair exit is resolved from the smaller (hedged) leg.  A
+            # tiny pre-existing mismatch on the larger leg must therefore not
+            # become the desired end position.  It is still closed only below
+            # the normal dust/minimum thresholds, so a material orphan is not
+            # market-closed silently.
+            target_end_qty = (
+                0.0
+                if close_full_pair
+                else max(0.0, start_qty - requested_exit_qty)
+            )
             current_qty = self._sum_position_qty(
                 positions,
                 exchange=exchange,
@@ -10633,6 +10643,7 @@ class ManualTradeManager:
             {
                 "symbol": symbol,
                 "requested_exit_qty": requested_exit_qty,
+                "close_full_pair": close_full_pair,
                 "dust_notional_usd": dust_notional_usd,
                 "candidates": [
                     {
