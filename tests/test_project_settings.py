@@ -763,8 +763,24 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
                 "snapshot": lambda self=None: {
                     "exchange_health": {
                         "kucoin": {"health": "healthy"},
-                        "gate": {"health": "stale"},
-                    }
+                        "gate": {"health": "healthy"},
+                    },
+                    "status": [
+                        {
+                            "exchange": "kucoin",
+                            "status": "ok",
+                            "positions_fetch_ok": True,
+                            "checked_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                        {
+                            "exchange": "gate",
+                            "status": "ok",
+                            "positions_fetch_ok": True,
+                            "checked_at": (
+                                datetime.now(timezone.utc) - timedelta(minutes=10)
+                            ).isoformat(),
+                        },
+                    ],
                 }
             },
         )()

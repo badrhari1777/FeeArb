@@ -18053,6 +18053,20 @@ class DataService:
             }
             if not healthy_exchanges:
                 healthy_exchanges = self._account_monitor_enabled_exchanges()
+            healthy_exchanges = {
+                exchange
+                for exchange in healthy_exchanges
+                if bool(
+                    self._position_scan_evidence(
+                        snapshot,
+                        {exchange},
+                        now_ts=now_ts,
+                        stale_after_sec=90.0,
+                    ).get("trusted")
+                )
+            }
+            if not healthy_exchanges:
+                return []
             discovery = await self._protective_manager.discover_open_protective_targets(
                 healthy_exchanges
             )
