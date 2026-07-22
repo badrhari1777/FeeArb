@@ -9435,7 +9435,7 @@ class DataService:
         if level_index < 0 or level_index >= len(levels):
             raise ValueError("Grid transition level is outside the configured range.")
         level_qty = float(levels[level_index].get("qty") or 0.0)
-        target_qty = (
+        level_target_qty = (
             float(levels[to_level - 1].get("cumulative_qty") or 0.0)
             if to_level > 0
             else 0.0
@@ -9459,26 +9459,78 @@ class DataService:
             and int(existing_transition.get("to_level") or 0) == to_level
         )
         current_hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+        existing_filled_qty = max(
+            0.0,
+            float(existing_transition.get("filled_qty") or 0.0),
+        )
+        origin_hedged_qty = (
+            _safe_float(existing_transition.get("origin_hedged_qty"))
+            if same_transition
+            else None
+        )
+        if origin_hedged_qty is None:
+            if same_transition and existing_filled_qty > 0:
+                origin_hedged_qty = (
+                    max(0.0, current_hedged_qty - existing_filled_qty)
+                    if action == "enter"
+                    else current_hedged_qty + existing_filled_qty
+                )
+            else:
+                origin_hedged_qty = current_hedged_qty
+        position_target_qty = (
+            _safe_float(existing_transition.get("position_target_qty"))
+            if same_transition
+            else None
+        )
+        if position_target_qty is None:
+            position_target_qty = level_target_qty
         desired_qty = (
-            max(0.0, target_qty - current_hedged_qty)
+            max(0.0, position_target_qty - current_hedged_qty)
             if action == "enter"
-            else max(0.0, current_hedged_qty - target_qty)
+            else max(0.0, current_hedged_qty - position_target_qty)
         )
         transition_qty = desired_qty if desired_qty > 0 else level_qty
-        transition = existing_transition if same_transition else {
-            "action": action,
-            "from_level": from_level,
-            "to_level": to_level,
-            "target_qty": transition_qty,
-            "filled_qty": 0.0,
-            "remaining_qty": transition_qty,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+        if same_transition:
+            transition = dict(existing_transition)
+            transition["origin_hedged_qty"] = float(origin_hedged_qty)
+            transition["position_target_qty"] = float(position_target_qty)
+            if transition.pop("rebase_from_positions", False):
+                transition_qty = desired_qty
+                transition["origin_hedged_qty"] = current_hedged_qty
+                transition["target_qty"] = transition_qty
+                transition["filled_qty"] = 0.0
+                transition["remaining_qty"] = transition_qty
+                transition["rebased_at"] = datetime.now(timezone.utc).isoformat()
+        else:
+            transition = {
+                "action": action,
+                "from_level": from_level,
+                "to_level": to_level,
+                "target_qty": transition_qty,
+                "filled_qty": 0.0,
+                "remaining_qty": transition_qty,
+                "origin_hedged_qty": float(origin_hedged_qty),
+                "position_target_qty": float(position_target_qty),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+        transition_target_qty = transition.get("target_qty")
         total_transition_qty = max(
             0.0,
-            float(transition.get("target_qty") or transition_qty or level_qty),
+            float(
+                transition_target_qty
+                if transition_target_qty is not None
+                else transition_qty or level_qty
+            ),
         )
-        qty = max(0.0, float(transition.get("remaining_qty") or total_transition_qty))
+        transition_remaining_qty = transition.get("remaining_qty")
+        qty = max(
+            0.0,
+            float(
+                transition_remaining_qty
+                if transition_remaining_qty is not None
+                else total_transition_qty
+            ),
+        )
         tolerance = self._auto_arb_transition_completion_tolerance(
             rule_copy,
             total_transition_qty,
@@ -9565,7 +9617,7 @@ class DataService:
                 current["active_action"] = action
                 current["active_from_level"] = from_level
                 current["active_to_level"] = to_level
-                current["active_target_qty"] = target_qty
+                current["active_target_qty"] = position_target_qty
                 current["active_start_hedged_qty"] = float(
                     quantities.get("hedged_qty") or 0.0
                 )
@@ -9780,6 +9832,22 @@ class DataService:
                                 pending_transition.get("to_level") or current_level
                             )
                             levels = current.get("levels") or []
+                            actual_qty = float(current.get("actual_hedged_qty") or 0.0)
+                            origin_qty = _safe_float(
+                                pending_transition.get("origin_hedged_qty")
+                            )
+                            if origin_qty is None:
+                                origin_qty = (
+                                    max(0.0, actual_qty - pending_filled)
+                                    if pending_action == "enter"
+                                    else actual_qty + pending_filled
+                                )
+                            pending_transition["origin_hedged_qty"] = float(origin_qty)
+                            if pending_transition.get("position_target_qty") is None:
+                                pending_transition["position_target_qty"] = (
+                                    self._auto_arb_level_qty(current, to_level)
+                                )
+                            current["pending_transition"] = pending_transition
                             level_index = to_level - 1 if pending_action == "enter" else from_level - 1
                             trigger_level = (
                                 levels[level_index]
@@ -9807,6 +9875,74 @@ class DataService:
                                 "continuation": True,
                                 "remaining_qty": pending_transition.get("remaining_qty"),
                             }
+                            if (
+                                pending_action == "enter"
+                                and not trigger_matched
+                                and pending_filled <= 0
+                                and str(pending_transition.get("reason") or "")
+                                == "partial_exit_reversed_by_entry_trigger"
+                            ):
+                                original_exit = dict(
+                                    pending_transition.get("reversal_of") or {}
+                                )
+                                original_from_level = int(
+                                    original_exit.get("from_level") or to_level
+                                )
+                                original_to_level = int(
+                                    original_exit.get("to_level") or from_level
+                                )
+                                original_exit_level = (
+                                    levels[original_from_level - 1]
+                                    if 0 <= original_from_level - 1 < len(levels)
+                                    else {}
+                                )
+                                original_exit_threshold = original_exit.get("spread_min_pct")
+                                if original_exit_threshold is None:
+                                    original_exit_threshold = original_exit_level.get(
+                                        "exit_spread_pct"
+                                    )
+                                original_exit_matched = (
+                                    str(original_exit.get("action") or "") == "exit"
+                                    and original_exit_threshold is not None
+                                    and exit_spread >= float(original_exit_threshold)
+                                )
+                                if original_exit_matched:
+                                    pending_transition = original_exit
+                                    current["pending_transition"] = pending_transition
+                                    decision = {
+                                        "action": "exit",
+                                        "current_level": current_level,
+                                        "target_level": original_to_level,
+                                        "entry_target_level": None,
+                                        "exit_target_level": original_to_level,
+                                        "levels_delta": (
+                                            original_to_level - original_from_level
+                                        ),
+                                        "continuation": True,
+                                        "reversal_cancelled": True,
+                                        "remaining_qty": original_exit.get(
+                                            "remaining_qty"
+                                        ),
+                                    }
+                                    transition_event = {
+                                        "event": "live_partial_exit_reversal_cancelled",
+                                        "rule_id": current.get("id"),
+                                        "generation": current.get("generation"),
+                                        "symbol": current.get("symbol"),
+                                        "long_exchange": current.get("long_exchange"),
+                                        "short_exchange": current.get("short_exchange"),
+                                        "from_level": original_from_level,
+                                        "to_level": original_to_level,
+                                        "remaining_qty": original_exit.get(
+                                            "remaining_qty"
+                                        ),
+                                        "exit_threshold_pct": float(
+                                            original_exit_threshold
+                                        ),
+                                        "entry_spread_pct": entry_spread,
+                                        "exit_spread_pct": exit_spread,
+                                        "ts": now_iso,
+                                    }
                             if (
                                 pending_action == "exit"
                                 and not trigger_matched
@@ -9848,20 +9984,103 @@ class DataService:
                                     }
                                     pending_transition = {}
                             if (
+                                pending_action == "exit"
+                                and not trigger_matched
+                                and pending_filled > 0
+                                and from_level > 0
+                            ):
+                                entry_level = (
+                                    levels[from_level - 1]
+                                    if 0 <= from_level - 1 < len(levels)
+                                    else {}
+                                )
+                                entry_threshold = entry_level.get("entry_spread_pct")
+                                restore_qty = max(0.0, float(origin_qty) - actual_qty)
+                                tolerance = self._auto_arb_completion_tolerance(
+                                    current,
+                                    restore_qty or None,
+                                )
+                                reversal_matched = (
+                                    entry_threshold is not None
+                                    and restore_qty > tolerance
+                                    and entry_spread <= float(entry_threshold)
+                                )
+                                if reversal_matched:
+                                    reversed_transition = dict(
+                                        current.get("pending_transition") or pending_transition
+                                    )
+                                    pending_transition = {
+                                        "action": "enter",
+                                        "from_level": to_level,
+                                        "to_level": from_level,
+                                        "target_qty": restore_qty,
+                                        "filled_qty": 0.0,
+                                        "remaining_qty": restore_qty,
+                                        "origin_hedged_qty": actual_qty,
+                                        "position_target_qty": float(origin_qty),
+                                        "rebase_from_positions": True,
+                                        "spread_max_pct": float(entry_threshold),
+                                        "created_at": now_iso,
+                                        "reversal_of": reversed_transition,
+                                        "reason": "partial_exit_reversed_by_entry_trigger",
+                                    }
+                                    current["pending_transition"] = pending_transition
+                                    decision = {
+                                        "action": "enter",
+                                        "current_level": current_level,
+                                        "target_level": from_level,
+                                        "entry_target_level": from_level,
+                                        "exit_target_level": None,
+                                        "levels_delta": from_level - to_level,
+                                        "continuation": False,
+                                        "reversal": True,
+                                        "restore_qty": restore_qty,
+                                        "entry_threshold_pct": float(entry_threshold),
+                                    }
+                                    transition_event = {
+                                        "event": "live_partial_exit_reversal_queued",
+                                        "rule_id": current.get("id"),
+                                        "generation": current.get("generation"),
+                                        "symbol": current.get("symbol"),
+                                        "long_exchange": current.get("long_exchange"),
+                                        "short_exchange": current.get("short_exchange"),
+                                        "from_level": from_level,
+                                        "to_level": to_level,
+                                        "restore_qty": restore_qty,
+                                        "entry_threshold_pct": float(entry_threshold),
+                                        "entry_spread_pct": entry_spread,
+                                        "exit_spread_pct": exit_spread,
+                                        "ts": now_iso,
+                                    }
+                            if (
                                 pending_action == "enter"
                                 and not trigger_matched
                                 and from_level > 0
                             ):
-                                base_qty = self._auto_arb_level_qty(current, from_level)
-                                actual_qty = float(current.get("actual_hedged_qty") or 0.0)
-                                rollback_qty = max(0.0, actual_qty - base_qty)
+                                rollback_target_qty = float(origin_qty)
+                                if (
+                                    str(pending_transition.get("reason") or "")
+                                    == "partial_exit_reversed_by_entry_trigger"
+                                ):
+                                    original_exit = pending_transition.get("reversal_of")
+                                    if isinstance(original_exit, Mapping):
+                                        original_exit_target = _safe_float(
+                                            original_exit.get("position_target_qty")
+                                        )
+                                        if original_exit_target is None:
+                                            original_exit_target = self._auto_arb_level_qty(
+                                                current,
+                                                int(original_exit.get("to_level") or from_level),
+                                            )
+                                        rollback_target_qty = float(original_exit_target)
+                                rollback_qty = max(0.0, actual_qty - rollback_target_qty)
                                 tolerance = self._auto_arb_completion_tolerance(
                                     current,
                                     rollback_qty or None,
                                 )
                                 exit_level = (
-                                    levels[from_level - 1]
-                                    if 0 <= from_level - 1 < len(levels)
+                                    levels[to_level - 1]
+                                    if 0 <= to_level - 1 < len(levels)
                                     else {}
                                 )
                                 exit_threshold = exit_level.get("exit_spread_pct")
@@ -9878,6 +10097,9 @@ class DataService:
                                         "target_qty": rollback_qty,
                                         "filled_qty": 0.0,
                                         "remaining_qty": rollback_qty,
+                                        "origin_hedged_qty": actual_qty,
+                                        "position_target_qty": rollback_target_qty,
+                                        "rebase_from_positions": True,
                                         "spread_min_pct": float(exit_threshold),
                                         "created_at": now_iso,
                                         "reversal_of": dict(

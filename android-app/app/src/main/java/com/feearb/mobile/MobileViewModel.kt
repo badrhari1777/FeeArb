@@ -1012,6 +1012,45 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                 append(" | Status: ${rule.optString("status").ifBlank { "-" }}")
                 rule.optIntOrNull("live_level")?.let { append(" | Level: $it") }
                 rule.optDoubleOrNull("actual_hedged_qty")?.let { append("\nHedged: ${formatCompact(it)}") }
+                val transition = rule.objectOrNull("pending_transition")
+                if (transition != null) {
+                    val action = transition.optString("action")
+                    val frontierLevel = if (action == "exit") {
+                        transition.optIntOrNull("from_level")
+                    } else {
+                        transition.optIntOrNull("to_level")
+                    }
+                    val frontier = rule.getAsJsonArray("levels")
+                        ?.map { it.asJsonObject }
+                        ?.firstOrNull { it.optIntOrNull("level") == frontierLevel }
+                    val entryThreshold = frontier?.optDoubleOrNull("entry_spread_pct")
+                    val exitThreshold = frontier?.optDoubleOrNull("exit_spread_pct")
+                    if (entryThreshold != null && exitThreshold != null) {
+                        val remaining = transition.optDoubleOrNull("remaining_qty") ?: 0.0
+                        val filled = transition.optDoubleOrNull("filled_qty") ?: 0.0
+                        val actual = rule.optDoubleOrNull("actual_hedged_qty") ?: 0.0
+                        val origin = transition.optDoubleOrNull("origin_hedged_qty")
+                        val buyQty = if (action == "enter") {
+                            remaining.coerceAtLeast(0.0)
+                        } else {
+                            (origin?.minus(actual) ?: filled).coerceAtLeast(0.0)
+                        }
+                        val sellQty = if (action == "exit") {
+                            remaining.coerceAtLeast(0.0)
+                        } else if (
+                            transition.optString("reason") ==
+                            "partial_exit_reversed_by_entry_trigger"
+                        ) {
+                            val originalTarget = transition.objectOrNull("reversal_of")
+                                ?.optDoubleOrNull("position_target_qty")
+                            (originalTarget?.let { actual - it } ?: filled).coerceAtLeast(0.0)
+                        } else {
+                            filled.coerceAtLeast(0.0)
+                        }
+                        append("\nBUY ${formatCompact(buyQty)} @ entry <= ${formatCompact(entryThreshold)}%")
+                        append("\nSELL ${formatCompact(sellQty)} @ exit >= ${formatCompact(exitThreshold)}%")
+                    }
+                }
                 rule.optString("blocked_reason").takeIf { it.isNotBlank() }?.let { append("\nBlocked: $it") }
             }
         }

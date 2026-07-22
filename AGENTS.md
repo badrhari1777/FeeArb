@@ -102,6 +102,22 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Symmetric partial-step Grid control was added on 2026-07-22 for hot, rapidly
+  reversing symbols such as DEXE. A partial enter now continues its remaining
+  buy at the frontier entry threshold or rolls back its actual fill at that
+  frontier's exit threshold. A partial exit now continues only its unsold
+  remainder at the exit threshold or buys back the actually sold quantity at
+  the entry threshold; the deadband holds exposure. Repeated reversals preserve
+  the original position boundary, so a partly filled buyback followed by a new
+  exit also includes the older unsold remainder. Every reversal rebases from
+  fresh exchange positions, while Adopt Grid preserves its accepted actual
+  exposure instead of forcing nominal cumulative level size. A zero-fill queued
+  reversal can return to the original transition before placing an unnecessary
+  order. Web and Android Grid views show both partial-step triggers and their
+  current BUY/SELL quantities. Verified Python compilation, Grid tests (`48
+  passed`), the full suite (`489 passed`), plus Android unit tests and debug
+  assembly.
+
 - Maker-first smart-enter safety was hardened on 2026-07-22 after the MIRA
   preflight exposed a false primary-liquidity blocker. The primary entry leg is
   now a passive `post-only` order; its taker depth is informational. Auto hint

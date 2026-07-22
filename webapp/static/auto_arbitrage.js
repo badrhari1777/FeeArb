@@ -211,6 +211,35 @@
     }).join('');
   }
 
+  function partialGridTriggers(rule, transition) {
+    var action = String(transition.action || '');
+    if (!action) return '-';
+    var frontierNumber = Number(action === 'exit' ? transition.from_level : transition.to_level);
+    var frontier = (rule.levels || []).find(function (level) {
+      return Number(level.level) === frontierNumber;
+    }) || {};
+    var entryThreshold = Number(frontier.entry_spread_pct);
+    var exitThreshold = Number(frontier.exit_spread_pct);
+    if (!Number.isFinite(entryThreshold) || !Number.isFinite(exitThreshold)) return '-';
+    var remaining = Math.max(0, Number(transition.remaining_qty) || 0);
+    var filled = Math.max(0, Number(transition.filled_qty) || 0);
+    var actual = Math.max(0, Number(rule.actual_hedged_qty) || 0);
+    var origin = Number(transition.origin_hedged_qty);
+    var buyQty = action === 'enter'
+      ? remaining
+      : (Number.isFinite(origin) ? Math.max(0, origin - actual) : filled);
+    var sellQty = filled;
+    if (action === 'exit') {
+      sellQty = remaining;
+    } else if (transition.reason === 'partial_exit_reversed_by_entry_trigger') {
+      var originalExit = transition.reversal_of || {};
+      var originalTarget = Number(originalExit.position_target_qty);
+      sellQty = Number.isFinite(originalTarget) ? Math.max(0, actual - originalTarget) : filled;
+    }
+    return 'BUY ' + fmt(buyQty, 8) + ' @ entry <= ' + fmt(entryThreshold, 4) + '% | ' +
+      'SELL ' + fmt(sellQty, 8) + ' @ exit >= ' + fmt(exitThreshold, 4) + '%';
+  }
+
   function renderRules(payload) {
     var rules = payload.rules || [];
     el.ruleCount.textContent = String(rules.length);
@@ -247,6 +276,8 @@
           '<div><span>Текущая ступень</span><strong>' +
           escapeHtml(transition.action || '-') + ' · остаток ' +
           fmt(transition.remaining_qty, 8) + '</strong></div>' +
+          '<div><span>Триггеры частичной ступени</span><strong>' +
+          escapeHtml(partialGridTriggers(rule, transition)) + '</strong></div>' +
           '<div><span>Entry spread</span><strong>' + fmt(rule.live_entry_spread_pct, 4) + '%</strong></div>' +
           '<div><span>Exit spread</span><strong>' + fmt(rule.live_exit_spread_pct, 4) + '%</strong></div>' +
           '<div><span>Диапазон</span><strong>' + fmt(rule.range_start_pct, 2) + '% ... ' +

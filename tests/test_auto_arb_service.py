@@ -1594,7 +1594,7 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
         }
         self.service._auto_arb["rules"][rule["id"]] = rule
         self.service.auto_arb_spreads = AsyncMock(
-            return_value={"entry_spread_pct": -14.0, "exit_spread_pct": -12.0}
+            return_value={"entry_spread_pct": -14.0, "exit_spread_pct": -18.0}
         )
         self.service._auto_arb_refresh_quantities = AsyncMock(
             return_value={
@@ -1616,7 +1616,7 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
         payload = self.service.manual_exit.await_args.args[0]
         self.assertEqual(payload["mode"], "smart-exit")
         self.assertAlmostEqual(payload["qty"], 1500.0)
-        self.assertAlmostEqual(payload["spread_min_pct"], -12.5)
+        self.assertAlmostEqual(payload["spread_min_pct"], -18.5)
         self.assertEqual(rule["active_execution_id"], "grid-reversal")
         self.assertEqual(rule["active_action"], "exit")
         self.assertEqual(rule["active_from_level"], 3)
@@ -1625,6 +1625,340 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(rule["pending_transition"]["target_qty"], 1500.0)
         self.assertEqual(rule["pending_transition"]["reversal_of"]["action"], "enter")
         self.assertTrue(rule["last_decision"]["reversal"])
+
+    async def test_live_partial_exit_rebuys_filled_qty_when_entry_trigger_returns(self) -> None:
+        levels = [
+            {
+                "level": level,
+                "entry_spread_pct": 8.5 - level,
+                "exit_spread_pct": 9.5 - level,
+                "qty": 1000.0,
+                "cumulative_qty": level * 1000.0,
+            }
+            for level in range(1, 7)
+        ]
+        rule = {
+            "id": "reverse-partial-exit",
+            "generation": 1,
+            "enabled": True,
+            "mode": "live",
+            "symbol": "DEXE",
+            "long_exchange": "bybit",
+            "short_exchange": "binance",
+            "chunk_qty": 1000.0,
+            "levels": levels,
+            "live_level": 5,
+            "actual_hedged_qty": 4400.0,
+            "confirm_samples": 1,
+            "max_levels_per_cycle": 1,
+            "pending_transition": {
+                "action": "exit",
+                "from_level": 5,
+                "to_level": 4,
+                "target_qty": 1000.0,
+                "filled_qty": 600.0,
+                "remaining_qty": 400.0,
+            },
+        }
+        self.service._auto_arb["rules"][rule["id"]] = rule
+        self.service.auto_arb_spreads = AsyncMock(
+            return_value={"entry_spread_pct": 3.4, "exit_spread_pct": 4.4}
+        )
+        self.service._auto_arb_refresh_quantities = AsyncMock(
+            return_value={
+                "long_qty": 4450.0,
+                "short_qty": 4450.0,
+                "hedged_qty": 4450.0,
+                "imbalance_qty": 0.0,
+                "imbalance_pct": 0.0,
+            }
+        )
+        self.service.manual_exit = AsyncMock()
+        self.service.manual_enter = AsyncMock(
+            return_value={"execution_id": "grid-exit-reversal", "status": "running"}
+        )
+
+        await self.service._auto_arb_cycle()
+
+        self.service.manual_exit.assert_not_awaited()
+        payload = self.service.manual_enter.await_args.args[0]
+        self.assertAlmostEqual(payload["qty"], 550.0)
+        self.assertAlmostEqual(payload["spread_max_pct"], 3.5)
+        self.assertEqual(rule["active_action"], "enter")
+        self.assertEqual(rule["active_from_level"], 4)
+        self.assertEqual(rule["active_to_level"], 5)
+        transition = rule["pending_transition"]
+        self.assertEqual(transition["reason"], "partial_exit_reversed_by_entry_trigger")
+        self.assertAlmostEqual(transition["target_qty"], 550.0)
+        self.assertAlmostEqual(transition["remaining_qty"], 550.0)
+        self.assertAlmostEqual(transition["origin_hedged_qty"], 4450.0)
+        self.assertAlmostEqual(transition["position_target_qty"], 5000.0)
+        self.assertEqual(transition["reversal_of"]["action"], "exit")
+        self.assertTrue(rule["last_decision"]["reversal"])
+
+    async def test_live_partial_exit_continues_only_remaining_qty_when_exit_returns(self) -> None:
+        levels = [
+            {
+                "level": level,
+                "entry_spread_pct": 8.5 - level,
+                "exit_spread_pct": 9.5 - level,
+                "qty": 1000.0,
+                "cumulative_qty": level * 1000.0,
+            }
+            for level in range(1, 7)
+        ]
+        rule = {
+            "id": "continue-partial-exit",
+            "generation": 1,
+            "enabled": True,
+            "mode": "live",
+            "symbol": "DEXE",
+            "long_exchange": "bybit",
+            "short_exchange": "binance",
+            "chunk_qty": 1000.0,
+            "levels": levels,
+            "live_level": 5,
+            "actual_hedged_qty": 4400.0,
+            "confirm_samples": 1,
+            "max_levels_per_cycle": 1,
+            "pending_transition": {
+                "action": "exit",
+                "from_level": 5,
+                "to_level": 4,
+                "target_qty": 1000.0,
+                "filled_qty": 600.0,
+                "remaining_qty": 400.0,
+            },
+        }
+        self.service._auto_arb["rules"][rule["id"]] = rule
+        self.service.auto_arb_spreads = AsyncMock(
+            return_value={"entry_spread_pct": 4.0, "exit_spread_pct": 4.6}
+        )
+        self.service._auto_arb_refresh_quantities = AsyncMock(
+            return_value={
+                "long_qty": 4400.0,
+                "short_qty": 4400.0,
+                "hedged_qty": 4400.0,
+                "imbalance_qty": 0.0,
+                "imbalance_pct": 0.0,
+            }
+        )
+        self.service.manual_enter = AsyncMock()
+        self.service.manual_exit = AsyncMock(
+            return_value={"execution_id": "grid-exit-continue", "status": "running"}
+        )
+
+        await self.service._auto_arb_cycle()
+
+        self.service.manual_enter.assert_not_awaited()
+        payload = self.service.manual_exit.await_args.args[0]
+        self.assertAlmostEqual(payload["qty"], 400.0)
+        self.assertAlmostEqual(payload["spread_min_pct"], 4.5)
+        self.assertEqual(rule["active_action"], "exit")
+        self.assertEqual(rule["active_from_level"], 5)
+        self.assertEqual(rule["active_to_level"], 4)
+
+    async def test_live_zero_fill_exit_reversal_returns_to_original_exit(self) -> None:
+        levels = [
+            {
+                "level": level,
+                "entry_spread_pct": 8.5 - level,
+                "exit_spread_pct": 9.5 - level,
+                "qty": 1000.0,
+                "cumulative_qty": level * 1000.0,
+            }
+            for level in range(1, 7)
+        ]
+        original_exit = {
+            "action": "exit",
+            "from_level": 5,
+            "to_level": 4,
+            "target_qty": 1000.0,
+            "filled_qty": 600.0,
+            "remaining_qty": 400.0,
+            "origin_hedged_qty": 5000.0,
+            "position_target_qty": 4000.0,
+        }
+        rule = {
+            "id": "cancel-zero-fill-reversal",
+            "generation": 1,
+            "enabled": True,
+            "mode": "live",
+            "symbol": "DEXE",
+            "long_exchange": "bybit",
+            "short_exchange": "binance",
+            "chunk_qty": 1000.0,
+            "levels": levels,
+            "live_level": 5,
+            "actual_hedged_qty": 4400.0,
+            "confirm_samples": 1,
+            "max_levels_per_cycle": 1,
+            "pending_transition": {
+                "action": "enter",
+                "from_level": 4,
+                "to_level": 5,
+                "target_qty": 600.0,
+                "filled_qty": 0.0,
+                "remaining_qty": 600.0,
+                "origin_hedged_qty": 4400.0,
+                "position_target_qty": 5000.0,
+                "reason": "partial_exit_reversed_by_entry_trigger",
+                "reversal_of": original_exit,
+            },
+        }
+        self.service._auto_arb["rules"][rule["id"]] = rule
+        self.service.auto_arb_spreads = AsyncMock(
+            return_value={"entry_spread_pct": 4.0, "exit_spread_pct": 4.6}
+        )
+        self.service._auto_arb_refresh_quantities = AsyncMock(
+            return_value={
+                "long_qty": 4400.0,
+                "short_qty": 4400.0,
+                "hedged_qty": 4400.0,
+                "imbalance_qty": 0.0,
+                "imbalance_pct": 0.0,
+            }
+        )
+        self.service.manual_enter = AsyncMock()
+        self.service.manual_exit = AsyncMock(
+            return_value={"execution_id": "grid-original-exit", "status": "running"}
+        )
+
+        await self.service._auto_arb_cycle()
+
+        self.service.manual_enter.assert_not_awaited()
+        payload = self.service.manual_exit.await_args.args[0]
+        self.assertAlmostEqual(payload["qty"], 400.0)
+        self.assertEqual(rule["active_action"], "exit")
+        self.assertTrue(rule["last_decision"]["reversal_cancelled"])
+        self.assertEqual(rule["pending_transition"]["action"], "exit")
+
+    async def test_live_partial_rebuy_then_exit_closes_rebuy_and_original_remainder(self) -> None:
+        levels = [
+            {
+                "level": level,
+                "entry_spread_pct": 8.5 - level,
+                "exit_spread_pct": 9.5 - level,
+                "qty": 1000.0,
+                "cumulative_qty": level * 1000.0,
+            }
+            for level in range(1, 7)
+        ]
+        original_exit = {
+            "action": "exit",
+            "from_level": 5,
+            "to_level": 4,
+            "target_qty": 1000.0,
+            "filled_qty": 600.0,
+            "remaining_qty": 400.0,
+            "origin_hedged_qty": 5000.0,
+            "position_target_qty": 4000.0,
+        }
+        rule = {
+            "id": "reverse-partial-rebuy",
+            "generation": 1,
+            "enabled": True,
+            "mode": "live",
+            "symbol": "DEXE",
+            "long_exchange": "bybit",
+            "short_exchange": "binance",
+            "chunk_qty": 1000.0,
+            "levels": levels,
+            "live_level": 5,
+            "actual_hedged_qty": 4500.0,
+            "confirm_samples": 1,
+            "max_levels_per_cycle": 1,
+            "pending_transition": {
+                "action": "enter",
+                "from_level": 4,
+                "to_level": 5,
+                "target_qty": 600.0,
+                "filled_qty": 100.0,
+                "remaining_qty": 500.0,
+                "origin_hedged_qty": 4400.0,
+                "position_target_qty": 5000.0,
+                "reason": "partial_exit_reversed_by_entry_trigger",
+                "reversal_of": original_exit,
+            },
+        }
+        self.service._auto_arb["rules"][rule["id"]] = rule
+        self.service.auto_arb_spreads = AsyncMock(
+            return_value={"entry_spread_pct": 4.0, "exit_spread_pct": 4.6}
+        )
+        self.service._auto_arb_refresh_quantities = AsyncMock(
+            return_value={
+                "long_qty": 4500.0,
+                "short_qty": 4500.0,
+                "hedged_qty": 4500.0,
+                "imbalance_qty": 0.0,
+                "imbalance_pct": 0.0,
+            }
+        )
+        self.service.manual_enter = AsyncMock()
+        self.service.manual_exit = AsyncMock(
+            return_value={"execution_id": "grid-rebuy-rollback", "status": "running"}
+        )
+
+        await self.service._auto_arb_cycle()
+
+        self.service.manual_enter.assert_not_awaited()
+        payload = self.service.manual_exit.await_args.args[0]
+        self.assertAlmostEqual(payload["qty"], 500.0)
+        self.assertAlmostEqual(payload["spread_min_pct"], 4.5)
+        transition = rule["pending_transition"]
+        self.assertEqual(transition["action"], "exit")
+        self.assertAlmostEqual(transition["target_qty"], 500.0)
+        self.assertAlmostEqual(transition["position_target_qty"], 4000.0)
+        self.assertEqual(rule["active_from_level"], 5)
+        self.assertEqual(rule["active_to_level"], 4)
+
+    async def test_live_partial_exit_holds_between_entry_and_exit_triggers(self) -> None:
+        levels = [
+            {
+                "level": level,
+                "entry_spread_pct": 8.5 - level,
+                "exit_spread_pct": 9.5 - level,
+                "qty": 1000.0,
+                "cumulative_qty": level * 1000.0,
+            }
+            for level in range(1, 7)
+        ]
+        rule = {
+            "id": "hold-partial-exit",
+            "generation": 1,
+            "enabled": True,
+            "mode": "live",
+            "symbol": "DEXE",
+            "long_exchange": "bybit",
+            "short_exchange": "binance",
+            "chunk_qty": 1000.0,
+            "levels": levels,
+            "live_level": 5,
+            "actual_hedged_qty": 4400.0,
+            "confirm_samples": 1,
+            "max_levels_per_cycle": 1,
+            "pending_transition": {
+                "action": "exit",
+                "from_level": 5,
+                "to_level": 4,
+                "target_qty": 1000.0,
+                "filled_qty": 600.0,
+                "remaining_qty": 400.0,
+            },
+        }
+        self.service._auto_arb["rules"][rule["id"]] = rule
+        self.service.auto_arb_spreads = AsyncMock(
+            return_value={"entry_spread_pct": 3.8, "exit_spread_pct": 4.2}
+        )
+        self.service.manual_enter = AsyncMock()
+        self.service.manual_exit = AsyncMock()
+
+        await self.service._auto_arb_cycle()
+
+        self.service.manual_enter.assert_not_awaited()
+        self.service.manual_exit.assert_not_awaited()
+        self.assertEqual(rule["status"], "partial_exit_waiting_trigger")
+        self.assertAlmostEqual(rule["pending_transition"]["remaining_qty"], 400.0)
 
     async def test_live_zero_fill_balance_error_uses_backoff(self) -> None:
         rule = {
