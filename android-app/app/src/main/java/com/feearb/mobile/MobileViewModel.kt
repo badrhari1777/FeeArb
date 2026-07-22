@@ -395,8 +395,8 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         val longExchange = card.long_exchange ?: return
         val shortExchange = card.short_exchange ?: return
         viewModelScope.launch {
-            val target = targetSpreadPct.toDoubleOrNull()
-            val exitPercent = exitPercentText.toDoubleOrNull()
+            val target = targetSpreadPct.toInputDoubleOrNull()
+            val exitPercent = exitPercentText.toInputDoubleOrNull()
             if (enabled && target == null) {
                 uiState = uiState.copy(statusText = "Auto-exit target spread is required.")
                 return@launch
@@ -430,7 +430,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
     fun startPositionAction(card: PositionCardDto, action: String, percentText: String) {
         val longExchange = card.long_exchange
         val shortExchange = card.short_exchange
-        val percent = percentText.toDoubleOrNull()
+        val percent = percentText.toInputDoubleOrNull()
         if (longExchange.isNullOrBlank() || shortExchange.isNullOrBlank()) {
             uiState = uiState.copy(statusText = "Exchange pair is unavailable for this position.")
             return
@@ -798,8 +798,8 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             uiState = uiState.copy(manualStatusText = "Symbol is required.")
             return null
         }
-        val qty = form.qty.toDoubleOrNull()
-        val notional = form.notional.toDoubleOrNull()
+        val qty = form.qty.toInputDoubleOrNull()
+        val notional = form.notional.toInputDoubleOrNull()
         if (form.action != "exit" && qty == null && notional == null) {
             uiState = uiState.copy(manualStatusText = "Qty or notional is required.")
             return null
@@ -811,7 +811,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         } else {
             if (form.action == "exit") "smart-exit" else "smart-enter"
         }
-        val triggerSpread = form.triggerSpreadPct.toDoubleOrNull()
+        val triggerSpread = form.triggerSpreadPct.toInputDoubleOrNull()
         val triggerOperator = when (form.action) {
             "enter" -> "lte"
             "exit" -> "gte"
@@ -836,23 +836,23 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             qty = qty,
             notional = notional,
             mode = mode,
-            max_slippage_bps = advanced.maxSlippageBps.toDoubleOrNull(),
+            max_slippage_bps = advanced.maxSlippageBps.toInputDoubleOrNull(),
             spread_min_pct = if (triggerSpread != null && triggerOperator == "gte") triggerSpread else null,
             spread_max_pct = if (triggerSpread != null && triggerOperator == "lte") triggerSpread else null,
             timeout_sec = advanced.timeoutSec.toIntOrNull(),
             max_runtime_sec = maxRuntimeSec,
-            reprice_sec = advanced.repriceSec.toDoubleOrNull(),
-            chunk_qty = advanced.chunkQty.toDoubleOrNull(),
-            chunk_notional = advanced.chunkNotional.toDoubleOrNull(),
+            reprice_sec = advanced.repriceSec.toInputDoubleOrNull(),
+            chunk_qty = advanced.chunkQty.toInputDoubleOrNull(),
+            chunk_notional = advanced.chunkNotional.toInputDoubleOrNull(),
             force_chunk_qty = advanced.forceChunkQty,
             hedge_order_type = advanced.hedgeOrderType.ifBlank { null },
             hedge_limit_mode = advanced.hedgeLimitMode.ifBlank { null },
-            hedge_favorable_bps = advanced.hedgeFavorableBps.toDoubleOrNull(),
-            hedge_adverse_bps = advanced.hedgeAdverseBps.toDoubleOrNull(),
-            hedge_reprice_min_sec = advanced.hedgeRepriceMinSec.toDoubleOrNull(),
-            limit_offset_bps = advanced.limitOffsetBps.toDoubleOrNull(),
+            hedge_favorable_bps = advanced.hedgeFavorableBps.toInputDoubleOrNull(),
+            hedge_adverse_bps = advanced.hedgeAdverseBps.toInputDoubleOrNull(),
+            hedge_reprice_min_sec = advanced.hedgeRepriceMinSec.toInputDoubleOrNull(),
+            limit_offset_bps = advanced.limitOffsetBps.toInputDoubleOrNull(),
             limit_offset_ticks = advanced.limitOffsetTicks.toIntOrNull(),
-            max_limit_deviation_bps = advanced.maxLimitDeviationBps.toDoubleOrNull(),
+            max_limit_deviation_bps = advanced.maxLimitDeviationBps.toInputDoubleOrNull(),
             use_orderbook_check = advanced.useOrderbookCheck,
             allow_liquidity_chunking = true,
             fallback_to_market = false,
@@ -914,9 +914,9 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         val symbol = form.symbol.trim().uppercase()
         val longExchange = form.longExchange.trim()
         val shortExchange = form.shortExchange.trim()
-        val maxNotional = form.maxNotional.toDoubleOrNull()
-        val rangeStart = form.rangeStartPct.toDoubleOrNull()
-        val rangeEnd = form.rangeEndPct.toDoubleOrNull()
+        val maxNotional = form.maxNotional.toInputDoubleOrNull()
+        val rangeStart = form.rangeStartPct.toInputDoubleOrNull()
+        val rangeEnd = form.rangeEndPct.toInputDoubleOrNull()
         val levelCount = form.levelCount.toIntOrNull()
         if (symbol.isBlank()) {
             uiState = uiState.copy(gridStatusText = "Grid symbol is required.")
@@ -952,7 +952,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             exit_range_start_pct = if (usesExitRange) rangeStart else null,
             exit_range_end_pct = if (usesExitRange) rangeEnd else null,
             level_count = levelCount,
-            max_slippage_bps = uiState.advancedSettings.maxSlippageBps.toDoubleOrNull() ?: 8.0,
+            max_slippage_bps = uiState.advancedSettings.maxSlippageBps.toInputDoubleOrNull() ?: 8.0,
             liquidity_safety_factor = 0.70,
             confirm_samples = 2,
             enabled = true,

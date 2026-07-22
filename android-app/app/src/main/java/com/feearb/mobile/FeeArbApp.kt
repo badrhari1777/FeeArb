@@ -6,6 +6,7 @@
 package com.feearb.mobile
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -54,6 +55,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.feearb.mobile.ui.theme.FeeArbTheme
@@ -589,6 +591,7 @@ private fun PositionCard(
                     suffix = { Text("%") },
                     modifier = Modifier.weight(1f),
                     singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 )
                 OutlinedTextField(
                     value = autoExitPercent,
@@ -597,6 +600,7 @@ private fun PositionCard(
                     suffix = { Text("%") },
                     modifier = Modifier.weight(1f),
                     singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                 )
             }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1165,10 +1169,7 @@ private fun SimpleSelect(label: String, value: String, options: List<String>, on
     }
 }
 
-private fun formatNumber(value: Double?): String = value?.let {
-    val text = String.format("%.4f", it)
-    text.trimEnd('0').trimEnd('.')
-} ?: "-"
+private fun formatNumber(value: Double?): String = value?.let(::formatInputNumber) ?: "-"
 
 private fun formatMoney(value: Double?): String = value?.let {
     String.format("%,.2f", it)
