@@ -101,6 +101,10 @@
         <strong id="pss-active-window-count">0</strong>
       </div>
       <div class="pump-dashboard-stat">
+        <span>Slow watch</span>
+        <strong id="pss-slow-watch-count">0</strong>
+      </div>
+      <div class="pump-dashboard-stat">
         <span>Updated</span>
         <strong id="pss-updated">-</strong>
       </div>
@@ -130,6 +134,33 @@
           </thead>
           <tbody id="pss-active-window-body">
             <tr><td colspan="9" class="muted">No active windows.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <h2>Slow Pump Watch</h2>
+        <span class="hint" id="pss-slow-watch-note">Research only · no paper or live entries</span>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Stage</th>
+              <th>Window / Growth</th>
+              <th>Trigger / Current</th>
+              <th>Peak / Pullback</th>
+              <th>OI</th>
+              <th>Funding / Ratio</th>
+              <th>Age</th>
+              <th>Mode</th>
+            </tr>
+          </thead>
+          <tbody id="pss-slow-watch-body">
+            <tr><td colspan="9" class="muted">No slow-pump research candidates.</td></tr>
           </tbody>
         </table>
       </div>

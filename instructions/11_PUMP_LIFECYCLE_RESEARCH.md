@@ -245,6 +245,19 @@ Current combined pump-cycle result for `long_broad + short_clean_p100_l3`:
   They use independent paper slots per track (`4` short slots or `2` long slots), same entry/exit accounting as cycle paper, and do not affect the main `4 short + 2 long` portfolio.
 - The online long logic is `1h` shadow-scan based, not the exact `5m` historical research logic. Treat it as operational paper/shadow first; use its logs to decide whether a dedicated `5m` active-window scanner is worth adding.
 
+## Slow Pump Watch
+
+- `slow_pump_watch` is a research-only discovery path for gradual parabolic moves that do not satisfy the fast-pump thresholds.
+- Current discovery thresholds are `+75% / 72h` and `+75% / 168h`; a detected slow event stays observable for up to `336h`.
+- Slow candidates use status `watch_slow_pump` and lifecycle stages `rising`, `distribution`, `breakdown`, or `capitulation` based on pullback from the post-trigger high.
+- This path must never create legacy paper, strategy paper, cycle paper, candidate paper, or live orders. Existing classifiers explicitly return `research_only_slow_pump`.
+- Persisted research files:
+  - `data/research/bybit_pump_short_shadow/slow_pump_watch_latest.csv`;
+  - `data/research/bybit_pump_short_shadow/slow_pump_watch_history.jsonl`.
+- Slow candidates are included in the existing `5m` active follow-up, but collection is capped to the latest rolling `24h` and to at most `5` slow symbols per cycle. Normal entry/watch rows and open paper positions keep higher priority.
+- The `/pump-short-strategies` page exposes a separate `Slow Pump Watch` table and the API returns top-level `slow_pump_watch` with `mode=research_only_no_trades`.
+- Do not promote this watch into a paper strategy from one successful case such as DEXE. First build an independent event cohort, use time/symbol holdouts, and test entry filters separately from the existing fast-pump strategy.
+
 ## Shadow/Paper Notes
 
 Audit on 2026-07-12 found:

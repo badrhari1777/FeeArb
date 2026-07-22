@@ -58,6 +58,54 @@ class BybitPumpShortShadowTestCase(unittest.TestCase):
         self.assertEqual(row["matched_profile"], "conservative")
         self.assertEqual(row["matched_entry_strategy"], "pb20_oi50_lr_mid_ladder3_step_50")
 
+    def test_classifies_gradual_rally_as_research_only_slow_pump_watch(self) -> None:
+        base_ts = 1_900_000_000_000
+        closes = [1.0] * 80
+        closes.extend(1.0 + 0.8 * step / 72 for step in range(1, 73))
+        closes.extend([1.8] * 24)
+        klines = []
+        oi = []
+        ratios = []
+        for idx, close in enumerate(closes):
+            ts = base_ts + idx * 3_600_000
+            klines.append(
+                {
+                    "ts_ms": ts,
+                    "open": close,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "close": close,
+                    "volume": 100.0 + idx,
+                }
+            )
+            oi.append({"ts_ms": ts, "open_interest": 100.0 + idx})
+            ratios.append({"ts_ms": ts, "buy_ratio": 0.30, "sell_ratio": 0.70})
+        sample = {
+            "symbol": "SLOWUSDT",
+            "instrument": {"launch_time_ms": base_ts - 60 * 86_400_000},
+            "summary": {"symbol": "SLOWUSDT", "last_close": closes[-1], "pump_score": 20.0},
+            "series": {
+                "klines_1h": klines,
+                "premium_index_1h": [
+                    {"ts_ms": base_ts + idx * 3_600_000, "close": 0.0, "low": 0.0}
+                    for idx in range(len(closes))
+                ],
+                "funding": [{"ts_ms": base_ts + 160 * 3_600_000, "funding_rate": 0.0001}],
+                "open_interest_1h": oi,
+                "long_short_1h": ratios,
+            },
+        }
+
+        row = classify_shadow_sample(sample, profiles=[], scan_ts_ms=base_ts + len(closes) * 3_600_000)
+
+        self.assertEqual(row["status"], "watch_slow_pump")
+        self.assertEqual(row["research_mode"], "research_only_no_trades")
+        self.assertEqual(row["slow_pump_window_h"], 72)
+        self.assertGreaterEqual(row["slow_pump_return_pct"], 75.0)
+        self.assertTrue(row["slow_pump_event_id"].startswith("SLOWUSDT|slow_w72|75|"))
+        self.assertNotIn("event_id", row)
+        self.assertNotIn("trigger_pump_pct", row)
+
     def test_parses_pullback_threshold(self) -> None:
         self.assertEqual(pullback_threshold_from_strategy("pb20_oi50_lr_mid"), 20.0)
         self.assertIsNone(pullback_threshold_from_strategy("immediate"))

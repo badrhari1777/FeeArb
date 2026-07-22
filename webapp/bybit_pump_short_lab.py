@@ -23,6 +23,10 @@ from analysis_features.bybit_pump_short_outcomes import DEFAULT_OUTPUT_DIR as DE
 from analysis_features.bybit_pump_short_paper import read_paper_summary
 from analysis_features.bybit_pump_short_shadow import (
     DEFAULT_SHADOW_OUTPUT_DIR,
+    SLOW_PUMP_WATCH_CONFIGS,
+    SLOW_PUMP_WATCH_HISTORY_FILE,
+    SLOW_PUMP_WATCH_LATEST_FILE,
+    SLOW_PUMP_WATCH_RECENT_HOURS,
     ShadowScanConfig,
     run_shadow_scan,
 )
@@ -85,6 +89,7 @@ PUMP_ACTIVE_WINDOW_INTERVAL = "5"
 PUMP_ACTIVE_WINDOW_PRE_HOURS = 6
 PUMP_ACTIVE_WINDOW_LOOKBACK_HOURS = 24
 PUMP_ACTIVE_WINDOW_MAX_SYMBOLS = 20
+PUMP_ACTIVE_WINDOW_SLOW_WATCH_MAX_SYMBOLS = 5
 
 PUMP_STRATEGY_CATALOG: tuple[dict[str, Any], ...] = (
     {
@@ -319,6 +324,10 @@ class BybitPumpShortLab:
             payload = json.loads(json.dumps(self._shadow_state, ensure_ascii=True))
         output_dir = Path(payload.get("config", {}).get("output_dir") or DEFAULT_SHADOW_OUTPUT_DIR)
         payload["latest_rows"] = read_first_csv_rows(output_dir / "shadow_scan_latest.csv", limit=50)
+        payload["slow_pump_watch_rows"] = read_first_csv_rows(
+            output_dir / SLOW_PUMP_WATCH_LATEST_FILE,
+            limit=100,
+        )
         payload["metadata"] = read_json_file(output_dir / "shadow_metadata.json")
         payload["paper"] = read_paper_summary(state_path=output_dir / "paper_positions.json", limit=50)
         payload["strategy_paper"] = read_strategy_paper_summary(output_dir=output_dir, limit=200)
@@ -331,6 +340,8 @@ class BybitPumpShortLab:
                 "shadow_metadata.json",
                 "shadow_scan_latest.csv",
                 "shadow_scan_history.jsonl",
+                SLOW_PUMP_WATCH_LATEST_FILE,
+                SLOW_PUMP_WATCH_HISTORY_FILE,
                 "shadow_errors.jsonl",
                 "paper_positions.json",
                 "paper_positions_latest.csv",
@@ -1987,7 +1998,10 @@ def classify_cycle_long_signal(row: dict[str, Any], *, track_id: str, priority: 
     source_status = str(row.get("status") or "")
     state = "waiting_pump"
     reason = "no_recent_pump"
-    if source_status in {"no_data", "no_recent_pump"}:
+    if source_status == "watch_slow_pump":
+        state = "waiting_pump"
+        reason = "research_only_slow_pump"
+    elif source_status in {"no_data", "no_recent_pump"}:
         state = "waiting_pump"
         reason = source_status or "no_recent_pump"
     elif premium is None:
@@ -2712,6 +2726,7 @@ def apply_pump_active_window_scan(
             "pre_hours": PUMP_ACTIVE_WINDOW_PRE_HOURS,
             "lookback_hours": PUMP_ACTIVE_WINDOW_LOOKBACK_HOURS,
             "max_symbols": max_symbols,
+            "slow_watch_max_symbols": PUMP_ACTIVE_WINDOW_SLOW_WATCH_MAX_SYMBOLS,
         },
     }
     latest_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True), encoding="utf-8")
@@ -2741,7 +2756,13 @@ def select_active_window_rows(
             selected[symbol] = dict(row, active_source=status or "shadow")
     for position in open_paper_positions_for_active_window(output_dir):
         symbol = normalize_symbol(position.get("symbol"))
-        if not symbol or symbol in selected:
+        if not symbol:
+            continue
+        if symbol in selected:
+            selected[symbol]["active_open_paper"] = True
+            selected[symbol]["active_source"] = str(
+                position.get("track_id") or position.get("strategy_id") or position.get("side") or "paper"
+            )
             continue
         selected[symbol] = {
             "symbol": symbol,
@@ -2754,7 +2775,17 @@ def select_active_window_rows(
         }
     out = list(selected.values())
     out.sort(key=active_window_row_sort_key)
-    return out[: max(0, int(max_symbols or 0))]
+    limited: list[dict[str, Any]] = []
+    slow_watch_count = 0
+    for row in out:
+        if row.get("status") == "watch_slow_pump" and not row.get("active_open_paper"):
+            if slow_watch_count >= PUMP_ACTIVE_WINDOW_SLOW_WATCH_MAX_SYMBOLS:
+                continue
+            slow_watch_count += 1
+        limited.append(row)
+        if len(limited) >= max(0, int(max_symbols or 0)):
+            break
+    return limited
 
 
 def open_paper_positions_for_active_window(output_dir: Path) -> list[dict[str, Any]]:
@@ -2771,8 +2802,18 @@ def open_paper_positions_for_active_window(output_dir: Path) -> list[dict[str, A
 
 def active_window_row_sort_key(row: dict[str, Any]) -> tuple[int, float, str]:
     status = str(row.get("status") or "")
-    priority = 0 if status == "entry_candidate" else 1 if status.startswith("watch") else 2
-    return (priority, -(to_optional_float(row.get("trigger_pump_pct")) or 0.0), str(row.get("symbol") or ""))
+    if row.get("active_open_paper") or status == "entry_candidate" or status == "open_paper_position":
+        priority = 0
+    elif status.startswith("watch") and status != "watch_slow_pump":
+        priority = 1
+    elif status == "watch_slow_pump":
+        priority = 2
+    else:
+        priority = 3
+    strength = to_optional_float(row.get("trigger_pump_pct"))
+    if strength is None:
+        strength = to_optional_float(row.get("slow_pump_return_pct"))
+    return (priority, -(strength or 0.0), str(row.get("symbol") or ""))
 
 
 def collect_active_window_sample(collector: BybitPumpShortCollector, row: dict[str, Any]) -> dict[str, Any]:
@@ -2780,8 +2821,20 @@ def collect_active_window_sample(collector: BybitPumpShortCollector, row: dict[s
     if not symbol:
         raise ValueError("missing active-window symbol")
     end_ms = now_ms()
-    trigger_ts = to_int(row.get("trigger_ts")) or to_int(row.get("ts_ms")) or end_ms
-    start_ms = min(trigger_ts - PUMP_ACTIVE_WINDOW_PRE_HOURS * 3_600_000, end_ms - PUMP_ACTIVE_WINDOW_LOOKBACK_HOURS * 3_600_000)
+    is_slow_watch = str(row.get("status") or "") == "watch_slow_pump"
+    trigger_ts = (
+        to_int(row.get("trigger_ts"))
+        or to_int(row.get("slow_pump_trigger_ts"))
+        or to_int(row.get("ts_ms"))
+        or end_ms
+    )
+    if is_slow_watch:
+        start_ms = end_ms - PUMP_ACTIVE_WINDOW_LOOKBACK_HOURS * 3_600_000
+    else:
+        start_ms = min(
+            trigger_ts - PUMP_ACTIVE_WINDOW_PRE_HOURS * 3_600_000,
+            end_ms - PUMP_ACTIVE_WINDOW_LOOKBACK_HOURS * 3_600_000,
+        )
     start_ms = max(0, start_ms)
     klines = collector.fetch_klines(symbol, interval=PUMP_ACTIVE_WINDOW_INTERVAL, start_ms=start_ms, end_ms=end_ms)
     premium = collector.fetch_price_klines(
@@ -2815,6 +2868,7 @@ def collect_active_window_sample(collector: BybitPumpShortCollector, row: dict[s
         "start_ts": start_ms,
         "end_ts": end_ms,
         "interval": PUMP_ACTIVE_WINDOW_INTERVAL,
+        "collection_mode": "rolling_24h_research_only" if is_slow_watch else "event_window",
         "series": {
             "klines": klines,
             "premium_index": premium,
@@ -2839,6 +2893,8 @@ def build_active_window_summary(sample: dict[str, Any]) -> dict[str, Any]:
     trigger_ts = to_int(sample.get("trigger_ts")) or end_ts
     last_close = active_latest_value(klines, "close")
     trigger_close = active_value_at_or_before(klines, trigger_ts, "close")
+    if trigger_close is None:
+        trigger_close = to_optional_float(row.get("slow_pump_trigger_close"))
     premium_latest = active_latest_value(premium, "close")
     premium_min_1h = active_min_between(premium, end_ts - 3_600_000, end_ts, "low")
     premium_min_4h = active_min_between(premium, end_ts - 4 * 3_600_000, end_ts, "low")
@@ -2854,9 +2910,20 @@ def build_active_window_summary(sample: dict[str, Any]) -> dict[str, Any]:
         "source_status": row.get("status"),
         "active_source": row.get("active_source"),
         "event_id": row.get("event_id"),
+        "slow_pump_event_id": row.get("slow_pump_event_id"),
         "trigger_ts": trigger_ts,
         "hours_since_trigger": round_optional((end_ts - trigger_ts) / 3_600_000.0 if end_ts >= trigger_ts else None, 3),
         "trigger_pump_pct": round_optional(to_optional_float(row.get("trigger_pump_pct")), 6),
+        "slow_pump_return_pct": round_optional(to_optional_float(row.get("slow_pump_return_pct")), 6),
+        "slow_pump_window_h": to_int(row.get("slow_pump_window_h")),
+        "slow_pump_stage": row.get("slow_pump_stage"),
+        "slow_pump_pullback_from_high_pct": round_optional(
+            to_optional_float(row.get("slow_pump_pullback_from_high_pct")),
+            6,
+        ),
+        "research_mode": row.get("research_mode"),
+        "active_open_paper": bool(row.get("active_open_paper")),
+        "collection_mode": sample.get("collection_mode"),
         "shadow_pullback_from_high_pct": round_optional(to_optional_float(row.get("pullback_from_high_pct")), 6),
         "last_close_5m": round_optional(last_close, 10),
         "return_from_trigger_pct_5m": round_optional(pct_change_number(last_close, trigger_close), 6),
@@ -3132,6 +3199,11 @@ def build_pump_strategy_monitor_state(
     strategy_summaries = strategy_paper.get("strategy_summaries") if isinstance(strategy_paper.get("strategy_summaries"), dict) else {}
     cycle_paper = shadow_status.get("cycle_paper") if isinstance(shadow_status.get("cycle_paper"), dict) else {}
     active_window = shadow_status.get("active_window") if isinstance(shadow_status.get("active_window"), dict) else {}
+    slow_pump_watch_rows = [
+        row
+        for row in shadow_status.get("slow_pump_watch_rows") or []
+        if isinstance(row, dict)
+    ]
     legacy_open = [
         enrich_pump_dashboard_position(
             position,
@@ -3250,6 +3322,17 @@ def build_pump_strategy_monitor_state(
             "strategy_summaries": strategy_summaries,
             "events_latest": strategy_paper.get("events_latest") or [],
         },
+        "slow_pump_watch": {
+            "schema": "slow_pump_watch_v1",
+            "mode": "research_only_no_trades",
+            "recent_hours": SLOW_PUMP_WATCH_RECENT_HOURS,
+            "configs": [
+                {"window_h": window_h, "threshold_pct": threshold_pct}
+                for window_h, threshold_pct in SLOW_PUMP_WATCH_CONFIGS
+            ],
+            "count": len(slow_pump_watch_rows),
+            "rows": slow_pump_watch_rows,
+        },
         "cycle_paper": {
             "schema": cycle_paper.get("schema") or "pump_cycle_paper_v1",
             "updated_at_ms": cycle_paper.get("updated_at_ms"),
@@ -3299,7 +3382,10 @@ def classify_strategy_signal(strategy: dict[str, Any], row: dict[str, Any]) -> d
     state = "waiting_pump"
     reason = "no_recent_pump"
 
-    if source_status in {"no_data", "no_recent_pump"}:
+    if source_status == "watch_slow_pump":
+        state = "waiting_pump"
+        reason = "research_only_slow_pump"
+    elif source_status in {"no_data", "no_recent_pump"}:
         state = "waiting_pump"
         reason = source_status or "no_recent_pump"
     elif tier is None:

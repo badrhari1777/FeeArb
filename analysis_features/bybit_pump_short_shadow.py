@@ -31,6 +31,13 @@ from analysis_features.bybit_pump_short_paper import apply_shadow_rows_to_paper
 from config import BASE_DIR
 
 DEFAULT_SHADOW_OUTPUT_DIR = BASE_DIR / "data" / "research" / "bybit_pump_short_shadow"
+SLOW_PUMP_WATCH_CONFIGS: tuple[tuple[int, float], ...] = (
+    (72, 75.0),
+    (168, 75.0),
+)
+SLOW_PUMP_WATCH_RECENT_HOURS = 336
+SLOW_PUMP_WATCH_LATEST_FILE = "slow_pump_watch_latest.csv"
+SLOW_PUMP_WATCH_HISTORY_FILE = "slow_pump_watch_history.jsonl"
 
 
 @dataclass(slots=True)
@@ -80,6 +87,20 @@ def run_shadow_scan(config: ShadowScanConfig | None = None) -> dict[str, Any]:
     rows = sorted(rows, key=shadow_sort_key)
     write_csv(cfg.output_dir / "shadow_scan_latest.csv", rows)
     append_jsonl(cfg.output_dir / "shadow_scan_history.jsonl", {"ts_ms": scan_ts, "rows": rows})
+    slow_watch_rows = [row for row in rows if row.get("status") == "watch_slow_pump"]
+    write_csv(cfg.output_dir / SLOW_PUMP_WATCH_LATEST_FILE, slow_watch_rows)
+    append_jsonl(
+        cfg.output_dir / SLOW_PUMP_WATCH_HISTORY_FILE,
+        {
+            "ts_ms": scan_ts,
+            "mode": "research_only_no_trades",
+            "configs": [
+                {"window_h": window_h, "threshold_pct": threshold_pct}
+                for window_h, threshold_pct in SLOW_PUMP_WATCH_CONFIGS
+            ],
+            "rows": slow_watch_rows,
+        },
+    )
     paper = apply_shadow_rows_to_paper(rows)
     if errors:
         for error in errors:
@@ -92,6 +113,7 @@ def run_shadow_scan(config: ShadowScanConfig | None = None) -> dict[str, Any]:
         "rows": len(rows),
         "entry_candidates": sum(1 for row in rows if row.get("status") == "entry_candidate"),
         "watchlist": sum(1 for row in rows if str(row.get("status") or "").startswith("watch")),
+        "slow_pump_watch": len(slow_watch_rows),
         "blocked": sum(1 for row in rows if str(row.get("status") or "").startswith("blocked")),
         "errors": len(errors),
         "paper_positions": paper.get("positions", 0),
@@ -138,6 +160,15 @@ def classify_shadow_sample(
     events = detect_pump_events(series)
     event = latest_recent_event(series, events, recent_event_hours=recent_event_hours)
     if event is None:
+        slow_watch = classify_slow_pump_watch(series, sample=sample)
+        if slow_watch:
+            return {
+                **base,
+                **slow_watch,
+                "status": "watch_slow_pump",
+                "reason": f"slow_pump_{slow_watch['slow_pump_stage']}",
+                "research_mode": "research_only_no_trades",
+            }
         return {**base, "status": "no_recent_pump", "reason": "no_pump_trigger_in_recent_window"}
 
     features = current_event_features(series, event, latest_idx, sample=sample)
@@ -209,6 +240,108 @@ def latest_recent_event(series: Series, events: list[PumpEvent], *, recent_event
         if 0 <= latest_ts - event.trigger_ts <= recent_event_hours * 3_600_000
     ]
     return max(recent, key=lambda event: event.trigger_ts) if recent else None
+
+
+def classify_slow_pump_watch(series: Series, *, sample: dict[str, Any] | None = None) -> dict[str, Any]:
+    event = latest_slow_pump_event(series)
+    if event is None or not series.ts:
+        return {}
+    latest_idx = len(series.ts) - 1
+    latest_ts = series.ts[latest_idx]
+    current_close = series.close[latest_idx]
+    high_since_trigger = safe_max(series.high[event["trigger_idx"] : latest_idx + 1])
+    pullback = (
+        (1.0 - current_close / high_since_trigger) * 100.0
+        if current_close and high_since_trigger
+        else None
+    )
+    high_from_trigger = (
+        (high_since_trigger / event["trigger_close"] - 1.0) * 100.0
+        if high_since_trigger and event["trigger_close"]
+        else None
+    )
+    hours_since_trigger = (latest_ts - event["trigger_ts"]) / 3_600_000.0
+    sample_series = sample.get("series") if isinstance(sample, dict) and isinstance(sample.get("series"), dict) else {}
+    premium_index = sample_series.get("premium_index_1h") if isinstance(sample_series, dict) else []
+    klines = sample_series.get("klines_1h") if isinstance(sample_series, dict) else []
+    stage = slow_pump_stage(pullback)
+    return {
+        "slow_pump_event_id": event["event_id"],
+        "slow_pump_trigger_ts": event["trigger_ts"],
+        "slow_pump_hours_since_trigger": round(hours_since_trigger, 3),
+        "slow_pump_window_h": event["window_h"],
+        "slow_pump_threshold_pct": event["threshold_pct"],
+        "slow_pump_return_pct": round_float(event["return_pct"]),
+        "slow_pump_velocity_pct_per_h": round_float(event["return_pct"] / event["window_h"]),
+        "slow_pump_trigger_close": round_float(event["trigger_close"]),
+        "slow_pump_high_since_trigger_pct": round_float(high_from_trigger),
+        "slow_pump_pullback_from_high_pct": round_float(pullback),
+        "slow_pump_stage": stage,
+        "slow_pump_funding_prev_24h_pct": round_float(
+            funding_sum_pct(series.funding, latest_ts - 24 * 3_600_000, latest_ts)
+        ),
+        "slow_pump_oi_change_4h_pct": round_float(point_change_pct(series.oi, series.ts, latest_idx, 4)),
+        "slow_pump_oi_change_24h_pct": round_float(point_change_pct(series.oi, series.ts, latest_idx, 24)),
+        "slow_pump_long_ratio": round_float(series.long_ratio.get(latest_ts), 6),
+        "slow_pump_premium_latest_pct": round_float(scale_pct(value_at_or_before(premium_index, latest_ts, "close"))),
+        "slow_pump_volume_z_24h": round_float(latest_volume_z(klines, latest_ts, lookback_rows=24)),
+    }
+
+
+def latest_slow_pump_event(series: Series) -> dict[str, Any] | None:
+    if not series.ts:
+        return None
+    latest_ts = series.ts[-1]
+    events: list[dict[str, Any]] = []
+    for window_h, threshold_pct in SLOW_PUMP_WATCH_CONFIGS:
+        cooldown_until = -1
+        for idx in range(window_h, len(series.ts)):
+            if idx < cooldown_until:
+                continue
+            current = series.close[idx]
+            prior = series.close[idx - window_h]
+            prev_current = series.close[idx - 1]
+            prev_prior = series.close[idx - 1 - window_h] if idx - 1 - window_h >= 0 else None
+            if not current or not prior or not prev_current or not prev_prior:
+                continue
+            return_pct = (current / prior - 1.0) * 100.0
+            previous_return_pct = (prev_current / prev_prior - 1.0) * 100.0
+            if return_pct < threshold_pct or previous_return_pct >= threshold_pct:
+                continue
+            trigger_ts = series.ts[idx]
+            if latest_ts - trigger_ts <= SLOW_PUMP_WATCH_RECENT_HOURS * 3_600_000:
+                events.append(
+                    {
+                        "event_id": f"{series.symbol}|slow_w{window_h}|{int(threshold_pct)}|{trigger_ts}",
+                        "trigger_idx": idx,
+                        "trigger_ts": trigger_ts,
+                        "trigger_close": current,
+                        "window_h": window_h,
+                        "threshold_pct": threshold_pct,
+                        "return_pct": return_pct,
+                    }
+                )
+            cooldown_until = idx + max(24, window_h // 2)
+    if not events:
+        return None
+    return max(
+        events,
+        key=lambda item: (
+            item["trigger_ts"],
+            item["return_pct"] / item["threshold_pct"],
+            -item["window_h"],
+        ),
+    )
+
+
+def slow_pump_stage(pullback_pct: float | None) -> str:
+    if pullback_pct is None or pullback_pct < 10.0:
+        return "rising"
+    if pullback_pct < 30.0:
+        return "distribution"
+    if pullback_pct < 60.0:
+        return "breakdown"
+    return "capitulation"
 
 
 def match_candidate_profile(features: dict[str, Any], profiles: list[dict[str, Any]]) -> dict[str, Any]:
@@ -314,10 +447,11 @@ def shadow_sort_key(row: dict[str, Any]) -> tuple[int, float, float]:
         "watch_oi": 2,
         "watch_ratio": 3,
         "watch_profile": 4,
-        "blocked_continuation": 5,
-        "blocked_funding": 6,
-        "no_recent_pump": 7,
-        "no_data": 8,
+        "watch_slow_pump": 5,
+        "blocked_continuation": 6,
+        "blocked_funding": 7,
+        "no_recent_pump": 8,
+        "no_data": 9,
     }
     return (
         status_rank.get(str(row.get("status") or ""), 99),
@@ -425,7 +559,12 @@ def latest_volume_z(rows: list[dict[str, Any]], ts_ms: int, *, lookback_rows: in
 
 __all__ = [
     "DEFAULT_SHADOW_OUTPUT_DIR",
+    "SLOW_PUMP_WATCH_CONFIGS",
+    "SLOW_PUMP_WATCH_HISTORY_FILE",
+    "SLOW_PUMP_WATCH_LATEST_FILE",
+    "SLOW_PUMP_WATCH_RECENT_HOURS",
     "ShadowScanConfig",
+    "classify_slow_pump_watch",
     "classify_shadow_sample",
     "load_candidate_profiles",
     "run_shadow_scan",

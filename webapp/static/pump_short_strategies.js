@@ -112,6 +112,7 @@
     renderOverview();
     renderStrategies();
     renderActiveWindow();
+    renderSlowPumpWatch();
     renderCyclePaper();
     renderCycleTrackSummary();
     renderCandidateShadow();
@@ -164,6 +165,7 @@
     setText('pss-cycle-topup', money(summary.current_topup_needed_usd || 0));
     var activeWindow = state.active_window || {};
     setText('pss-active-window-count', activeWindow.symbols || 0);
+    setText('pss-slow-watch-count', (state.slow_pump_watch || {}).count || 0);
     setText('pss-updated', shortTime((state.shadow || {}).updated_at_ms || (state.shadow || {}).finished_at_ms));
   }
 
@@ -369,20 +371,54 @@
     }
     rows.forEach(function (row) {
       var probeState = row.long_broad_state_5m || '-';
+      var eventId = row.event_id || row.slow_pump_event_id || '';
+      var pumpPct = row.trigger_pump_pct;
+      if (pumpPct === undefined || pumpPct === null || pumpPct === '') pumpPct = row.slow_pump_return_pct;
       var tr = document.createElement('tr');
       if (probeState === 'entry_ready') tr.className = '';
       else if (String(probeState).indexOf('blocked') === 0) tr.className = 'row--danger';
       else tr.className = 'row--warning';
       tr.innerHTML = [
-        cell(strong(row.symbol) + '<div class="muted mini">' + esc(row.event_id || '') + '</div>'),
+        cell(strong(row.symbol) + '<div class="muted mini">' + esc(eventId) + '</div>'),
         cell(esc(row.source_status || '-') + '<div class="muted mini">' + esc(row.active_source || '') + '</div>'),
-        cell(fmt(row.trigger_pump_pct, 1) + '%<div class="muted mini">' + fmt(row.hours_since_trigger, 2) + 'h ago</div>'),
+        cell(fmt(pumpPct, 1) + '%<div class="muted mini">' + fmt(row.hours_since_trigger, 2) + 'h ago</div>'),
         cell(price(row.last_close_5m) + '<div class="muted mini">' + fmt(row.return_from_trigger_pct_5m, 2) + '% from trigger</div>'),
         cell(fmt(row.premium_latest_pct_5m, 3) + '%<div class="muted mini">min4h ' + fmt(row.premium_min_4h_pct_5m, 3) + '% · relief ' + fmt(row.premium_relief_1h_pct_5m, 3) + '%</div>'),
         cell(fmt(row.oi_change_1h_pct_5m, 1) + '% / ' + fmt(row.oi_change_4h_pct_5m, 1) + '%<div class="muted mini">1h / 4h</div>'),
         cell(fmt(row.volume_z_24h_5m, 2) + '<div class="muted mini">basis ' + fmt(row.mark_index_basis_pct_5m, 3) + '%</div>'),
         cell(statusBadge(probeState) + '<div class="muted mini">' + esc(row.long_broad_reason_5m || '') + '</div>'),
         cell(esc(row.klines_5m || 0) + ' candles<div class="muted mini">prem ' + esc(row.premium_points_5m || 0) + ' · oi ' + esc(row.oi_points_5m || 0) + '</div>')
+      ].join('');
+      body.appendChild(tr);
+    });
+  }
+
+  function renderSlowPumpWatch() {
+    var body = $('pss-slow-watch-body');
+    var watch = state.slow_pump_watch || {};
+    var rows = watch.rows || [];
+    if (!body) return;
+    setText('pss-slow-watch-note', rows.length
+      ? rows.length + ' research candidates · no paper or live entries'
+      : 'Research only · no paper or live entries');
+    body.innerHTML = '';
+    if (!rows.length) {
+      body.innerHTML = '<tr><td colspan="9" class="muted">No slow-pump research candidates.</td></tr>';
+      return;
+    }
+    rows.forEach(function (row) {
+      var tr = document.createElement('tr');
+      tr.className = row.slow_pump_stage === 'capitulation' ? 'row--danger' : 'row--warning';
+      tr.innerHTML = [
+        cell(strong(row.symbol) + '<div class="muted mini">' + esc(row.slow_pump_event_id || '') + '</div>'),
+        cell(statusBadge(row.slow_pump_stage || 'watch')),
+        cell(fmt(row.slow_pump_window_h, 0) + 'h / ' + fmt(row.slow_pump_return_pct, 1) + '%<div class="muted mini">threshold ' + fmt(row.slow_pump_threshold_pct, 0) + '%</div>'),
+        cell(price(row.slow_pump_trigger_close) + ' / ' + price(row.last_close)),
+        cell('+' + fmt(row.slow_pump_high_since_trigger_pct, 1) + '% / -' + fmt(row.slow_pump_pullback_from_high_pct, 1) + '%'),
+        cell(fmt(row.slow_pump_oi_change_4h_pct, 1) + '% / ' + fmt(row.slow_pump_oi_change_24h_pct, 1) + '%<div class="muted mini">4h / 24h</div>'),
+        cell(fmt(row.slow_pump_funding_prev_24h_pct, 3) + '% / ' + fmt(row.slow_pump_long_ratio, 3)),
+        cell(fmt(row.slow_pump_hours_since_trigger, 1) + 'h'),
+        cell(esc(row.research_mode || 'research_only_no_trades'))
       ].join('');
       body.appendChild(tr);
     });

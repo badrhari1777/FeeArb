@@ -518,6 +518,75 @@ class BybitPumpShortLabTestCase(unittest.TestCase):
         self.assertEqual(monitor["active_window"]["symbols"], 1)
         self.assertEqual(monitor["active_window"]["rows"][0]["symbol"], "EVAAUSDT")
 
+    def test_slow_pump_watch_is_limited_and_never_opens_paper(self) -> None:
+        slow_rows = [
+            {
+                "ts_ms": "1900100000000",
+                "status": "watch_slow_pump",
+                "symbol": f"SLOW{index}USDT",
+                "slow_pump_event_id": f"slow-{index}",
+                "slow_pump_trigger_ts": "1900000000000",
+                "slow_pump_window_h": "72",
+                "slow_pump_threshold_pct": "75",
+                "slow_pump_return_pct": str(90 - index),
+                "slow_pump_trigger_close": "1.8",
+                "slow_pump_pullback_from_high_pct": "20",
+                "slow_pump_stage": "distribution",
+                "premium_latest_pct": "-2",
+                "oi_change_4h_pct": "20",
+                "oi_change_24h_pct": "10",
+                "long_ratio": "0.52",
+                "funding_prev_24h_pct": "0.1",
+                "hours_since_trigger": "1",
+                "last_close": "1.4",
+            }
+            for index in range(7)
+        ]
+        normal_watch = {
+            "ts_ms": "1900100000000",
+            "status": "watch_ratio",
+            "symbol": "FASTUSDT",
+            "event_id": "fast-1",
+            "trigger_ts": "1900000000000",
+            "trigger_pump_pct": "120",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            with patch(
+                "webapp.bybit_pump_short_lab.open_paper_positions_for_active_window",
+                return_value=[
+                    {
+                        "symbol": "SLOW6USDT",
+                        "status": "open",
+                        "track_id": "legacy_fast_track",
+                    }
+                ],
+            ):
+                selected = select_active_window_rows([*slow_rows, normal_watch], output_dir=output_dir, max_symbols=20)
+            paper = apply_pump_cycle_paper_rows(slow_rows, output_dir=output_dir)
+            monitor = build_pump_strategy_monitor_state(
+                {
+                    "config": {"output_dir": str(output_dir)},
+                    "latest_rows": [normal_watch],
+                    "slow_pump_watch_rows": slow_rows,
+                },
+                {"status": "waiting"},
+            )
+
+        self.assertEqual(selected[0]["symbol"], "SLOW6USDT")
+        self.assertIn("FASTUSDT", {row["symbol"] for row in selected})
+        self.assertEqual(sum(1 for row in selected if row["status"] == "watch_slow_pump"), 6)
+        active_open = next(row for row in selected if row["symbol"] == "SLOW6USDT")
+        self.assertTrue(active_open["active_open_paper"])
+        self.assertEqual(active_open["active_source"], "legacy_fast_track")
+        self.assertEqual(paper["positions"], 0)
+        decision = classify_strategy_signal(PUMP_STRATEGY_CATALOG[0], slow_rows[0])
+        self.assertEqual(decision["state"], "waiting_pump")
+        self.assertEqual(decision["reason"], "research_only_slow_pump")
+        self.assertEqual(monitor["slow_pump_watch"]["count"], 7)
+        self.assertEqual(monitor["slow_pump_watch"]["mode"], "research_only_no_trades")
+
     def test_dashboard_api_returns_operator_payload(self) -> None:
         try:
             webapp_app = import_module("webapp.app")
