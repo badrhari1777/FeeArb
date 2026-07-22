@@ -3343,6 +3343,8 @@ class ManualTradeManager:
         ccxt_symbols: dict[str, str] = {}
         max_qty_by_exchange: dict[str, float | None] = {}
         market_constraints: dict[str, dict[str, float | None]] = {}
+        liquidity_messages: dict[str, str] = {}
+        slippage_messages: dict[str, str] = {}
 
         for leg in legs:
             exchange = leg["exchange"]
@@ -3428,12 +3430,11 @@ class ManualTradeManager:
                     if stats.min_liquidity_top3 is not None:
                         details.append(f"top3_usd={stats.min_liquidity_top3:.2f}")
                     message = "; ".join(details)
-                    if is_dry_run or allow_liquidity_chunking:
-                        warnings.append(message)
-                    else:
-                        errors.append(message)
+                    liquidity_messages[exchange] = message
             if use_orderbook_check and slip is not None and max_slippage_bps > 0 and slip > max_slippage_bps:
-                warnings.append(f"{exchange}: expected slippage {slip:.2f} bps exceeds max {max_slippage_bps:.2f}")
+                slippage_messages[exchange] = (
+                    f"{exchange}: expected slippage {slip:.2f} bps exceeds max {max_slippage_bps:.2f}"
+                )
 
         suggestion = suggest_expensive_leg(
             long_exchange,
@@ -3441,6 +3442,50 @@ class ManualTradeManager:
             fee_table=self._fees,
             liquidity=liquidity_map,
         )
+        smart_maker_first = action == "enter" and str(payload.get("mode") or "") == "smart-enter"
+        _, planned_primary, planned_hedge = self._resolve_primary_hedge_legs(
+            explicit=payload.get("expensive_leg"),
+            plan={"suggested_expensive_leg": suggestion},
+            legs=legs,
+        )
+        min_chunk_candidates = [
+            val.get("min_qty_required")
+            for val in market_constraints.values()
+            if val.get("min_qty_required")
+        ]
+        min_chunk_qty = max(min_chunk_candidates) if min_chunk_candidates else None
+        if smart_maker_first and not payload.get("expensive_leg") and planned_primary and planned_hedge:
+            hedge_cap = max_qty_by_exchange.get(planned_hedge["exchange"])
+            alternate_hedge_cap = max_qty_by_exchange.get(planned_primary["exchange"])
+            hedge_ready = hedge_cap is not None and (
+                not min_chunk_qty or float(hedge_cap) >= float(min_chunk_qty)
+            )
+            alternate_ready = alternate_hedge_cap is not None and (
+                not min_chunk_qty or float(alternate_hedge_cap) >= float(min_chunk_qty)
+            )
+            if max_slippage_bps > 0 and not hedge_ready and alternate_ready:
+                suggestion = dict(suggestion)
+                suggestion["suggested_leg"] = planned_hedge.get("label")
+                suggestion["reason"] = "hedge_liquidity_guard"
+                _, planned_primary, planned_hedge = self._resolve_primary_hedge_legs(
+                    explicit=None,
+                    plan={"suggested_expensive_leg": suggestion},
+                    legs=legs,
+                )
+
+        primary_exchange = planned_primary.get("exchange") if planned_primary else None
+        hedge_exchange = planned_hedge.get("exchange") if planned_hedge else None
+        for exchange, message in liquidity_messages.items():
+            if smart_maker_first and exchange == primary_exchange:
+                continue
+            if is_dry_run or allow_liquidity_chunking:
+                warnings.append(message)
+            else:
+                errors.append(message)
+        for exchange, message in slippage_messages.items():
+            if smart_maker_first and exchange == primary_exchange:
+                continue
+            warnings.append(message)
         funding = await self._fetch_funding_meta(symbol, [leg["exchange"] for leg in legs])
         long_stats = stats_by_exchange.get(long_exchange)
         short_stats = stats_by_exchange.get(short_exchange)
@@ -3460,17 +3505,14 @@ class ManualTradeManager:
                     within_range = False
                 if within_range is False:
                     warnings.append("spread outside configured range")
-        max_qty_candidates = [val for val in max_qty_by_exchange.values() if val is not None]
-        recommended_qty = min(max_qty_candidates) if max_qty_candidates else None
+        if smart_maker_first and hedge_exchange:
+            recommended_qty = max_qty_by_exchange.get(hedge_exchange)
+        else:
+            max_qty_candidates = [val for val in max_qty_by_exchange.values() if val is not None]
+            recommended_qty = min(max_qty_candidates) if max_qty_candidates else None
         recommended_notional = None
         if recommended_qty and short_stats and short_stats.mid:
             recommended_notional = recommended_qty * short_stats.mid
-        min_chunk_candidates = [
-            val.get("min_qty_required")
-            for val in market_constraints.values()
-            if val.get("min_qty_required")
-        ]
-        min_chunk_qty = max(min_chunk_candidates) if min_chunk_candidates else None
         recommended_chunk_qty = None
         if qty and qty > 0:
             candidate = qty
@@ -3536,6 +3578,37 @@ class ManualTradeManager:
             "min_chunk_qty": min_chunk_qty,
             "recommended_chunk_qty": recommended_chunk_qty,
             "max_qty_by_exchange": max_qty_by_exchange,
+            "execution_liquidity": {
+                "primary_maker": {
+                    "exchange": primary_exchange,
+                    "ready": bool(
+                        planned_primary
+                        and stats_by_exchange.get(str(primary_exchange))
+                        and stats_by_exchange[str(primary_exchange)].best_bid
+                        and stats_by_exchange[str(primary_exchange)].best_ask
+                    ),
+                    "immediate_taker_max_qty": max_qty_by_exchange.get(str(primary_exchange)),
+                    "taker_depth_blocking": False if smart_maker_first else True,
+                },
+                "hedge_taker": {
+                    "exchange": hedge_exchange,
+                    "ready": bool(
+                        planned_hedge
+                        and (
+                            max_slippage_bps <= 0
+                            or (
+                                max_qty_by_exchange.get(str(hedge_exchange)) is not None
+                                and (
+                                    not min_chunk_qty
+                                    or float(max_qty_by_exchange[str(hedge_exchange)]) >= float(min_chunk_qty)
+                                )
+                            )
+                        )
+                    ),
+                    "max_qty_within_slippage": max_qty_by_exchange.get(str(hedge_exchange)),
+                    "max_slippage_bps": max_slippage_bps,
+                },
+            },
             "auto_limit_defaults": {
                 "min_level_notional": auto_min_notional,
                 "min_level_qty": auto_min_qty,
@@ -5750,6 +5823,10 @@ class ManualTradeManager:
         hedge_offset_bps = _safe_float(payload.get("hedge_offset_bps")) or 2.0
         hedge_offset_ticks = int(_safe_float(payload.get("hedge_offset_ticks")) or 0)
         hedge_limit_mode = str(payload.get("hedge_limit_mode") or "passive").lower()
+        hedge_mode_safety_override = False
+        if plan.get("action") == "enter" and hedge_order_type == "limit" and hedge_limit_mode != "aggressive":
+            hedge_limit_mode = "aggressive"
+            hedge_mode_safety_override = True
         hedge_favorable_bps = _safe_float(payload.get("hedge_favorable_bps")) or 2.0
         raw_adverse_bps = _safe_float(payload.get("hedge_adverse_bps"))
         hedge_adverse_bps = 10.0 if raw_adverse_bps is None else raw_adverse_bps
@@ -5765,6 +5842,8 @@ class ManualTradeManager:
         actions: list[dict[str, Any]] = []
         errors: list[str] = []
         warnings: list[str] = list(plan.get("warnings") or [])
+        if hedge_mode_safety_override:
+            warnings.append("smart-enter hedge upgraded to aggressive limit for bounded unhedged exposure")
 
         mode_label = mode_label or "smart-enter"
 
@@ -6254,6 +6333,58 @@ class ManualTradeManager:
                     },
                 )
             return total_delta
+
+        async def _cancel_primary_and_confirm(reason: str) -> bool:
+            nonlocal active_order_id, active_price, active_qty, active_filled, active_since
+            nonlocal active_ws_missing_since, active_ws_rest_checked_at, active_ws_missing_open
+            order_id = active_order_id
+            if not order_id:
+                return True
+            await _sync_primary_fills(
+                f"{reason}_pre_cancel",
+                include_active=True,
+                force_rest=True,
+            )
+            if active_order_id is None:
+                return True
+            order_id = active_order_id
+            await self._cancel_order(primary_leg, symbol, order_id)
+            pending_order_ids.add(order_id)
+            active_order_id = None
+            active_price = None
+            active_qty = None
+            active_filled = 0.0
+            active_since = None
+            active_ws_missing_since = None
+            active_ws_rest_checked_at = None
+            active_ws_missing_open = False
+            deadline = time.time() + max(3.0, min(10.0, reprice_sec + 2.0))
+            while order_id in pending_order_ids and time.time() < deadline:
+                await _sync_primary_fills(
+                    f"{reason}_cancel_confirm",
+                    delay=0.2,
+                    include_active=False,
+                    force_rest=True,
+                )
+                if order_id in pending_order_ids:
+                    await asyncio.sleep(0.2)
+            if order_id in pending_order_ids:
+                message = f"primary cancel unconfirmed on {primary_leg['exchange']}: {order_id}"
+                errors.append(message)
+                self._emit_log(
+                    log_cb,
+                    "error",
+                    "primary cancel unconfirmed",
+                    {"exchange": primary_leg["exchange"], "order_id": order_id, "reason": reason},
+                )
+                return False
+            self._emit_log(
+                log_cb,
+                "cancel",
+                "primary cancel confirmed",
+                {"exchange": primary_leg["exchange"], "order_id": order_id, "reason": reason},
+            )
+            return True
 
         async def _final_reconcile_positions(reason: str) -> bool:
             nonlocal primary_filled_total, hedge_filled_total
@@ -6763,6 +6894,14 @@ class ManualTradeManager:
                 continue
 
             await _sync_primary_fills("loop")
+            if pending_hedge_qty > 0:
+                if active_order_id and not await _cancel_primary_and_confirm("primary_partial_fill"):
+                    break
+                await _hedge_pending("primary_fill")
+                if hedge_failed:
+                    break
+                await asyncio.sleep(max(0.2, reprice_sec))
+                continue
             if not await _ensure_active_order_visible("loop"):
                 continue
 
@@ -6812,30 +6951,28 @@ class ManualTradeManager:
                     break
 
             max_qty_by_exchange = snapshot.get("max_qty_by_exchange") or {}
-            max_chunk = None
-            max_candidates = [val for val in max_qty_by_exchange.values() if val]
-            if max_candidates:
-                max_chunk = min(max_candidates)
-            limiting_exchange = None
-            if max_chunk is not None:
-                limiting_exchange = next(
-                    (
-                        exchange
-                        for exchange, value in max_qty_by_exchange.items()
-                        if value is not None and abs(float(value) - float(max_chunk)) <= 1e-9
-                    ),
-                    None,
-                )
-            if max_slippage_bps > 0 and max_chunk is not None:
-                if max_chunk <= 0:
-                    self._emit_log(log_cb, "wait", "liquidity below slippage cap; waiting")
-                    await asyncio.sleep(max(0.2, reprice_sec))
-                    continue
-                if min_chunk_qty and max_chunk < min_chunk_qty:
+            primary_taker_cap = max_qty_by_exchange.get(primary_leg["exchange"])
+            hedge_taker_cap = max_qty_by_exchange.get(hedge_leg["exchange"])
+            max_chunk = hedge_taker_cap
+            limiting_exchange = hedge_leg["exchange"] if hedge_taker_cap is not None else None
+            if max_slippage_bps > 0:
+                hedge_ready = hedge_taker_cap is not None and float(hedge_taker_cap) > 0
+                if hedge_ready and min_chunk_qty:
+                    hedge_ready = float(hedge_taker_cap) >= float(min_chunk_qty)
+                if not hedge_ready:
+                    if active_order_id and not await _cancel_primary_and_confirm("hedge_liquidity_lost"):
+                        break
                     self._emit_log(
                         log_cb,
                         "wait",
-                        f"liquidity below min chunk (max {max_chunk:g} < min {min_chunk_qty:g}); waiting",
+                        "hedge liquidity below safe chunk; primary maker paused",
+                        {
+                            "primary_exchange": primary_leg["exchange"],
+                            "hedge_exchange": hedge_leg["exchange"],
+                            "hedge_max_qty": hedge_taker_cap,
+                            "min_chunk_qty": min_chunk_qty,
+                            "max_slippage_bps": max_slippage_bps,
+                        },
                     )
                     await asyncio.sleep(max(0.2, reprice_sec))
                     continue
@@ -6849,7 +6986,7 @@ class ManualTradeManager:
                 chunk_notional=chunk_notional,
                 max_chunk=max_chunk if max_slippage_bps > 0 else None,
                 mid_price=mid_price,
-                legs=[primary_leg, hedge_leg],
+                legs=[hedge_leg],
             )
             chunk, chunk_warnings = _choose_chunk_qty(
                 remaining=remaining,
@@ -6875,6 +7012,8 @@ class ManualTradeManager:
                     "max_chunk_for_choice": max_chunk_for_choice,
                     "auto_chunk_notional_cap": auto_chunk_notional_cap,
                     "max_qty_by_exchange": dict(max_qty_by_exchange),
+                    "primary_immediate_taker_cap": primary_taker_cap,
+                    "hedge_taker_cap": hedge_taker_cap,
                     "limiting_exchange": limiting_exchange,
                     "max_slippage_bps": max_slippage_bps,
                     "amount_step": amount_step,
@@ -6921,6 +7060,12 @@ class ManualTradeManager:
                     "improve_ticks": improve_ticks,
                 },
             )
+
+            if active_order_id and timeout > 0 and active_since and (time.time() - active_since) > timeout:
+                if not await _cancel_primary_and_confirm("timeout"):
+                    break
+                await asyncio.sleep(max(0.2, reprice_sec))
+                continue
 
             if active_order_id:
                 if active_price != limit_price or (active_qty is not None and active_qty != chunk):
@@ -7035,6 +7180,7 @@ class ManualTradeManager:
                     "limit",
                     price=limit_price,
                     reduce_only=bool(primary_leg.get("reduce_only")),
+                    post_only=True,
                     log_cb=log_cb,
                 )
                 actions.append(submit)
@@ -7065,72 +7211,6 @@ class ManualTradeManager:
                     active_filled = primary_fill_map.get(order_id, 0.0)
 
             if active_order_id:
-                if timeout > 0 and active_since and (time.time() - active_since) > timeout:
-                    ws_delta, used_ws = await _sync_primary_from_orders("timeout_cancel")
-                    if not used_ws:
-                        if self._ws_orders_live(primary_leg["exchange"]):
-                            self._emit_log(
-                                log_cb,
-                                "wait",
-                                "primary ws order update missing; skipping rest sync",
-                                {"exchange": primary_leg["exchange"], "order_id": active_order_id},
-                            )
-                            status = {"status": "open", "filled_qty": active_filled}
-                        else:
-                            status = await self._fetch_order_status(
-                                primary_leg,
-                                symbol,
-                                active_order_id,
-                                expected_qty=active_qty or order_qty_map.get(active_order_id),
-                                allow_trades_fallback=False,
-                            )
-                            if status.get("status") == "error":
-                                self._emit_log(
-                                    log_cb,
-                                    "warn",
-                                    "primary rest order status failed",
-                                    {"exchange": primary_leg["exchange"], "order_id": active_order_id, "error": status.get("error")},
-                                )
-                                status = {"status": "open", "filled_qty": active_filled}
-                        await _apply_primary_fill(
-                            active_order_id,
-                            status.get("filled_qty"),
-                            status=status,
-                            reason="timeout_cancel",
-                        )
-                        self._emit_log(
-                            log_cb,
-                            "cancel",
-                            "final status before cancel (timeout)",
-                            {
-                                "exchange": primary_leg["exchange"],
-                                "order_id": active_order_id,
-                                "status": status,
-                            },
-                        )
-                    else:
-                        self._emit_log(
-                            log_cb,
-                            "cancel",
-                            "final order ws sync before cancel (timeout)",
-                            {
-                                "exchange": primary_leg["exchange"],
-                                "order_id": active_order_id,
-                                "ws_delta": ws_delta,
-                                "filled_total": primary_filled_total,
-                            },
-                        )
-                    if active_order_id:
-                        await self._cancel_order(primary_leg, symbol, active_order_id)
-                        pending_order_ids.add(active_order_id)
-                    active_order_id = None
-                    active_price = None
-                    active_qty = None
-                    active_filled = 0.0
-                    active_since = None
-                    await _sync_primary_fills("post_timeout_cancel", delay=0.2, include_active=False)
-                    await asyncio.sleep(max(0.2, reprice_sec))
-                    continue
                 if self._ws_orders_live(primary_leg["exchange"]):
                     await _sync_primary_from_orders("limit_wait")
                     await asyncio.sleep(max(0.2, reprice_sec))
@@ -7190,9 +7270,7 @@ class ManualTradeManager:
             await asyncio.sleep(max(0.2, reprice_sec))
 
         if active_order_id:
-            await self._cancel_order(primary_leg, symbol, active_order_id)
-            pending_order_ids.add(active_order_id)
-            active_order_id = None
+            await _cancel_primary_and_confirm("runtime_end")
         if pending_order_ids:
             await _sync_primary_fills("final_sync", delay=0.2, include_active=False)
 
@@ -8520,6 +8598,7 @@ class ManualTradeManager:
         *,
         price: float | None,
         reduce_only: bool,
+        post_only: bool = False,
         require_ws: bool = True,
         log_cb: Optional[callable] = None,
     ) -> dict[str, Any]:
@@ -8688,6 +8767,8 @@ class ManualTradeManager:
         params = {}
         if reduce_only:
             params["reduceOnly"] = True
+        if post_only and order_type == "limit":
+            params["postOnly"] = True
         kucoin_margin_mode = None
         leg_margin_mode = str(leg.get("margin_mode") or "").strip().lower()
         margin_key = (exchange, ccxt_symbol, leg_margin_mode)
@@ -9445,6 +9526,7 @@ class ManualTradeManager:
         log_cb: Optional[callable] = None,
     ) -> dict[str, Any]:
         payload = payload or {}
+        hedge_timeout_sec = max(1.0, _safe_float(payload.get("hedge_timeout_sec")) or 5.0)
         if min_qty_required and qty < min_qty_required:
             self._emit_log(
                 log_cb,
@@ -9714,6 +9796,7 @@ class ManualTradeManager:
                         leg["side"], order_price, stats.best_bid, stats.best_ask, price_step
                     )
                 now = time.time()
+                deadline_triggered = (now - start_time) >= hedge_timeout_sec
                 adverse_triggered = False
                 if hedge_adverse_ticks is not None and hedge_adverse_ticks > 0:
                     if (
@@ -9735,6 +9818,8 @@ class ManualTradeManager:
                     )
                     and (now - last_reprice) >= hedge_reprice_min_sec
                 ):
+                    adverse_triggered = True
+                if deadline_triggered:
                     adverse_triggered = True
                 if adverse_triggered:
                     if min_qty_required and remaining < min_qty_required:
@@ -9852,20 +9937,30 @@ class ManualTradeManager:
                         continue
                     self._emit_story(
                         log_cb,
-                        f"Hedge adverse move; switching to market {leg['exchange']} qty={remaining:g}",
+                        (
+                            f"Hedge deadline reached; switching to market {leg['exchange']} qty={remaining:g}"
+                            if deadline_triggered
+                            else f"Hedge adverse move; switching to market {leg['exchange']} qty={remaining:g}"
+                        ),
                         {
                             "exchange": leg.get("exchange"),
                             "adverse_bps": adverse_bps,
                             "adverse_ticks": adverse_ticks,
                             "qty": remaining,
+                            "deadline_triggered": deadline_triggered,
+                            "hedge_timeout_sec": hedge_timeout_sec,
                         },
                     )
-                    submit_message = f"hedge market {leg['exchange']} qty={remaining:g} adverse_bps={adverse_bps:.2f}"
+                    trigger_reason = "hedge_timeout" if deadline_triggered else "hedge_adverse_bps"
+                    submit_message = (
+                        f"hedge market {leg['exchange']} qty={remaining:g} reason={trigger_reason} "
+                        f"adverse_bps={adverse_bps:.2f}"
+                    )
                     if hedge_adverse_ticks is not None and hedge_adverse_ticks > 0 and adverse_ticks is not None:
                         submit_message += f" adverse_ticks={adverse_ticks:.2f}"
                     self._emit_log(log_cb, "submit", submit_message)
                     market_result = await self._place_market(
-                        leg, symbol, remaining, {}, reason="hedge_adverse_bps", log_cb=log_cb
+                        leg, symbol, remaining, {}, reason=trigger_reason, log_cb=log_cb
                     )
                     market_filled = max(0.0, _safe_float(market_result.get("filled_qty")) or 0.0)
                     market_status = None

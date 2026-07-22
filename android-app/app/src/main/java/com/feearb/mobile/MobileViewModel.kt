@@ -721,6 +721,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                         val statusMessage = when (payload.status) {
                             "running" -> if (payload.stop_requested) "Stop requested; waiting..." else "Execution running..."
                             "completed" -> "Execution completed."
+                            "completed_no_fill" -> "No fill before execution time; primary order canceled; no position opened."
                             "completed_with_errors" -> "Execution completed with errors."
                             "failed" -> "Execution failed: ${payload.error ?: "unknown error"}"
                             else -> "Execution status: ${payload.status ?: "-"}"
@@ -850,6 +851,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             hedge_favorable_bps = advanced.hedgeFavorableBps.toInputDoubleOrNull(),
             hedge_adverse_bps = advanced.hedgeAdverseBps.toInputDoubleOrNull(),
             hedge_reprice_min_sec = advanced.hedgeRepriceMinSec.toInputDoubleOrNull(),
+            hedge_timeout_sec = 5.0,
             limit_offset_bps = advanced.limitOffsetBps.toInputDoubleOrNull(),
             limit_offset_ticks = advanced.limitOffsetTicks.toIntOrNull(),
             max_limit_deviation_bps = advanced.maxLimitDeviationBps.toInputDoubleOrNull(),
@@ -1049,6 +1051,24 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         payload.optDoubleOrNull("recommended_notional")?.let { lines += "Recommended notional: ${formatCompact(it)}" }
         payload.optDoubleOrNull("min_chunk_qty")?.let { lines += "Min chunk qty: ${formatCompact(it)}" }
         payload.optDoubleOrNull("recommended_chunk_qty")?.let { lines += "Recommended chunk qty: ${formatCompact(it)}" }
+        payload.objectOrNull("execution_liquidity")?.let { execution ->
+            execution.objectOrNull("primary_maker")?.let { primary ->
+                val exchange = primary.optString("exchange").uppercase().ifBlank { "-" }
+                val ready = primary.get("ready")?.let { runCatching { it.asBoolean }.getOrNull() }
+                lines += "Primary maker: $exchange (${if (ready == true) "ready" else "not ready"})"
+                primary.optDoubleOrNull("immediate_taker_max_qty")?.let {
+                    lines += "Primary immediate depth: ${formatCompact(it)} (informational)"
+                }
+            }
+            execution.objectOrNull("hedge_taker")?.let { hedge ->
+                val exchange = hedge.optString("exchange").uppercase().ifBlank { "-" }
+                val ready = hedge.get("ready")?.let { runCatching { it.asBoolean }.getOrNull() }
+                lines += "Hedge taker: $exchange (${if (ready == true) "ready" else "not ready"})"
+                hedge.optDoubleOrNull("max_qty_within_slippage")?.let {
+                    lines += "Hedge capacity: ${formatCompact(it)}"
+                }
+            }
+        }
         return if (lines.isNotEmpty()) lines.joinToString("\n") else gson.toJson(payload)
     }
 

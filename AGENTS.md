@@ -102,6 +102,19 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Maker-first smart-enter safety was hardened on 2026-07-22 after the MIRA
+  preflight exposed a false primary-liquidity blocker. The primary entry leg is
+  now a passive `post-only` order; its taker depth is informational. Auto hint
+  normally keeps the thinner venue primary but swaps roles if the hedge venue
+  cannot execute the minimum chunk. Chunk sizing uses hedge taker capacity and
+  the bounded unhedged-notional cap. Any primary partial fill cancels and
+  confirms the remainder before immediately hedging the exact fill; limit
+  hedges are forced aggressive and market-fallback after a configurable hard
+  deadline (default 5s). Runtime expiry with zero fills is reported as
+  `completed_no_fill`, not a liquidity error. Dry-run/UI diagnostics explicitly
+  show `primary_maker` versus `hedge_taker`. Verified Python syntax, 187 related
+  tests, Android unit tests, and Android debug assembly.
+
 - Protective fallback take-profit was widened on 2026-07-22 from `10%` to `30%` after the DEXE review confirmed that the normal mirrored TP correctly follows the opposite leg's liquidation-buffer stop, but the no-peer-stop fallback was too close for sharp wick-prone coins. The mirrored mark-ratio formula is unchanged. `RiskConfig` now defaults `fallback_take_rr_pct` to `0.30`; the value is persisted/normalized as `protective.fallback_take_rr_pct`, loaded into the runtime risk config, and validated in `(0, 0.50]`. Regression coverage verifies default long `+30%` and short `-30%` targets plus settings loading/range rejection. Verified protective/settings tests (`97 passed`) and the full suite (`481 passed`).
 - Slow-pump research watch was added on 2026-07-22 after DEXE showed a gradual `~+85%/72h` rise that correctly missed the existing explosive-pump thresholds before a later capitulation. `analysis_features/bybit_pump_short_shadow.py` now detects research-only `+75%/72h` and `+75%/168h` crossings, retains them for `336h`, labels `rising`/`distribution`/`breakdown`/`capitulation`, and writes `slow_pump_watch_latest.csv` plus append-only `slow_pump_watch_history.jsonl`. These rows use `watch_slow_pump` and are explicitly blocked from legacy, strategy, cycle, candidate-paper, and live entry logic. Up to `5` slow symbols join the existing active `5m` follow-up behind normal signals, using only a rolling `24h` collection window to control request volume. `/pump-short-strategies` and `/api/pump-short/strategies` expose a separate `slow_pump_watch` research view. DEXE live-data smoke classified as `slow_pump_capitulation` with `84.56%/72h`; pump-focused tests passed (`74 passed`) and the full suite passed (`478 passed`).
 - Duplicate Live Grid ownership was blocked on 2026-07-22 after Android `Adopt full grid` created a second DEXE rule for the already-managed Bybit/Binance position. Android correctly submitted a new rule without `id`; the backend allowed it because Live activation checked matching Auto Exit but not another Grid. The old DEXE rule `06d491000c5e` was paused and then deleted only after confirming no active execution; the surviving rule `515886266d2b` remained Live at level `7`, and the balanced `1671.9/1671.9 DEXE` legs were unchanged. New Live upserts and arm requests reject any same-symbol Grid sharing at least one venue with an enabled Live Grid, with `DEXE`/`DEXEUSDT` treated as the same ownership key. The scheduler and transition start also block legacy/racing duplicates before orders. Verified Python compilation, targeted Grid tests (`43 passed`), safe backend restart, and post-restart live state.

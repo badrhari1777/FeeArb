@@ -25,10 +25,23 @@ Position Use (Entry/Exit)
   venue IDs are resolved to a CCXT unified symbol before reading or cancelling.
 
 Smart (Limit) Mode
-- Execute one chunk at a time: primary leg fills -> hedge leg executes; next chunk waits for hedge (unless residual < fallback_min).
+- On enter, the primary leg is a passive `post-only` maker order; immediate
+  taker depth on that venue is diagnostic and does not block the entry.
+- Auto hint normally chooses the thinner venue as primary, but swaps the roles
+  when the proposed hedge venue cannot safely execute the minimum chunk.
+- Chunk capacity is limited by urgent taker liquidity on the hedge venue plus
+  the exchange-tier unhedged-notional cap, not by primary taker depth.
+- Execute one chunk at a time: any primary fill cancels the primary remainder,
+  confirms cancellation, and immediately hedges exactly the filled quantity.
+- Smart-enter limit hedges are forced to aggressive mode. If they remain open
+  for `hedge_timeout_sec` (default 5 seconds), cancel and market-fallback the
+  remaining hedge quantity.
 - Limit prices use filtered orderbook levels (ignore thin "junk" below min-level thresholds; default 1% of chunk notional/qty).
 - Active order size is excluded from best-level checks to avoid self-outbidding.
-- Reprice waits for cancel confirmation before placing a new limit order.
+- Reprice, timeout, runtime end, and partial-fill handling all require confirmed
+  primary cancellation before placing another primary order or finishing.
+- Runtime expiry with zero fills is a normal `completed_no_fill` result, not a
+  liquidity error. Partial or unhedged exposure remains an error state.
 
 Chunk Reconciliation (market fallback)
 - fallback_min = min_qty_required * 1.15, rounded up to amount step.
@@ -46,6 +59,7 @@ Market Mode (Fast Enter/Exit)
 Hedge Timing + Price Moves
 - Hedge adverse move threshold default: 0.1% (10 bps).
 - Adverse moves are measured from orderbook best bid/ask (WS orderbook source).
+- Smart-enter hedge hard deadline default: 5 seconds (configurable 1..30).
 
 REST vs WS
 - Order placement/cancel via ccxt REST.

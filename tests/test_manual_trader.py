@@ -547,6 +547,66 @@ class ManualTradeHelpersTestCase(unittest.TestCase):
         )
         self.assertAlmostEqual(result["recommended_chunk_qty"], 100.0)
 
+    def test_smart_enter_plan_uses_hedge_depth_not_primary_taker_depth(self) -> None:
+        manager = ManualTradeManager()
+        manager._ensure_client = AsyncMock(return_value=object())
+        manager._resolve_market_symbol = AsyncMock(return_value="MIRA/USDT:USDT")
+
+        async def _book(*, exchange, **_kwargs):
+            if exchange == "kucoin":
+                return {
+                    "bids": [[100.0, 100.0]],
+                    "asks": [[101.0, 100.0]],
+                    "source": "test",
+                }
+            return {
+                "bids": [[99.0, 10000.0]],
+                "asks": [[100.0, 10000.0]],
+                "source": "test",
+            }
+
+        manager._fetch_orderbook = AsyncMock(side_effect=_book)
+        manager._extract_market_constraints = lambda *_args, **_kwargs: {
+            "min_qty": 10.0,
+            "min_notional": None,
+            "amount_step": 10.0,
+            "price_step": 0.1,
+            "contract_size": 1.0,
+        }
+        manager._fetch_funding_meta = AsyncMock(return_value={})
+
+        result = asyncio.run(
+            manager._build_plan(
+                {
+                    "symbol": "MIRA",
+                    "qty": 1000.0,
+                    "long_exchange": "binance",
+                    "short_exchange": "kucoin",
+                    "mode": "smart-enter",
+                    "max_slippage_bps": 8.0,
+                    "use_orderbook_check": True,
+                    "allow_liquidity_chunking": True,
+                    "dry_run": True,
+                },
+                action="enter",
+            )
+        )
+
+        self.assertEqual(result.get("errors"), [])
+        self.assertEqual(result["suggested_expensive_leg"]["suggested_leg"], "short")
+        self.assertAlmostEqual(result["max_qty_by_exchange"]["kucoin"], 100.0)
+        self.assertAlmostEqual(result["max_qty_by_exchange"]["binance"], 10000.0)
+        self.assertAlmostEqual(result["recommended_qty"], 10000.0)
+        self.assertAlmostEqual(result["recommended_chunk_qty"], 1000.0)
+        liquidity = result["execution_liquidity"]
+        self.assertEqual(liquidity["primary_maker"]["exchange"], "kucoin")
+        self.assertFalse(liquidity["primary_maker"]["taker_depth_blocking"])
+        self.assertEqual(liquidity["hedge_taker"]["exchange"], "binance")
+        self.assertTrue(liquidity["hedge_taker"]["ready"])
+        self.assertFalse(
+            any("kucoin: insufficient liquidity" in warning for warning in result.get("warnings") or [])
+        )
+
     def test_enter_balance_precheck_preserves_plan_diagnostics(self) -> None:
         manager = ManualTradeManager()
         plan = {
@@ -885,6 +945,7 @@ class _HedgeFallbackManager(ManualTradeManager):
     def __init__(self) -> None:
         super().__init__()
         self.cancelled_order_ids: list[str] = []
+        self.last_market_reason: str | None = None
 
     async def _snapshot_legs(self, symbol, legs, max_slippage_bps=0.0):  # noqa: D401, ARG002
         exchange = legs[0]["exchange"]
@@ -925,6 +986,7 @@ class _HedgeFallbackManager(ManualTradeManager):
         *,
         price,
         reduce_only,
+        post_only=False,
         require_ws=True,
         log_cb=None,
     ):  # noqa: D401, ARG002
@@ -969,6 +1031,7 @@ class _HedgeFallbackManager(ManualTradeManager):
         require_ws=True,
         log_cb=None,
     ):  # noqa: D401, ARG002
+        self.last_market_reason = reason
         return {
             "exchange": leg["exchange"],
             "status": "submitted",
@@ -1146,6 +1209,39 @@ class ManualTradeHedgeFallbackTestCase(unittest.TestCase):
         self.assertAlmostEqual(result.get("filled_qty") or 0.0, 10.0)
         self.assertEqual(result.get("order_id"), "M1")
         self.assertIsNone(result.get("pending_qty"))
+
+    def test_hedge_deadline_forces_market_when_price_is_static(self) -> None:
+        manager = _HedgeFallbackManager()
+        leg = {
+            "exchange": "binance",
+            "side": "buy",
+            "label": "short",
+            "reduce_only": False,
+        }
+
+        result = asyncio.run(
+            manager._hedge_position(
+                leg,
+                "MIRA",
+                10.0,
+                hedge_order_type="limit",
+                hedge_offset_bps=0.0,
+                hedge_offset_ticks=0,
+                hedge_limit_mode="passive",
+                hedge_favorable_bps=9999.0,
+                hedge_adverse_bps=9999.0,
+                hedge_adverse_ticks=None,
+                hedge_reprice_min_sec=0.0,
+                payload={"hedge_timeout_sec": 1.0},
+                min_qty_required=None,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(result.get("status"), "filled")
+        self.assertAlmostEqual(result.get("filled_qty") or 0.0, 10.0)
+        self.assertEqual(manager.cancelled_order_ids, ["L1"])
+        self.assertEqual(manager.last_market_reason, "hedge_timeout")
 
 
 class _BingxLeverageClient:
@@ -1645,9 +1741,11 @@ class _SmartEnterPartialExposureManager(ManualTradeManager):
         *,
         price,
         reduce_only,
+        post_only=False,
         require_ws=True,
         log_cb=None,
     ):  # noqa: D401, ARG002
+        self.last_primary_post_only = post_only
         return {
             "exchange": leg["exchange"],
             "status": "submitted",
@@ -1696,6 +1794,7 @@ class _SmartEnterPartialExposureManager(ManualTradeManager):
         min_qty_required=None,
         log_cb=None,
     ):  # noqa: D401, ARG002
+        self.last_hedge_limit_mode = hedge_limit_mode
         return {
             "exchange": leg["exchange"],
             "status": "error",
@@ -1743,6 +1842,27 @@ class ManualTradeSubmitOrderValidationTestCase(unittest.TestCase):
         self.assertEqual(result.get("status"), "submitted")
         self.assertEqual(len(client.calls), 1)
         self.assertAlmostEqual(float(client.calls[0]["price"]), 0.636)
+
+    def test_submit_order_passes_post_only_for_primary_maker(self) -> None:
+        client = _SubmitOrderClient()
+        manager = _SubmitOrderManager(client)
+
+        result = asyncio.run(
+            manager._submit_order(
+                {"exchange": "binance", "side": "sell"},
+                "SIREN",
+                200.0,
+                "limit",
+                price=0.635,
+                reduce_only=False,
+                post_only=True,
+                log_cb=None,
+            )
+        )
+
+        self.assertEqual(result.get("status"), "submitted")
+        self.assertEqual(len(client.calls), 1)
+        self.assertIs((client.calls[0].get("params") or {}).get("postOnly"), True)
 
     def test_submit_order_preserves_gate_decimal_contract_amount(self) -> None:
         client = _GateDecimalSubmitClient()
@@ -1949,7 +2069,11 @@ class ManualTradeSubmitOrderValidationTestCase(unittest.TestCase):
                         "okx": {"amount_step": 0.1, "min_qty_required": 0.1, "price_step": 0.1},
                     },
                 },
-                {"verbose_logs": False},
+                {
+                    "verbose_logs": False,
+                    "hedge_order_type": "limit",
+                    "hedge_limit_mode": "passive",
+                },
             )
         )
 
@@ -1964,6 +2088,12 @@ class ManualTradeSubmitOrderValidationTestCase(unittest.TestCase):
         ]
         self.assertTrue(
             any(action.get("risk_state") == "partial_fill_exposure" for action in hedge_errors)
+        )
+
+        self.assertTrue(manager.last_primary_post_only)
+        self.assertEqual(manager.last_hedge_limit_mode, "aggressive")
+        self.assertTrue(
+            any("hedge upgraded to aggressive" in warning for warning in (result.get("warnings") or []))
         )
 
     def test_smart_enter_uses_auto_hint_suggested_leg_as_primary(self) -> None:
@@ -2009,7 +2139,7 @@ class ManualTradeSubmitOrderValidationTestCase(unittest.TestCase):
                         "okx": {"amount_step": 0.1, "min_qty_required": 0.1, "price_step": 0.1},
                     },
                 },
-                {"verbose_logs": False},
+                {"verbose_logs": False, "hedge_order_type": "limit", "hedge_limit_mode": "passive"},
             )
         )
 

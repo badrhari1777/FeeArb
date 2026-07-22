@@ -11582,13 +11582,29 @@ class DataService:
                         )
                 run["result"] = result
                 result_warnings = [str(item) for item in (result.get("warnings") or [])]
+                result_actions = [
+                    dict(item)
+                    for item in (result.get("actions") or [])
+                    if isinstance(item, Mapping)
+                ]
+                result_filled_qty = sum(
+                    max(0.0, _safe_float(item.get("filled_qty")) or 0.0)
+                    for item in result_actions
+                )
                 remaining_qty = _safe_float(result.get("remaining_qty")) or 0.0
                 incomplete_runtime_end = remaining_qty > 0 and any(
                     "runtime ended" in warning.lower()
                     and any(token in warning.lower() for token in ("not entered", "not exited", "not rolled"))
                     for warning in result_warnings
                 )
-                if result.get("errors") or incomplete_runtime_end:
+                no_fill_runtime_end = (
+                    incomplete_runtime_end
+                    and result_filled_qty <= 0
+                    and not result.get("errors")
+                )
+                if no_fill_runtime_end:
+                    run["status"] = "completed_no_fill"
+                elif result.get("errors") or incomplete_runtime_end:
                     run["status"] = "completed_with_errors"
                     if result.get("errors"):
                         _append_log(
@@ -11601,11 +11617,6 @@ class DataService:
                         )
                 else:
                     run["status"] = "completed"
-                result_actions = [
-                    dict(item)
-                    for item in (result.get("actions") or [])
-                    if isinstance(item, Mapping)
-                ]
                 fills_by_exchange: dict[str, float] = {}
                 order_ids: list[str] = []
                 for item in result_actions:
@@ -11621,6 +11632,8 @@ class DataService:
                 terminal_reason = "completed"
                 if result.get("errors"):
                     terminal_reason = "completed_with_errors"
+                elif no_fill_runtime_end:
+                    terminal_reason = "no_fill_before_runtime"
                 elif incomplete_runtime_end:
                     terminal_reason = "runtime_ended_incomplete"
                 elif "stopped_by_user" in result_warnings:
@@ -12341,10 +12354,11 @@ class DataService:
                 "chunk_notional": None,
                 "force_chunk_qty": False,
                 "hedge_order_type": "market",
-                "hedge_limit_mode": "passive",
+                "hedge_limit_mode": "aggressive",
                 "hedge_favorable_bps": 2.0,
                 "hedge_adverse_bps": 6.0,
                 "hedge_reprice_min_sec": 2.0,
+                "hedge_timeout_sec": 5.0,
                 "limit_offset_bps": 0.0,
                 "limit_offset_ticks": 0,
                 "max_limit_deviation_bps": 30.0,

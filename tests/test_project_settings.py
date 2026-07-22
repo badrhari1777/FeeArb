@@ -676,7 +676,7 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(payload["spread_pct"], (101.0 - 103.0) / 101.0 * 100.0)
         self.assertEqual(payload["quotes"]["binance"]["source"], "websocket")
 
-    async def test_manual_async_runtime_end_remaining_qty_is_error_status(self) -> None:
+    async def test_manual_async_runtime_end_without_fills_is_no_fill_status(self) -> None:
         service = DataService(settings_manager=self.manager)
 
         async def _manual_enter(payload, **_kwargs):
@@ -712,13 +712,13 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
                 break
             await asyncio.sleep(0.01)
 
-        self.assertEqual(status.get("status"), "completed_with_errors")
+        self.assertEqual(status.get("status"), "completed_no_fill")
         summary = next(
             entry
             for entry in (status.get("logs") or [])
             if entry.get("event") == "summary"
         )
-        self.assertEqual(summary["data"]["terminal_reason"], "runtime_ended_incomplete")
+        self.assertEqual(summary["data"]["terminal_reason"], "no_fill_before_runtime")
 
     async def test_manual_exit_cleans_protection_only_through_verified_cleanup(self) -> None:
         service = DataService(settings_manager=self.manager)

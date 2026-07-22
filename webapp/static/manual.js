@@ -352,6 +352,21 @@
         formatNumber(plan.suggested_expensive_leg.top3_liquidity_usd.long, 2) +
         ' ' + shortLabel + '=' + formatNumber(plan.suggested_expensive_leg.top3_liquidity_usd.short, 2));
     }
+    if (plan.execution_liquidity) {
+      var primaryMaker = plan.execution_liquidity.primary_maker || {};
+      var hedgeTaker = plan.execution_liquidity.hedge_taker || {};
+      lines.push('Primary maker: ' + String(primaryMaker.exchange || '-').toUpperCase() +
+        ' (' + (primaryMaker.ready ? 'ready' : 'not ready') + ')');
+      if (primaryMaker.immediate_taker_max_qty !== null && primaryMaker.immediate_taker_max_qty !== undefined) {
+        lines.push('Primary immediate depth: ' + formatNumber(primaryMaker.immediate_taker_max_qty, 6) +
+          ' (informational)');
+      }
+      lines.push('Hedge taker: ' + String(hedgeTaker.exchange || '-').toUpperCase() +
+        ' (' + (hedgeTaker.ready ? 'ready' : 'not ready') + ')');
+      if (hedgeTaker.max_qty_within_slippage !== null && hedgeTaker.max_qty_within_slippage !== undefined) {
+        lines.push('Hedge capacity: ' + formatNumber(hedgeTaker.max_qty_within_slippage, 6));
+      }
+    }
     if (plan.spread_pct !== undefined && plan.spread_pct !== null) {
       lines.push('Spread (%): ' + formatNumber(plan.spread_pct, 4));
     }
@@ -490,6 +505,7 @@
       'hedge-favorable-bps',
       'hedge-adverse-bps',
       'hedge-reprice-min',
+      'hedge-timeout-sec',
       'hedge-bps',
       'hedge-ticks'
     ];
@@ -690,6 +706,10 @@
           setStatus(statusEl, 'Completed with errors', 'error');
           return;
         }
+        if (data.status === 'completed_no_fill') {
+          setStatus(statusEl, 'No fill before execution time; primary order canceled', 'info');
+          return;
+        }
         if (data.status === 'completed') {
           setStatus(statusEl, 'Execution complete', 'success');
           return;
@@ -802,6 +822,7 @@
       hedge_offset_bps: parseOptionalNumber(getValue('hedge-bps')),
       hedge_offset_ticks: parseOptionalNumber(getValue('hedge-ticks')),
       hedge_limit_mode: getValue('hedge-limit-mode') || null,
+      hedge_timeout_sec: parseOptionalNumber(getValue('hedge-timeout-sec')),
       hedge_favorable_bps: parseOptionalNumber(getValue('hedge-favorable-bps')),
       hedge_adverse_bps: parseOptionalNumber(getValue('hedge-adverse-bps')),
       hedge_reprice_min_sec: parseOptionalNumber(getValue('hedge-reprice-min')),

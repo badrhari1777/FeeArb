@@ -110,6 +110,7 @@ class ManualBasePayload(BaseModel):
     hedge_adverse_bps: Optional[float] = Field(default=None, ge=0)
     hedge_adverse_ticks: Optional[float] = Field(default=None, ge=0)
     hedge_reprice_min_sec: Optional[float] = Field(default=None, ge=0)
+    hedge_timeout_sec: Optional[float] = Field(default=5.0, ge=1, le=30)
     limit_offset_bps: Optional[float] = Field(default=None, ge=0)
     limit_offset_ticks: Optional[int] = Field(default=None, ge=0)
     limit_improve_ticks: Optional[int] = Field(default=None, ge=0)

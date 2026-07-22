@@ -59,7 +59,7 @@ class SettingsStore(context: Context) {
             chunkNotional = prefs.getString(KEY_ADV_CHUNK_NOTIONAL, defaults?.chunk_notional?.toString().orEmpty()).orEmpty(),
             forceChunkQty = prefs.getBoolean(KEY_ADV_FORCE_CHUNK, defaults?.force_chunk_qty ?: false),
             hedgeOrderType = prefs.getString(KEY_ADV_HEDGE_TYPE, defaults?.hedge_order_type ?: "market").orEmpty(),
-            hedgeLimitMode = prefs.getString(KEY_ADV_HEDGE_MODE, defaults?.hedge_limit_mode ?: "passive").orEmpty(),
+            hedgeLimitMode = prefs.getString(KEY_ADV_HEDGE_MODE, defaults?.hedge_limit_mode ?: "aggressive").orEmpty(),
             hedgeFavorableBps = prefs.getString(KEY_ADV_HEDGE_FAVORABLE, defaults?.hedge_favorable_bps?.toString().orEmpty()).orEmpty(),
             hedgeAdverseBps = prefs.getString(KEY_ADV_HEDGE_ADVERSE, defaults?.hedge_adverse_bps?.toString().orEmpty()).orEmpty(),
             hedgeRepriceMinSec = prefs.getString(KEY_ADV_HEDGE_REPRICE, defaults?.hedge_reprice_min_sec?.toString().orEmpty()).orEmpty(),
