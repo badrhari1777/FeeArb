@@ -13921,6 +13921,9 @@ class DataService:
             cfg.fallback_liq_factor_short = float(
                 protective.get("fallback_liq_factor_short", cfg.fallback_liq_factor_short)
             )
+            cfg.fallback_take_rr_pct = float(
+                protective.get("fallback_take_rr_pct", cfg.fallback_take_rr_pct)
+            )
             cfg.target_safe_buffer_pct = float(
                 protective.get("target_safe_buffer_pct", cfg.target_safe_buffer_pct)
             )

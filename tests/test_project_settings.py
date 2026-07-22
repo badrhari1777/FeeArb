@@ -112,6 +112,19 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             self.manager.update({"protective": {"target_leverage": 0}})
 
+    def test_fallback_take_defaults_to_thirty_percent_and_loads_into_risk_config(self) -> None:
+        protective = self.manager.current.protective
+        self.assertAlmostEqual(float(protective.get("fallback_take_rr_pct", 0.0)), 0.30)
+
+        service = DataService(settings_manager=self.manager)
+        self.assertAlmostEqual(service._risk_config_from_settings().fallback_take_rr_pct, 0.30)
+
+    def test_fallback_take_rejects_unsafe_range(self) -> None:
+        with self.assertRaises(ValueError):
+            self.manager.update({"protective": {"fallback_take_rr_pct": 0}})
+        with self.assertRaises(ValueError):
+            self.manager.update({"protective": {"fallback_take_rr_pct": 0.51}})
+
     def test_notification_primary_channel_must_be_supported(self) -> None:
         with self.assertRaises(ValueError):
             self.manager.update({"protective": {"notification_primary_channel": "email"}})

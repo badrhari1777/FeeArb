@@ -14,7 +14,7 @@ class RiskConfig:
     stop_force_requote_max_age_sec: int = 60  # force stop refresh when older than this
     fallback_liq_factor_long: float = 0.33
     fallback_liq_factor_short: float = 1.66
-    fallback_take_rr_pct: float = 0.10    # 10% fallback when no peer stop is available
+    fallback_take_rr_pct: float = 0.30    # 30% fallback when no peer stop is available
 
     min_free_balance_abs: float = 500.0
     min_free_balance_rel: float = 0.10    # 10% of used margin

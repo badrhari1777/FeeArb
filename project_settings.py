@@ -125,6 +125,7 @@ class AppSettings:
             "stop_force_requote_max_age_sec": 60,
             "fallback_liq_factor_long": 0.33,
             "fallback_liq_factor_short": 1.66,
+            "fallback_take_rr_pct": 0.30,
             "rebalance_delta_pct": 0.20,
             "rebalance_cooldown_sec": 120,
             "rebalance_limit_timeout_sec": 10,
@@ -309,6 +310,7 @@ class AppSettings:
             "stop_force_requote_max_age_sec": 60,
             "fallback_liq_factor_long": 0.33,
             "fallback_liq_factor_short": 1.66,
+            "fallback_take_rr_pct": 0.30,
             "rebalance_delta_pct": 0.20,
             "rebalance_cooldown_sec": 120,
             "rebalance_limit_timeout_sec": 10,
@@ -466,6 +468,9 @@ class AppSettings:
                 raise ValueError("stop_gap_from_liq_pct must be >= 0.")
             if protective.get("stop_requote_threshold_pct", 0.0025) < 0:
                 raise ValueError("stop_requote_threshold_pct must be >= 0.")
+            fallback_take_rr_pct = float(protective.get("fallback_take_rr_pct", 0.30))
+            if not 0 < fallback_take_rr_pct <= 0.50:
+                raise ValueError("fallback_take_rr_pct must be > 0 and <= 0.50.")
             if float(protective.get("target_leverage", 3.0) or 0.0) <= 0:
                 raise ValueError("target_leverage must be > 0.")
             if float(protective.get("derisk_target_buffer_pct", 0.30) or 0.0) < 0:

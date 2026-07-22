@@ -458,6 +458,25 @@ class StopManagerStaleGuardTestCase(unittest.TestCase):
         )
         self.assertEqual(price, 0.20)
 
+    def test_default_fallback_take_uses_thirty_percent_both_sides(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+
+        long_price = manager._fallback_take_price(
+            "long",
+            mark_price=100.0,
+            entry_price=None,
+            ratio=manager._risk_config.fallback_take_rr_pct,
+        )
+        short_price = manager._fallback_take_price(
+            "short",
+            mark_price=100.0,
+            entry_price=None,
+            ratio=manager._risk_config.fallback_take_rr_pct,
+        )
+
+        self.assertEqual(long_price, 130.0)
+        self.assertEqual(short_price, 70.0)
+
     def test_invalid_peer_take_uses_safe_fallback_side(self) -> None:
         manager = ProtectiveOrderManager(RiskConfig(fallback_take_rr_pct=0.10))
         targets = manager._compute_targets(
