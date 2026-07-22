@@ -702,6 +702,111 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(conflict)
 
+    def test_paused_grid_does_not_block_live_ownership(self) -> None:
+        self.service._auto_arb["rules"]["paused-old"] = {
+            "id": "paused-old",
+            "enabled": False,
+            "mode": "live",
+            "symbol": "DEXEUSDT",
+            "long_exchange": "bybit",
+            "short_exchange": "binance",
+        }
+
+        conflict = self.service._auto_arb_live_grid_conflict(
+            {
+                "symbol": "DEXE",
+                "long_exchange": "bybit",
+                "short_exchange": "binance",
+            }
+        )
+
+        self.assertIsNone(conflict)
+
+    async def test_live_upsert_rejects_matching_live_grid_before_analysis(self) -> None:
+        self.service._auto_arb["rules"]["existing-live"] = {
+            "id": "existing-live",
+            "enabled": True,
+            "mode": "live",
+            "symbol": "DEXEUSDT",
+            "long_exchange": "bybit",
+            "short_exchange": "binance",
+        }
+        self.service.analyze_auto_arb = AsyncMock()
+
+        with self.assertRaisesRegex(ValueError, "existing-live.*Adopt grid"):
+            await self.service.upsert_auto_arb_rule(
+                {
+                    "symbol": "DEXE",
+                    "long_exchange": "bybit",
+                    "short_exchange": "binance",
+                    "setup_mode": "adopt_existing_full_grid",
+                    "live": True,
+                }
+            )
+
+        self.service.analyze_auto_arb.assert_not_awaited()
+        self.assertEqual(set(self.service._auto_arb["rules"]), {"existing-live"})
+
+    async def test_live_arm_rejects_grid_sharing_a_symbol_venue(self) -> None:
+        self.service._auto_arb["rules"].update(
+            {
+                "existing-live": {
+                    "id": "existing-live",
+                    "enabled": True,
+                    "mode": "live",
+                    "symbol": "DEXEUSDT",
+                    "long_exchange": "bybit",
+                    "short_exchange": "binance",
+                },
+                "candidate": {
+                    "id": "candidate",
+                    "enabled": True,
+                    "mode": "shadow",
+                    "symbol": "DEXE",
+                    "long_exchange": "bybit",
+                    "short_exchange": "kucoin",
+                },
+            }
+        )
+        self.service._auto_arb_refresh_quantities = AsyncMock()
+
+        with self.assertRaisesRegex(ValueError, "existing-live"):
+            await self.service.arm_auto_arb_live("candidate", "LIVE candidate")
+
+        self.service._auto_arb_refresh_quantities.assert_not_awaited()
+        self.assertEqual(self.service._auto_arb["rules"]["candidate"]["mode"], "shadow")
+
+    async def test_cycle_blocks_legacy_duplicate_live_grids(self) -> None:
+        for rule_id in ("legacy-one", "legacy-two"):
+            self.service._auto_arb["rules"][rule_id] = {
+                "id": rule_id,
+                "enabled": True,
+                "mode": "live",
+                "symbol": "DEXEUSDT",
+                "long_exchange": "bybit",
+                "short_exchange": "binance",
+                "status": "monitoring",
+                "pending_action": "enter",
+                "pending_samples": 1,
+            }
+        self.service.auto_arb_spreads = AsyncMock()
+
+        await self.service._auto_arb_cycle()
+
+        self.service.auto_arb_spreads.assert_not_awaited()
+        for rule_id, conflicting_id in (
+            ("legacy-one", "legacy-two"),
+            ("legacy-two", "legacy-one"),
+        ):
+            rule = self.service._auto_arb["rules"][rule_id]
+            self.assertEqual(rule["status"], "blocked_conflict")
+            self.assertEqual(
+                rule["blocked_reason"],
+                f"matching_live_grid_rule:{conflicting_id}",
+            )
+            self.assertIsNone(rule["pending_action"])
+            self.assertEqual(rule["pending_samples"], 0)
+
     async def test_live_adopts_near_level_position_with_small_imbalance(self) -> None:
         self.service._auto_arb["rules"]["adopt"] = {
             "id": "adopt",

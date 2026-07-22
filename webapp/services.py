@@ -8335,6 +8335,14 @@ class DataService:
 
     async def upsert_auto_arb_rule(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         requested_id = str(payload.get("id") or "").strip()
+        if bool(payload.get("live")):
+            async with self._auto_arb_lock:
+                conflict = self._auto_arb_live_grid_conflict(
+                    payload,
+                    exclude_rule_id=requested_id,
+                )
+            if conflict is not None:
+                raise ValueError(self._auto_arb_live_grid_conflict_message(conflict))
         if requested_id:
             async with self._auto_arb_lock:
                 existing_rule = (self._auto_arb.get("rules") or {}).get(requested_id)
@@ -8446,6 +8454,64 @@ class DataService:
             if candidate_long == long_exchange and candidate_short == short_exchange:
                 return True
         return False
+
+    @staticmethod
+    def _auto_arb_symbol_ownership_key(rule: Mapping[str, Any]) -> str:
+        symbol = normalize_symbol(str(rule.get("symbol") or "")).upper()
+        for quote in ("USDT", "USDC", "USD"):
+            if symbol.endswith(quote) and len(symbol) > len(quote):
+                return symbol[: -len(quote)]
+        return symbol
+
+    @staticmethod
+    def _auto_arb_rules_share_live_ownership(
+        left: Mapping[str, Any],
+        right: Mapping[str, Any],
+    ) -> bool:
+        left_symbol = DataService._auto_arb_symbol_ownership_key(left)
+        right_symbol = DataService._auto_arb_symbol_ownership_key(right)
+        if not left_symbol or left_symbol != right_symbol:
+            return False
+        left_venues = {
+            normalize_exchange_name(str(left.get("long_exchange") or "")),
+            normalize_exchange_name(str(left.get("short_exchange") or "")),
+        }
+        right_venues = {
+            normalize_exchange_name(str(right.get("long_exchange") or "")),
+            normalize_exchange_name(str(right.get("short_exchange") or "")),
+        }
+        left_venues.discard("")
+        right_venues.discard("")
+        return bool(left_venues.intersection(right_venues))
+
+    def _auto_arb_live_grid_conflict(
+        self,
+        rule: Mapping[str, Any],
+        *,
+        exclude_rule_id: str = "",
+    ) -> Mapping[str, Any] | None:
+        excluded = str(exclude_rule_id or rule.get("id") or "")
+        for candidate in (self._auto_arb.get("rules") or {}).values():
+            if not isinstance(candidate, Mapping):
+                continue
+            candidate_id = str(candidate.get("id") or "")
+            if candidate_id and candidate_id == excluded:
+                continue
+            if not candidate.get("enabled") or candidate.get("mode") != "live":
+                continue
+            if self._auto_arb_rules_share_live_ownership(rule, candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _auto_arb_live_grid_conflict_message(conflict: Mapping[str, Any]) -> str:
+        conflict_id = str(conflict.get("id") or "unknown")
+        symbol = normalize_symbol(str(conflict.get("symbol") or "")).upper()
+        return (
+            f"Grid Live ownership conflict with rule {conflict_id}: {symbol} already "
+            "has a Live Grid on one or both requested exchanges. Pause or delete that "
+            "Grid before starting another one, including Adopt grid."
+        )
 
     @staticmethod
     def _auto_arb_completion_tolerance(
@@ -8649,6 +8715,15 @@ class DataService:
             if rule.get("active_execution_id"):
                 raise ValueError("The grid already has an active execution.")
             rule_copy = dict(rule)
+            live_grid_conflict = self._auto_arb_live_grid_conflict(
+                rule_copy,
+                exclude_rule_id=rule_id,
+            )
+
+        if live_grid_conflict is not None:
+            raise ValueError(
+                self._auto_arb_live_grid_conflict_message(live_grid_conflict)
+            )
 
         if self._auto_arb_auto_exit_conflict(rule_copy):
             raise ValueError("Disable the matching Auto Exit rule before enabling Grid Live.")
@@ -8693,6 +8768,14 @@ class DataService:
             rule = (self._auto_arb.get("rules") or {}).get(rule_id)
             if not isinstance(rule, dict):
                 raise ValueError("Auto-arbitrage rule not found.")
+            live_grid_conflict = self._auto_arb_live_grid_conflict(
+                rule,
+                exclude_rule_id=rule_id,
+            )
+            if live_grid_conflict is not None:
+                raise ValueError(
+                    self._auto_arb_live_grid_conflict_message(live_grid_conflict)
+                )
             rule["mode"] = "live"
             rule["enabled"] = True
             rule["live_level"] = int(live_level)
@@ -9307,6 +9390,20 @@ class DataService:
             if not isinstance(rule, dict) or not rule.get("enabled") or rule.get("mode") != "live":
                 return
             rule_copy = dict(rule)
+            live_grid_conflict = self._auto_arb_live_grid_conflict(
+                rule_copy,
+                exclude_rule_id=rule_id,
+            )
+            if live_grid_conflict is not None:
+                rule["status"] = "blocked_conflict"
+                rule["blocked_reason"] = (
+                    f"matching_live_grid_rule:{live_grid_conflict.get('id')}"
+                )
+                rule["pending_action"] = None
+                rule["pending_samples"] = 0
+                rule["updated_at"] = datetime.now(timezone.utc).isoformat()
+                self._save_auto_arb_config()
+                return
         running = self._auto_exit_running_exec()
         if running:
             async with self._auto_arb_lock:
@@ -9514,6 +9611,45 @@ class DataService:
                     continue
                 await self._reconcile_auto_arb_execution(rule_id)
                 continue
+            if rule.get("mode") == "live":
+                async with self._auto_arb_lock:
+                    current = (self._auto_arb.get("rules") or {}).get(rule_id)
+                    live_grid_conflict = (
+                        self._auto_arb_live_grid_conflict(
+                            current,
+                            exclude_rule_id=rule_id,
+                        )
+                        if isinstance(current, Mapping)
+                        else None
+                    )
+                    if isinstance(current, dict) and live_grid_conflict is not None:
+                        conflict_reason = (
+                            f"matching_live_grid_rule:{live_grid_conflict.get('id')}"
+                        )
+                        changed = (
+                            current.get("status") != "blocked_conflict"
+                            or current.get("blocked_reason") != conflict_reason
+                        )
+                        current["status"] = "blocked_conflict"
+                        current["blocked_reason"] = conflict_reason
+                        current["pending_action"] = None
+                        current["pending_samples"] = 0
+                        current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                        self._save_auto_arb_config()
+                    else:
+                        changed = False
+                if live_grid_conflict is not None:
+                    if changed:
+                        self._auto_arb_history_store.append(
+                            {
+                                "event": "live_grid_conflict_blocked",
+                                "rule_id": rule_id,
+                                "conflicting_rule_id": live_grid_conflict.get("id"),
+                                "symbol": rule.get("symbol"),
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                            }
+                        )
+                    continue
             if time.time() < float(rule.get("next_eligible_ts") or 0.0):
                 continue
             if str(rule.get("status") or "") in {
