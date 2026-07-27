@@ -8586,6 +8586,38 @@ class DataService:
             or "min_order_size" in joined
         )
 
+    @staticmethod
+    def _auto_arb_dust_only_errors(
+        result: Mapping[str, Any] | None,
+    ) -> bool:
+        if not isinstance(result, Mapping):
+            return False
+        errors = [str(item).lower() for item in (result.get("errors") or [])]
+        if not errors:
+            return False
+        dust_tokens = (
+            "qty_below_step",
+            "below min qty",
+            "below exchange minimum",
+            "min_order_size",
+            "non-closeable dust",
+        )
+        return all(any(token in error for token in dust_tokens) for error in errors)
+
+    @classmethod
+    def _auto_arb_reset_after_flat_repair(
+        cls,
+        rule: dict[str, Any],
+        hedged_qty: float,
+    ) -> bool:
+        if max(0.0, float(hedged_qty or 0.0)) > cls._auto_arb_completion_tolerance(rule):
+            return False
+        rule["live_level"] = 0
+        rule["pending_transition"] = None
+        rule["pending_action"] = None
+        rule["pending_samples"] = 0
+        return True
+
     @classmethod
     def _auto_arb_level_for_qty(
         cls,
@@ -8921,14 +8953,26 @@ class DataService:
                         }
                         if imbalance_qty <= tolerance:
                             transition = dict(current.get("pending_transition") or {})
-                            current["status"] = (
-                                f"partial_{transition.get('action')}"
-                                if transition
-                                else ("waiting_entry" if not current.get("live_level") else "monitoring")
+                            flat_repair_reset = self._auto_arb_reset_after_flat_repair(
+                                current,
+                                hedged_qty,
                             )
+                            if flat_repair_reset:
+                                current["status"] = "waiting_entry"
+                            else:
+                                current["status"] = (
+                                    f"partial_{transition.get('action')}"
+                                    if transition
+                                    else (
+                                        "waiting_entry"
+                                        if not current.get("live_level")
+                                        else "monitoring"
+                                    )
+                                )
                             current["blocked_reason"] = None
                             current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
                             event["event"] = "live_hedge_repair_missing_but_balanced"
+                            event["flat_repair_reset"] = flat_repair_reset
                         else:
                             current["status"] = "hedge_repair_required"
                             current["blocked_reason"] = "active_execution_state_missing"
@@ -9020,16 +9064,28 @@ class DataService:
                 }
                 if active_action == "repair":
                     if imbalance_qty <= hedge_tolerance:
-                        current["status"] = (
-                            f"partial_{transition.get('action')}"
-                            if transition
-                            else ("waiting_entry" if not current.get("live_level") else "monitoring")
+                        flat_repair_reset = self._auto_arb_reset_after_flat_repair(
+                            current,
+                            hedged_qty,
                         )
+                        if flat_repair_reset:
+                            current["status"] = "waiting_entry"
+                        else:
+                            current["status"] = (
+                                f"partial_{transition.get('action')}"
+                                if transition
+                                else (
+                                    "waiting_entry"
+                                    if not current.get("live_level")
+                                    else "monitoring"
+                                )
+                            )
                         current["blocked_reason"] = None
                         current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
                         event["event"] = "live_hedge_repaired"
                         event["actual_hedged_qty"] = hedged_qty
                         event["imbalance_qty"] = imbalance_qty
+                        event["flat_repair_reset"] = flat_repair_reset
                         completed = True
                     else:
                         current["status"] = "hedge_repair_retry"
@@ -9222,7 +9278,14 @@ class DataService:
                         remaining_qty,
                     )
                 )
-                if transition and (remaining_qty <= transition_tolerance or non_closeable_dust):
+                hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+                flat_repair_reset = self._auto_arb_reset_after_flat_repair(
+                    current,
+                    hedged_qty,
+                )
+                if flat_repair_reset:
+                    current["status"] = "waiting_entry"
+                elif transition and (remaining_qty <= transition_tolerance or non_closeable_dust):
                     target_level = int(
                         transition.get("to_level")
                         or current.get("live_level")
@@ -9243,7 +9306,7 @@ class DataService:
                 current["active_to_level"] = None
                 current["active_target_qty"] = None
                 current["active_start_hedged_qty"] = None
-                current["actual_hedged_qty"] = float(quantities.get("hedged_qty") or 0.0)
+                current["actual_hedged_qty"] = hedged_qty
                 current["blocked_reason"] = None
                 current["pending_action"] = None
                 current["pending_samples"] = 0
@@ -9258,6 +9321,7 @@ class DataService:
                     "tolerance_qty": tolerance,
                     "remaining_qty": remaining_qty,
                     "non_closeable_dust_completed": bool(non_closeable_dust),
+                    "flat_repair_reset": flat_repair_reset,
                     "ts": now_iso,
                 }
             )
@@ -11814,6 +11878,37 @@ class DataService:
                     for item in result_actions
                 )
                 remaining_qty = _safe_float(result.get("remaining_qty")) or 0.0
+                requested_qty = (
+                    _safe_float(result.get("qty"))
+                    or _safe_float(payload.get("qty"))
+                    or 0.0
+                )
+                result_errors = [str(item) for item in (result.get("errors") or [])]
+                dust_tolerance = max(
+                    1e-8,
+                    requested_qty * AUTO_ARB_COMPLETION_TOLERANCE_PCT / 100.0,
+                )
+                dust_only_errors = self._auto_arb_dust_only_errors(result)
+                auto_arb_dust_completion = (
+                    bool(run.get("auto_arb_agent"))
+                    and result_filled_qty > 0
+                    and remaining_qty > 0
+                    and (not result_errors or dust_only_errors)
+                    and (
+                        remaining_qty <= dust_tolerance
+                        or dust_only_errors
+                    )
+                )
+                if auto_arb_dust_completion:
+                    if result_errors:
+                        result["dust_errors"] = list(result_errors)
+                        result_warnings.extend(
+                            f"non-closeable dust: {item}" for item in result_errors
+                        )
+                    result["errors"] = []
+                    result["warnings"] = list(dict.fromkeys(result_warnings))
+                    result["completed_with_dust"] = True
+                    result["dust_remaining_qty"] = remaining_qty
                 incomplete_runtime_end = remaining_qty > 0 and any(
                     "runtime ended" in warning.lower()
                     and any(token in warning.lower() for token in ("not entered", "not exited", "not rolled"))
@@ -11826,6 +11921,8 @@ class DataService:
                 )
                 if no_fill_runtime_end:
                     run["status"] = "completed_no_fill"
+                elif auto_arb_dust_completion:
+                    run["status"] = "completed_with_dust"
                 elif result.get("errors") or incomplete_runtime_end:
                     run["status"] = "completed_with_errors"
                     if result.get("errors"):
@@ -11852,7 +11949,9 @@ class DataService:
                     if order_id:
                         order_ids.append(order_id)
                 terminal_reason = "completed"
-                if result.get("errors"):
+                if auto_arb_dust_completion:
+                    terminal_reason = "completed_with_dust"
+                elif result.get("errors"):
                     terminal_reason = "completed_with_errors"
                 elif no_fill_runtime_end:
                     terminal_reason = "no_fill_before_runtime"
@@ -11889,6 +11988,7 @@ class DataService:
                             "terminal_reason": terminal_reason,
                             "warning_count": len(result_warnings),
                             "error_count": len(result.get("errors") or []),
+                            "dust_error_count": len(result.get("dust_errors") or []),
                         },
                     }
                 )

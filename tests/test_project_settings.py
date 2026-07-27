@@ -720,6 +720,75 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(summary["data"]["terminal_reason"], "no_fill_before_runtime")
 
+    async def test_grid_rounding_residual_is_completed_with_dust(self) -> None:
+        service = DataService(settings_manager=self.manager)
+
+        async def _manual_enter(payload, **_kwargs):
+            return {
+                "dry_run": False,
+                "action": "enter",
+                "symbol": payload["symbol"],
+                "qty": 100.0,
+                "errors": ["bybit: order precheck failed (qty_below_step)"],
+                "warnings": [
+                    "Remaining qty 1e-14 not entered (smart-enter runtime ended).",
+                ],
+                "remaining_qty": 1e-14,
+                "actions": [
+                    {
+                        "exchange": "bybit",
+                        "status": "filled",
+                        "filled_qty": 99.99999999999999,
+                        "order_id": "filled-leg",
+                    },
+                    {
+                        "exchange": "bybit",
+                        "status": "error",
+                        "error": "qty_below_step",
+                        "filled_qty": 0.0,
+                    },
+                ],
+            }
+
+        service._manual.enter = _manual_enter  # type: ignore[method-assign]
+        started = await service.manual_enter(
+            {
+                "symbol": "DEXEUSDT",
+                "long_exchange": "bybit",
+                "short_exchange": "binance",
+                "qty": 100.0,
+                "mode": "smart-enter",
+                "async_run": True,
+                "dry_run": False,
+                "auto_arb_agent": True,
+                "auto_arb_rule_id": "dexe-grid",
+            }
+        )
+
+        exec_id = str(started["execution_id"])
+        status = {}
+        for _ in range(20):
+            status = await service.manual_exec_status(exec_id)
+            if status.get("status") != "running":
+                break
+            await asyncio.sleep(0.01)
+
+        self.assertEqual(status.get("status"), "completed_with_dust")
+        result = status.get("result") or {}
+        self.assertEqual(result.get("errors"), [])
+        self.assertEqual(
+            result.get("dust_errors"),
+            ["bybit: order precheck failed (qty_below_step)"],
+        )
+        summary = next(
+            entry
+            for entry in (status.get("logs") or [])
+            if entry.get("event") == "summary"
+        )
+        self.assertEqual(summary["data"]["terminal_reason"], "completed_with_dust")
+        self.assertEqual(summary["data"]["error_count"], 0)
+        self.assertEqual(summary["data"]["dust_error_count"], 1)
+
     async def test_manual_exit_cleans_protection_only_through_verified_cleanup(self) -> None:
         service = DataService(settings_manager=self.manager)
         service._accounts = type(  # type: ignore[attr-defined]

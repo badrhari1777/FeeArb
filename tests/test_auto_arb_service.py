@@ -1146,6 +1146,65 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repair_payload["cleanup_position_side"], "long")
         self.assertAlmostEqual(repair_payload["qty"], 100.0)
 
+    async def test_live_repair_that_closes_both_legs_clears_stale_transition(self) -> None:
+        rule = {
+            "id": "flat-repair-grid",
+            "generation": 1,
+            "enabled": True,
+            "mode": "live",
+            "symbol": "DEXEUSDT",
+            "long_exchange": "bybit",
+            "short_exchange": "binance",
+            "max_qty": 1000.0,
+            "chunk_qty": 500.0,
+            "levels": [
+                {"level": 1, "qty": 500.0, "cumulative_qty": 500.0},
+                {"level": 2, "qty": 500.0, "cumulative_qty": 1000.0},
+            ],
+            "live_level": 2,
+            "active_execution_id": "flat-repair",
+            "active_action": "repair",
+            "active_start_hedged_qty": 186.607,
+            "pending_action": "exit",
+            "pending_samples": 2,
+            "pending_transition": {
+                "action": "exit",
+                "from_level": 2,
+                "to_level": 1,
+                "target_qty": 500.0,
+                "filled_qty": 313.393,
+                "remaining_qty": 186.607,
+            },
+        }
+        self.service._auto_arb["rules"][rule["id"]] = rule
+        self.service._manual_runs["flat-repair"] = {
+            "status": "completed",
+            "result": {"errors": [], "warnings": [], "remaining_qty": 0.0},
+            "error": None,
+        }
+        self.service._auto_arb_refresh_quantities = AsyncMock(
+            return_value={
+                "long_qty": 0.0,
+                "short_qty": 0.0,
+                "hedged_qty": 0.0,
+                "imbalance_qty": 0.0,
+                "imbalance_pct": 0.0,
+            }
+        )
+        append_event = MagicMock(wraps=self.service._auto_arb_history_store.append)
+        self.service._auto_arb_history_store.append = append_event
+
+        await self.service._reconcile_auto_arb_execution(rule["id"])
+
+        self.assertEqual(rule["live_level"], 0)
+        self.assertIsNone(rule["pending_transition"])
+        self.assertIsNone(rule["pending_action"])
+        self.assertEqual(rule["pending_samples"], 0)
+        self.assertEqual(rule["status"], "waiting_entry")
+        event = append_event.call_args.args[0]
+        self.assertEqual(event["event"], "live_hedge_repaired")
+        self.assertTrue(event["flat_repair_reset"])
+
     async def test_live_missing_repair_run_retries_after_restart(self) -> None:
         rule = {
             "id": "missing-repair-grid",
