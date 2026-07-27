@@ -7,6 +7,25 @@ from exchanges.kucoin import KucoinAdapter
 
 
 class KucoinAdapterCacheTestCase(unittest.TestCase):
+    def test_missing_contract_is_negative_cached(self) -> None:
+        adapter = KucoinAdapter()
+        contracts_payload = {
+            "code": "200000",
+            "data": [{"symbol": "BTCUSDTM", "fundingFeeRate": 0.0001}],
+        }
+
+        with patch("exchanges.kucoin._get_json", return_value=contracts_payload) as get_json, patch(
+            "exchanges.kucoin.time.time",
+            return_value=1000.0,
+        ), patch("exchanges.kucoin.logger.info") as info:
+            first = adapter.fetch_market_snapshots(["DEXEUSDT"])
+            second = adapter.fetch_market_snapshots(["DEXEUSDT"])
+
+        self.assertEqual(first, [])
+        self.assertEqual(second, [])
+        self.assertEqual(get_json.call_count, 1)
+        info.assert_called_once_with("KuCoin: contract %s not found", "DEXEUSDTM")
+
     def test_contracts_reload_after_ttl(self) -> None:
         adapter = KucoinAdapter()
 

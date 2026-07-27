@@ -18,10 +18,12 @@ class KucoinAdapter(ExchangeAdapter):
     name = "kucoin"
     base_url = "https://api-futures.kucoin.com"
     _CONTRACTS_TTL_SEC = 30.0
+    _MISSING_CONTRACT_TTL_SEC = 3600.0
 
     def __init__(self) -> None:
         self._contracts: Dict[str, dict] | None = None
         self._contracts_loaded_at: float | None = None
+        self._missing_contracts: Dict[str, float] = {}
 
     def map_symbol(self, symbol: str) -> str | None:
         symbol = symbol.upper().strip()
@@ -33,19 +35,32 @@ class KucoinAdapter(ExchangeAdapter):
         return None
 
     def fetch_market_snapshots(self, symbols: Iterable[str]) -> List[MarketSnapshot]:
-        contracts = self._load_contracts()
-        snapshots: list[MarketSnapshot] = []
-
+        now = time.time()
+        requested: list[tuple[str, str]] = []
         for canonical in {sym.upper() for sym in symbols}:
             contract_symbol = self.map_symbol(canonical)
             if not contract_symbol:
                 logger.debug("KuCoin: unsupported symbol %s", canonical)
                 continue
+            missing_at = self._missing_contracts.get(contract_symbol)
+            if missing_at is not None and now - missing_at < self._MISSING_CONTRACT_TTL_SEC:
+                continue
+            if missing_at is not None:
+                self._missing_contracts.pop(contract_symbol, None)
+            requested.append((canonical, contract_symbol))
+        if not requested:
+            return []
 
+        contracts = self._load_contracts()
+        snapshots: list[MarketSnapshot] = []
+
+        for canonical, contract_symbol in requested:
             contract_info = contracts.get(contract_symbol)
             if not contract_info:
+                self._missing_contracts[contract_symbol] = time.time()
                 logger.info("KuCoin: contract %s not found", contract_symbol)
                 continue
+            self._missing_contracts.pop(contract_symbol, None)
 
             ticker_url = (
                 f"{self.base_url}/api/v1/ticker?" + urlencode({"symbol": contract_symbol})

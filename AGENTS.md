@@ -102,6 +102,8 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Grid/execution cleanup was hardened after the 2026-07-27 DEXE audit. A completed hedge repair that leaves both exchange legs confirmed flat now resets `live_level=0`, clears stale partial-transition and trigger state, and returns the rule to `waiting_entry`, preventing the old transition from repeatedly launching exits against missing positions. Auto-Arb executions with a real positive fill and only a rounding/min-order residual are now terminal `completed_with_dust`: raw residual messages are retained under `dust_errors`, while connectivity, balance, position, and material order errors remain `completed_with_errors`. Operator behavior was documented in `instructions/08_АВТОАРБИТРАЖ_GRID_LIVE_МАЛЫЙ_ОБЪЕМ.md`. Verified Python compilation and the expanded Grid/manual suite (`192 passed`).
+- KuCoin public snapshots now negative-cache a missing futures contract for one hour, so unavailable mappings such as `DEXEUSDTM` are periodically rechecked without flooding INFO logs. Available contracts still use the existing short contracts-list cache. Verified adapter cache coverage (`5 passed`).
 - Symmetric partial-step Grid control was added on 2026-07-22 for hot, rapidly
   reversing symbols such as DEXE. A partial enter now continues its remaining
   buy at the frontier entry threshold or rolls back its actual fill at that
