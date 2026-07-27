@@ -10,6 +10,7 @@ private const val KEY_ADV_TIMEOUT = "adv_timeout"
 private const val KEY_ADV_RUNTIME = "adv_runtime"
 private const val KEY_ADV_RUNTIME_MINUTES = "adv_runtime_minutes"
 private const val KEY_ADV_UNTIL_FILLED = "adv_until_filled"
+private const val KEY_EXECUTION_TIMING_POLICY_VERSION = "execution_timing_policy_version"
 private const val KEY_ADV_REPRICE = "adv_reprice"
 private const val KEY_ADV_CHUNK_QTY = "adv_chunk_qty"
 private const val KEY_ADV_CHUNK_NOTIONAL = "adv_chunk_notional"
@@ -42,17 +43,23 @@ class SettingsStore(context: Context) {
     }
 
     fun loadAdvancedSettings(defaults: ManualDefaultsDto?): AdvancedSettingsUiState {
-        val defaultRuntimeMinutes = defaults?.max_runtime_sec
-            ?.let { seconds -> ((seconds.coerceAtLeast(1) + 59) / 60).toString() }
-            .orEmpty()
         val savedRuntimeMinutes = prefs.getString(KEY_ADV_RUNTIME_MINUTES, null)
-        val migratedRuntimeMinutes = prefs.getString(KEY_ADV_RUNTIME, null)
-            ?.toIntOrNull()
-            ?.let { seconds -> ((seconds.coerceAtLeast(1) + 59) / 60).toString() }
+        val legacyRuntimeSeconds = prefs.getString(KEY_ADV_RUNTIME, null)
+        val runtimeMinutes = resolveExecutionRuntimeMinutes(
+            savedMinutes = savedRuntimeMinutes,
+            legacySeconds = legacyRuntimeSeconds,
+            backendDefaultSeconds = defaults?.max_runtime_sec,
+            previousPolicyVersion = prefs.getInt(KEY_EXECUTION_TIMING_POLICY_VERSION, 0),
+        )
+        prefs.edit()
+            .putString(KEY_ADV_RUNTIME_MINUTES, runtimeMinutes)
+            .remove(KEY_ADV_RUNTIME)
+            .putInt(KEY_EXECUTION_TIMING_POLICY_VERSION, EXECUTION_TIMING_POLICY_VERSION)
+            .apply()
         return AdvancedSettingsUiState(
             maxSlippageBps = prefs.getString(KEY_ADV_MAX_SLIPPAGE, defaults?.max_slippage_bps?.toString().orEmpty()).orEmpty(),
             timeoutSec = prefs.getString(KEY_ADV_TIMEOUT, defaults?.timeout_sec?.toString().orEmpty()).orEmpty(),
-            maxRuntimeMinutes = savedRuntimeMinutes ?: migratedRuntimeMinutes ?: defaultRuntimeMinutes,
+            maxRuntimeMinutes = runtimeMinutes,
             untilFilled = prefs.getBoolean(KEY_ADV_UNTIL_FILLED, false),
             repriceSec = prefs.getString(KEY_ADV_REPRICE, defaults?.reprice_sec?.toString().orEmpty()).orEmpty(),
             chunkQty = prefs.getString(KEY_ADV_CHUNK_QTY, defaults?.chunk_qty?.toString().orEmpty()).orEmpty(),

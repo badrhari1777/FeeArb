@@ -808,7 +808,7 @@ private fun ManualScreen(
                 KeyValue(
                     "Execution time",
                     if (state.advancedSettings.untilFilled) {
-                        "Until filled (max 30 min)"
+                        "Until filled (max 10 min)"
                     } else {
                         "${state.advancedSettings.maxRuntimeMinutes.ifBlank { "default" }} min"
                     },
@@ -995,7 +995,7 @@ private fun SettingsScreen(
                 KeyValue(
                     "Current limit",
                     if (state.advancedSettings.untilFilled) {
-                        "Until filled, max 30 min"
+                        "Until filled, max 10 min"
                     } else {
                         "${state.advancedSettings.maxRuntimeMinutes.ifBlank { "backend default" }} min"
                     },
@@ -1005,20 +1005,25 @@ private fun SettingsScreen(
                 }
                 AnimatedVisibility(executionTimingExpanded) {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        SettingsField(
-                            "Execution time, minutes (1-30)",
-                            state.advancedSettings.maxRuntimeMinutes,
+                        SimpleSelect(
+                            "Execution time, minutes",
+                            state.advancedSettings.maxRuntimeMinutes.ifBlank {
+                                DEFAULT_EXECUTION_RUNTIME_MINUTES.toString()
+                            },
+                            (
+                                MIN_EXECUTION_RUNTIME_MINUTES..MAX_EXECUTION_RUNTIME_MINUTES
+                            ).map(Int::toString),
                         ) { value ->
-                            onAdvancedChange { it.copy(maxRuntimeMinutes = value.filter(Char::isDigit)) }
+                            onAdvancedChange { it.copy(maxRuntimeMinutes = value) }
                         }
                         BooleanSetting(
-                            "Until filled (max 30 min)",
+                            "Until filled (max 10 min)",
                             state.advancedSettings.untilFilled,
                         ) { value ->
                             onAdvancedChange { it.copy(untilFilled = value) }
                         }
                         Text(
-                            "Smart execution keeps retrying while quantity remains. The checkbox uses a hard 30-minute ceiling; Stop remains available at any time.",
+                            "Smart execution keeps retrying while quantity remains. The checkbox uses a hard 10-minute ceiling; Stop remains available at any time.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

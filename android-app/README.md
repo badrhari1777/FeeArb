@@ -23,6 +23,9 @@ Backend contract used by the app:
 Notes:
 - Default base URL is `http://10.0.2.2:8000/` for Android emulator access to local FastAPI.
 - `usesCleartextTraffic=true` is enabled for LAN/dev setups.
+- Version `0.2.0` uses a 5-minute execution default, exposes a 1-10 minute
+  selector, and caps `Until filled` at 10 minutes for Manual and position
+  `Add` / `Exit` execution paths.
 - The module can be built from Android Studio, Cursor, or the bundled Gradle wrapper.
 - Before the first CLI build, copy `local.properties.example` to `local.properties` and point `sdk.dir` to your Android SDK.
 - Current debug build output after successful local assemble:

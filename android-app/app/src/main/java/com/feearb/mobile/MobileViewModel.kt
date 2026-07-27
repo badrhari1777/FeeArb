@@ -35,7 +35,7 @@ enum class PositionSort(val label: String) {
 data class AdvancedSettingsUiState(
     val maxSlippageBps: String = "",
     val timeoutSec: String = "",
-    val maxRuntimeMinutes: String = "",
+    val maxRuntimeMinutes: String = DEFAULT_EXECUTION_RUNTIME_MINUTES.toString(),
     val untilFilled: Boolean = false,
     val repriceSec: String = "",
     val chunkQty: String = "",
@@ -447,6 +447,10 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             percent = percent,
             dry_run = true,
             async_run = false,
+            max_runtime_sec = executionRuntimeSeconds(
+                uiState.advancedSettings.maxRuntimeMinutes,
+                uiState.advancedSettings.untilFilled,
+            ),
         )
         viewModelScope.launch {
             pendingPositionAction = null
@@ -822,16 +826,20 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         if (
             !advanced.untilFilled &&
             advanced.maxRuntimeMinutes.isNotBlank() &&
-            (runtimeMinutes == null || runtimeMinutes !in 1..30)
+            (
+                runtimeMinutes == null ||
+                    runtimeMinutes !in MIN_EXECUTION_RUNTIME_MINUTES..MAX_EXECUTION_RUNTIME_MINUTES
+            )
         ) {
-            uiState = uiState.copy(manualStatusText = "Execution time must be between 1 and 30 minutes.")
+            uiState = uiState.copy(
+                manualStatusText = "Execution time must be between 1 and 10 minutes."
+            )
             return null
         }
-        val maxRuntimeSec = if (advanced.untilFilled) {
-            30 * 60
-        } else {
-            runtimeMinutes?.times(60)
-        }
+        val maxRuntimeSec = executionRuntimeSeconds(
+            advanced.maxRuntimeMinutes,
+            advanced.untilFilled,
+        )
         return ManualRequest(
             symbol = symbol,
             qty = qty,

@@ -10286,6 +10286,10 @@ class DataService:
         percent = _safe_float(payload.get("percent"))
         dry_run = bool(payload.get("dry_run", True))
         async_run = bool(payload.get("async_run", True))
+        max_runtime_sec = int(
+            _safe_float(payload.get("max_runtime_sec"))
+            or 300
+        )
         if not symbol or not long_exchange or not short_exchange:
             raise ValueError("symbol, long_exchange, and short_exchange are required.")
         if action not in {"add", "exit"}:
@@ -10332,7 +10336,7 @@ class DataService:
             "mode": "smart-enter" if action == "add" else "smart-exit",
             "max_slippage_bps": 12.0 if action == "add" else 8.0,
             "timeout_sec": 15,
-            "max_runtime_sec": 600,
+            "max_runtime_sec": max_runtime_sec,
             "reprice_sec": 5.0,
             "chunk_qty": None,
             "chunk_notional": None,
@@ -12670,7 +12674,7 @@ class DataService:
                 "max_slippage_bps": 8.0,
                 "margin_mode": "isolated",
                 "timeout_sec": 15,
-                "max_runtime_sec": 600,
+                "max_runtime_sec": 300,
                 "reprice_sec": 2.0,
                 "chunk_qty": None,
                 "chunk_notional": None,

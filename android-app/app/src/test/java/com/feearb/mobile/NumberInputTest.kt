@@ -7,6 +7,52 @@ import org.junit.Test
 
 class NumberInputTest {
     @Test
+    fun executionTimingDefaultsAndMigratesToFiveMinutes() {
+        assertEquals(
+            "5",
+            resolveExecutionRuntimeMinutes(
+                savedMinutes = null,
+                legacySeconds = null,
+                backendDefaultSeconds = 300,
+                previousPolicyVersion = EXECUTION_TIMING_POLICY_VERSION,
+            ),
+        )
+        assertEquals(
+            "5",
+            resolveExecutionRuntimeMinutes(
+                savedMinutes = "1",
+                legacySeconds = null,
+                backendDefaultSeconds = 300,
+                previousPolicyVersion = 1,
+            ),
+        )
+        assertEquals(
+            "1",
+            resolveExecutionRuntimeMinutes(
+                savedMinutes = "1",
+                legacySeconds = null,
+                backendDefaultSeconds = 300,
+                previousPolicyVersion = EXECUTION_TIMING_POLICY_VERSION,
+            ),
+        )
+    }
+
+    @Test
+    fun executionTimingIsBoundedToTenMinutes() {
+        assertEquals(
+            "10",
+            resolveExecutionRuntimeMinutes(
+                savedMinutes = "30",
+                legacySeconds = null,
+                backendDefaultSeconds = 300,
+                previousPolicyVersion = EXECUTION_TIMING_POLICY_VERSION,
+            ),
+        )
+        assertEquals(300, executionRuntimeSeconds("5", untilFilled = false))
+        assertEquals(600, executionRuntimeSeconds("1", untilFilled = true))
+    }
+
+    @Test
     fun parsesIntegerAndFractionalForms() {
         assertEquals(7.0, "7".toInputDoubleOrNull()!!, 0.0)
         assertEquals(7.0, "7.".toInputDoubleOrNull()!!, 0.0)

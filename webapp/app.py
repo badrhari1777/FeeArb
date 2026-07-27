@@ -186,7 +186,10 @@ def _manual_payload_dict(payload: ManualBasePayload) -> dict:
         and not chunk_notional
     ):
         current_runtime = data.get("max_runtime_sec")
-        if not isinstance(current_runtime, (int, float)) or current_runtime < 600:
+        if (
+            "max_runtime_sec" not in provided_fields
+            or not isinstance(current_runtime, (int, float))
+        ):
             data["max_runtime_sec"] = 600
     return data
 
@@ -199,6 +202,7 @@ class PositionActionPayload(BaseModel):
     percent: float = Field(default=100.0, gt=0, le=100)
     dry_run: bool = True
     async_run: bool = True
+    max_runtime_sec: Optional[int] = Field(default=None, ge=60, le=600)
 
 
 class AutoArbRulePayload(BaseModel):

@@ -424,6 +424,7 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(payload["exchanges"], ["binance", "okx"])
         self.assertEqual(payload["defaults"]["margin_mode"], "isolated")
+        self.assertEqual(payload["defaults"]["max_runtime_sec"], 300)
         self.assertEqual(payload["main_modes"][0]["id"], "smart")
 
     def test_mobile_positions_payload_builds_cards(self) -> None:
@@ -599,6 +600,7 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
                 "percent": 25,
                 "dry_run": True,
                 "async_run": False,
+                "max_runtime_sec": 300,
             }
         )
 
@@ -606,6 +608,7 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(result["position_action"]["hedged_qty"], 100000.0)
         self.assertAlmostEqual(result["position_action"]["action_qty"], 25000.0)
         self.assertEqual(captured["max_slippage_bps"], 8.0)
+        self.assertEqual(captured["max_runtime_sec"], 300)
         self.assertTrue(captured["allow_liquidity_chunking"])
         self.assertFalse(captured["exit_close_full_pair"])
         self.assertEqual(result["position_action"]["quantity_basis"], "min_long_short_coin_qty")

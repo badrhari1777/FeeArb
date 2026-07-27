@@ -201,6 +201,7 @@ data class PositionActionRequest(
     val percent: Double,
     val dry_run: Boolean,
     val async_run: Boolean,
+    val max_runtime_sec: Int? = null,
 )
 
 data class ManualRequest(
