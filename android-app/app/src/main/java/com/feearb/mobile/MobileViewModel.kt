@@ -91,11 +91,14 @@ data class MobileUiState(
     val statusText: String = "",
     val positionsLoading: Boolean = false,
     val positionsErrorText: String? = null,
+    val positionsOverviewErrorText: String? = null,
     val manualLoading: Boolean = false,
     val manualDefaultsLoading: Boolean = false,
     val manualDefaultsErrorText: String? = null,
     val positionsResponse: MobilePositionsResponse = MobilePositionsResponse(),
+    val positionsOverview: PositionsOverviewResponse = PositionsOverviewResponse(),
     val manualDefaults: ManualDefaultsResponse? = null,
+    val positionModuleFilter: PositionModuleFilter = PositionModuleFilter.All,
     val positionFilter: PositionFilter = PositionFilter.All,
     val positionSort: PositionSort = PositionSort.ByNextFunding,
     val manualForm: ManualFormUiState = ManualFormUiState(),
@@ -127,6 +130,8 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         settingsStore.loadRemoteAccessToken(),
     )
     private var pollingJob: Job? = null
+    private var positionsRefreshJob: Job? = null
+    private var positionsAutoRefreshJob: Job? = null
     private var spreadJob: Job? = null
     private var pendingExecuteRequest: ManualRequest? = null
     private var pendingExecuteAction: String? = null
@@ -152,29 +157,57 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         refreshGridStatus()
     }
 
-    fun refreshPositions(statusAfterRefresh: String? = null) {
-        viewModelScope.launch {
+    fun refreshPositions(
+        statusAfterRefresh: String? = null,
+        silent: Boolean = false,
+    ) {
+        if (positionsRefreshJob?.isActive == true) return
+        positionsRefreshJob = viewModelScope.launch {
+            if (!silent) {
+                uiState = uiState.copy(
+                    positionsLoading = true,
+                    positionsErrorText = null,
+                    positionsOverviewErrorText = null,
+                    statusText = "Refreshing account data...",
+                )
+            }
+            val positionsResult = runCatching { api.getMobilePositions() }
+            val overviewResult = runCatching { api.getPositionsOverview() }
+            val positionsError = positionsResult.exceptionOrNull()?.message
+            val overviewError = overviewResult.exceptionOrNull()?.message
+            val nextStatus = when {
+                !positionsError.isNullOrBlank() ->
+                    "Account refresh failed: $positionsError"
+                !overviewError.isNullOrBlank() ->
+                    "Pump overview failed: $overviewError"
+                !silent ->
+                    statusAfterRefresh ?: "Account data updated."
+                else ->
+                    uiState.statusText
+            }
             uiState = uiState.copy(
-                positionsLoading = true,
-                positionsErrorText = null,
-                statusText = "Refreshing account data...",
+                positionsLoading = false,
+                positionsErrorText = positionsError,
+                positionsOverviewErrorText = overviewError,
+                positionsResponse = positionsResult.getOrNull() ?: uiState.positionsResponse,
+                positionsOverview = overviewResult.getOrNull() ?: uiState.positionsOverview,
+                statusText = nextStatus,
             )
-            runCatching { api.getMobilePositions() }
-                .onSuccess { payload ->
-                    uiState = uiState.copy(
-                        positionsLoading = false,
-                        positionsErrorText = null,
-                        positionsResponse = payload,
-                        statusText = statusAfterRefresh ?: "Account data updated.",
-                    )
-                }
-                .onFailure { error ->
-                    uiState = uiState.copy(
-                        positionsLoading = false,
-                        positionsErrorText = error.message ?: "unknown error",
-                        statusText = "Account refresh failed: ${error.message}",
-                    )
-                }
+        }
+    }
+
+    fun setPositionsAutoRefresh(enabled: Boolean) {
+        if (!enabled) {
+            positionsAutoRefreshJob?.cancel()
+            positionsAutoRefreshJob = null
+            return
+        }
+        if (positionsAutoRefreshJob?.isActive == true) return
+        positionsAutoRefreshJob = viewModelScope.launch {
+            while (true) {
+                refreshPositions(silent = true)
+                delay(POSITIONS_OVERVIEW_POLL_INTERVAL_MS)
+            }
         }
     }
 
@@ -241,6 +274,10 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
 
     fun updateFilter(filter: PositionFilter) {
         uiState = uiState.copy(positionFilter = filter)
+    }
+
+    fun updateModuleFilter(filter: PositionModuleFilter) {
+        uiState = uiState.copy(positionModuleFilter = filter)
     }
 
     fun updateSort(sort: PositionSort) {
@@ -699,6 +736,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun visibleCards(): List<PositionCardDto> {
+        if (!uiState.positionModuleFilter.showsMain()) return emptyList()
         val filtered = uiState.positionsResponse.cards.filter { card ->
             when (uiState.positionFilter) {
                 PositionFilter.All -> true
@@ -713,6 +751,20 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
             PositionSort.ByNextFunding -> filtered.sortedBy { it.minutes_to_next_funding ?: Double.POSITIVE_INFINITY }
             PositionSort.BySymbol -> filtered.sortedBy { it.symbol }
         }
+    }
+
+    fun visiblePumpPositions(): List<PumpPositionDto> {
+        if (!uiState.positionModuleFilter.showsPump()) return emptyList()
+        return uiState.positionsOverview.pump.positions.sortedWith(
+            compareBy<PumpPositionDto> {
+                when (it.risk_level) {
+                    "high" -> 0
+                    "warn" -> 1
+                    "ok" -> 2
+                    else -> 3
+                }
+            }.thenBy { it.symbol }
+        )
     }
 
     private fun startPollingExecution(executionId: String, positionAction: Boolean = false) {
