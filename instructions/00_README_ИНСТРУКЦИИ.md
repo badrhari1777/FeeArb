@@ -40,6 +40,8 @@
   [`13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`](13_PUMP_LIVE_BYBIT_SUBACCOUNT.md)
 - Unified read-only web view for main and Pump Live positions:
   [`14_UNIFIED_POSITIONS_WEB.md`](14_UNIFIED_POSITIONS_WEB.md)
+- Лёгкая Android-визуализация Main и Pump Live позиций:
+  [`15_ANDROID_MAIN_PUMP_POSITIONS.md`](15_ANDROID_MAIN_PUMP_POSITIONS.md)
 
 ## Важно
 

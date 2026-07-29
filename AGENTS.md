@@ -102,6 +102,21 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Android positions visualization was completed on 2026-07-30 as a lightweight
+  read-only companion to the unified web dashboard. Mobile version `0.3.0`
+  adds `All / Main / Pump` module filters, a combined risk/freshness card,
+  Pump arm/monitor/balance/reserve status, and expandable Pump position cards
+  with liquidation buffer, TP/emergency stop, hold time, top-up, and ladder
+  state. Existing Main actions remain isolated from Pump rows. The app fetches
+  `/api/mobile/positions` and `/api/positions/overview` independently every
+  15 seconds only while `Positions` is visible in the foreground, so one
+  endpoint failure does not hide the other module. Android API 27 theme
+  attributes now live in `values-v27`, preserving minSdk 26 compatibility.
+  Verified the full Python suite (`521 passed`), Android unit tests (`11
+  passed`), lint (`0 errors`), clean debug assembly, fresh install and UI-tree
+  smoke on `Pixel_8`, foreground polling/background stop, and zero crash-log
+  entries. Operator guide:
+  `instructions/15_ANDROID_MAIN_PUMP_POSITIONS.md`.
 - Unified positions visualization was added after the read-only API contract.
   The main `/` positions panel now has `All positions`, `Main module`, and
   `Pump Live` tabs plus combined risk counters; unlike hedged and one-sided

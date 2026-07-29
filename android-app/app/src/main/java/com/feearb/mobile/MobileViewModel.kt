@@ -16,6 +16,7 @@ import com.google.gson.JsonObject
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.util.Locale
 
 enum class PositionFilter(val label: String) {
     All("All"),
@@ -1315,7 +1316,7 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun formatCompact(value: Double): String {
-        val text = String.format("%.6f", value)
+        val text = String.format(Locale.ROOT, "%.6f", value)
         return text.trimEnd('0').trimEnd('.')
     }
 

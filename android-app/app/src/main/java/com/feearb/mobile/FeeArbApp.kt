@@ -46,6 +46,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -58,7 +59,11 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.feearb.mobile.ui.theme.FeeArbTheme
+import java.util.Locale
 import kotlin.math.absoluteValue
 
 private enum class AppTab(val title: String) {
@@ -74,6 +79,23 @@ fun FeeArbApp(viewModel: MobileViewModel) {
     FeeArbTheme {
         var currentTab by remember { mutableStateOf(AppTab.Balances) }
         val state = viewModel.uiState
+        val lifecycleOwner = LocalLifecycleOwner.current
+        DisposableEffect(lifecycleOwner, currentTab) {
+            val lifecycle = lifecycleOwner.lifecycle
+            fun syncPositionsPolling() {
+                viewModel.setPositionsAutoRefresh(
+                    currentTab == AppTab.Positions &&
+                        lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+                )
+            }
+            val observer = LifecycleEventObserver { _, _ -> syncPositionsPolling() }
+            lifecycle.addObserver(observer)
+            syncPositionsPolling()
+            onDispose {
+                lifecycle.removeObserver(observer)
+                viewModel.setPositionsAutoRefresh(false)
+            }
+        }
         state.executeConfirmationText?.let { confirmationText ->
             AlertDialog(
                 onDismissRequest = viewModel::cancelExecute,
@@ -204,13 +226,18 @@ fun FeeArbApp(viewModel: MobileViewModel) {
                 )
                 AppTab.Positions -> PositionsScreen(
                     cards = viewModel.visibleCards(),
+                    pumpPositions = viewModel.visiblePumpPositions(),
                     totalCards = state.positionsResponse.cards.size,
                     loading = state.positionsLoading,
                     errorText = state.positionsErrorText,
+                    overviewErrorText = state.positionsOverviewErrorText,
                     lastUpdated = state.positionsResponse.last_updated,
+                    overview = state.positionsOverview,
+                    selectedModule = state.positionModuleFilter,
                     selectedFilter = state.positionFilter,
                     selectedSort = state.positionSort,
                     filters = state.positionsResponse.filters,
+                    onModuleSelected = viewModel::updateModuleFilter,
                     onFilterSelected = viewModel::updateFilter,
                     onSortSelected = viewModel::updateSort,
                     onUseInManual = {
@@ -333,13 +360,18 @@ private fun BalancesScreen(
 @Composable
 private fun PositionsScreen(
     cards: List<PositionCardDto>,
+    pumpPositions: List<PumpPositionDto>,
     totalCards: Int,
     loading: Boolean,
     errorText: String?,
+    overviewErrorText: String?,
     lastUpdated: String?,
+    overview: PositionsOverviewResponse,
+    selectedModule: PositionModuleFilter,
     selectedFilter: PositionFilter,
     selectedSort: PositionSort,
     filters: Map<String, Int>,
+    onModuleSelected: (PositionModuleFilter) -> Unit,
     onFilterSelected: (PositionFilter) -> Unit,
     onSortSelected: (PositionSort) -> Unit,
     onUseInManual: (PositionCardDto) -> Unit,
@@ -348,7 +380,7 @@ private fun PositionsScreen(
     onSaveAutoExit: (PositionCardDto, Boolean, String, String) -> Unit,
     actionLoading: Boolean,
     modifier: Modifier = Modifier,
-) {
+    ) {
     var filtersExpanded by remember { mutableStateOf(false) }
     LazyColumn(
         modifier = modifier.fillMaxSize(),
@@ -356,46 +388,101 @@ private fun PositionsScreen(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "${cards.size} positions · ${selectedFilter.label} · ${selectedSort.label}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    TextButton(onClick = { filtersExpanded = !filtersExpanded }) {
-                        Text(if (filtersExpanded) "Hide filters" else "Filters")
+            PortfolioOverviewCard(overview)
+        }
+        item {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                PositionModuleFilter.entries.forEach { module ->
+                    val count = when (module) {
+                        PositionModuleFilter.All ->
+                            overview.summary.main_positions + overview.summary.pump_positions
+                        PositionModuleFilter.Main ->
+                            overview.summary.main_positions
+                        PositionModuleFilter.Pump ->
+                            overview.summary.pump_positions
                     }
+                    FilterChip(
+                        selected = selectedModule == module,
+                        onClick = { onModuleSelected(module) },
+                        label = { Text("${module.label} ($count)") },
+                    )
                 }
-                AnimatedVisibility(filtersExpanded) {
-                    SectionCard("Filters") {
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            PositionFilter.entries.forEach { filter ->
-                                val count = when (filter) {
-                                    PositionFilter.All -> filters["all"] ?: cards.size
-                                    PositionFilter.Risk -> filters["risk"] ?: 0
-                                    PositionFilter.FundingSoon -> filters["funding_soon"] ?: 0
-                                    PositionFilter.AutoExitOn -> filters["auto_exit_on"] ?: 0
-                                }
-                                FilterChip(
-                                    selected = selectedFilter == filter,
-                                    onClick = { onFilterSelected(filter) },
-                                    label = { Text("${filter.label} ($count)") },
-                                )
-                            }
+            }
+        }
+        if (!overviewErrorText.isNullOrBlank()) {
+            item {
+                StateCard(
+                    title = "Pump overview unavailable",
+                    body = overviewErrorText,
+                )
+            }
+        }
+        if (selectedModule.showsPump()) {
+            item {
+                PumpStatusCard(
+                    overview = overview,
+                    hasPositions = pumpPositions.isNotEmpty(),
+                )
+            }
+            items(
+                pumpPositions,
+                key = { it.live_id ?: "pump-${it.symbol}" },
+            ) { position ->
+                PumpPositionCard(position)
+            }
+        }
+        if (selectedModule.showsMain()) {
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "${cards.size} main positions · ${selectedFilter.label} · ${selectedSort.label}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        TextButton(onClick = { filtersExpanded = !filtersExpanded }) {
+                            Text(if (filtersExpanded) "Hide filters" else "Filters")
                         }
-                        Spacer(Modifier.height(10.dp))
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            PositionSort.entries.forEach { sort ->
-                                FilterChip(
-                                    selected = selectedSort == sort,
-                                    onClick = { onSortSelected(sort) },
-                                    label = { Text(sort.label) },
-                                )
+                    }
+                    AnimatedVisibility(filtersExpanded) {
+                        SectionCard("Main position filters") {
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                PositionFilter.entries.forEach { filter ->
+                                    val count = when (filter) {
+                                        PositionFilter.All -> filters["all"] ?: cards.size
+                                        PositionFilter.Risk -> filters["risk"] ?: 0
+                                        PositionFilter.FundingSoon -> filters["funding_soon"] ?: 0
+                                        PositionFilter.AutoExitOn -> filters["auto_exit_on"] ?: 0
+                                    }
+                                    FilterChip(
+                                        selected = selectedFilter == filter,
+                                        onClick = { onFilterSelected(filter) },
+                                        label = { Text("${filter.label} ($count)") },
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                PositionSort.entries.forEach { sort ->
+                                    FilterChip(
+                                        selected = selectedSort == sort,
+                                        onClick = { onSortSelected(sort) },
+                                        label = { Text(sort.label) },
+                                    )
+                                }
                             }
                         }
                     }
@@ -419,10 +506,10 @@ private fun PositionsScreen(
                 )
             }
         }
-        if (cards.isEmpty()) {
+        if (selectedModule.showsMain() && cards.isEmpty()) {
             item {
                 StateCard(
-                    title = if (totalCards == 0) "No positions" else "No cards match filters",
+                    title = if (totalCards == 0) "No main positions" else "No main cards match filters",
                     body = when {
                         totalCards == 0 && !lastUpdated.isNullOrBlank() -> "Backend returned no active positions. Last update: $lastUpdated"
                         totalCards == 0 -> "Backend returned no active positions."
@@ -431,17 +518,253 @@ private fun PositionsScreen(
                 )
             }
         }
-        items(cards, key = { "${it.symbol}-${it.pair_label}" }) { card ->
-            PositionCard(
-                card = card,
-                actionLoading = actionLoading,
-                onUseInManual = { onUseInManual(card) },
-                onUseInGrid = { onUseInGrid(card) },
-                onPositionAction = { action, percent -> onPositionAction(card, action, percent) },
-                onSaveAutoExit = { enabled, target, percent ->
-                    onSaveAutoExit(card, enabled, target, percent)
-                },
-            )
+        if (selectedModule.showsMain()) {
+            items(cards, key = { "${it.symbol}-${it.pair_label}" }) { card ->
+                PositionCard(
+                    card = card,
+                    actionLoading = actionLoading,
+                    onUseInManual = { onUseInManual(card) },
+                    onUseInGrid = { onUseInGrid(card) },
+                    onPositionAction = { action, percent -> onPositionAction(card, action, percent) },
+                    onSaveAutoExit = { enabled, target, percent ->
+                        onSaveAutoExit(card, enabled, target, percent)
+                    },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PortfolioOverviewCard(overview: PositionsOverviewResponse) {
+    val summary = overview.summary
+    val tone = overviewRiskTone(summary, overview.pump)
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+        ),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Portfolio risk",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                OverviewRiskPill(tone)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock("Main", summary.main_positions.toString(), Modifier.weight(1f))
+                MetricBlock(
+                    "Pump",
+                    "${summary.pump_positions} / ${summary.pump_cap}",
+                    Modifier.weight(1f),
+                )
+                MetricBlock(
+                    "Total PnL",
+                    formatSigned(summary.total_unrealized_pnl_usd),
+                    Modifier.weight(1f),
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock(
+                    "Min liq buffer",
+                    formatPercent(summary.min_liq_buffer_pct),
+                    Modifier.weight(1f),
+                )
+                MetricBlock(
+                    "Protection",
+                    if (summary.protection_issues == 0) "OK" else "${summary.protection_issues} issue",
+                    Modifier.weight(1f),
+                )
+                MetricBlock(
+                    "Freshness",
+                    if (positionsOverviewIsStale(summary)) "STALE" else "LIVE",
+                    Modifier.weight(1f),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PumpStatusCard(
+    overview: PositionsOverviewResponse,
+    hasPositions: Boolean,
+) {
+    val pump = overview.pump
+    val balance = pump.balance
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+        ),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text(
+                        "Pump Live · Bybit subaccount",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        if (pump.entry_armed) "New entries enabled" else "New entries disabled",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                StatusPill(pump.status ?: "unknown")
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock("Total", "\$${formatMoney(balance.total_usd)}", Modifier.weight(1f))
+                MetricBlock("Available", "\$${formatMoney(balance.available_usd)}", Modifier.weight(1f))
+                MetricBlock("Reserve", "\$${formatMoney(pump.config.reserve_usd)}", Modifier.weight(1f))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock(
+                    "Monitor",
+                    if (pump.monitor_thread_alive) "ACTIVE" else "IDLE",
+                    Modifier.weight(1f),
+                )
+                MetricBlock(
+                    "Cycle",
+                    formatAgeSeconds(overview.summary.pump_age_sec),
+                    Modifier.weight(1f),
+                )
+                MetricBlock(
+                    "Alerts",
+                    pump.notifications.last_status ?: "unknown",
+                    Modifier.weight(1f),
+                )
+            }
+            if (!hasPositions) {
+                Text(
+                    "No open Pump positions. Monitoring for the next eligible signal.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            pump.blocked_reason?.takeIf { it.isNotBlank() }?.let {
+                Text("Blocked: $it", color = MaterialTheme.colorScheme.error)
+            }
+            pump.last_error?.takeIf { it.isNotBlank() }?.let {
+                Text("Error: $it", color = MaterialTheme.colorScheme.error)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PumpPositionCard(position: PumpPositionDto) {
+    var expanded by remember(position.live_id, position.symbol) { mutableStateOf(false) }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
+        ),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text(
+                        position.symbol,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        "${position.side.uppercase()} · read only",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                RiskChip(position.liq_buffer_pct, position.risk_level)
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock("Qty", formatNumber(position.qty), Modifier.weight(1f))
+                MetricBlock("PnL", formatSigned(position.unrealized_pnl_usd), Modifier.weight(1f))
+                MetricBlock("Liq buffer", formatPercent(position.liq_buffer_pct), Modifier.weight(1f))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock("Entry", formatNumber(position.avg_entry_price), Modifier.weight(1f))
+                MetricBlock("Mark", formatNumber(position.mark_price), Modifier.weight(1f))
+                MetricBlock("Liq", formatNumber(position.liq_price), Modifier.weight(1f))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock("TP", formatNumber(position.tp_price), Modifier.weight(1f))
+                MetricBlock("Stop", formatNumber(position.stop_price), Modifier.weight(1f))
+                MetricBlock(
+                    "Hold",
+                    "${formatHours(position.age_h)} / ${formatHours(position.max_hold_h)}",
+                    Modifier.weight(1f),
+                )
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock(
+                    "Top-up",
+                    "\$${formatMoney(position.margin_topup_usd)} / \$${formatMoney(position.margin_topup_cap_usd)}",
+                    Modifier.weight(1f),
+                )
+                MetricBlock(
+                    "Ladder",
+                    "${position.legs_filled} filled · ${position.legs_open} open",
+                    Modifier.weight(1f),
+                )
+            }
+            position.last_error?.takeIf { it.isNotBlank() }?.let {
+                Text("Error: $it", color = MaterialTheme.colorScheme.error)
+            }
+            TextButton(onClick = { expanded = !expanded }) {
+                Text(if (expanded) "Hide details" else "Details")
+            }
+            AnimatedVisibility(expanded) {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    SectionCard("Protection") {
+                        KeyValue("Take profit", formatNumber(position.tp_price))
+                        KeyValue("Emergency stop", formatNumber(position.stop_price))
+                        KeyValue("Liquidation", formatNumber(position.liq_price))
+                        KeyValue("Remaining hold", formatHours(position.remaining_hold_h))
+                    }
+                    SectionCard("Ladder") {
+                        if (position.legs.isEmpty()) {
+                            Text(
+                                "No ladder legs reported.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        position.legs.forEachIndexed { index, leg ->
+                            if (index > 0) HorizontalDivider()
+                            KeyValue("Step", leg.step?.toString() ?: "-")
+                            KeyValue("Status", leg.status ?: "-")
+                            KeyValue("Trigger", formatNumber(leg.trigger_price))
+                            KeyValue("Filled qty", formatNumber(leg.filled_qty))
+                            KeyValue("Notional", "\$${formatMoney(leg.notional_usd)}")
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1108,6 +1431,31 @@ private fun RiskChip(distancePct: Double?, riskLevel: String?) {
 }
 
 @Composable
+private fun OverviewRiskPill(tone: OverviewRiskTone) {
+    val color = when (tone) {
+        OverviewRiskTone.Ok -> Color(0xFF2E7D32)
+        OverviewRiskTone.Warn -> Color(0xFFE67E22)
+        OverviewRiskTone.High -> Color(0xFFB3261E)
+        OverviewRiskTone.Unknown -> Color(0xFF6B7280)
+    }
+    val label = when (tone) {
+        OverviewRiskTone.Ok -> "PROTECTED"
+        OverviewRiskTone.Warn -> "CHECK"
+        OverviewRiskTone.High -> "RISK"
+        OverviewRiskTone.Unknown -> "UNKNOWN"
+    }
+    AssistChip(
+        onClick = {},
+        enabled = false,
+        label = { Text(label) },
+        colors = AssistChipDefaults.assistChipColors(
+            disabledContainerColor = color.copy(alpha = 0.12f),
+            disabledLabelColor = color,
+        ),
+    )
+}
+
+@Composable
 private fun StatusPill(status: String) {
     val color = when (status) {
         "ok" -> Color(0xFF2E7D32)
@@ -1177,10 +1525,10 @@ private fun SimpleSelect(label: String, value: String, options: List<String>, on
 private fun formatNumber(value: Double?): String = value?.let(::formatInputNumber) ?: "-"
 
 private fun formatMoney(value: Double?): String = value?.let {
-    String.format("%,.2f", it)
+    String.format(Locale.ROOT, "%,.2f", it)
 } ?: "-"
 
-private fun formatMoney(value: Double): String = String.format("%,.2f", value)
+private fun formatMoney(value: Double): String = String.format(Locale.ROOT, "%,.2f", value)
 
 private fun formatSigned(value: Double?): String = value?.let {
     val prefix = if (it > 0) "+" else ""
@@ -1190,6 +1538,18 @@ private fun formatSigned(value: Double?): String = value?.let {
 private fun formatPercent(value: Double?): String = value?.let { "${formatNumber(it)}%" } ?: "-"
 
 private fun formatRatio(value: Double?): String = value?.let { "${formatNumber(it * 100.0)}%" } ?: "-"
+
+private fun formatAgeSeconds(value: Double?): String {
+    if (value == null) return "-"
+    return when {
+        value < 60 -> "${value.toInt()}s ago"
+        value < 3600 -> "${(value / 60).toInt()}m ago"
+        else -> "${formatNumber(value / 3600)}h ago"
+    }
+}
+
+private fun formatHours(value: Double?): String =
+    value?.let { "${formatNumber(it)}h" } ?: "-"
 
 private fun formatMinutes(value: Double?): String {
     if (value == null) return "-"
