@@ -266,3 +266,12 @@ Pump-specific risk events use the same configured primary/fallback
 notification route as the main FeeArb monitor. Notification delivery is
 failure-isolated from order, margin, reconciliation, and emergency-close
 actions, and every delivery result is written to the Pump live JSONL audit.
+
+The live risk layer was hardened before the first position: Bybit now receives
+a full-position Mark Price TP plus a catastrophic SL kept `2.5%` inside the
+current short liquidation price. A margin top-up is immediately verified from
+a fresh exchange position; the critical `10%` buffer bypasses the ordinary
+five-minute top-up cooldown and closes if the verified buffer remains
+critical. Pump can return only its own tracked top-up margin, after two
+consecutive `>=35%` buffer scans and a 30-minute adjustment cooldown, in `$25`
+chunks. Any removal that leaves less than `30%` is rolled back immediately.

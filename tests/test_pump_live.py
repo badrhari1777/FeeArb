@@ -19,10 +19,14 @@ class FakePumpGateway:
         self.positions: list[dict[str, Any]] = []
         self.orders: list[dict[str, Any]] = []
         self.take_profits: list[tuple[str, float]] = []
+        self.protections: list[tuple[str, float, float]] = []
         self.margin_adds: list[tuple[str, float]] = []
+        self.margin_removes: list[tuple[str, float]] = []
         self.leverage_calls: list[tuple[str, float]] = []
         self.canceled: list[str] = []
         self.fail_market = False
+        self.liq_after_add: float | None = None
+        self.liq_after_remove: float | None = None
 
     def credentials_status(self) -> dict[str, Any]:
         return {
@@ -153,13 +157,33 @@ class FakePumpGateway:
             if order.get("id") == order_id:
                 order["status"] = "canceled"
 
-    def set_full_take_profit(self, symbol: str, price: float) -> dict[str, Any]:
-        self.take_profits.append((symbol, price))
+    def set_full_protection(
+        self,
+        symbol: str,
+        *,
+        take_profit_price: float,
+        stop_loss_price: float,
+    ) -> dict[str, Any]:
+        self.take_profits.append((symbol, take_profit_price))
+        self.protections.append((symbol, take_profit_price, stop_loss_price))
         return {"status": "ok"}
 
     def add_margin(self, symbol: str, amount_usd: float) -> dict[str, Any]:
         self.margin_adds.append((symbol, amount_usd))
         self.balance["available"] -= amount_usd
+        if self.liq_after_add is not None:
+            for position in self.positions:
+                if position.get("symbol") == symbol:
+                    position["liq_price"] = self.liq_after_add
+        return {"status": "ok"}
+
+    def remove_margin(self, symbol: str, amount_usd: float) -> dict[str, Any]:
+        self.margin_removes.append((symbol, amount_usd))
+        self.balance["available"] += amount_usd
+        if self.liq_after_remove is not None:
+            for position in self.positions:
+                if position.get("symbol") == symbol:
+                    position["liq_price"] = self.liq_after_remove
         return {"status": "ok"}
 
 
@@ -259,6 +283,8 @@ def test_arm_ignores_old_signal_and_opens_new_main_signal(tmp_path: Path) -> Non
     assert len(gateway.orders) == 2
     assert gateway.leverage_calls == [("TESTUSDT", 3.0)]
     assert gateway.take_profits[-1] == ("TESTUSDT", 7.5)
+    assert gateway.protections[-1] == ("TESTUSDT", 7.5, 14.625)
+    assert open_items[0]["stop_price"] == 14.625
 
 
 def test_flat_position_needs_two_cycles_then_cancels_ladder(tmp_path: Path) -> None:
@@ -365,6 +391,147 @@ def test_liquidation_buffer_adds_margin_from_reserved_cash(tmp_path: Path) -> No
 
     assert gateway.margin_adds == [("TESTUSDT", 25.0)]
     assert status["positions"][0]["margin_topup_usd"] == 25.0
+
+
+def test_critical_buffer_bypasses_topup_cooldown_and_closes(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    controller._state["positions"][0]["last_topup_at_ms"] = int(time.time() * 1000)  # pylint: disable=protected-access
+    gateway.balance["available"] = 25.0
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 14.0
+
+    status = controller.run_cycle()
+
+    assert gateway.positions == []
+    assert status["positions"][0]["status"] == "closing"
+    assert status["positions"][0]["close_reason"] == "emergency_liq_buffer"
+
+
+def test_topup_is_immediately_verified_and_closes_if_buffer_stays_critical(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 14.0
+
+    status = controller.run_cycle()
+
+    assert gateway.margin_adds == [("TESTUSDT", 50.0)]
+    assert gateway.positions == []
+    assert status["positions"][0]["close_reason"] == "emergency_buffer_after_topup"
+
+
+def test_only_bot_added_margin_is_removed_after_safe_hysteresis(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 15.0
+    controller.run_cycle()
+    assert controller.status()["positions"][0]["margin_topup_usd"] == 25.0
+
+    controller._state["positions"][0]["last_topup_at_ms"] = (  # pylint: disable=protected-access
+        int(time.time() * 1000) - 1_900_000
+    )
+    gateway.positions[0]["mark_price"] = 10.0
+    gateway.positions[0]["liq_price"] = 15.0
+    controller.run_cycle()
+    assert gateway.margin_removes == []
+
+    status = controller.run_cycle()
+
+    assert gateway.margin_removes == [("TESTUSDT", 25.0)]
+    assert status["positions"][0]["margin_topup_usd"] == 0.0
+    assert status["positions"][0]["liq_buffer_pct"] == 50.0
+
+
+def test_unsafe_margin_reduction_is_rolled_back_immediately(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    gateway.liq_after_add = 15.0
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 15.0
+    controller.run_cycle()
+    controller._state["positions"][0]["last_topup_at_ms"] = (  # pylint: disable=protected-access
+        int(time.time() * 1000) - 1_900_000
+    )
+    gateway.positions[0]["mark_price"] = 10.0
+    gateway.positions[0]["liq_price"] = 15.0
+    gateway.liq_after_remove = 12.5
+    controller.run_cycle()
+
+    status = controller.run_cycle()
+
+    assert gateway.margin_removes == [("TESTUSDT", 25.0)]
+    assert gateway.margin_adds == [("TESTUSDT", 25.0), ("TESTUSDT", 25.0)]
+    assert status["positions"][0]["margin_topup_usd"] == 25.0
+    assert status["positions"][0]["liq_price"] == 15.0
+
+
+def test_exchange_stop_is_resynced_when_liquidation_price_moves(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    assert gateway.protections[-1] == ("TESTUSDT", 7.5, 14.625)
+
+    gateway.positions[0]["liq_price"] = 16.0
+    status = controller.run_cycle()
+
+    assert gateway.protections[-1] == ("TESTUSDT", 7.5, 15.6)
+    assert status["positions"][0]["stop_price"] == 15.6
 
 
 def test_four_slot_cap_can_open_four_distinct_main_signals(tmp_path: Path) -> None:

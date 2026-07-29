@@ -102,6 +102,18 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live risk parity was hardened before its first real position. Full-mode
+  Bybit protection now synchronizes both Mark Price TP and a catastrophic SL
+  `2.5%` inside the current short liquidation price after qty/average/liq
+  changes. Top-ups are immediately re-read from the exchange; a verified
+  buffer at or below `10%` closes reduce-only without waiting for the normal
+  five-minute top-up cooldown. Pump can remove only its own tracked added
+  margin: two consecutive `>=35%` buffer scans, 30-minute adjustment cooldown,
+  `$25` chunks, and immediate rollback below a `30%` post-removal buffer.
+  Verification uncertainty disarms new entries and is audited/notified.
+  Verified Pump tests (`18 passed`) and the expanded Pump/account/stop/derisk
+  regression set (`193 passed`).
+
 - Pump Live was advanced to the complete fixed four-slot configuration on
   2026-07-29 by explicit operator decision after a clean dedicated-subaccount
   preflight. The local ignored `config/pump_live.env` now uses

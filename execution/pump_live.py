@@ -44,12 +44,17 @@ class PumpLiveConfig:
     warning_liq_buffer_pct: float = 20.0
     panic_liq_buffer_pct: float = 15.0
     emergency_liq_buffer_pct: float = 10.0
+    exchange_stop_gap_from_liq_pct: float = 2.5
     margin_topup_chunk_usd: float = 25.0
     max_position_topup_usd: float = 175.0
     max_total_topup_usd: float = 275.0
     operating_cash_floor_usd: float = 25.0
     flat_confirm_cycles: int = 2
     topup_cooldown_sec: int = 300
+    margin_reduce_trigger_buffer_pct: float = 35.0
+    margin_reduce_target_buffer_pct: float = 30.0
+    margin_reduce_confirm_cycles: int = 2
+    margin_reduce_cooldown_sec: int = 1_800
     preflight_max_age_sec: int = 300
 
     @property
@@ -99,9 +104,17 @@ class PumpGateway(Protocol):
 
     def cancel_order(self, order_id: str, symbol: str) -> None: ...
 
-    def set_full_take_profit(self, symbol: str, price: float) -> dict[str, Any]: ...
+    def set_full_protection(
+        self,
+        symbol: str,
+        *,
+        take_profit_price: float,
+        stop_loss_price: float,
+    ) -> dict[str, Any]: ...
 
     def add_margin(self, symbol: str, amount_usd: float) -> dict[str, Any]: ...
+
+    def remove_margin(self, symbol: str, amount_usd: float) -> dict[str, Any]: ...
 
 
 class PumpLiveNotifier(Protocol):
@@ -546,19 +559,30 @@ class BybitPumpLiveGateway:
                 if "order not exists" not in message and "110001" not in message:
                     raise
 
-    def set_full_take_profit(self, symbol: str, price: float) -> dict[str, Any]:
+    def set_full_protection(
+        self,
+        symbol: str,
+        *,
+        take_profit_price: float,
+        stop_loss_price: float,
+    ) -> dict[str, Any]:
         with self._lock:
             client = self._ensure_client()
             market = self._market(symbol)
-            trigger = client.price_to_precision(str(market.get("symbol")), price)
+            ccxt_symbol = str(market.get("symbol"))
+            take_trigger = client.price_to_precision(ccxt_symbol, take_profit_price)
+            stop_trigger = client.price_to_precision(ccxt_symbol, stop_loss_price)
             payload = client.private_post_v5_position_trading_stop(
                 {
                     "category": "linear",
                     "symbol": market.get("id"),
-                    "takeProfit": str(trigger),
+                    "takeProfit": str(take_trigger),
+                    "stopLoss": str(stop_trigger),
                     "tpTriggerBy": "MarkPrice",
+                    "slTriggerBy": "MarkPrice",
                     "tpslMode": "Full",
                     "tpOrderType": "Market",
+                    "slOrderType": "Market",
                     "positionIdx": 0,
                 }
             )
@@ -572,6 +596,19 @@ class BybitPumpLiveGateway:
                     "category": "linear",
                     "symbol": market.get("id"),
                     "margin": str(round(amount_usd, 4)),
+                    "positionIdx": 0,
+                }
+            )
+            return _compact_exchange_result(payload)
+
+    def remove_margin(self, symbol: str, amount_usd: float) -> dict[str, Any]:
+        with self._lock:
+            market = self._market(symbol)
+            payload = self._ensure_client().private_post_v5_position_add_margin(
+                {
+                    "category": "linear",
+                    "symbol": market.get("id"),
+                    "margin": str(round(-abs(amount_usd), 4)),
                     "positionIdx": 0,
                 }
             )
@@ -916,10 +953,13 @@ class PumpLiveController:
                 "mark_price": reference_price,
                 "liq_price": None,
                 "tp_price": None,
+                "stop_price": None,
                 "max_hold_h": _safe_int(tier.get("max_hold_h"), 168),
                 "flat_confirm_count": 0,
                 "margin_topup_usd": 0.0,
                 "last_topup_at_ms": None,
+                "last_margin_reduce_at_ms": None,
+                "margin_reduce_confirm_count": 0,
                 "last_error": None,
                 "open_decision": _compact_decision(decision),
             }
@@ -1045,46 +1085,114 @@ class PumpLiveController:
             return
         old_qty = _safe_float(item.get("qty"), 0.0)
         old_avg = _safe_float(item.get("avg_entry_price"), 0.0)
-        qty = _safe_float(exchange.get("qty"), 0.0)
-        avg = _safe_float(exchange.get("avg_price"), 0.0)
-        mark = _safe_float(exchange.get("mark_price"), 0.0)
-        liq = _optional_float(exchange.get("liq_price"))
+        old_liq = _optional_float(item.get("liq_price"))
+        self._apply_exchange_position(item, exchange)
+        qty = _safe_float(item.get("qty"), 0.0)
+        avg = _safe_float(item.get("avg_entry_price"), 0.0)
+        mark = _safe_float(item.get("mark_price"), 0.0)
+        liq = _optional_float(item.get("liq_price"))
+        if item.get("status") == "closing":
+            return
+        self._refresh_leg_statuses(item)
+        desired_stop = self._desired_emergency_stop(liq, config)
+        if desired_stop is not None and mark >= desired_stop:
+            self._close_position(item, "emergency_exchange_stop_reached", config)
+            return
+        self._sync_full_protection(
+            item,
+            config,
+            force=(
+                abs(qty - old_qty) > max(1e-8, qty * 1e-6)
+                or abs(avg - old_avg) > max(1e-10, avg * 1e-6)
+                or _material_float_change(liq, old_liq)
+            ),
+        )
+        max_hold_ms = _safe_int(item.get("max_hold_h"), 168) * 3_600_000
+        if _now_ms() - _safe_int(item.get("opened_at_ms"), _now_ms()) >= max_hold_ms:
+            self._close_position(item, "time_stop", config)
+            return
+        self._maybe_topup_or_emergency(item, config)
+
+    def _apply_exchange_position(
+        self,
+        item: dict[str, Any],
+        exchange: Mapping[str, Any],
+    ) -> None:
         with self._lock:
             item.update(
                 {
-                    "qty": qty,
-                    "avg_entry_price": avg,
-                    "mark_price": mark,
-                    "liq_price": liq,
+                    "qty": _safe_float(exchange.get("qty"), 0.0),
+                    "avg_entry_price": _safe_float(exchange.get("avg_price"), 0.0),
+                    "mark_price": _safe_float(exchange.get("mark_price"), 0.0),
+                    "liq_price": _optional_float(exchange.get("liq_price")),
                     "unrealized_pnl_usd": _safe_float(exchange.get("unrealized_pnl"), 0.0),
                     "flat_confirm_count": 0,
                     "updated_at_ms": _now_ms(),
                 }
             )
             self._save_state_locked()
-        if item.get("status") == "closing":
-            return
-        self._refresh_leg_statuses(item)
+
+    @staticmethod
+    def _desired_emergency_stop(
+        liq_price: float | None,
+        config: PumpLiveConfig,
+    ) -> float | None:
+        if liq_price is None or liq_price <= 0:
+            return None
+        gap = max(0.1, min(20.0, config.exchange_stop_gap_from_liq_pct))
+        return liq_price * (1.0 - gap / 100.0)
+
+    def _sync_full_protection(
+        self,
+        item: dict[str, Any],
+        config: PumpLiveConfig,
+        *,
+        force: bool = False,
+    ) -> None:
+        symbol = _normalize_symbol(item.get("symbol"))
+        qty = _safe_float(item.get("qty"), 0.0)
+        avg = _safe_float(item.get("avg_entry_price"), 0.0)
+        mark = _safe_float(item.get("mark_price"), 0.0)
+        liq = _optional_float(item.get("liq_price"))
         tp_pct = _safe_float((item.get("tier") or {}).get("tp_pct"), 25.0)
         desired_tp = avg * (1.0 - tp_pct / 100.0) if avg > 0 else 0.0
+        desired_stop = self._desired_emergency_stop(liq, config)
+        if qty <= 0 or desired_tp <= 0 or desired_stop is None:
+            raise RuntimeError("pump_live_full_protection_inputs_missing")
+        if desired_tp >= mark or desired_stop <= mark:
+            raise RuntimeError("pump_live_full_protection_price_invalid")
         old_tp = _safe_float(item.get("tp_price"), 0.0)
-        if desired_tp > 0 and (
-            old_tp <= 0
-            or abs(qty - old_qty) > max(1e-8, qty * 1e-6)
-            or abs(avg - old_avg) > max(1e-10, avg * 1e-6)
+        old_stop = _safe_float(item.get("stop_price"), 0.0)
+        needs_sync = (
+            force
+            or old_tp <= 0
+            or old_stop <= 0
             or abs(desired_tp - old_tp) > max(1e-10, desired_tp * 1e-6)
-        ):
-            self.gateway.set_full_take_profit(symbol, desired_tp)
-            with self._lock:
-                item["tp_price"] = desired_tp
-                item["tp_updated_at_ms"] = _now_ms()
-                self._save_state_locked()
-            self._event("take_profit_synced", {"symbol": symbol, "price": desired_tp, "qty": qty})
-        max_hold_ms = _safe_int(item.get("max_hold_h"), 168) * 3_600_000
-        if _now_ms() - _safe_int(item.get("opened_at_ms"), _now_ms()) >= max_hold_ms:
-            self._close_position(item, "time_stop", config)
+            or abs(desired_stop - old_stop) > max(1e-10, desired_stop * 1e-6)
+        )
+        if not needs_sync:
             return
-        self._maybe_topup_or_emergency(item, config)
+        self.gateway.set_full_protection(
+            symbol,
+            take_profit_price=desired_tp,
+            stop_loss_price=desired_stop,
+        )
+        now = _now_ms()
+        with self._lock:
+            item["tp_price"] = desired_tp
+            item["stop_price"] = desired_stop
+            item["protection_updated_at_ms"] = now
+            item["updated_at_ms"] = now
+            self._save_state_locked()
+        self._event(
+            "full_protection_synced",
+            {
+                "symbol": symbol,
+                "take_profit_price": desired_tp,
+                "stop_loss_price": desired_stop,
+                "qty": qty,
+            },
+        )
 
     def _refresh_leg_statuses(self, item: dict[str, Any]) -> None:
         symbol = _normalize_symbol(item.get("symbol"))
@@ -1130,10 +1238,15 @@ class PumpLiveController:
             item["liq_buffer_pct"] = buffer_pct
             self._save_state_locked()
         if buffer_pct > config.warning_liq_buffer_pct:
+            self._maybe_reduce_bot_margin(item, config, buffer_pct)
             return
+        with self._lock:
+            item["margin_reduce_confirm_count"] = 0
+            self._save_state_locked()
         now = _now_ms()
         last_topup = _safe_int(item.get("last_topup_at_ms"), 0)
-        if now - last_topup < config.topup_cooldown_sec * 1000:
+        topup_in_cooldown = now - last_topup < config.topup_cooldown_sec * 1000
+        if topup_in_cooldown and buffer_pct > config.emergency_liq_buffer_pct:
             return
         position_topup = _safe_float(item.get("margin_topup_usd"), 0.0)
         with self._lock:
@@ -1155,26 +1268,45 @@ class PumpLiveController:
             max(0.0, available - config.operating_cash_floor_usd),
         )
         if allowed >= 1.0:
-            self.gateway.add_margin(_normalize_symbol(item.get("symbol")), allowed)
+            symbol = _normalize_symbol(item.get("symbol"))
+            self.gateway.add_margin(symbol, allowed)
             position_topup_after = position_topup + allowed
             total_topup_after = total_topup + allowed
             available_after = max(0.0, available - allowed)
             with self._lock:
                 item["margin_topup_usd"] = position_topup_after
                 item["last_topup_at_ms"] = now
+                item["margin_reduce_confirm_count"] = 0
                 item["updated_at_ms"] = now
                 self._save_state_locked()
+            verified = self._fetch_exchange_short(symbol)
+            if verified is None:
+                self.disarm("margin_topup_position_unconfirmed")
+                self._event(
+                    "margin_topup_verification_failed",
+                    {"symbol": symbol, "amount_usd": allowed},
+                )
+                return
+            self._apply_exchange_position(item, verified)
+            verified_mark = _safe_float(item.get("mark_price"), 0.0)
+            verified_liq = _optional_float(item.get("liq_price"))
+            verified_buffer = _short_liq_buffer_pct(verified_mark, verified_liq)
             self._event(
                 "margin_added",
                 {
-                    "symbol": item.get("symbol"),
+                    "symbol": symbol,
                     "amount_usd": allowed,
                     "liq_buffer_pct_before": buffer_pct,
+                    "liq_buffer_pct_after": verified_buffer,
                     "position_topup_usd": position_topup_after,
                     "total_topup_usd": total_topup_after,
                     "available_after_usd": available_after,
                 },
             )
+            if verified_buffer is None or verified_buffer <= config.emergency_liq_buffer_pct:
+                self._close_position(item, "emergency_buffer_after_topup", config)
+                return
+            self._sync_full_protection(item, config, force=True)
             return
         if buffer_pct <= config.emergency_liq_buffer_pct:
             self._close_position(item, "emergency_liq_buffer", config)
@@ -1190,6 +1322,97 @@ class PumpLiveController:
                     "total_topup_usd": total_topup,
                 },
             )
+
+    def _fetch_exchange_short(self, symbol: str) -> dict[str, Any] | None:
+        return next(
+            (
+                row
+                for row in self.gateway.fetch_positions()
+                if _normalize_symbol(row.get("symbol")) == symbol and row.get("side") == "short"
+            ),
+            None,
+        )
+
+    def _maybe_reduce_bot_margin(
+        self,
+        item: dict[str, Any],
+        config: PumpLiveConfig,
+        buffer_pct: float,
+    ) -> None:
+        tracked_topup = _safe_float(item.get("margin_topup_usd"), 0.0)
+        if tracked_topup < 1.0 or buffer_pct < config.margin_reduce_trigger_buffer_pct:
+            with self._lock:
+                item["margin_reduce_confirm_count"] = 0
+                self._save_state_locked()
+            return
+        confirm_count = _safe_int(item.get("margin_reduce_confirm_count"), 0) + 1
+        with self._lock:
+            item["margin_reduce_confirm_count"] = confirm_count
+            self._save_state_locked()
+        if confirm_count < config.margin_reduce_confirm_cycles:
+            return
+        now = _now_ms()
+        last_adjust = max(
+            _safe_int(item.get("last_topup_at_ms"), 0),
+            _safe_int(item.get("last_margin_reduce_at_ms"), 0),
+        )
+        if now - last_adjust < config.margin_reduce_cooldown_sec * 1000:
+            return
+        symbol = _normalize_symbol(item.get("symbol"))
+        amount = min(config.margin_topup_chunk_usd, tracked_topup)
+        if amount < 1.0:
+            return
+        self.gateway.remove_margin(symbol, amount)
+        verified = self._fetch_exchange_short(symbol)
+        if verified is None:
+            self.disarm("margin_reduce_position_unconfirmed")
+            self._event(
+                "margin_reduce_verification_failed",
+                {"symbol": symbol, "amount_usd": amount},
+            )
+            return
+        self._apply_exchange_position(item, verified)
+        verified_buffer = _short_liq_buffer_pct(
+            _safe_float(item.get("mark_price"), 0.0),
+            _optional_float(item.get("liq_price")),
+        )
+        if verified_buffer is None or verified_buffer < config.margin_reduce_target_buffer_pct:
+            self.gateway.add_margin(symbol, amount)
+            restored = self._fetch_exchange_short(symbol)
+            if restored is not None:
+                self._apply_exchange_position(item, restored)
+            with self._lock:
+                item["last_margin_reduce_at_ms"] = now
+                item["margin_reduce_confirm_count"] = 0
+                self._save_state_locked()
+            self._event(
+                "margin_reduce_rolled_back",
+                {
+                    "symbol": symbol,
+                    "amount_usd": amount,
+                    "liq_buffer_pct_after_remove": verified_buffer,
+                },
+            )
+            self._sync_full_protection(item, config, force=True)
+            return
+        remaining = max(0.0, tracked_topup - amount)
+        with self._lock:
+            item["margin_topup_usd"] = remaining
+            item["last_margin_reduce_at_ms"] = now
+            item["margin_reduce_confirm_count"] = 0
+            item["updated_at_ms"] = now
+            self._save_state_locked()
+        self._event(
+            "margin_removed",
+            {
+                "symbol": symbol,
+                "amount_usd": amount,
+                "liq_buffer_pct_before": buffer_pct,
+                "liq_buffer_pct_after": verified_buffer,
+                "position_topup_usd": remaining,
+            },
+        )
+        self._sync_full_protection(item, config, force=True)
 
     def _close_position(self, item: dict[str, Any], reason: str, config: PumpLiveConfig) -> None:
         symbol = _normalize_symbol(item.get("symbol"))
@@ -1547,15 +1770,22 @@ def _pump_live_notification(
     if event == "margin_added":
         amount = _safe_float(payload.get("amount_usd"), 0.0)
         buffer_pct = _safe_float(payload.get("liq_buffer_pct_before"), 0.0)
+        buffer_after = _optional_float(payload.get("liq_buffer_pct_after"))
         position_total = _safe_float(payload.get("position_topup_usd"), 0.0)
         portfolio_total = _safe_float(payload.get("total_topup_usd"), 0.0)
         available_after = _safe_float(payload.get("available_after_usd"), 0.0)
+        buffer_after_line = (
+            f"\nБуфер после проверки: {buffer_after:.2f}%"
+            if buffer_after is not None
+            else "\nБуфер после проверки: не подтверждён"
+        )
         return (
             f"Pump Live TOP-UP {symbol}",
             (
                 f"Pump Live: добавлена изолированная маржа{symbol_line}"
                 f"\nСумма: ${amount:.2f}"
                 f"\nБуфер до пополнения: {buffer_pct:.2f}%"
+                f"{buffer_after_line}"
                 f"\nВсего по позиции: ${position_total:.2f}"
                 f"\nВсего по Pump-портфелю: ${portfolio_total:.2f}"
                 f"\nСвободно после: ${available_after:.2f}"
@@ -1579,6 +1809,46 @@ def _pump_live_notification(
                 "\nНовые входы отключены."
             ),
             f"margin_blocked:{symbol}",
+            300,
+        )
+    if event == "margin_removed":
+        amount = _safe_float(payload.get("amount_usd"), 0.0)
+        buffer_after = _safe_float(payload.get("liq_buffer_pct_after"), 0.0)
+        remaining = _safe_float(payload.get("position_topup_usd"), 0.0)
+        return (
+            f"Pump Live возврат резерва {symbol}",
+            (
+                f"Pump Live: снята ранее добавленная маржа{symbol_line}"
+                f"\nСумма: ${amount:.2f}"
+                f"\nБуфер после: {buffer_after:.2f}%"
+                f"\nОсталось добавленной маржи: ${remaining:.2f}"
+            ),
+            f"margin_removed:{symbol}:{remaining:.2f}",
+            0,
+        )
+    if event == "margin_reduce_rolled_back":
+        amount = _safe_float(payload.get("amount_usd"), 0.0)
+        buffer_after = _optional_float(payload.get("liq_buffer_pct_after_remove"))
+        return (
+            f"Pump Live возврат маржи отменён {symbol}",
+            (
+                f"Pump Live: снятие маржи немедленно отменено{symbol_line}"
+                f"\nСумма возвращена в позицию: ${amount:.2f}"
+                f"\nБуфер после пробного снятия: {buffer_after if buffer_after is not None else 'не подтверждён'}"
+            ),
+            f"margin_reduce_rollback:{symbol}",
+            300,
+        )
+    if event in {"margin_topup_verification_failed", "margin_reduce_verification_failed"}:
+        amount = _safe_float(payload.get("amount_usd"), 0.0)
+        return (
+            f"Pump Live маржа не подтверждена {symbol}",
+            (
+                f"Pump Live: результат изменения маржи не подтверждён{symbol_line}"
+                f"\nСумма: ${amount:.2f}"
+                "\nНовые входы отключены; требуется проверка позиции на бирже."
+            ),
+            f"{event}:{symbol}",
             300,
         )
     if event == "position_close_submitted":
@@ -1780,6 +2050,18 @@ def _optional_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
+
+
+def _material_float_change(current: float | None, previous: float | None) -> bool:
+    if current is None or previous is None:
+        return current != previous
+    return abs(current - previous) > max(1e-10, abs(current) * 1e-6)
+
+
+def _short_liq_buffer_pct(mark_price: float, liq_price: float | None) -> float | None:
+    if mark_price <= 0 or liq_price is None or liq_price <= mark_price:
+        return None
+    return (liq_price / mark_price - 1.0) * 100.0
 
 
 def _safe_float(value: Any, default: float) -> float:

@@ -122,8 +122,11 @@ positions continue in recovery monitoring.
 - The first ladder leg is a guarded market short.
 - Remaining legs are post-only short limits at the strategy's actual tier
   prices and weights.
-- A full-position market take-profit is synchronized after every quantity or
-  average-entry change.
+- A full-position market take-profit and a catastrophic exchange-side
+  stop-loss are synchronized after every quantity, average-entry, or
+  liquidation-price change. The stop sits `2.5%` inside the current
+  liquidation price and uses Mark Price, so it remains available if the
+  backend or API monitor is temporarily unavailable.
 - A time stop uses the tier's configured maximum hold.
 - The monitor polls every `15` seconds.
 - New entries are blocked on unknown positions/orders, insufficient reserve,
@@ -133,9 +136,18 @@ positions continue in recovery monitoring.
   after two consecutive flat scans.
 - Liquidation distance is monitored. Margin is added from the subaccount
   reserve in capped `$25/$50` steps; per-position and portfolio top-up caps are
-  enforced. If the emergency buffer is reached and no allowed reserve remains,
-  the bot cancels its adds and submits a reduce-only market close. Normal
-  orders use a `50 bps` depth guard; emergency exits allow up to `300 bps`.
+  enforced. Warning/panic/emergency buffers are `20% / 15% / 10%`.
+- Every top-up is followed immediately by a fresh position read. If the buffer
+  is still at or below `10%`, the bot does not wait for the five-minute top-up
+  cooldown: it cancels adds and submits a reduce-only emergency close.
+- Only margin previously added and recorded by Pump Live can be removed
+  automatically. Removal starts after two consecutive scans at or above a
+  `35%` buffer and at least 30 minutes after the previous margin adjustment,
+  in `$25` chunks. The post-removal position is read immediately; a buffer
+  below `30%` causes the same amount to be restored at once.
+- If the emergency buffer is reached and no allowed reserve remains, the bot
+  cancels its adds and submits a reduce-only market close. Normal orders use a
+  `50 bps` depth guard; emergency exits allow up to `300 bps`.
 - Pump Live uses the same configured primary/fallback notification router as
   the main FeeArb account monitor. Arm/disarm, live entry, margin top-up,
   blocked top-up, close submission, confirmed flat state, emergency close, and
