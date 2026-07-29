@@ -48,7 +48,7 @@ from .bybit_pump_short_lab import (
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-07-12-01"
+STATIC_VERSION = "v2026-07-29-pump-live-01"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -324,6 +324,10 @@ class BybitPumpShortShadowStartPayload(BaseModel):
 class BybitPumpShortShadowSchedulePayload(BybitPumpShortShadowStartPayload):
     interval_sec: Optional[int] = Field(default=3600, ge=60, le=86400)
     run_immediately: Optional[bool] = True
+
+
+class PumpLiveConfirmationPayload(BaseModel):
+    confirmation: str
 
 
 class NotificationTestPayload(BaseModel):
@@ -632,6 +636,54 @@ async def pump_short_dashboard_api() -> JSONResponse:
 @app.get("/api/pump-short/strategies")
 async def pump_short_strategies_api() -> JSONResponse:
     return JSONResponse(jsonable_encoder(bybit_pump_short_lab.strategy_monitor_status()))
+
+
+@app.get("/api/pump-short/live")
+async def pump_short_live_status_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(bybit_pump_short_lab.pump_live_status()))
+
+
+@app.post("/api/pump-short/live/preflight")
+async def pump_short_live_preflight_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(bybit_pump_short_lab.pump_live_preflight()))
+
+
+@app.post("/api/pump-short/live/prepare")
+async def pump_short_live_prepare_api(payload: PumpLiveConfirmationPayload) -> JSONResponse:
+    try:
+        result = bybit_pump_short_lab.pump_live_prepare(payload.confirmation)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/pump-short/live/arm")
+async def pump_short_live_arm_api(payload: PumpLiveConfirmationPayload) -> JSONResponse:
+    try:
+        result = bybit_pump_short_lab.pump_live_arm(payload.confirmation)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/pump-short/live/disarm")
+async def pump_short_live_disarm_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(bybit_pump_short_lab.pump_live_disarm()))
+
+
+@app.post("/api/pump-short/live/emergency-close")
+async def pump_short_live_emergency_close_api(
+    payload: PumpLiveConfirmationPayload,
+) -> JSONResponse:
+    try:
+        result = bybit_pump_short_lab.pump_live_emergency_close(payload.confirmation)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
 
 
 @app.post("/api/pump-short/bybit/start")

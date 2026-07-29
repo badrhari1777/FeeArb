@@ -63,6 +63,53 @@
       </form>
     </section>
 
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <div>
+          <h2>Pump Live Canary &middot; Bybit Subaccount</h2>
+          <p class="muted">Main pullback-tier only &middot; $700 deployable &middot; $300 reserve &middot; four $175 slots &middot; entries disabled after every backend restart.</p>
+        </div>
+        <div class="panel-actions">
+          <button type="button" class="button button--ghost" id="pss-live-preflight">Read-only preflight</button>
+          <button type="button" class="button button--ghost" id="pss-live-prepare">Prepare isolated / one-way</button>
+          <button type="button" class="button" id="pss-live-arm">Arm live</button>
+          <button type="button" class="button button--danger" id="pss-live-disarm">Disarm entries</button>
+          <button type="button" class="button button--danger" id="pss-live-emergency">Emergency close all</button>
+        </div>
+      </div>
+      <div class="pump-dashboard-band">
+        <div class="pump-dashboard-stat"><span>Status</span><strong id="pss-live-status">disabled</strong></div>
+        <div class="pump-dashboard-stat"><span>Credentials</span><strong id="pss-live-credentials">missing</strong></div>
+        <div class="pump-dashboard-stat"><span>API key</span><strong id="pss-live-key-expiry">not checked</strong></div>
+        <div class="pump-dashboard-stat"><span>Preflight</span><strong id="pss-live-preflight-status">not checked</strong></div>
+        <div class="pump-dashboard-stat"><span>Balance</span><strong id="pss-live-balance">$0.00</strong></div>
+        <div class="pump-dashboard-stat"><span>Available</span><strong id="pss-live-available">$0.00</strong></div>
+        <div class="pump-dashboard-stat"><span>Open / cap</span><strong id="pss-live-slots">0 / 1</strong></div>
+        <div class="pump-dashboard-stat"><span>Reserve floor</span><strong id="pss-live-reserve">$300.00</strong></div>
+        <div class="pump-dashboard-stat"><span>Last cycle</span><strong id="pss-live-cycle">-</strong></div>
+      </div>
+      <p id="pss-live-warning" class="settings-status"></p>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Status</th>
+              <th>Legs</th>
+              <th>Qty / Avg / Mark</th>
+              <th>TP / Liq</th>
+              <th>Liq buffer</th>
+              <th>Margin top-up</th>
+              <th>Age</th>
+            </tr>
+          </thead>
+          <tbody id="pss-live-positions-body">
+            <tr><td colspan="8" class="muted">No Pump live positions.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="pump-dashboard-band" id="pss-overview-band">
       <div class="pump-dashboard-stat">
         <span>Rows seen</span>

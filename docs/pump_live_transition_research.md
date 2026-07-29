@@ -2,8 +2,56 @@
 
 Date: 2026-07-29
 
-Status: research and design only. This work does not enable live orders, create a
-Bybit subaccount, or transfer funds.
+Status: the research remains the sizing evidence, and a guarded first-canary
+implementation is now present. Live entry is disabled by default and after
+every backend restart. This work does not create the Bybit subaccount, copy
+credentials, transfer funds, or arm real entries.
+
+## Implemented First Canary
+
+The operator approved a smaller initial account than the conservative `$5000`
+target:
+
+- `$1000` subaccount equity;
+- `$700` deployable;
+- `$300` protected reserve;
+- four fixed `$175` margin slots at `3x`;
+- operational entry cap `1` until the first full entry/add/TP/restart/exit
+  review; hard strategy cap remains `4`.
+
+This is a linear one-fifth scale of the fixed `$5000 / $3500 deployable /
+$1500 reserve / 4 slots` replay. The historical sample therefore still has
+`35` trades and the same percentage statistics (`3.146%` max drawdown), while
+the observed peak concurrent rescue scales from `$948.41` to about `$189.68`,
+below the `$300` reserve. This scaling does not model minimum sizes, live
+slippage, latency, API failures, or delisted contracts; live canary evidence
+must supersede it.
+
+Implemented controls:
+
+- separate `bybit_pump` credentials and account identity;
+- local ignored key file `config/pump_live.env`;
+- main-short `main_pullback_tier` is the only live signal consumer;
+- all long, slow-pump, cycle, and candidate tracks remain paper/shadow;
+- preflight verifies subaccount identity, UID, permissions, UTA, equity,
+  available reserve, isolated mode, and flat/clean exchange state;
+- dynamic-IP keys expose Bybit `deadlineDay` and `expiredAt` in preflight;
+- durable intent is written before the first order;
+- guarded first market leg plus post-only rescue ladder;
+- exchange-side full-position market TP, resynchronized after adds;
+- tier time-stop, liquidation-buffer monitoring, capped margin top-ups, and
+  emergency reduce-only close;
+- two-cycle flat confirmation, with add-order cancellation on the first flat
+  cycle;
+- unknown exchange state, ambiguous execution, and monitor errors disarm new
+  entries;
+- restart recovery monitors existing positions but never rearms entries;
+- manual disarm and confirmed emergency-close endpoints/UI.
+
+The operator procedure is
+`instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`. Automatic transfers remain
+out of scope for this phase: the operator manually funds the subaccount before
+arming.
 
 ## Evidence
 

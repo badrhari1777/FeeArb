@@ -36,6 +36,8 @@
   [`11_PUMP_LIFECYCLE_RESEARCH.md`](11_PUMP_LIFECYCLE_RESEARCH.md)
 - Обязательный порядок ведения Git, проверки и логические коммиты:
   [`12_GIT_ПОРЯДОК_И_КОММИТЫ.md`](12_GIT_ПОРЯДОК_И_КОММИТЫ.md)
+- Первый live-canary Pump/Dump на отдельном Bybit subaccount:
+  [`13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`](13_PUMP_LIVE_BYBIT_SUBACCOUNT.md)
 
 ## Важно
 

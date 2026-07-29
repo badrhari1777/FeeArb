@@ -23,14 +23,22 @@ Current decision:
 - first live candidate is `main_pullback_tier` short-only;
 - use a dedicated Bybit UTA subaccount so Pump positions cannot merge with
   funding/grid positions on the same symbol and side;
-- initial Pump capital model is `$5000`: `$3500` deployable in four fixed
-  `$875` slots and `$1500` uncommitted subaccount reserve;
-- transfers and top-ups require manual approval initially;
+- conservative target model remains `$5000`, but the first explicitly approved
+  small canary uses `$1000`: `$700` deployable in four fixed `$175` slots and
+  `$300` subaccount reserve, with only one entry slot armed initially;
+- master/sub transfers and external top-ups require manual approval initially;
+  capped isolated-margin allocation from the Pump subaccount's existing
+  `$300` reserve is automatic;
 - long/cycle candidates, full dynamic compounding, and automatic transfers
   remain paper/research features;
-- do not enable live until account ownership keys, read-only permission
-  diagnostics, transfer reconciliation, and the staged gates in the design
-  document are implemented and verified.
+- the separate gateway, durable ownership ledger, read-only permission gate,
+  isolated margin protection, TP/time-stop, restart recovery, margin top-up,
+  and emergency close are implemented;
+- automatic master/sub transfers remain deliberately excluded from the first
+  phase;
+- follow the operator gate in
+  `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`; live remains disabled until
+  the operator fills the local key file, passes preflight, and explicitly arms.
 
 ## Current Stage
 

@@ -30,6 +30,7 @@ from analysis_features.bybit_pump_short_shadow import (
     ShadowScanConfig,
     run_shadow_scan,
 )
+from execution.pump_live import PumpLiveController
 
 PUMP_DASHBOARD_CAPITAL_USD = 1_000.0
 PUMP_DASHBOARD_MAX_ACTIVE_COINS = 3
@@ -206,7 +207,12 @@ class BybitPumpShortShadowScheduleConfig(BybitPumpShortShadowConfig):
 
 
 class BybitPumpShortLab:
-    def __init__(self, *, restore_shadow_schedule: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        restore_shadow_schedule: bool = True,
+        pump_live_controller: PumpLiveController | None = None,
+    ) -> None:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._shadow_thread: threading.Thread | None = None
@@ -217,6 +223,7 @@ class BybitPumpShortLab:
         self._shadow_state: dict[str, Any] = self._initial_shadow_state()
         self._shadow_schedule_state: dict[str, Any] = self._initial_shadow_schedule_state()
         self._strategy_monitor_last_audit_key: str | None = None
+        self._pump_live = pump_live_controller or PumpLiveController()
         if restore_shadow_schedule:
             self._restore_shadow_schedule_if_enabled()
 
@@ -393,7 +400,26 @@ class BybitPumpShortLab:
         self._write_strategy_monitor_audit_if_new(output_dir, payload)
         audit = payload.get("audit") if isinstance(payload.get("audit"), dict) else {}
         audit["latest"] = read_latest_jsonl(output_dir / PUMP_STRATEGY_MONITOR_AUDIT_FILE, limit=20)
+        payload["pump_live"] = self._pump_live.status()
         return payload
+
+    def pump_live_status(self) -> dict[str, Any]:
+        return self._pump_live.status()
+
+    def pump_live_preflight(self) -> dict[str, Any]:
+        return self._pump_live.preflight()
+
+    def pump_live_prepare(self, confirmation: str) -> dict[str, Any]:
+        return self._pump_live.prepare_account(confirmation)
+
+    def pump_live_arm(self, confirmation: str) -> dict[str, Any]:
+        return self._pump_live.arm(confirmation)
+
+    def pump_live_disarm(self) -> dict[str, Any]:
+        return self._pump_live.disarm()
+
+    def pump_live_emergency_close(self, confirmation: str) -> dict[str, Any]:
+        return self._pump_live.emergency_close_all(confirmation)
 
     def _restore_shadow_schedule_if_enabled(self) -> None:
         state = load_shadow_schedule_state(DEFAULT_SHADOW_OUTPUT_DIR / PUMP_SHADOW_SCHEDULE_STATE_FILE)
@@ -743,8 +769,7 @@ class BybitPumpShortLab:
             return True
         return False
 
-    @staticmethod
-    def _execute_shadow_scan(run_config: BybitPumpShortShadowConfig) -> dict[str, Any]:
+    def _execute_shadow_scan(self, run_config: BybitPumpShortShadowConfig) -> dict[str, Any]:
         metadata = run_shadow_scan(
             ShadowScanConfig(
                 output_dir=run_config.output_dir,
@@ -758,6 +783,21 @@ class BybitPumpShortLab:
         )
         rows = read_first_csv_rows(run_config.output_dir / "shadow_scan_latest.csv", limit=10_000)
         strategy_paper = apply_pump_strategy_paper_rows(rows, output_dir=run_config.output_dir)
+        main_strategy = next(
+            (
+                strategy
+                for strategy in PUMP_STRATEGY_CATALOG
+                if strategy.get("strategy_id") == "main_pullback_tier"
+            ),
+            None,
+        )
+        live_signal_result = (
+            self._pump_live.submit_decisions(
+                [classify_strategy_signal(main_strategy, row) for row in rows]
+            )
+            if main_strategy
+            else {"accepted": 0, "armed": False}
+        )
         cycle_paper = apply_pump_cycle_paper_rows(rows, output_dir=run_config.output_dir)
         active_window = apply_pump_active_window_scan(
             rows,
@@ -770,6 +810,8 @@ class BybitPumpShortLab:
         metadata["strategy_paper_events"] = strategy_paper.get("events")
         metadata["strategy_paper_current_topup_usd"] = strategy_paper.get("current_topup_usd")
         metadata["strategy_paper_peak_topup_usd"] = strategy_paper.get("peak_topup_usd")
+        metadata["pump_live_signals_accepted"] = live_signal_result.get("accepted")
+        metadata["pump_live_armed"] = live_signal_result.get("armed")
         metadata["cycle_paper_positions"] = cycle_paper.get("positions")
         metadata["cycle_paper_open_positions"] = cycle_paper.get("open_positions")
         metadata["cycle_paper_closed_positions"] = cycle_paper.get("closed_positions")

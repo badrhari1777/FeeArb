@@ -110,6 +110,7 @@
   function render() {
     renderHeader();
     renderOverview();
+    renderPumpLive();
     renderStrategies();
     renderActiveWindow();
     renderSlowPumpWatch();
@@ -167,6 +168,137 @@
     setText('pss-active-window-count', activeWindow.symbols || 0);
     setText('pss-slow-watch-count', (state.slow_pump_watch || {}).count || 0);
     setText('pss-updated', shortTime((state.shadow || {}).updated_at_ms || (state.shadow || {}).finished_at_ms));
+  }
+
+  function renderPumpLive() {
+    var live = state.pump_live || {};
+    var config = live.config || {};
+    var credentials = live.credentials || {};
+    var preflight = live.last_preflight || {};
+    var keyInfo = preflight.key || {};
+    var balance = live.last_balance || (preflight.account || {});
+    var open = Number(live.open_positions || 0);
+    var cap = Number(config.entry_cap || 1);
+    setText('pss-live-status', live.status || 'disabled');
+    setText('pss-live-credentials', credentials.ready ? 'ready' : 'missing');
+    setText(
+      'pss-live-key-expiry',
+      keyInfo.ip_bound
+        ? 'IP-bound'
+        : (keyInfo.expired_at ? ('expires ' + String(keyInfo.expired_at).slice(0, 10)) : (keyInfo.deadline_day !== null && keyInfo.deadline_day !== undefined ? keyInfo.deadline_day + 'd left' : 'not checked'))
+    );
+    setText('pss-live-preflight-status', preflight.checked_at_ms ? (preflight.ready ? 'ready' : 'blocked') : 'not checked');
+    setText('pss-live-balance', money(balance.total || balance.total_usdt || 0));
+    setText('pss-live-available', money(balance.available || balance.available_usdt || 0));
+    setText('pss-live-slots', open + ' / ' + cap + ' (max ' + Number(config.max_active_positions || 4) + ')');
+    setText('pss-live-reserve', money(config.reserve_usd || 300));
+    setText('pss-live-cycle', shortTime(live.last_cycle_at_ms));
+
+    var warnings = [];
+    if (live.blocked_reason) warnings.push('Blocked: ' + live.blocked_reason);
+    (preflight.errors || []).forEach(function (item) { warnings.push(item); });
+    (preflight.warnings || []).forEach(function (item) { warnings.push(item); });
+    if (live.last_error) warnings.push('Monitor error: ' + live.last_error);
+    var warningNode = $('pss-live-warning');
+    if (warningNode) {
+      warningNode.textContent = warnings.join(' / ');
+      warningNode.className = warnings.length ? 'settings-status settings-status--error' : 'settings-status';
+    }
+
+    var body = $('pss-live-positions-body');
+    if (body) {
+      var rows = (live.positions || []).filter(function (item) { return item.status !== 'closed'; });
+      body.innerHTML = rows.length ? rows.map(function (item) {
+        var legs = item.legs || [];
+        var filled = legs.filter(function (leg) { return leg.status === 'filled'; }).length;
+        var ageHours = item.opened_at_ms ? (Date.now() - Number(item.opened_at_ms)) / 3600000 : 0;
+        return '<tr>' +
+          cell(strong(item.symbol)) +
+          cell(statusBadge(item.status, item.last_error || item.close_reason || '')) +
+          cell(filled + ' / ' + legs.length) +
+          cell(fmt(item.qty || 0, 6) + '<br>' + price(item.avg_entry_price) + ' / ' + price(item.mark_price)) +
+          cell(price(item.tp_price) + ' / ' + price(item.liq_price)) +
+          cell(item.liq_buffer_pct === null || item.liq_buffer_pct === undefined ? '-' : fmt(item.liq_buffer_pct, 2) + '%') +
+          cell(money(item.margin_topup_usd || 0)) +
+          cell(fmt(ageHours, 1) + 'h') +
+          '</tr>';
+      }).join('') : '<tr><td colspan="8" class="muted">No Pump live positions.</td></tr>';
+    }
+
+    setDisabled('pss-live-arm', !preflight.ready || !!live.entry_armed);
+    setDisabled('pss-live-disarm', !live.entry_armed);
+    setDisabled('pss-live-emergency', open <= 0);
+  }
+
+  function livePreflight() {
+    setStatus('Running Pump live read-only preflight...', false);
+    requestJson('POST', '/api/pump-short/live/preflight', null, function (err, data) {
+      if (err) {
+        setStatus(err.message, true);
+        return;
+      }
+      setStatus(data.ready ? 'Pump live preflight passed' : 'Pump live preflight blocked', !data.ready);
+      refresh();
+    });
+  }
+
+  function livePrepare() {
+    var confirmation = window.prompt('This changes only the Pump subaccount to isolated margin and one-way mode. Type: PREPARE PUMP SUBACCOUNT');
+    if (confirmation !== 'PREPARE PUMP SUBACCOUNT') {
+      setStatus('Pump live prepare canceled', true);
+      return;
+    }
+    requestJson('POST', '/api/pump-short/live/prepare', { confirmation: confirmation }, function (err) {
+      if (err) {
+        setStatus(err.message, true);
+        return;
+      }
+      setStatus('Pump subaccount prepared; run preflight again', false);
+      refresh();
+    });
+  }
+
+  function liveArm() {
+    var confirmation = window.prompt('REAL TRADING: new main-tier signals can place orders. Type: ARM PUMP LIVE 1000');
+    if (confirmation !== 'ARM PUMP LIVE 1000') {
+      setStatus('Pump live arm canceled', true);
+      return;
+    }
+    requestJson('POST', '/api/pump-short/live/arm', { confirmation: confirmation }, function (err) {
+      if (err) {
+        setStatus(err.message, true);
+        return;
+      }
+      setStatus('Pump live armed for new signals', false);
+      refresh();
+    });
+  }
+
+  function liveDisarm() {
+    requestJson('POST', '/api/pump-short/live/disarm', null, function (err) {
+      if (err) {
+        setStatus(err.message, true);
+        return;
+      }
+      setStatus('New Pump live entries disarmed; open positions remain monitored', false);
+      refresh();
+    });
+  }
+
+  function liveEmergencyClose() {
+    var confirmation = window.prompt('EMERGENCY: cancel Pump orders and market-close Pump positions. Type: CLOSE ALL PUMP POSITIONS');
+    if (confirmation !== 'CLOSE ALL PUMP POSITIONS') {
+      setStatus('Emergency close canceled', true);
+      return;
+    }
+    requestJson('POST', '/api/pump-short/live/emergency-close', { confirmation: confirmation }, function (err) {
+      if (err) {
+        setStatus(err.message, true);
+        return;
+      }
+      setStatus('Emergency close requested', true);
+      refresh();
+    });
   }
 
   function renderStrategies() {
@@ -759,6 +891,11 @@
     if ($('pss-run-scan')) $('pss-run-scan').addEventListener('click', runScan);
     if ($('pss-start-schedule')) $('pss-start-schedule').addEventListener('click', startSchedule);
     if ($('pss-stop-schedule')) $('pss-stop-schedule').addEventListener('click', stopSchedule);
+    if ($('pss-live-preflight')) $('pss-live-preflight').addEventListener('click', livePreflight);
+    if ($('pss-live-prepare')) $('pss-live-prepare').addEventListener('click', livePrepare);
+    if ($('pss-live-arm')) $('pss-live-arm').addEventListener('click', liveArm);
+    if ($('pss-live-disarm')) $('pss-live-disarm').addEventListener('click', liveDisarm);
+    if ($('pss-live-emergency')) $('pss-live-emergency').addEventListener('click', liveEmergencyClose);
   }
 
   bind();
