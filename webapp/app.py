@@ -24,6 +24,7 @@ from .services import (
 )
 from .manual_stream import ManualSpreadStream
 from .manual_trade_stream import ManualTradeStream
+from .positions_overview import build_positions_overview
 from .ws_trade_raw import WsTradeRawStream
 from .ws_trade_private_raw import WsTradePrivateRawStream
 from .ws_trade_okx_raw import WsTradeOkxRawStream
@@ -602,6 +603,16 @@ async def spread_monitor_page(request: Request) -> HTMLResponse:
 @app.get("/api/snapshot")
 async def snapshot_api() -> JSONResponse:
     return JSONResponse(service.state_payload())
+
+
+@app.get("/api/positions/overview")
+async def positions_overview_api() -> JSONResponse:
+    payload = build_positions_overview(
+        service.mobile_positions_payload(),
+        bybit_pump_short_lab.pump_live_status(),
+    )
+    return JSONResponse(jsonable_encoder(payload))
+
 
 @app.get("/api/coin/sessions")
 async def coin_sessions_api() -> JSONResponse:

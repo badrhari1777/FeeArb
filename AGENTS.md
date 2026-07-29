@@ -102,6 +102,15 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- A read-only unified positions contract was added as
+  `/api/positions/overview` before building the shared UI. It keeps main
+  hedged cards and one-sided Pump Live positions in separate groups while
+  providing combined PnL, minimum liquidation buffer, protection-issue count,
+  risk counts, source ages, Pump slot/capital limits, whitelisted balance
+  state, ladder progress, top-up state, TP/SL, and recent Pump events. Pump
+  credentials/preflight identity details are deliberately excluded. Verified
+  endpoint/builder plus Pump/manual API regression (`24 passed`).
+
 - Pump Live risk parity was hardened before its first real position. Full-mode
   Bybit protection now synchronizes both Mark Price TP and a catastrophic SL
   `2.5%` inside the current short liquidation price after qty/average/liq
