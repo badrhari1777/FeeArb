@@ -97,7 +97,8 @@ class FakePumpGateway:
             raise RuntimeError("simulated_market_timeout")
         if side == "sell":
             fill_qty = float(notional_usd or 0.0) / 10.0
-            self.positions = [
+            self.positions = [item for item in self.positions if item.get("symbol") != symbol]
+            self.positions.append(
                 {
                     "symbol": symbol,
                     "side": "short",
@@ -110,10 +111,10 @@ class FakePumpGateway:
                     "position_idx": 0,
                     "unrealized_pnl": 0.0,
                 }
-            ]
+            )
         elif reduce_only:
             fill_qty = float(qty or 0.0)
-            self.positions = []
+            self.positions = [item for item in self.positions if item.get("symbol") != symbol]
         else:  # pragma: no cover - defensive
             raise AssertionError("unexpected fake market order")
         return {
@@ -162,6 +163,18 @@ class FakePumpGateway:
         return {"status": "ok"}
 
 
+class FakePumpNotifier:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.messages: list[tuple[str, str]] = []
+
+    async def send_text_status(self, text: str, *, title: str | None = None) -> str:
+        if self.fail:
+            raise RuntimeError("simulated_notification_failure")
+        self.messages.append((str(title or ""), text))
+        return "ok"
+
+
 def write_env(path: Path, *, entry_cap: int = 1) -> None:
     path.write_text(
         "\n".join(
@@ -178,11 +191,16 @@ def write_env(path: Path, *, entry_cap: int = 1) -> None:
     )
 
 
-def ready_decision(ts_ms: int) -> dict[str, Any]:
+def ready_decision(
+    ts_ms: int,
+    *,
+    symbol: str = "TESTUSDT",
+    event_id: str = "test-event",
+) -> dict[str, Any]:
     return {
         "strategy_id": "main_pullback_tier",
-        "symbol": "TESTUSDT",
-        "event_id": "test-event",
+        "symbol": symbol,
+        "event_id": event_id,
         "state": "entry_ready",
         "reason": "strategy_conditions_met",
         "ts_ms": ts_ms,
@@ -347,6 +365,98 @@ def test_liquidation_buffer_adds_margin_from_reserved_cash(tmp_path: Path) -> No
 
     assert gateway.margin_adds == [("TESTUSDT", 25.0)]
     assert status["positions"][0]["margin_topup_usd"] == 25.0
+
+
+def test_four_slot_cap_can_open_four_distinct_main_signals(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    decisions = [
+        ready_decision(
+            armed_at + index + 1,
+            symbol=f"TEST{index}USDT",
+            event_id=f"test-event-{index}",
+        )
+        for index in range(4)
+    ]
+
+    assert controller.submit_decisions(decisions)["accepted"] == 4
+    status = controller.run_cycle()
+
+    assert status["config"]["entry_cap"] == 4
+    assert status["open_positions"] == 4
+    assert {item["symbol"] for item in status["positions"]} == {
+        "TEST0USDT",
+        "TEST1USDT",
+        "TEST2USDT",
+        "TEST3USDT",
+    }
+
+
+def test_topup_notification_uses_injected_shared_route(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    notifier = FakePumpNotifier()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+        notifier=notifier,
+        background_notifications=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 15.0
+
+    status = controller.run_cycle()
+
+    assert gateway.margin_adds == [("TESTUSDT", 25.0)]
+    assert any(title == "Pump Live TOP-UP TESTUSDT" for title, _ in notifier.messages)
+    topup_message = next(text for title, text in notifier.messages if "TOP-UP" in title)
+    assert "Сумма: $25.00" in topup_message
+    assert "Свободно после: $975.00" in topup_message
+    assert status["notifications"]["last_event"] == "margin_added"
+    assert status["notifications"]["last_status"] == "ok"
+
+
+def test_notification_failure_never_blocks_margin_protection(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+        notifier=FakePumpNotifier(fail=True),
+        background_notifications=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 15.0
+
+    status = controller.run_cycle()
+
+    assert gateway.margin_adds == [("TESTUSDT", 25.0)]
+    assert status["positions"][0]["margin_topup_usd"] == 25.0
+    assert status["notifications"]["last_status"] == "error"
+    assert status["notifications"]["last_error"] == "simulated_notification_failure"
 
 
 def test_emergency_buffer_closes_when_no_topup_cash_is_available(tmp_path: Path) -> None:

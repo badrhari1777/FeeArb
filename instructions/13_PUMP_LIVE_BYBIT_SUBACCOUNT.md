@@ -4,15 +4,15 @@ This is the operator procedure for the first real Pump/Dump canary. The live
 path is disabled by default and is isolated from the existing FeeArb Bybit
 account.
 
-## Fixed First-Canary Limits
+## Current Live Limits
 
 - Bybit mainnet Unified Trading subaccount.
 - Total Pump capital: `$1000`.
 - Deployable capital: `$700`.
 - Protected local reserve: `$300`.
 - Four hard strategy slots of `$175` isolated margin each.
-- Operational entry cap starts at `1`; the code still sizes that position as
-  one `$175` slot.
+- Operational entry cap is `4`; each position still has its own fixed `$175`
+  isolated-margin slot.
 - Leverage: `3x`.
 - Live strategy: `main_pullback_tier` short only.
 - Long, slow-pump, super-pump, clean-control, and cycle strategies remain
@@ -61,7 +61,7 @@ Keep these first-canary values unchanged:
 
 ```text
 BYBIT_PUMP_TESTNET=0
-PUMP_LIVE_ENTRY_CAP=1
+PUMP_LIVE_ENTRY_CAP=4
 PUMP_LIVE_POLL_INTERVAL_SEC=15
 PUMP_LIVE_MAX_SLIPPAGE_BPS=50
 ```
@@ -101,7 +101,7 @@ PREPARE PUMP SUBACCOUNT
 Then run the read-only preflight again. Do not arm while any other error is
 present.
 
-## 4. Start Signal Collection and Arm One Slot
+## 4. Start Signal Collection and Arm Four Slots
 
 The existing paper/shadow schedule remains the signal source. Confirm it is
 `running` or `waiting`; start it from the same page if needed.
@@ -136,11 +136,17 @@ positions continue in recovery monitoring.
   enforced. If the emergency buffer is reached and no allowed reserve remains,
   the bot cancels its adds and submits a reduce-only market close. Normal
   orders use a `50 bps` depth guard; emergency exits allow up to `300 bps`.
+- Pump Live uses the same configured primary/fallback notification router as
+  the main FeeArb account monitor. Arm/disarm, live entry, margin top-up,
+  blocked top-up, close submission, confirmed flat state, emergency close, and
+  monitor errors are sent there. Delivery runs outside the protection cycle;
+  a notification failure is audited but cannot block margin or exit logic.
 
-## 6. First-Trade Review Gate
+## 6. Four-Slot Live Review
 
-Do not raise `PUMP_LIVE_ENTRY_CAP` above `1` until one complete real case has
-been checked:
+On 2026-07-29 the operator explicitly chose to test the complete four-slot
+strategy immediately after a clean subaccount preflight, rather than wait for
+automatic promotion from one slot. Review every first real case against:
 
 1. Entry price and quantity match the live ledger.
 2. Remaining ladder orders have the expected prices and quantities.
@@ -150,8 +156,9 @@ been checked:
 6. Exit leaves no position and no Pump ladder orders.
 7. `live_events.jsonl` contains no unresolved error.
 
-After that review, raising the cap to `2`, and later to `4`, is a separate
-operator decision. There is no automatic promotion.
+There is still no automatic promotion or sizing growth. Any change above four
+slots, above `$175` per slot, or any automated master/sub transfer requires a
+new explicit operator decision.
 
 ## Emergency Controls
 
@@ -173,4 +180,6 @@ data/research/bybit_pump_short_live/live_events.jsonl
 ```
 
 Exchange positions and orders remain authoritative; the local files are the
-durable strategy ledger and audit trail.
+durable strategy ledger and audit trail. Notification attempts are appended as
+`notification_delivery` rows and the most recent delivery status is persisted
+in `live_state.json`.

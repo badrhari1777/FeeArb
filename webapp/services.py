@@ -3502,6 +3502,11 @@ class DataService:
         self._account_state_cache: dict[str, object] | None = None
         self._apply_alert_settings()
 
+    @property
+    def notification_router(self) -> NotificationRouter:
+        """Shared primary/fallback notification route for all live subsystems."""
+        return self._notifier
+
     async def bootstrap_symbol_session(
         self,
         symbol: str,

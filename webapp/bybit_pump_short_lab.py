@@ -30,7 +30,7 @@ from analysis_features.bybit_pump_short_shadow import (
     ShadowScanConfig,
     run_shadow_scan,
 )
-from execution.pump_live import PumpLiveController
+from execution.pump_live import PumpLiveController, PumpLiveNotifier
 
 PUMP_DASHBOARD_CAPITAL_USD = 1_000.0
 PUMP_DASHBOARD_MAX_ACTIVE_COINS = 3
@@ -212,6 +212,7 @@ class BybitPumpShortLab:
         *,
         restore_shadow_schedule: bool = True,
         pump_live_controller: PumpLiveController | None = None,
+        notifier: PumpLiveNotifier | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -223,7 +224,7 @@ class BybitPumpShortLab:
         self._shadow_state: dict[str, Any] = self._initial_shadow_state()
         self._shadow_schedule_state: dict[str, Any] = self._initial_shadow_schedule_state()
         self._strategy_monitor_last_audit_key: str | None = None
-        self._pump_live = pump_live_controller or PumpLiveController()
+        self._pump_live = pump_live_controller or PumpLiveController(notifier=notifier)
         if restore_shadow_schedule:
             self._restore_shadow_schedule_if_enabled()
 

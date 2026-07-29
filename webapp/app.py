@@ -56,7 +56,7 @@ templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 settings_manager = SettingsManager()
 service = DataService(settings_manager=settings_manager)
-bybit_pump_short_lab = BybitPumpShortLab()
+bybit_pump_short_lab = BybitPumpShortLab(notifier=service.notification_router)
 logger = logging.getLogger(__name__)
 
 

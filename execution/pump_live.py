@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -101,6 +102,10 @@ class PumpGateway(Protocol):
     def set_full_take_profit(self, symbol: str, price: float) -> dict[str, Any]: ...
 
     def add_margin(self, symbol: str, amount_usd: float) -> dict[str, Any]: ...
+
+
+class PumpLiveNotifier(Protocol):
+    async def send_text_status(self, text: str, *, title: str | None = None) -> str: ...
 
 
 def read_pump_live_env(path: Path = PUMP_LIVE_ENV_PATH) -> dict[str, str]:
@@ -582,14 +587,21 @@ class PumpLiveController:
         env_path: Path = PUMP_LIVE_ENV_PATH,
         start_recovery_monitor: bool = True,
         background_monitor: bool = True,
+        notifier: PumpLiveNotifier | None = None,
+        background_notifications: bool = True,
     ) -> None:
         self.env_path = env_path
         self.state_dir = state_dir
         self.state_path = state_dir / PUMP_LIVE_STATE_FILE
         self.events_path = state_dir / PUMP_LIVE_EVENTS_FILE
         self.gateway = gateway or BybitPumpLiveGateway(env_path=env_path)
+        self.notifier = notifier
         self._background_monitor = background_monitor
+        self._background_notifications = background_notifications
         self._lock = threading.RLock()
+        self._event_lock = threading.Lock()
+        self._notification_lock = threading.Lock()
+        self._notification_last_sent: dict[str, int] = {}
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -621,6 +633,13 @@ class PumpLiveController:
         payload["state_file"] = str(self.state_path)
         payload["events_file"] = str(self.events_path)
         payload["open_positions"] = len(self._open_positions(payload))
+        payload["notifications"] = {
+            "configured": self.notifier is not None,
+            "last_event": payload.get("last_notification_event"),
+            "last_status": payload.get("last_notification_status"),
+            "last_at_ms": payload.get("last_notification_at_ms"),
+            "last_error": payload.get("last_notification_error"),
+        }
         payload["recent_events"] = _read_latest_jsonl(self.events_path, limit=30)
         return payload
 
@@ -980,7 +999,13 @@ class PumpLiveController:
                 self._save_state_locked()
             self._event(
                 "live_position_opened",
-                {"symbol": symbol, "live_id": live_id, "ladder_errors": ladder_errors},
+                {
+                    "symbol": symbol,
+                    "live_id": live_id,
+                    "slot_margin_usd": config.slot_margin_usd,
+                    "ladder_legs": len(legs),
+                    "ladder_errors": ladder_errors,
+                },
             )
             self._maintain_single_position(position, config)
         except Exception as exc:
@@ -1131,8 +1156,11 @@ class PumpLiveController:
         )
         if allowed >= 1.0:
             self.gateway.add_margin(_normalize_symbol(item.get("symbol")), allowed)
+            position_topup_after = position_topup + allowed
+            total_topup_after = total_topup + allowed
+            available_after = max(0.0, available - allowed)
             with self._lock:
-                item["margin_topup_usd"] = position_topup + allowed
+                item["margin_topup_usd"] = position_topup_after
                 item["last_topup_at_ms"] = now
                 item["updated_at_ms"] = now
                 self._save_state_locked()
@@ -1142,6 +1170,9 @@ class PumpLiveController:
                     "symbol": item.get("symbol"),
                     "amount_usd": allowed,
                     "liq_buffer_pct_before": buffer_pct,
+                    "position_topup_usd": position_topup_after,
+                    "total_topup_usd": total_topup_after,
+                    "available_after_usd": available_after,
                 },
             )
             return
@@ -1151,7 +1182,13 @@ class PumpLiveController:
             self.disarm("margin_reserve_insufficient")
             self._event(
                 "margin_topup_blocked",
-                {"symbol": item.get("symbol"), "liq_buffer_pct": buffer_pct},
+                {
+                    "symbol": item.get("symbol"),
+                    "liq_buffer_pct": buffer_pct,
+                    "available_usd": available,
+                    "position_topup_usd": position_topup,
+                    "total_topup_usd": total_topup,
+                },
             )
 
     def _close_position(self, item: dict[str, Any], reason: str, config: PumpLiveConfig) -> None:
@@ -1375,6 +1412,10 @@ class PumpLiveController:
             "last_error": payload.get("last_error"),
             "blocked_reason": payload.get("blocked_reason"),
             "emergency_close_requested": bool(payload.get("emergency_close_requested")),
+            "last_notification_event": payload.get("last_notification_event"),
+            "last_notification_status": payload.get("last_notification_status"),
+            "last_notification_at_ms": payload.get("last_notification_at_ms"),
+            "last_notification_error": payload.get("last_notification_error"),
         }
 
     def _save_state_locked(self) -> None:
@@ -1387,8 +1428,214 @@ class PumpLiveController:
     def _event(self, event: str, payload: dict[str, Any]) -> None:
         row = {"ts_ms": _now_ms(), "event": event, **payload}
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        with self.events_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n")
+        self._append_event(row)
+        notification = _pump_live_notification(event, payload)
+        if self.notifier is not None and notification is not None:
+            title, text, dedupe_key, cooldown_sec = notification
+            self._dispatch_notification(
+                event=event,
+                title=title,
+                text=text,
+                dedupe_key=dedupe_key,
+                cooldown_sec=cooldown_sec,
+            )
+
+    def _append_event(self, row: Mapping[str, Any]) -> None:
+        with self._event_lock:
+            with self.events_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(dict(row), ensure_ascii=True, sort_keys=True) + "\n")
+
+    def _dispatch_notification(
+        self,
+        *,
+        event: str,
+        title: str,
+        text: str,
+        dedupe_key: str,
+        cooldown_sec: int,
+    ) -> None:
+        now = _now_ms()
+        with self._notification_lock:
+            last_sent = self._notification_last_sent.get(dedupe_key, 0)
+            if cooldown_sec > 0 and now - last_sent < cooldown_sec * 1000:
+                return
+            self._notification_last_sent[dedupe_key] = now
+
+        def deliver() -> None:
+            status = "error"
+            error: str | None = None
+            try:
+                if self.notifier is not None:
+                    status = str(asyncio.run(self.notifier.send_text_status(text, title=title)))
+            except Exception as exc:  # notifications must never stop risk handling
+                error = _clean_error(exc)
+                logger.warning("Pump live notification failed event=%s error=%s", event, error)
+            delivered_at = _now_ms()
+            with self._lock:
+                self._state["last_notification_event"] = event
+                self._state["last_notification_status"] = status
+                self._state["last_notification_at_ms"] = delivered_at
+                self._state["last_notification_error"] = error
+                self._save_state_locked()
+            delivery_row: dict[str, Any] = {
+                "ts_ms": delivered_at,
+                "event": "notification_delivery",
+                "source_event": event,
+                "status": status,
+            }
+            if error:
+                delivery_row["error"] = error
+            self._append_event(delivery_row)
+
+        if self._background_notifications:
+            threading.Thread(
+                target=deliver,
+                name=f"pump-live-notify-{event}",
+                daemon=True,
+            ).start()
+        else:
+            deliver()
+
+
+def _pump_live_notification(
+    event: str,
+    payload: Mapping[str, Any],
+) -> tuple[str, str, str, int] | None:
+    symbol = _normalize_symbol(payload.get("symbol"))
+    symbol_line = f"\nМонета: {symbol}" if symbol else ""
+    if event == "armed":
+        cap = _safe_int(payload.get("entry_cap"), 0)
+        return (
+            "FeeArb Pump Live включён",
+            f"Pump Live: разрешены новые входы\nЛимит одновременно: {cap}",
+            "armed",
+            0,
+        )
+    if event == "disarmed":
+        reason = str(payload.get("reason") or "unknown")
+        return (
+            "FeeArb Pump Live остановил входы",
+            f"Pump Live: новые входы отключены\nПричина: {reason}",
+            f"disarmed:{reason}",
+            60,
+        )
+    if event == "live_position_opened":
+        slot_margin = _safe_float(payload.get("slot_margin_usd"), 0.0)
+        legs = _safe_int(payload.get("ladder_legs"), 0)
+        errors = list(payload.get("ladder_errors") or [])
+        text = (
+            f"Pump Live: открыта SHORT-позиция{symbol_line}"
+            f"\nМаржа слота: ${slot_margin:.2f}"
+            f"\nСтупеней: {legs}"
+        )
+        if errors:
+            text += f"\nВНИМАНИЕ: ошибки лестницы: {len(errors)}"
+        return (
+            f"Pump Live вход {symbol}",
+            text,
+            f"opened:{payload.get('live_id') or symbol}",
+            0,
+        )
+    if event == "live_entry_failed":
+        error = str(payload.get("error") or "unknown")
+        return (
+            f"Pump Live ошибка входа {symbol}",
+            f"Pump Live: вход не завершён{symbol_line}\nОшибка: {error}\nНовые входы отключены.",
+            f"entry_failed:{symbol}:{error}",
+            300,
+        )
+    if event == "margin_added":
+        amount = _safe_float(payload.get("amount_usd"), 0.0)
+        buffer_pct = _safe_float(payload.get("liq_buffer_pct_before"), 0.0)
+        position_total = _safe_float(payload.get("position_topup_usd"), 0.0)
+        portfolio_total = _safe_float(payload.get("total_topup_usd"), 0.0)
+        available_after = _safe_float(payload.get("available_after_usd"), 0.0)
+        return (
+            f"Pump Live TOP-UP {symbol}",
+            (
+                f"Pump Live: добавлена изолированная маржа{symbol_line}"
+                f"\nСумма: ${amount:.2f}"
+                f"\nБуфер до пополнения: {buffer_pct:.2f}%"
+                f"\nВсего по позиции: ${position_total:.2f}"
+                f"\nВсего по Pump-портфелю: ${portfolio_total:.2f}"
+                f"\nСвободно после: ${available_after:.2f}"
+            ),
+            f"margin_added:{symbol}:{position_total:.2f}",
+            0,
+        )
+    if event == "margin_topup_blocked":
+        buffer_pct = _safe_float(payload.get("liq_buffer_pct"), 0.0)
+        available = _safe_float(payload.get("available_usd"), 0.0)
+        position_total = _safe_float(payload.get("position_topup_usd"), 0.0)
+        portfolio_total = _safe_float(payload.get("total_topup_usd"), 0.0)
+        return (
+            f"Pump Live TOP-UP заблокирован {symbol}",
+            (
+                f"Pump Live: не удалось добавить допустимую маржу{symbol_line}"
+                f"\nБуфер до ликвидации: {buffer_pct:.2f}%"
+                f"\nСвободно: ${available:.2f}"
+                f"\nДобавлено по позиции: ${position_total:.2f}"
+                f"\nДобавлено всего: ${portfolio_total:.2f}"
+                "\nНовые входы отключены."
+            ),
+            f"margin_blocked:{symbol}",
+            300,
+        )
+    if event == "position_close_submitted":
+        reason = str(payload.get("reason") or "unknown")
+        qty = _safe_float(payload.get("qty"), 0.0)
+        return (
+            f"Pump Live выход {symbol}",
+            (
+                f"Pump Live: отправлен reduce-only выход{symbol_line}"
+                f"\nКоличество: {qty:.8f}"
+                f"\nПричина: {reason}"
+            ),
+            f"close_submitted:{symbol}:{reason}",
+            0,
+        )
+    if event == "position_absent_first_cycle":
+        return (
+            f"Pump Live проверяет закрытие {symbol}",
+            (
+                f"Pump Live: позиция не найдена в первом полном скане{symbol_line}"
+                "\nОрдера добора отменены, новые входы отключены; ожидается второй скан."
+            ),
+            f"absent_first:{symbol}",
+            300,
+        )
+    if event == "position_confirmed_flat":
+        reason = str(payload.get("reason") or "exchange_position_flat")
+        return (
+            f"Pump Live позиция закрыта {symbol}",
+            f"Pump Live: отсутствие позиции подтверждено двумя сканами{symbol_line}\nПричина: {reason}",
+            f"confirmed_flat:{symbol}:{reason}",
+            0,
+        )
+    if event == "emergency_close_requested":
+        return (
+            "FeeArb Pump Live аварийный выход",
+            "Pump Live: оператор запросил закрытие всех Pump-позиций.",
+            "emergency_requested",
+            60,
+        )
+    if event == "emergency_close_submitted":
+        count = _safe_int(payload.get("positions"), 0)
+        return (
+            "FeeArb Pump Live аварийные ордера",
+            f"Pump Live: аварийные reduce-only выходы отправлены\nПозиций: {count}",
+            "emergency_submitted",
+            60,
+        )
+    if event == "monitor_error":
+        error = str(payload.get("error") or "unknown")
+        return (
+            "FeeArb Pump Live ошибка мониторинга",
+            f"Pump Live: защитный цикл завершился ошибкой\nОшибка: {error}\nНовые входы отключены.",
+            f"monitor_error:{error}",
+            300,
+        )
+    return None
 
 
 def build_live_legs(

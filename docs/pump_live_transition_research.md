@@ -249,3 +249,20 @@ drain the main strategy to rescue Pump automatically.
     daily limits.
 
 No stage should silently promote itself to the next one.
+
+## Operator Decision: Full Four-Slot Validation
+
+On 2026-07-29 the dedicated `$1000` Bybit Pump subaccount passed the read-only
+gate with no positions or open orders. The operator then explicitly selected
+the complete fixed strategy for immediate live error discovery:
+
+- four concurrent `main_pullback_tier` short slots;
+- `$175` isolated margin per slot, `$700` deployable total;
+- `$300` local reserve with the existing capped `$25/$50` margin additions;
+- all long, slow-pump, and alternative tracks remain paper/shadow only;
+- no automatic transfer from the main account.
+
+Pump-specific risk events use the same configured primary/fallback
+notification route as the main FeeArb monitor. Notification delivery is
+failure-isolated from order, margin, reconciliation, and emergency-close
+actions, and every delivery result is written to the Pump live JSONL audit.
