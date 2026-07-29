@@ -69,6 +69,13 @@ PUMP_LIVE_MAX_SLIPPAGE_BPS=50
 The file is excluded by `.gitignore`. The tracked template is
 `config/pump_live.env.example`.
 
+After the file is filled, restart the FeeArb backend once so the newly deployed
+Pump live routes/controller are loaded. Do this as a supervised restart because
+the same backend may be monitoring Grid or manual positions. Before restart,
+verify there is no active execution; after restart, verify the main health
+endpoints and confirm `GET /api/pump-short/live` returns `200`. Do not arm as
+part of the restart.
+
 ## 3. Run the Read-Only Gate
 
 Open `/pump-short-strategies` and use `Read-only preflight`.
