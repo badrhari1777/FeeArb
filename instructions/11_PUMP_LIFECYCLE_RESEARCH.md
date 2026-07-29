@@ -2,6 +2,36 @@
 
 Purpose: operator checklist for the pump lifecycle research track.
 
+## Paper-to-Live Gate
+
+The current Pump/Dump stack remains paper/shadow only. The reproducible
+transition study and staged account/money-management design are documented in:
+
+```text
+docs/pump_live_transition_research.md
+data/research/pump_live_transition_research/index.md
+```
+
+Rebuild the evidence with:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\pump_live_transition_research.py
+```
+
+Current decision:
+
+- first live candidate is `main_pullback_tier` short-only;
+- use a dedicated Bybit UTA subaccount so Pump positions cannot merge with
+  funding/grid positions on the same symbol and side;
+- initial Pump capital model is `$5000`: `$3500` deployable in four fixed
+  `$875` slots and `$1500` uncommitted subaccount reserve;
+- transfers and top-ups require manual approval initially;
+- long/cycle candidates, full dynamic compounding, and automatic transfers
+  remain paper/research features;
+- do not enable live until account ownership keys, read-only permission
+  diagnostics, transfer reconciliation, and the staged gates in the design
+  document are implemented and verified.
+
 ## Current Stage
 
 Stage started on 2026-07-12.
