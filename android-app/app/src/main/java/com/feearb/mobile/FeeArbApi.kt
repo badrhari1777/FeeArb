@@ -15,6 +15,9 @@ interface FeeArbApi {
     @GET("api/mobile/positions")
     suspend fun getMobilePositions(): MobilePositionsResponse
 
+    @GET("api/positions/overview")
+    suspend fun getPositionsOverview(): PositionsOverviewResponse
+
     @GET("api/mobile/manual-defaults")
     suspend fun getManualDefaults(): ManualDefaultsResponse
 

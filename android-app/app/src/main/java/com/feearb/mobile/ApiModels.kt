@@ -116,6 +116,127 @@ data class PositionLegDto(
     val expected_funding: Double? = null,
 )
 
+data class PositionsOverviewResponse(
+    val schema: String? = null,
+    val generated_at_ms: Long? = null,
+    val summary: PositionsOverviewSummaryDto = PositionsOverviewSummaryDto(),
+    val main: PositionsOverviewMainDto = PositionsOverviewMainDto(),
+    val pump: PumpOverviewDto = PumpOverviewDto(),
+)
+
+data class PositionsOverviewSummaryDto(
+    val main_positions: Int = 0,
+    val pump_positions: Int = 0,
+    val pump_cap: Int = 0,
+    val total_unrealized_pnl_usd: Double? = null,
+    val main_unrealized_pnl_usd: Double? = null,
+    val pump_unrealized_pnl_usd: Double? = null,
+    val min_liq_buffer_pct: Double? = null,
+    val protection_issues: Int = 0,
+    val high_risk_positions: Int = 0,
+    val warning_risk_positions: Int = 0,
+    val main_age_sec: Double? = null,
+    val pump_age_sec: Double? = null,
+)
+
+data class PositionsOverviewMainDto(
+    val status: String? = null,
+    val last_updated: String? = null,
+    val account_last_updated: String? = null,
+    val balances: List<BalanceDto> = emptyList(),
+    val filters: Map<String, Int> = emptyMap(),
+    val positions: List<PositionCardDto> = emptyList(),
+)
+
+data class PumpOverviewDto(
+    val status: String? = null,
+    val entry_armed: Boolean = false,
+    val blocked_reason: String? = null,
+    val last_error: String? = null,
+    val last_cycle_at_ms: Long? = null,
+    val monitor_thread_alive: Boolean = false,
+    val config: PumpOverviewConfigDto = PumpOverviewConfigDto(),
+    val balance: PumpOverviewBalanceDto = PumpOverviewBalanceDto(),
+    val notifications: PumpOverviewNotificationsDto = PumpOverviewNotificationsDto(),
+    val positions: List<PumpPositionDto> = emptyList(),
+    val recent_events: List<JsonObject> = emptyList(),
+)
+
+data class PumpOverviewConfigDto(
+    val total_capital_usd: Double? = null,
+    val deployable_capital_usd: Double? = null,
+    val reserve_usd: Double? = null,
+    val entry_cap: Int = 0,
+    val max_active_positions: Int = 0,
+    val slot_margin_usd: Double? = null,
+    val warning_liq_buffer_pct: Double? = null,
+    val panic_liq_buffer_pct: Double? = null,
+    val emergency_liq_buffer_pct: Double? = null,
+    val exchange_stop_gap_from_liq_pct: Double? = null,
+    val max_position_topup_usd: Double? = null,
+    val max_total_topup_usd: Double? = null,
+    val margin_reduce_trigger_buffer_pct: Double? = null,
+    val margin_reduce_target_buffer_pct: Double? = null,
+)
+
+data class PumpOverviewBalanceDto(
+    val total_usd: Double? = null,
+    val available_usd: Double? = null,
+    val used_usd: Double? = null,
+)
+
+data class PumpOverviewNotificationsDto(
+    val configured: Boolean = false,
+    val last_event: String? = null,
+    val last_status: String? = null,
+    val last_at_ms: Long? = null,
+    val last_error: String? = null,
+)
+
+data class PumpPositionDto(
+    val module: String? = null,
+    val account_alias: String? = null,
+    val live_id: String? = null,
+    val strategy_id: String? = null,
+    val symbol: String = "",
+    val side: String = "short",
+    val status: String? = null,
+    val qty: Double? = null,
+    val avg_entry_price: Double? = null,
+    val mark_price: Double? = null,
+    val unrealized_pnl_usd: Double? = null,
+    val liq_price: Double? = null,
+    val liq_buffer_pct: Double? = null,
+    val risk_level: String? = null,
+    val tp_price: Double? = null,
+    val stop_price: Double? = null,
+    val protection_updated_at_ms: Long? = null,
+    val margin_topup_usd: Double? = null,
+    val margin_topup_cap_usd: Double? = null,
+    val margin_reduce_confirm_count: Int = 0,
+    val opened_at_ms: Long? = null,
+    val age_h: Double? = null,
+    val max_hold_h: Double? = null,
+    val remaining_hold_h: Double? = null,
+    val close_reason: String? = null,
+    val last_error: String? = null,
+    val tier: Map<String, JsonElement> = emptyMap(),
+    val legs: List<PumpPositionLegDto> = emptyList(),
+    val legs_filled: Int = 0,
+    val legs_open: Int = 0,
+)
+
+data class PumpPositionLegDto(
+    val step: Int? = null,
+    val weight: Double? = null,
+    val trigger_price: Double? = null,
+    val margin_usd: Double? = null,
+    val notional_usd: Double? = null,
+    val status: String? = null,
+    val filled_qty: Double? = null,
+    val avg_fill_price: Double? = null,
+)
+
 data class ManualDefaultsResponse(
     val status: String? = null,
     val last_updated: String? = null,
