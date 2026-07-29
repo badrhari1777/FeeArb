@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FeeArb Position Control Center</title>
+  {% set rp = request.scope.get('root_path', '') %}
+  <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
+  <script defer src="{{ rp }}/static/positions.js?v={{ static_version }}"></script>
+</head>
+<body class="page page--positions">
+  <header class="masthead">
+    <div>
+      <h1>Position Control Center</h1>
+      <p class="subtitle">Read-only combined view of main hedged positions and Pump Live</p>
+    </div>
+    <div class="status-block">
+      <dl>
+        <div><dt>View status</dt><dd><span id="positions-page-status" class="status-pill status-pill--pending">loading</span></dd></div>
+        <div><dt>Generated</dt><dd id="positions-page-generated">-</dd></div>
+        <div><dt>Next refresh</dt><dd id="positions-page-next-refresh">-</dd></div>
+      </dl>
+      <button type="button" class="button" id="positions-page-refresh">Refresh now</button>
+      <a class="button button--ghost" href="/">Main dashboard</a>
+      <a class="button button--ghost" href="/pump-short-strategies">Pump controls</a>
+      <a class="button button--ghost" href="/manual">Manual trading</a>
+    </div>
+  </header>
+
+  <main class="content content--dense">
+    <section class="panel panel--compact">
+      <div class="panel-heading">
+        <div>
+          <h2>Portfolio risk overview</h2>
+          <p class="muted">Exchange positions remain authoritative. No trading action is available on this page.</p>
+        </div>
+        <span id="positions-page-risk" class="status-pill status-pill--pending">checking</span>
+      </div>
+      <div class="positions-overview-band positions-overview-band--large">
+        <div><span>Main positions</span><strong id="pp-main-count">0</strong></div>
+        <div><span>Pump Live</span><strong id="pp-pump-count">0 / 4</strong></div>
+        <div><span>Total PnL</span><strong id="pp-total-pnl">$0.00</strong></div>
+        <div><span>Main PnL</span><strong id="pp-main-pnl">$0.00</strong></div>
+        <div><span>Pump PnL</span><strong id="pp-pump-pnl">$0.00</strong></div>
+        <div><span>Min liq buffer</span><strong id="pp-min-liq">-</strong></div>
+        <div><span>Protection issues</span><strong id="pp-protection">0</strong></div>
+        <div><span>High / warning</span><strong id="pp-risk-count">0 / 0</strong></div>
+      </div>
+      <p id="positions-page-warning" class="settings-status"></p>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <h2>Main module</h2>
+          <p class="muted" id="pp-main-freshness">Account snapshot: -</p>
+        </div>
+        <a class="button button--ghost" href="/strategies">Open strategies</a>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table table--compact">
+          <thead>
+            <tr>
+              <th>Symbol / Pair</th>
+              <th>Exchanges</th>
+              <th>PnL</th>
+              <th>Amount</th>
+              <th>Live spread</th>
+              <th>Min liq buffer</th>
+              <th>Stops / Takes</th>
+              <th>Auto exit</th>
+              <th>Risk</th>
+            </tr>
+          </thead>
+          <tbody id="pp-main-body">
+            <tr><td colspan="9" class="muted">Main positions are loading.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <h2>Pump Live · Bybit subaccount</h2>
+          <p class="muted" id="pp-pump-freshness">Protective cycle: -</p>
+        </div>
+        <div class="panel-actions">
+          <span id="pp-pump-arm" class="status-pill status-pill--idle">disarmed</span>
+          <a class="button button--ghost" href="/pump-short-strategies">Open Pump controls</a>
+        </div>
+      </div>
+      <div class="positions-overview-band">
+        <div><span>Status</span><strong id="pp-pump-status">-</strong></div>
+        <div><span>Total</span><strong id="pp-pump-total">$0.00</strong></div>
+        <div><span>Available</span><strong id="pp-pump-available">$0.00</strong></div>
+        <div><span>Reserve floor</span><strong id="pp-pump-reserve">$300.00</strong></div>
+        <div><span>Top-up used</span><strong id="pp-pump-topup">$0.00</strong></div>
+        <div><span>Notifications</span><strong id="pp-pump-notifications">-</strong></div>
+      </div>
+      <div id="pp-pump-cards" class="position-detail-grid">
+        <p class="muted">Pump Live positions are loading.</p>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Pump protective event journal</h2>
+        <span class="muted">Latest 20 durable events</span>
+      </div>
+      <div class="table-wrapper">
+        <table class="table table--compact">
+          <thead><tr><th>Time</th><th>Event</th><th>Symbol</th><th>Details</th></tr></thead>
+          <tbody id="pp-events-body">
+            <tr><td colspan="4" class="muted">Events are loading.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

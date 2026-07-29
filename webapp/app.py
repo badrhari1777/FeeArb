@@ -49,7 +49,7 @@ from .bybit_pump_short_lab import (
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-07-29-pump-live-01"
+STATIC_VERSION = "v2026-07-29-positions-01"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -429,6 +429,18 @@ async def index(request: Request) -> HTMLResponse:
             "static_version": STATIC_VERSION,
         },
     )
+
+
+@app.get("/positions", response_class=HTMLResponse)
+async def positions_page(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(
+        "positions.html",
+        {
+            "request": request,
+            "static_version": STATIC_VERSION,
+        },
+    )
+
 
 @app.get("/coin/{symbol}", response_class=HTMLResponse)
 async def coin_analysis_page(

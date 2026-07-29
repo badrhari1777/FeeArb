@@ -38,6 +38,8 @@
   [`12_GIT_ПОРЯДОК_И_КОММИТЫ.md`](12_GIT_ПОРЯДОК_И_КОММИТЫ.md)
 - Первый live-canary Pump/Dump на отдельном Bybit subaccount:
   [`13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`](13_PUMP_LIVE_BYBIT_SUBACCOUNT.md)
+- Unified read-only web view for main and Pump Live positions:
+  [`14_UNIFIED_POSITIONS_WEB.md`](14_UNIFIED_POSITIONS_WEB.md)
 
 ## Важно
 

@@ -170,6 +170,9 @@
   var pollingTimer = null;
   var currentPollInterval = 0;
   var pollingInFlight = false;
+  var positionsOverviewState = null;
+  var positionsOverviewInFlight = false;
+  var positionsActiveTab = 'all';
   var autoExitExecState = {
     execId: null,
     status: null,
@@ -279,6 +282,15 @@
     symbolPositionsTable: document.getElementById('symbol-positions-body'),
     symbolPositionsMeta: document.getElementById('symbol-positions-meta'),
     symbolPositionsDiffs: document.getElementById('symbol-positions-diffs'),
+    positionsSummaryMain: document.getElementById('positions-summary-main'),
+    positionsSummaryPump: document.getElementById('positions-summary-pump'),
+    positionsSummaryPnl: document.getElementById('positions-summary-pnl'),
+    positionsSummaryLiq: document.getElementById('positions-summary-liq'),
+    positionsSummaryProtection: document.getElementById('positions-summary-protection'),
+    positionsSummaryPumpCycle: document.getElementById('positions-summary-pump-cycle'),
+    positionsPumpBody: document.getElementById('positions-pump-body'),
+    positionsTabs: document.querySelectorAll('[data-positions-tab]'),
+    positionsPanes: document.querySelectorAll('[data-positions-pane]'),
     gridStrategiesList: document.getElementById('grid-strategies-list'),
     liveStrategiesList: document.getElementById('live-strategies-list'),
     marginDiagnosticsBody: document.getElementById('margin-diagnostics-body'),
@@ -1768,6 +1780,120 @@
     elements.symbolPositionsDiffs.innerHTML = lines.map(escapeHtml).join('<br>');
   }
 
+  function positionsMoney(value) {
+    var parsed = typeof value === 'number' ? value : parseFloat(value);
+    if (isNaN(parsed)) {
+      return '-';
+    }
+    return (parsed < 0 ? '-$' : '$') + Math.abs(parsed).toFixed(2);
+  }
+
+  function positionsRiskBadge(level) {
+    var normalized = String(level || 'unknown').toLowerCase();
+    var cls = normalized === 'high'
+      ? 'status-pill status-pill--error'
+      : (normalized === 'warn' ? 'status-pill status-pill--pending' : 'status-pill status-pill--ready');
+    return '<span class="' + cls + '">' + escapeHtml(normalized) + '</span>';
+  }
+
+  function renderPositionsOverview(payload) {
+    positionsOverviewState = payload || null;
+    var summary = (payload && payload.summary) || {};
+    var pump = (payload && payload.pump) || {};
+    var pumpPositions = Array.isArray(pump.positions) ? pump.positions : [];
+    setText(elements.positionsSummaryMain, String(summary.main_positions || 0));
+    setText(
+      elements.positionsSummaryPump,
+      String(summary.pump_positions || 0) + ' / ' + String(summary.pump_cap || 0)
+    );
+    setText(elements.positionsSummaryPnl, positionsMoney(summary.total_unrealized_pnl_usd || 0));
+    setText(
+      elements.positionsSummaryLiq,
+      summary.min_liq_buffer_pct === null || summary.min_liq_buffer_pct === undefined
+        ? '-'
+        : formatNumber(summary.min_liq_buffer_pct, 2) + '%'
+    );
+    var issues = Number(summary.protection_issues || 0);
+    setText(elements.positionsSummaryProtection, issues ? issues + ' issue(s)' : 'OK');
+    if (elements.positionsSummaryProtection) {
+      elements.positionsSummaryProtection.className = issues ? 'value-negative' : 'value-positive';
+    }
+    setText(
+      elements.positionsSummaryPumpCycle,
+      pump.last_cycle_at_ms ? formatDate(Number(pump.last_cycle_at_ms)) : '-'
+    );
+    if (!elements.positionsPumpBody) {
+      return;
+    }
+    if (!pumpPositions.length) {
+      elements.positionsPumpBody.innerHTML =
+        '<tr><td colspan="10" class="muted">No open Pump Live positions. Status: ' +
+        escapeHtml(pump.status || 'unknown') + '.</td></tr>';
+      return;
+    }
+    elements.positionsPumpBody.innerHTML = pumpPositions.map(function (row) {
+      var pnl = Number(row.unrealized_pnl_usd || 0);
+      var pnlClass = pnl > 0 ? 'value-positive' : (pnl < 0 ? 'value-negative' : '');
+      var topupCap = row.margin_topup_cap_usd === null || row.margin_topup_cap_usd === undefined
+        ? '-'
+        : positionsMoney(row.margin_topup_cap_usd);
+      var legs = String(row.legs_filled || 0) + ' filled / ' +
+        String(row.legs_open || 0) + ' open / ' + String((row.legs || []).length);
+      var timeLeft = row.remaining_hold_h === null || row.remaining_hold_h === undefined
+        ? '-'
+        : formatNumber(row.remaining_hold_h, 1) + 'h';
+      return '<tr>' +
+        '<td><strong>' + escapeHtml(row.symbol || '-') + '</strong><span class="cell-note">SHORT · bybit_pump</span></td>' +
+        '<td>' + positionsRiskBadge(row.risk_level) + '<span class="cell-note">' + escapeHtml(row.status || '-') + '</span></td>' +
+        '<td>' + formatTrimmedNumber(row.qty, 8) + '</td>' +
+        '<td>' + formatTrimmedNumber(row.avg_entry_price, 8) + ' / ' + formatTrimmedNumber(row.mark_price, 8) + '</td>' +
+        '<td class="' + pnlClass + '">' + positionsMoney(pnl) + '</td>' +
+        '<td>' + formatTrimmedNumber(row.tp_price, 8) + ' / ' + formatTrimmedNumber(row.stop_price, 8) + '</td>' +
+        '<td>' + formatTrimmedNumber(row.liq_price, 8) + '<span class="cell-note">' +
+          (row.liq_buffer_pct === null || row.liq_buffer_pct === undefined ? '-' : formatNumber(row.liq_buffer_pct, 2) + '%') +
+        '</span></td>' +
+        '<td>' + positionsMoney(row.margin_topup_usd || 0) + ' / ' + topupCap + '</td>' +
+        '<td>' + escapeHtml(legs) + '</td>' +
+        '<td>' + escapeHtml(timeLeft) + '</td>' +
+      '</tr>';
+    }).join('');
+  }
+
+  function setPositionsTab(tab) {
+    positionsActiveTab = ['all', 'main', 'pump'].indexOf(tab) >= 0 ? tab : 'all';
+    var i;
+    for (i = 0; i < elements.positionsTabs.length; i += 1) {
+      var button = elements.positionsTabs[i];
+      var active = String(button.getAttribute('data-positions-tab') || '') === positionsActiveTab;
+      button.classList.toggle('is-active', active);
+      button.setAttribute('aria-selected', active ? 'true' : 'false');
+    }
+    for (i = 0; i < elements.positionsPanes.length; i += 1) {
+      var pane = elements.positionsPanes[i];
+      var paneName = String(pane.getAttribute('data-positions-pane') || '');
+      pane.hidden = positionsActiveTab !== 'all' && paneName !== positionsActiveTab;
+    }
+  }
+
+  function pollPositionsOverview() {
+    if (positionsOverviewInFlight) {
+      return;
+    }
+    positionsOverviewInFlight = true;
+    request('GET', '/api/positions/overview', null, function (err, data) {
+      positionsOverviewInFlight = false;
+      if (err) {
+        if (elements.positionsPumpBody) {
+          elements.positionsPumpBody.innerHTML =
+            '<tr><td colspan="10" class="value-negative">Positions overview error: ' +
+            escapeHtml(err.message || 'unknown') + '</td></tr>';
+        }
+        return;
+      }
+      renderPositionsOverview(data || {});
+    });
+  }
+
   function renderAutoExitLog(autoExit) {
     if (!elements.autoExitLog || !elements.autoExitLogEmpty) {
       return;
@@ -2624,6 +2750,7 @@
       if (data) {
         globalState = normalizeState(data);
         renderAll();
+        pollPositionsOverview();
         ensurePolling();
         if (force && data.status === 'pending') {
           window.setTimeout(function () {
@@ -2654,6 +2781,7 @@
         globalState = normalizeState(data.state);
       }
       renderAll();
+      pollPositionsOverview();
       ensurePolling();
       if (data && data.status === 'pending') {
         window.setTimeout(function () {
@@ -3487,6 +3615,14 @@
       elements.symbolPositionsTable.addEventListener('change', handleAutoExitChange);
       elements.symbolPositionsTable.addEventListener('click', handlePositionActionClick);
     }
+    if (elements.positionsTabs && elements.positionsTabs.length) {
+      Array.prototype.forEach.call(elements.positionsTabs, function (button) {
+        button.addEventListener('click', function () {
+          setPositionsTab(String(button.getAttribute('data-positions-tab') || 'all'));
+        });
+      });
+      setPositionsTab(positionsActiveTab);
+    }
     if (elements.autoExitLogCopy) {
       elements.autoExitLogCopy.addEventListener('click', function () {
         var text = autoExitLogText((globalState.auto_exit && globalState.auto_exit.events) ? globalState.auto_exit.events : []);
@@ -3528,6 +3664,7 @@
     }
 
     pollSnapshot(true);
+    pollPositionsOverview();
   }
 
   if (document.readyState === 'loading') {

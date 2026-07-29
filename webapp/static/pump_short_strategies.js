@@ -217,7 +217,7 @@
           cell(statusBadge(item.status, item.last_error || item.close_reason || '')) +
           cell(filled + ' / ' + legs.length) +
           cell(fmt(item.qty || 0, 6) + '<br>' + price(item.avg_entry_price) + ' / ' + price(item.mark_price)) +
-          cell(price(item.tp_price) + ' / ' + price(item.liq_price)) +
+          cell(price(item.tp_price) + ' / ' + price(item.stop_price) + ' / ' + price(item.liq_price)) +
           cell(item.liq_buffer_pct === null || item.liq_buffer_pct === undefined ? '-' : fmt(item.liq_buffer_pct, 2) + '%') +
           cell(money(item.margin_topup_usd || 0)) +
           cell(fmt(ageHours, 1) + 'h') +

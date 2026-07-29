@@ -115,6 +115,7 @@
       </dl>
       <button id="refresh-button" class="button" type="button">Manual refresh</button>
       <a class="button" href="/manual">Manual trading</a>
+      <a class="button" href="/positions">Positions</a>
       <a class="button" href="/strategies">Strategies</a>
       <a class="button" href="/funding-history">Funding history</a>
       <a class="button" href="/pump-short-lab">Pump Short Lab</a>
@@ -781,7 +782,28 @@
     </section>
 
     <section class="panel" id="symbol-positions-panel">
-      <h2>Symbol Positions</h2>
+      <div class="panel-heading">
+        <div>
+          <h2>Positions</h2>
+          <p class="muted">Main hedged positions and the dedicated Pump Live subaccount remain visibly separated.</p>
+        </div>
+        <a class="button button--ghost" href="/positions">Detailed positions</a>
+      </div>
+      <div class="positions-overview-band">
+        <div><span>Main</span><strong id="positions-summary-main">0</strong></div>
+        <div><span>Pump Live</span><strong id="positions-summary-pump">0 / 4</strong></div>
+        <div><span>Total PnL</span><strong id="positions-summary-pnl">$0.00</strong></div>
+        <div><span>Min liq buffer</span><strong id="positions-summary-liq">-</strong></div>
+        <div><span>Protection</span><strong id="positions-summary-protection">checking</strong></div>
+        <div><span>Pump cycle</span><strong id="positions-summary-pump-cycle">-</strong></div>
+      </div>
+      <div class="positions-tabs" role="tablist" aria-label="Position module filter">
+        <button type="button" class="positions-tab is-active" data-positions-tab="all" role="tab" aria-selected="true">All positions</button>
+        <button type="button" class="positions-tab" data-positions-tab="main" role="tab" aria-selected="false">Main module</button>
+        <button type="button" class="positions-tab" data-positions-tab="pump" role="tab" aria-selected="false">Pump Live</button>
+      </div>
+      <div class="positions-pane" id="positions-main-pane" data-positions-pane="main">
+      <h3>Main hedged positions</h3>
       <table class="data-table data-table--wide data-table--symbol-positions">
         <thead>
           <tr>
@@ -966,6 +988,34 @@
           <tr><td colspan="7" class="muted">No exchange health data yet.</td></tr>
         </tbody>
       </table>
+      </div>
+      <div class="positions-pane" id="positions-pump-pane" data-positions-pane="pump">
+        <div class="panel-heading">
+          <h3>Pump Live positions</h3>
+          <a class="button button--ghost" href="/pump-short-strategies">Open Pump controls</a>
+        </div>
+        <div class="table-wrapper table-wrapper--wide">
+          <table class="table table--compact">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Status</th>
+                <th>Qty</th>
+                <th>Entry / Mark</th>
+                <th>PnL</th>
+                <th>TP / Stop</th>
+                <th>Liq / Buffer</th>
+                <th>Top-up</th>
+                <th>Legs</th>
+                <th>Time left</th>
+              </tr>
+            </thead>
+            <tbody id="positions-pump-body">
+              <tr><td colspan="10" class="muted">Pump Live positions are loading.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <section class="panel" id="hedge-clusters-panel">

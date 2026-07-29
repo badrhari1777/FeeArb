@@ -302,6 +302,139 @@ a {
   line-height: 1.1;
 }
 
+.positions-overview-band {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  margin: 0.9rem 0;
+  border: 1px solid #243247;
+  border-radius: 8px;
+  background: #243247;
+}
+
+.positions-overview-band > div {
+  min-height: 70px;
+  display: grid;
+  align-content: center;
+  gap: 4px;
+  padding: 11px 13px;
+  background: #111a28;
+}
+
+.positions-overview-band span,
+.position-metric-grid span {
+  color: #8d98a8;
+  font-size: 0.72rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.positions-overview-band strong {
+  font-size: 1.1rem;
+}
+
+.positions-overview-band--large > div {
+  min-height: 82px;
+}
+
+.positions-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 1rem 0;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid #243247;
+}
+
+.positions-tab {
+  padding: 0.55rem 0.85rem;
+  border: 1px solid #2b3a50;
+  border-radius: 999px;
+  background: #101827;
+  color: #aebbd0;
+  cursor: pointer;
+}
+
+.positions-tab:hover,
+.positions-tab.is-active {
+  border-color: #5da9ff;
+  background: rgba(47, 129, 247, 0.16);
+  color: #f2f7ff;
+}
+
+.positions-pane {
+  margin-top: 0.75rem;
+}
+
+.positions-pane + .positions-pane {
+  padding-top: 1rem;
+  border-top: 1px solid #243247;
+}
+
+.positions-pane[hidden] {
+  display: none;
+}
+
+.position-detail-grid {
+  display: grid;
+  gap: 14px;
+  margin-top: 1rem;
+}
+
+.position-detail-card {
+  padding: 15px;
+  border: 1px solid #26364c;
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(17, 26, 40, 0.98), rgba(13, 21, 34, 0.98));
+}
+
+.position-detail-card--warn {
+  border-color: rgba(245, 158, 11, 0.65);
+}
+
+.position-detail-card--high {
+  border-color: rgba(239, 68, 68, 0.8);
+}
+
+.position-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  margin: 0.8rem 0;
+  border: 1px solid #243247;
+  border-radius: 8px;
+  background: #243247;
+}
+
+.position-metric-grid > div {
+  min-height: 66px;
+  display: grid;
+  align-content: center;
+  gap: 4px;
+  padding: 10px 12px;
+  background: #0f1825;
+}
+
+.position-detail-card details {
+  margin-top: 0.7rem;
+}
+
+.position-detail-card summary {
+  color: #93c5fd;
+  cursor: pointer;
+}
+
+.position-event-detail {
+  max-width: 640px;
+  white-space: normal !important;
+  overflow-wrap: anywhere;
+  color: #9eacc0;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 0.78rem;
+}
+
 .pump-strategy-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));

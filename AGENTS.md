@@ -102,6 +102,17 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Unified positions visualization was added after the read-only API contract.
+  The main `/` positions panel now has `All positions`, `Main module`, and
+  `Pump Live` tabs plus combined risk counters; unlike hedged and one-sided
+  rows remain grouped rather than mixed. New `/positions` is a read-only
+  control center for main cards/legs, Pump balance/reserve/arm state, ladder,
+  TP/catastrophic SL, liquidation buffer, tracked top-up, hold time, and the
+  durable Pump event journal. Trading/emergency controls remain on their
+  owning module pages. Operator guide: `instructions/14_UNIFIED_POSITIONS_WEB.md`.
+  Verified the positions/Pump/main regression set (`197 passed`) and the full
+  project suite (`521 passed`).
+
 - A read-only unified positions contract was added as
   `/api/positions/overview` before building the shared UI. It keeps main
   hedged cards and one-sided Pump Live positions in separate groups while

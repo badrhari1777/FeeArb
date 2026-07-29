@@ -5,6 +5,8 @@ import unittest
 from importlib import import_module
 from unittest.mock import patch
 
+from starlette.requests import Request
+
 from webapp.positions_overview import build_positions_overview
 
 webapp_app = import_module("webapp.app")
@@ -120,3 +122,49 @@ class PositionsOverviewApiTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["summary"]["main_positions"], 1)
         self.assertEqual(payload["summary"]["pump_positions"], 1)
         self.assertNotIn("credentials", payload["pump"])
+
+    async def test_detailed_positions_page_is_read_only_and_links_module_controls(self) -> None:
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/positions",
+                "root_path": "",
+                "scheme": "http",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 1),
+                "server": ("127.0.0.1", 8000),
+            }
+        )
+
+        response = await webapp_app.positions_page(request)
+        body = response.body.decode("utf-8")
+
+        self.assertIn("Position Control Center", body)
+        self.assertIn("/static/positions.js", body)
+        self.assertIn("/pump-short-strategies", body)
+        self.assertNotIn("Emergency close all", body)
+
+    async def test_main_page_exposes_all_main_and_pump_position_tabs(self) -> None:
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/",
+                "root_path": "",
+                "scheme": "http",
+                "query_string": b"",
+                "headers": [],
+                "client": ("127.0.0.1", 1),
+                "server": ("127.0.0.1", 8000),
+            }
+        )
+        with patch.object(webapp_app.service, "state_payload", return_value={"status": "ready"}):
+            response = await webapp_app.index(request)
+        body = response.body.decode("utf-8")
+
+        self.assertIn('data-positions-tab="all"', body)
+        self.assertIn('data-positions-tab="main"', body)
+        self.assertIn('data-positions-tab="pump"', body)
+        self.assertIn('href="/positions"', body)
