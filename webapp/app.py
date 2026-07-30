@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -45,6 +47,7 @@ from .bybit_pump_short_lab import (
     normalize_shadow_config,
     normalize_shadow_schedule_config,
 )
+from execution.pump_live import PumpLiveController
 
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
@@ -57,7 +60,21 @@ templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
 settings_manager = SettingsManager()
 service = DataService(settings_manager=settings_manager)
-bybit_pump_short_lab = BybitPumpShortLab(notifier=service.notification_router)
+if os.getenv("FEEARB_TESTING") == "1":
+    _pump_test_state_dir = Path(tempfile.mkdtemp(prefix="feearb-pump-live-test-"))
+    _pump_test_controller = PumpLiveController(
+        state_dir=_pump_test_state_dir,
+        env_path=_pump_test_state_dir / "pump_live.env",
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    bybit_pump_short_lab = BybitPumpShortLab(
+        restore_shadow_schedule=False,
+        pump_live_controller=_pump_test_controller,
+        notifier=service.notification_router,
+    )
+else:
+    bybit_pump_short_lab = BybitPumpShortLab(notifier=service.notification_router)
 logger = logging.getLogger(__name__)
 
 
