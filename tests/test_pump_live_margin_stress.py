@@ -75,6 +75,12 @@ def test_bank_rise_speed_scenarios_stop_before_liquidation() -> None:
     assert slow["extra_margin_usd"] <= 175.0
     assert slow["closed"] is True
     assert slow["close_price"] < slow["final_liq_price"]
+    assert all(
+        event["buffer_before_pct"] <= 15.0
+        for event in slow["events"]
+        if event["event"] == "margin_added"
+        and event["extra_margin_usd"] > 50.0
+    )
 
     assert fast["ladder_filled"] is True
     assert fast["extra_margin_usd"] >= 50.0

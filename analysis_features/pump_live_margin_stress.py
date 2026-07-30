@@ -97,6 +97,7 @@ def simulate_bank_rise(
     emergency_buffer_pct: float = 10.0,
     topup_chunk_usd: float = 25.0,
     max_position_topup_usd: float = 175.0,
+    guaranteed_position_topup_usd: float = 50.0,
     stop_gap_pct: float = 2.5,
 ) -> dict[str, Any]:
     position = ShortPosition(
@@ -194,9 +195,17 @@ def simulate_bank_rise(
                     if buffer_pct <= panic_buffer_pct
                     else topup_chunk_usd
                 )
+                position_cap = (
+                    max_position_topup_usd
+                    if buffer_pct <= panic_buffer_pct
+                    else min(
+                        max_position_topup_usd,
+                        guaranteed_position_topup_usd,
+                    )
+                )
                 allowed = min(
                     desired,
-                    max(0.0, max_position_topup_usd - extra_margin),
+                    max(0.0, position_cap - extra_margin),
                 )
                 if allowed >= 1.0:
                     extra_margin += allowed
@@ -209,6 +218,7 @@ def simulate_bank_rise(
                             "price": price,
                             "amount_usd": allowed,
                             "extra_margin_usd": extra_margin,
+                            "buffer_before_pct": buffer_pct,
                             "liq_price": liquidation,
                             "stop_price": stop,
                         }
