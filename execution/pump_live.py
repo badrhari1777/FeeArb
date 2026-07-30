@@ -29,6 +29,8 @@ PUMP_ORDER_LINK_PREFIX = "FAP"
 ARM_CONFIRMATION = "ARM PUMP LIVE 1000"
 PREPARE_CONFIRMATION = "PREPARE PUMP SUBACCOUNT"
 EMERGENCY_CONFIRMATION = "CLOSE ALL PUMP POSITIONS"
+TRANSIENT_RECOVERY_CYCLES = 2
+STATE_REPLACE_RETRY_DELAYS_SEC = (0.0, 0.05, 0.1, 0.2, 0.4, 0.8)
 
 
 @dataclass(frozen=True, slots=True)
@@ -572,20 +574,26 @@ class BybitPumpLiveGateway:
             ccxt_symbol = str(market.get("symbol"))
             take_trigger = client.price_to_precision(ccxt_symbol, take_profit_price)
             stop_trigger = client.price_to_precision(ccxt_symbol, stop_loss_price)
-            payload = client.private_post_v5_position_trading_stop(
-                {
-                    "category": "linear",
-                    "symbol": market.get("id"),
-                    "takeProfit": str(take_trigger),
-                    "stopLoss": str(stop_trigger),
-                    "tpTriggerBy": "MarkPrice",
-                    "slTriggerBy": "MarkPrice",
-                    "tpslMode": "Full",
-                    "tpOrderType": "Market",
-                    "slOrderType": "Market",
-                    "positionIdx": 0,
-                }
-            )
+            try:
+                payload = client.private_post_v5_position_trading_stop(
+                    {
+                        "category": "linear",
+                        "symbol": market.get("id"),
+                        "takeProfit": str(take_trigger),
+                        "stopLoss": str(stop_trigger),
+                        "tpTriggerBy": "MarkPrice",
+                        "slTriggerBy": "MarkPrice",
+                        "tpslMode": "Full",
+                        "tpOrderType": "Market",
+                        "slOrderType": "Market",
+                        "positionIdx": 0,
+                    }
+                )
+            except Exception as exc:
+                message = str(exc).lower()
+                if "not modified" not in message and "34040" not in message:
+                    raise
+                return {"status": "already_set"}
             return _compact_exchange_result(payload)
 
     def add_margin(self, symbol: str, amount_usd: float) -> dict[str, Any]:
@@ -644,6 +652,8 @@ class PumpLiveController:
         self._thread: threading.Thread | None = None
         self._state = self._load_state()
         self._state["entry_armed"] = False
+        self._state["transient_recovery_pending"] = False
+        self._state["healthy_recovery_cycles"] = 0
         if self._open_positions(self._state):
             self._state["monitor_enabled"] = True
             self._state["status"] = "recovery_monitoring"
@@ -709,11 +719,16 @@ class PumpLiveController:
         if confirmation != ARM_CONFIRMATION:
             raise ValueError("pump_live_arm_confirmation_invalid")
         preflight = self.preflight()
-        if not preflight.get("ready"):
-            raise RuntimeError("pump_live_arm_preflight_not_ready")
         with self._lock:
-            if self._open_positions(self._state):
-                raise RuntimeError("pump_live_arm_requires_no_existing_live_positions")
+            open_items = list(self._open_positions(self._state))
+        if open_items:
+            self._resume_tracked_positions(preflight, open_items)
+            event = "armed_resumed"
+        else:
+            if not preflight.get("ready"):
+                raise RuntimeError("pump_live_arm_preflight_not_ready")
+            event = "armed"
+        with self._lock:
             now = _now_ms()
             self._state.update(
                 {
@@ -724,12 +739,73 @@ class PumpLiveController:
                     "updated_at_ms": now,
                     "blocked_reason": None,
                     "pending_signals": [],
+                    "transient_recovery_pending": False,
+                    "healthy_recovery_cycles": 0,
                 }
             )
             self._save_state_locked()
-        self._event("armed", {"entry_cap": self.config().entry_cap})
+        self._event(event, {"entry_cap": self.config().entry_cap, "positions": len(open_items)})
         self.start_monitor()
         return self.status()
+
+    def _resume_tracked_positions(
+        self,
+        preflight: Mapping[str, Any],
+        open_items: list[dict[str, Any]],
+    ) -> None:
+        tolerated = {
+            "pump_live_subaccount_has_existing_positions",
+            "pump_live_subaccount_has_unknown_open_orders",
+        }
+        remaining_errors = [
+            str(item)
+            for item in preflight.get("errors") or []
+            if str(item) not in tolerated
+        ]
+        if remaining_errors:
+            raise RuntimeError(
+                "pump_live_resume_preflight_not_ready:" + ",".join(remaining_errors)
+            )
+        exchange_positions = self.gateway.fetch_positions()
+        open_orders = self.gateway.fetch_open_orders()
+        unknown_positions = self._unknown_exchange_positions(exchange_positions)
+        unknown_orders = self._unknown_open_orders(open_orders)
+        tracked_symbols = {
+            _normalize_symbol(item.get("symbol"))
+            for item in open_items
+            if item.get("status") == "open"
+        }
+        exchange_symbols = {
+            _normalize_symbol(item.get("symbol"))
+            for item in exchange_positions
+            if item.get("side") == "short" and _safe_float(item.get("qty"), 0.0) > 0
+        }
+        missing_symbols = sorted(tracked_symbols - exchange_symbols)
+        degraded = [
+            _normalize_symbol(item.get("symbol"))
+            for item in open_items
+            if item.get("status") != "open"
+        ]
+        if unknown_positions or unknown_orders or missing_symbols or degraded:
+            raise RuntimeError(
+                "pump_live_resume_unknown_exchange_state:"
+                f"unknown_positions={len(unknown_positions)},"
+                f"unknown_orders={len(unknown_orders)},"
+                f"missing={','.join(missing_symbols)},"
+                f"degraded={','.join(degraded)}"
+            )
+        exchange_by_symbol = {
+            _normalize_symbol(item.get("symbol")): item
+            for item in exchange_positions
+            if item.get("side") == "short"
+        }
+        config = self.config()
+        for item in open_items:
+            self._apply_exchange_position(
+                item,
+                exchange_by_symbol[_normalize_symbol(item.get("symbol"))],
+            )
+            self._sync_full_protection(item, config, force=True)
 
     def disarm(self, reason: str = "operator_disarm") -> dict[str, Any]:
         with self._lock:
@@ -738,6 +814,8 @@ class PumpLiveController:
             self._state["monitor_enabled"] = has_open_positions
             self._state["status"] = "monitoring" if has_open_positions else "disarmed"
             self._state["blocked_reason"] = reason
+            self._state["transient_recovery_pending"] = False
+            self._state["healthy_recovery_cycles"] = 0
             self._state["updated_at_ms"] = _now_ms()
             self._state["pending_signals"] = []
             self._save_state_locked()
@@ -752,6 +830,8 @@ class PumpLiveController:
             self._state["entry_armed"] = False
             self._state["monitor_enabled"] = False
             self._state["status"] = "stopped"
+            self._state["transient_recovery_pending"] = False
+            self._state["healthy_recovery_cycles"] = 0
             self._state["updated_at_ms"] = _now_ms()
             self._save_state_locked()
         self._stop.set()
@@ -805,6 +885,8 @@ class PumpLiveController:
             self._state["monitor_enabled"] = True
             self._state["emergency_close_requested"] = True
             self._state["status"] = "emergency_closing"
+            self._state["transient_recovery_pending"] = False
+            self._state["healthy_recovery_cycles"] = 0
             self._state["updated_at_ms"] = _now_ms()
             self._save_state_locked()
         self._event("emergency_close_requested", {})
@@ -844,26 +926,70 @@ class PumpLiveController:
             else:
                 self._process_pending_signals(balance, exchange_positions, open_orders, config)
                 self._maintain_positions(config)
+            recovered = False
             with self._lock:
-                if self._state.get("monitor_enabled"):
+                recovery_pending = bool(
+                    self._state.get("transient_recovery_pending")
+                    and self._state.get("blocked_reason") == "monitor_cycle_transient_error"
+                )
+                if recovery_pending:
+                    healthy = _safe_int(self._state.get("healthy_recovery_cycles"), 0) + 1
+                    self._state["healthy_recovery_cycles"] = healthy
+                    if healthy >= TRANSIENT_RECOVERY_CYCLES:
+                        self._state["entry_armed"] = True
+                        self._state["transient_recovery_pending"] = False
+                        self._state["healthy_recovery_cycles"] = 0
+                        self._state["blocked_reason"] = None
+                        recovered = True
+                if self._state.get("monitor_enabled") and not recovery_pending:
                     self._state["status"] = (
                         "armed" if self._state.get("entry_armed") else "monitoring"
                     )
+                elif self._state.get("monitor_enabled"):
+                    self._state["status"] = "recovering_monitor"
+                if recovered:
+                    self._state["status"] = "armed"
                 self._state["last_error"] = None
                 self._state["updated_at_ms"] = _now_ms()
                 self._save_state_locked()
+            if recovered:
+                self._event(
+                    "monitor_recovered",
+                    {"healthy_cycles": TRANSIENT_RECOVERY_CYCLES},
+                )
             return self.status()
         except Exception as exc:  # pylint: disable=broad-except
             error = _clean_error(exc)
+            transient = _is_transient_monitor_error(exc)
             logger.exception("Pump live monitor cycle failed: %s", error)
             with self._lock:
+                recovery_pending = bool(
+                    transient
+                    and (
+                        self._state.get("entry_armed")
+                        or self._state.get("transient_recovery_pending")
+                    )
+                )
                 self._state["last_error"] = error
-                self._state["status"] = "error_monitoring"
                 self._state["entry_armed"] = False
-                self._state["blocked_reason"] = "monitor_cycle_error"
+                self._state["transient_recovery_pending"] = recovery_pending
+                self._state["healthy_recovery_cycles"] = 0
+                if recovery_pending:
+                    self._state["status"] = "recovering_monitor"
+                    self._state["blocked_reason"] = "monitor_cycle_transient_error"
+                else:
+                    self._state["status"] = "error_monitoring"
+                    self._state["blocked_reason"] = "monitor_cycle_error"
                 self._state["updated_at_ms"] = _now_ms()
                 self._save_state_locked()
-            self._event("monitor_error", {"error": error})
+            self._event(
+                "monitor_error",
+                {
+                    "error": error,
+                    "transient": transient,
+                    "auto_recovery_pending": recovery_pending,
+                },
+            )
             return self.status()
 
     def _monitor_loop(self) -> None:
@@ -1036,6 +1162,8 @@ class PumpLiveController:
                     position["last_error"] = ";".join(ladder_errors)
                     self._state["entry_armed"] = False
                     self._state["blocked_reason"] = "ladder_order_error"
+                    self._state["transient_recovery_pending"] = False
+                    self._state["healthy_recovery_cycles"] = 0
                 self._save_state_locked()
             self._event(
                 "live_position_opened",
@@ -1471,6 +1599,8 @@ class PumpLiveController:
             self._state["entry_armed"] = False
             self._state["status"] = "emergency_close_submitted"
             self._state["blocked_reason"] = "emergency_close"
+            self._state["transient_recovery_pending"] = False
+            self._state["healthy_recovery_cycles"] = 0
             self._save_state_locked()
         self._event("emergency_close_submitted", {"positions": len(exchange_positions)})
 
@@ -1493,6 +1623,8 @@ class PumpLiveController:
             with self._lock:
                 self._state["entry_armed"] = False
                 self._state["blocked_reason"] = "unknown_exchange_state"
+                self._state["transient_recovery_pending"] = False
+                self._state["healthy_recovery_cycles"] = 0
                 self._state["unknown_positions"] = unknown_positions
                 self._state["unknown_orders"] = unknown_orders
                 self._save_state_locked()
@@ -1517,6 +1649,8 @@ class PumpLiveController:
                 with self._lock:
                     self._state["entry_armed"] = False
                     self._state["blocked_reason"] = "position_absent_unconfirmed"
+                    self._state["transient_recovery_pending"] = False
+                    self._state["healthy_recovery_cycles"] = 0
                     self._save_state_locked()
                 self._event("position_absent_first_cycle", {"symbol": symbol})
             with self._lock:
@@ -1634,6 +1768,8 @@ class PumpLiveController:
             "last_entry_ready": payload.get("last_entry_ready") or [],
             "last_error": payload.get("last_error"),
             "blocked_reason": payload.get("blocked_reason"),
+            "transient_recovery_pending": False,
+            "healthy_recovery_cycles": 0,
             "emergency_close_requested": bool(payload.get("emergency_close_requested")),
             "last_notification_event": payload.get("last_notification_event"),
             "last_notification_status": payload.get("last_notification_status"),
@@ -1644,9 +1780,29 @@ class PumpLiveController:
     def _save_state_locked(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(self._state, ensure_ascii=True, indent=2, sort_keys=True)
-        temp = self.state_path.with_suffix(".tmp")
-        temp.write_text(payload, encoding="utf-8")
-        os.replace(temp, self.state_path)
+        temp = self.state_path.with_name(
+            f"{self.state_path.stem}.{uuid4().hex}.tmp"
+        )
+        try:
+            with temp.open("w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            for attempt, delay in enumerate(STATE_REPLACE_RETRY_DELAYS_SEC):
+                if delay > 0:
+                    time.sleep(delay)
+                try:
+                    os.replace(temp, self.state_path)
+                    return
+                except OSError as exc:
+                    last_attempt = attempt == len(STATE_REPLACE_RETRY_DELAYS_SEC) - 1
+                    if last_attempt or not _is_retryable_state_replace_error(exc):
+                        raise
+        finally:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Pump live temporary state cleanup failed: %s", temp)
 
     def _event(self, event: str, payload: dict[str, Any]) -> None:
         row = {"ts_ms": _now_ms(), "event": event, **payload}
@@ -2037,6 +2193,37 @@ def _read_latest_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
         if isinstance(payload, dict):
             rows.append(payload)
     return rows
+
+
+def _is_retryable_state_replace_error(exc: OSError) -> bool:
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {
+        5,
+        32,
+        33,
+    }
+
+
+def _is_transient_monitor_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError, PermissionError)):
+        return True
+    network_error = getattr(ccxt, "NetworkError", None) if ccxt is not None else None
+    if network_error is not None and isinstance(exc, network_error):
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection reset",
+            "remote disconnected",
+            "network is unreachable",
+            "winerror 5",
+            "winerror 32",
+            "winerror 33",
+        )
+    )
 
 
 def _clean_error(exc: Exception) -> str:

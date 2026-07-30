@@ -7,6 +7,7 @@ from typing import Any
 
 from execution.pump_live import (
     ARM_CONFIRMATION,
+    BybitPumpLiveGateway,
     PumpLiveConfig,
     PumpLiveController,
     build_live_legs,
@@ -27,6 +28,8 @@ class FakePumpGateway:
         self.fail_market = False
         self.liq_after_add: float | None = None
         self.liq_after_remove: float | None = None
+        self.balance_failures: list[Exception] = []
+        self.preflight_existing_state_errors = False
 
     def credentials_status(self) -> dict[str, Any]:
         return {
@@ -40,8 +43,14 @@ class FakePumpGateway:
 
     def preflight(self, config: PumpLiveConfig) -> dict[str, Any]:
         del config
+        errors: list[str] = []
+        if self.preflight_existing_state_errors:
+            if self.positions:
+                errors.append("pump_live_subaccount_has_existing_positions")
+            if any(not bool(item.get("reduce_only")) for item in self.orders):
+                errors.append("pump_live_subaccount_has_unknown_open_orders")
         return {
-            "ready": True,
+            "ready": not errors,
             "checked_at_ms": int(time.time() * 1000),
             "credentials": self.credentials_status(),
             "account": {
@@ -51,7 +60,7 @@ class FakePumpGateway:
                 "positions": len(self.positions),
                 "open_orders": len(self.orders),
             },
-            "errors": [],
+            "errors": errors,
             "warnings": ["api_key_has_no_ip_binding_dynamic_ip_mode"],
         }
 
@@ -59,6 +68,8 @@ class FakePumpGateway:
         return {"status": "prepared"}
 
     def fetch_balance(self) -> dict[str, Any]:
+        if self.balance_failures:
+            raise self.balance_failures.pop(0)
         return dict(self.balance)
 
     def fetch_positions(self) -> list[dict[str, Any]]:
@@ -709,3 +720,205 @@ def test_non_main_strategy_can_never_queue_a_live_entry(tmp_path: Path) -> None:
 
     assert result["accepted"] == 0
     assert controller.status()["pending_signals"] == []
+
+
+def test_transient_monitor_error_recovers_entries_after_two_healthy_cycles(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller.arm(ARM_CONFIRMATION)
+    gateway.balance_failures.append(TimeoutError("temporary balance timeout"))
+
+    failed = controller.run_cycle()
+    assert failed["entry_armed"] is False
+    assert failed["blocked_reason"] == "monitor_cycle_transient_error"
+    assert failed["transient_recovery_pending"] is True
+
+    first_healthy = controller.run_cycle()
+    assert first_healthy["entry_armed"] is False
+    assert first_healthy["healthy_recovery_cycles"] == 1
+
+    recovered = controller.run_cycle()
+    assert recovered["entry_armed"] is True
+    assert recovered["blocked_reason"] is None
+    assert recovered["transient_recovery_pending"] is False
+    assert any(row["event"] == "monitor_recovered" for row in recovered["recent_events"])
+
+
+def test_non_transient_monitor_error_stays_disarmed(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller.arm(ARM_CONFIRMATION)
+    gateway.balance_failures.append(RuntimeError("invalid credentials"))
+
+    failed = controller.run_cycle()
+    assert failed["entry_armed"] is False
+    assert failed["blocked_reason"] == "monitor_cycle_error"
+    assert failed["transient_recovery_pending"] is False
+
+    controller.run_cycle()
+    controller.run_cycle()
+    assert controller.status()["entry_armed"] is False
+    assert controller.status()["blocked_reason"] == "monitor_cycle_error"
+
+
+def test_state_save_retries_transient_windows_replace_lock(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    controller = PumpLiveController(
+        gateway=FakePumpGateway(),
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    from execution import pump_live as pump_live_module
+
+    original_replace = pump_live_module.os.replace
+    attempts = 0
+
+    def flaky_replace(source: Any, target: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise PermissionError(5, "simulated Windows file lock", str(target))
+        original_replace(source, target)
+
+    monkeypatch.setattr(pump_live_module.os, "replace", flaky_replace)
+
+    status = controller.arm(ARM_CONFIRMATION)
+
+    assert status["entry_armed"] is True
+    assert attempts >= 3
+    assert not list((tmp_path / "state").glob("live_state.*.tmp"))
+
+
+def test_bybit_full_protection_treats_not_modified_as_success(
+    monkeypatch: Any,
+) -> None:
+    class AlreadyProtectedClient:
+        @staticmethod
+        def price_to_precision(symbol: str, value: float) -> str:
+            del symbol
+            return str(value)
+
+        @staticmethod
+        def private_post_v5_position_trading_stop(payload: dict[str, Any]) -> dict[str, Any]:
+            del payload
+            raise RuntimeError(
+                'bybit {"retCode":34040,"retMsg":"not modified","result":{}}'
+            )
+
+    gateway = BybitPumpLiveGateway()
+    monkeypatch.setattr(gateway, "_ensure_client", lambda: AlreadyProtectedClient())
+    monkeypatch.setattr(
+        gateway,
+        "_market",
+        lambda symbol: {"id": symbol, "symbol": f"{symbol[:-4]}/USDT:USDT"},
+    )
+
+    result = gateway.set_full_protection(
+        "TESTUSDT",
+        take_profit_price=7.5,
+        stop_loss_price=14.625,
+    )
+
+    assert result == {"status": "already_set"}
+
+
+def test_arm_can_resume_fully_tracked_position_after_restart(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4)
+    state_dir = tmp_path / "state"
+    gateway = FakePumpGateway()
+    first = PumpLiveController(
+        gateway=gateway,
+        state_dir=state_dir,
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(first.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    first.submit_decisions([ready_decision(armed_at + 1)])
+    first.run_cycle()
+    gateway.preflight_existing_state_errors = True
+
+    recovered = PumpLiveController(
+        gateway=gateway,
+        state_dir=state_dir,
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    resumed = recovered.arm(ARM_CONFIRMATION)
+
+    assert resumed["open_positions"] == 1
+    assert resumed["entry_armed"] is True
+    assert resumed["blocked_reason"] is None
+    assert any(row["event"] == "armed_resumed" for row in resumed["recent_events"])
+
+
+def test_arm_resume_rejects_unknown_exchange_position(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4)
+    state_dir = tmp_path / "state"
+    gateway = FakePumpGateway()
+    first = PumpLiveController(
+        gateway=gateway,
+        state_dir=state_dir,
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(first.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    first.submit_decisions([ready_decision(armed_at + 1)])
+    first.run_cycle()
+    gateway.positions.append(
+        {
+            "symbol": "ROGUEUSDT",
+            "side": "short",
+            "qty": 1.0,
+            "avg_price": 1.0,
+            "mark_price": 1.0,
+            "liq_price": 1.5,
+            "leverage": 3.0,
+            "margin_mode": "isolated",
+            "position_idx": 0,
+            "unrealized_pnl": 0.0,
+        }
+    )
+    gateway.preflight_existing_state_errors = True
+    recovered = PumpLiveController(
+        gateway=gateway,
+        state_dir=state_dir,
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+
+    try:
+        recovered.arm(ARM_CONFIRMATION)
+    except RuntimeError as exc:
+        assert "pump_live_resume_unknown_exchange_state" in str(exc)
+    else:  # pragma: no cover - regression guard
+        raise AssertionError("resume unexpectedly accepted an unknown position")
