@@ -13,6 +13,11 @@ account.
 - Four hard strategy slots of `$175` isolated margin each.
 - Operational entry cap is `4`; each position still has its own fixed `$175`
   isolated-margin slot.
+- Reserve policy inside the protected `$300`: `$50` is guaranteed for each of
+  the four positions (`$200` total), another `$75` is a shared emergency pool,
+  and at least `$25` remains as the hard account floor. The configured
+  `$175` per-position and `$275` portfolio top-up limits are emergency ceilings,
+  not an amount that all four positions can consume simultaneously.
 - Leverage: `3x`.
 - Live strategy: `main_pullback_tier` short only.
 - Long, slow-pump, super-pump, clean-control, and cycle strategies remain
@@ -114,8 +119,13 @@ ARM PUMP LIVE 1000
 
 Arming never adopts an old paper position. Only a new
 `main_pullback_tier/entry_ready` decision produced after arming can be queued.
-Every backend restart automatically disables new entries; existing Pump
-positions continue in recovery monitoring.
+Every backend restart initially disables new entries; existing Pump positions
+continue in recovery monitoring. `Arm live` may safely resume with tracked
+positions only after the controller matches all exchange positions and opening
+orders to its durable ledger and force-resynchronizes full TP/SL protection.
+Unknown, missing, or degraded state remains blocked. A successful resume is
+reported as a ready `tracked_positions_verified` preflight instead of leaving
+the UI on the expected existing-position warning.
 
 ## 5. What the First Position Does
 
@@ -130,13 +140,25 @@ positions continue in recovery monitoring.
 - A time stop uses the tier's configured maximum hold.
 - The monitor polls every `15` seconds.
 - New entries are blocked on unknown positions/orders, insufficient reserve,
-  execution uncertainty, or a monitor error.
+  execution uncertainty, or a hard monitor error. A transient network,
+  timeout, or Windows state-file replacement error pauses entries fail-closed
+  and automatically rearms them only after two consecutive healthy monitor
+  cycles. Hard or unclassified errors remain sticky until operator review.
+- Durable state writes use a unique temporary file plus bounded retry/backoff
+  for transient Windows sharing violations; an interrupted writer cannot reuse
+  another cycle's temporary path.
 - If a position is absent in one complete scan, remaining add orders are
   cancelled immediately and entries are disarmed. It is marked closed only
   after two consecutive flat scans.
 - Liquidation distance is monitored. Margin is added from the subaccount
   reserve in capped `$25/$50` steps; per-position and portfolio top-up caps are
   enforced. Warning/panic/emergency buffers are `20% / 15% / 10%`.
+- Normal top-ups stop at the position's guaranteed `$50`. At or below the
+  `15%` panic buffer, positions are processed from the smallest liquidation
+  buffer upward and may use the shared `$75` emergency pool while preserving
+  `$50` quotas for every other open position.
+- A new slot is rejected if opening it would make the guaranteed rescue quota
+  for all resulting positions unavailable.
 - Every top-up is followed immediately by a fresh position read. If the buffer
   is still at or below `10%`, the bot does not wait for the five-minute top-up
   cooldown: it cancels adds and submits a reduce-only emergency close.
@@ -164,7 +186,8 @@ automatic promotion from one slot. Review every first real case against:
 2. Remaining ladder orders have the expected prices and quantities.
 3. The Bybit full-position TP matches the current average entry.
 4. A filled add causes TP recalculation.
-5. Backend restart leaves new entries disarmed and resumes position monitoring.
+5. Backend restart resumes position monitoring fail-closed; explicit `Arm live`
+   succeeds only after owned-position/order validation and protection resync.
 6. Exit leaves no position and no Pump ladder orders.
 7. `live_events.jsonl` contains no unresolved error.
 
@@ -195,3 +218,31 @@ Exchange positions and orders remain authoritative; the local files are the
 durable strategy ledger and audit trail. Notification attempts are appended as
 `notification_delivery` rows and the most recent delivery status is persisted
 in `live_state.json`.
+
+## BANK Margin Stress Reference
+
+Reproduce the deterministic isolated-margin stress model with:
+
+```text
+.venv\Scripts\python.exe scripts\pump_live_margin_stress.py
+```
+
+Outputs are written under
+`data/research/pump_live_margin_stress/` (`summary.json`,
+`bank_margin_levels.csv`, `portfolio_capacity.csv`, and
+`rise_scenarios.csv`).
+
+For the captured BANK position (`1010` short, average `0.17180881`, Bybit
+liquidation `0.22349`, exchange stop `0.2179`, second ladder `1350 @ 0.25766`),
+the model reproduces liquidation at `0.223491`. No top-up, and even one `$25`
+top-up, leaves the stop below the second ladder. The minimum extra isolated
+margin that places the protected stop beyond `0.25766` is about `$42.24`;
+therefore the executable policy needs two `$25` chunks (`$50`) before that
+ladder can be reached safely. With `$50` added, the pre-fill liquidation/stop
+are about `0.271762 / 0.264968`; after the second leg fills, the recalculated
+position is about `2360` BANK at average `0.220919`, with liquidation/stop near
+`0.308032 / 0.300331`.
+
+This is a deterministic policy regression, not a promise that an exchange order
+will fill before a stop in a price gap. The exchange-side Mark Price stop remains
+the final protection for moves faster than the 15-second monitor.

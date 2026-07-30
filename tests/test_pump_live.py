@@ -1019,6 +1019,14 @@ def test_arm_can_resume_fully_tracked_position_after_restart(tmp_path: Path) -> 
     assert resumed["open_positions"] == 1
     assert resumed["entry_armed"] is True
     assert resumed["blocked_reason"] is None
+    assert resumed["last_preflight"]["ready"] is True
+    assert resumed["last_preflight"]["errors"] == []
+    assert resumed["last_preflight"]["raw_ready"] is False
+    assert resumed["last_preflight"]["resume_mode"] == "tracked_positions_verified"
+    assert set(resumed["last_preflight"]["resume_tolerated_errors"]) == {
+        "pump_live_subaccount_has_existing_positions",
+        "pump_live_subaccount_has_unknown_open_orders",
+    }
     assert any(row["event"] == "armed_resumed" for row in resumed["recent_events"])
 
 

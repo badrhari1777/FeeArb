@@ -807,6 +807,24 @@ class PumpLiveController:
                 exchange_by_symbol[_normalize_symbol(item.get("symbol"))],
             )
             self._sync_full_protection(item, config, force=True)
+        resume_preflight = dict(preflight)
+        resume_preflight.update(
+            {
+                "ready": True,
+                "errors": [],
+                "resume_mode": "tracked_positions_verified",
+                "raw_ready": bool(preflight.get("ready")),
+                "resume_tolerated_errors": [
+                    str(item)
+                    for item in preflight.get("errors") or []
+                    if str(item) in tolerated
+                ],
+            }
+        )
+        with self._lock:
+            self._state["last_preflight"] = resume_preflight
+            self._state["updated_at_ms"] = _now_ms()
+            self._save_state_locked()
 
     def disarm(self, reason: str = "operator_disarm") -> dict[str, Any]:
         with self._lock:
