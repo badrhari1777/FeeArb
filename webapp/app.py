@@ -52,7 +52,7 @@ from execution.pump_live import PumpLiveController
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-07-29-positions-01"
+STATIC_VERSION = "v2026-07-30-pump-margin-01"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")

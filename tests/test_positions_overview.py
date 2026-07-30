@@ -68,6 +68,10 @@ def pump_payload() -> dict:
                 "tp_price": 7.5,
                 "stop_price": 13.455,
                 "margin_topup_usd": 25.0,
+                "margin_prefund_floor_usd": 25.0,
+                "margin_prefund_status": "confirmed",
+                "margin_prefund_target_stop_price": 15.375,
+                "margin_prefund_next_ladder_price": 15.0,
                 "opened_at_ms": 500_000,
                 "max_hold_h": 336,
                 "legs": [
@@ -93,6 +97,8 @@ def test_overview_keeps_main_and_pump_groups_separate() -> None:
     assert payload["pump"]["positions"][0]["symbol"] == "TESTUSDT"
     assert payload["pump"]["positions"][0]["risk_level"] == "warn"
     assert payload["pump"]["positions"][0]["legs_filled"] == 1
+    assert payload["pump"]["positions"][0]["margin_prefund_floor_usd"] == 25.0
+    assert payload["pump"]["positions"][0]["margin_prefund_status"] == "confirmed"
     assert payload["pump"]["positions"][0]["remaining_hold_h"] > 335.0
     assert "credentials" not in payload["pump"]
 

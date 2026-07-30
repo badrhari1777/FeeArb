@@ -219,7 +219,7 @@
           cell(fmt(item.qty || 0, 6) + '<br>' + price(item.avg_entry_price) + ' / ' + price(item.mark_price)) +
           cell(price(item.tp_price) + ' / ' + price(item.stop_price) + ' / ' + price(item.liq_price)) +
           cell(item.liq_buffer_pct === null || item.liq_buffer_pct === undefined ? '-' : fmt(item.liq_buffer_pct, 2) + '%') +
-          cell(money(item.margin_topup_usd || 0)) +
+          cell(money(item.margin_topup_usd || 0) + ' / base ' + money(item.margin_prefund_floor_usd || 0)) +
           cell(fmt(ageHours, 1) + 'h') +
           '</tr>';
       }).join('') : '<tr><td colspan="8" class="muted">No Pump live positions.</td></tr>';

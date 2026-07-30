@@ -147,6 +147,16 @@ def _pump_position_card(
         "stop_price": _number(row.get("stop_price")),
         "protection_updated_at_ms": _integer(row.get("protection_updated_at_ms")),
         "margin_topup_usd": _number(row.get("margin_topup_usd")) or 0.0,
+        "margin_prefund_floor_usd": (
+            _number(row.get("margin_prefund_floor_usd")) or 0.0
+        ),
+        "margin_prefund_status": row.get("margin_prefund_status"),
+        "margin_prefund_target_stop_price": _number(
+            row.get("margin_prefund_target_stop_price")
+        ),
+        "margin_prefund_next_ladder_price": _number(
+            row.get("margin_prefund_next_ladder_price")
+        ),
         "margin_topup_cap_usd": _number(config.get("max_position_topup_usd")),
         "margin_reduce_confirm_count": _integer(row.get("margin_reduce_confirm_count")) or 0,
         "opened_at_ms": opened_at_ms,

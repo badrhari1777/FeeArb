@@ -102,6 +102,25 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live entry-prefund margin control was implemented on 2026-07-30 after
+  operator approval, without changing the trading strategy. Slot margin stays
+  `$175`; tier selection, 2/3/5 ladder count, prices, weights, TP, and hold
+  remain unchanged. After the actual L1 fill, the controller uses current
+  quantity, exchange liquidation, and actual L2 price to calculate the
+  isolated margin needed for an exchange stop `2.5%` above L2, rounds upward
+  to `$5`, adds it, verifies the refreshed Bybit position, and then submits
+  every original remaining ladder. The confirmed amount is persisted as
+  `margin_prefund_floor_usd`: warning/panic top-ups continue above it, but
+  safe margin reduction cannot remove the floor. Failed/unconfirmed prefund
+  leaves L1 exchange-protected, disarms entries, and does not submit ladders
+  under uncertain execution. The web/combined positions views expose total
+  top-up plus base floor. Automatic master-to-subaccount transfer remains a
+  separate future layer; existing position/portfolio caps and the `$25` floor
+  remain active. Verified Python/JS syntax, targeted Pump regression
+  (`137 passed`), full regression (`551 passed`, `11 warnings`), durable-floor
+  restart coverage, unchanged 3/5-leg behavior, four concurrent prefunded
+  positions, and no pytest writes to the real Pump event ledger.
+
 - Pump Live margin-management research was expanded on 2026-07-30 without
   changing live execution. `analysis_features/pump_live_margin_stress.py` now
   writes BANK pre-fund, tier-by-tier next-ladder protection, and portfolio

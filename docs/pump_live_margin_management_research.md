@@ -149,23 +149,48 @@ Use `$150` trade margin plus dynamic first-stage protection:
 This is the best risk/free-capital compromise for a `$1000` canary if lower
 growth is acceptable.
 
-## Proposed protection state machine
+## Approved margin-only implementation
 
-Before any implementation, replay it on historical cases:
+On 2026-07-30 the operator approved the margin-control part while explicitly
+keeping the trading strategy unchanged:
+
+- trade margin remains `$175` per slot;
+- tier selection, ladder count, prices, weights, TP, and hold time are
+  unchanged;
+- all configured 2/3/5 ladder legs remain part of the live strategy;
+- after the actual L1 fill, Pump Live calculates the minimum added isolated
+  margin required to put the exchange stop `2.5%` above the actual L2 price;
+- the amount is rounded upward to `$5`, added through the isolated-position
+  margin API, then verified from a fresh Bybit position read;
+- the verified entry prefund becomes a non-removable bot-margin floor;
+- later warning/panic top-ups continue above that floor, and only the excess
+  can be returned by the existing safe-removal hysteresis;
+- normal execution does not gate, cancel, resize, or remove L3–L5 based on the
+  margin study.
+
+If the entry prefund cannot be added or confirmed, the already-filled L1 keeps
+its exchange TP/SL, new entries are disarmed, and remaining ladders are not
+submitted under uncertain protection. This is an execution fail-safe, not a
+strategy rule.
+
+Automatic transfer from the master account is deliberately separate and is
+not implemented by this change. Until it exists, the existing per-position,
+portfolio, guaranteed-reserve, shared-emergency, and hard-floor limits remain
+authoritative.
+
+## Implemented margin state machine
 
 1. Calculate required margin from the actual first fill, actual next order,
    current Bybit risk tier, and current exchange liquidation.
 2. Add only enough margin to place the stop above the next ladder by the chosen
    safety percentage; round upward and cap it.
 3. Read the position again and refresh TP/SL.
-4. Create or retain the next ladder only after the margin and protection are
-   confirmed.
-5. After L2, recalculate the budget for L3. Permit only one deep-stage position
-   to use the shared emergency pool.
-6. Cancel L4/L5 when the required protection would violate the position cap,
-   portfolio cap, other-position guarantees, or operating floor.
-7. Continue removing only Pump-added margin after the existing recovery
+4. Submit every remaining ladder from the selected strategy without changing
+   its count, price, weight, or notional.
+5. Continue warning/panic top-ups under the existing reserve caps.
+6. Continue removing only Pump-added excess margin after the existing recovery
    confirmations and cooldown.
+7. Never remove the confirmed entry-prefund floor while the position is open.
 
 The next research step is a historical PnL replay comparing:
 
@@ -175,5 +200,5 @@ The next research step is a historical PnL replay comparing:
 - conservative `$125`;
 - L3 allowed versus L3 gated.
 
-No live policy should change until that replay measures the lost recovery PnL
-against the reduced stop loss and drawdown.
+That replay remains useful for future sizing decisions, but the approved live
+implementation keeps current `$175` sizing and every strategy ladder.

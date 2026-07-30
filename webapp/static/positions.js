@@ -200,7 +200,7 @@
         '<div><span>Liq / Buffer</span><strong>' + number(row.liq_price, 8) + ' / ' + number(row.liq_buffer_pct, 2) + '%</strong></div>' +
         '<div><span>Protection</span><strong class="' + (protectionOk ? 'value-positive' : 'value-negative') + '">' +
           (protectionOk ? 'TP + SL present' : 'incomplete') + '</strong></div>' +
-        '<div><span>Top-up / Cap</span><strong>' + money(row.margin_topup_usd || 0) + ' / ' + money(row.margin_topup_cap_usd) + '</strong></div>' +
+        '<div><span>Top-up / Base / Cap</span><strong>' + money(row.margin_topup_usd || 0) + ' / ' + money(row.margin_prefund_floor_usd || 0) + ' / ' + money(row.margin_topup_cap_usd) + '</strong></div>' +
         '<div><span>Hold left</span><strong>' + number(row.remaining_hold_h, 1) + 'h / ' + number(row.max_hold_h, 1) + 'h</strong></div>' +
         '<div><span>Ladder</span><strong>' + esc(row.legs_filled || 0) + ' filled · ' + esc(row.legs_open || 0) + ' open</strong></div>' +
         '</div><details><summary>Show ladder and exchange order state</summary>' + ladderTable(row) + '</details></article>';

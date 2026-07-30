@@ -1852,7 +1852,8 @@
         '<td>' + formatTrimmedNumber(row.liq_price, 8) + '<span class="cell-note">' +
           (row.liq_buffer_pct === null || row.liq_buffer_pct === undefined ? '-' : formatNumber(row.liq_buffer_pct, 2) + '%') +
         '</span></td>' +
-        '<td>' + positionsMoney(row.margin_topup_usd || 0) + ' / ' + topupCap + '</td>' +
+        '<td>' + positionsMoney(row.margin_topup_usd || 0) + ' / ' +
+          positionsMoney(row.margin_prefund_floor_usd || 0) + ' / ' + topupCap + '</td>' +
         '<td>' + escapeHtml(legs) + '</td>' +
         '<td>' + escapeHtml(timeLeft) + '</td>' +
       '</tr>';

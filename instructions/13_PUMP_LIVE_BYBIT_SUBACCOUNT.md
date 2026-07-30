@@ -69,6 +69,8 @@ BYBIT_PUMP_TESTNET=0
 PUMP_LIVE_ENTRY_CAP=4
 PUMP_LIVE_POLL_INTERVAL_SEC=15
 PUMP_LIVE_MAX_SLIPPAGE_BPS=50
+PUMP_LIVE_MARGIN_PREFUND_ENABLED=1
+PUMP_LIVE_MARGIN_PREFUND_SAFETY_PCT=2.5
 ```
 
 The file is excluded by `.gitignore`. The tracked template is
@@ -257,31 +259,35 @@ filters. One main-gated super-pump case remains inside the 15-minute
 warning-to-stop uncertainty bucket, and one case crossed the initial stop and
 L2 in the same 15-minute candle.
 
-The leading research candidate is to keep L2 absent until `$50` added margin
-and refreshed protection are confirmed, with `$50` pre-funded at entry for
-pump >=250% only. This is not implemented in live code. Before implementation,
-collect targeted 1-minute evidence and replay the missed-fill/PnL cost of a
-gated L2.
+That report originally proposed selective `$50` pre-funding only for
+pump `>=250%` plus a separately gated L2. The approved policy below supersedes
+the selective part: every tier now receives an actual-position-based entry
+prefund, while the normal 2/3/5 strategy remains unchanged. Targeted 1-minute
+evidence remains useful for measuring residual gap risk, not for changing the
+strategy ladder.
 
-## Margin Management Research (Not Active Policy)
+## Entry Margin Prefund (Active Policy)
 
 `docs/pump_live_margin_management_research.md` and
-`scripts/pump_live_margin_stress.py` compare immediate margin, free capital,
-stop loss, and sequential-ladder protection under the `$1000` four-slot
-budget. The deterministic result is that `$50` is the smallest practical
-current-size BANK protection before L2; `$60+` leaves too little shared cash
-at four positions and increases the catastrophic-stop loss.
+`scripts/pump_live_margin_stress.py` contain the supporting calculation. The
+active margin-only policy keeps `$175` per slot and does not change the
+strategy's tier, 2/3/5 ladder count, prices, weights, TP, or hold time.
 
-The capital-aware research candidate is to compute the minimum top-up required
-to place the stop above the next ladder, round it upward, confirm the exchange
-position/protection, and only then expose that ladder. Approximate current-size
-L2 amounts are `$30 / $50 / $25 / $50` for ordinary, strong `80–100%`, strong
-`100–250%`, and super tiers. A separate balanced candidate reduces trade
-margin to `$150` and uses the same tier-aware protection, leaving at least
-`$200` with four positions.
+After the actual L1 fill, Pump Live calculates the minimum added isolated
+margin required to place the exchange stop `2.5%` above actual L2, rounds
+upward to `$5`, adds it, reads the Bybit position again, and refreshes TP/SL.
+Approximate current-tier amounts are `$30 / $50 / $25 / $50` for ordinary,
+strong `80–100%`, strong `100–250%`, and super tiers. Actual fill, liquidation,
+quantity, and L2 price drive the live calculation.
 
-Deep ladders need a portfolio gate: one protected L3 can fit the shared pool,
-while ordinary L4/L5 cannot fit the current position/portfolio limits. These
-findings are research only. Do not change live sizing, pre-fund positions, or
-gate orders until the historical PnL/drawdown replay is complete and the
-operator explicitly approves the policy.
+The confirmed entry prefund is stored as a non-removable bot-margin floor.
+Warning/panic top-ups continue above it; safe reduction may return only the
+excess. If prefund or verification fails, L1 remains exchange-protected,
+entries are disarmed, and remaining ladders are not submitted under uncertain
+execution.
+
+All normal 2/3/5 ladders remain unchanged. There is no L3–L5 portfolio gate
+or cancellation from this margin policy. Automatic master-to-subaccount
+transfer is a separate future layer; current position/portfolio top-up caps,
+other-position guarantees, shared emergency pool, and `$25` hard floor remain
+in force until that layer is implemented and approved.
