@@ -214,10 +214,11 @@ strategy sizing and calculates three values:
 - a capped next slot, limited to at most `+25%` in one future promotion.
 
 Growth is only recommended above `+10%` relative to the active `$1000`
-capital; reduction is recommended below `-5%`. The manager uses wallet balance
-rather than unrealized equity and persists any operator-declared excluded
-reserve. It requires at least 14 observation days and 10 newly closed live
-trades before reporting the observation gate complete.
+capital; reduction is recommended below `-5%`. The manager uses exact USDT
+`walletBalance`, not unrealized equity or Bybit's fluctuating USD-converted
+`totalWalletBalance`, and persists any operator-declared excluded reserve. It
+requires at least 14 observation days and 10 newly closed live trades before
+reporting the observation gate complete.
 
 This layer is calculation-only. It cannot change live slot size, tier,
 ladder count, price, weight, TP, hold, existing orders, or margin policy.

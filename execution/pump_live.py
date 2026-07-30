@@ -395,13 +395,22 @@ class BybitPumpLiveGateway:
                 account = dict(((info.get("result") or {}).get("list") or [{}])[0])
             except (AttributeError, IndexError, TypeError):
                 account = {}
-            wallet = _optional_float(account.get("totalWalletBalance"))
+            coins = [
+                dict(item)
+                for item in account.get("coin") or []
+                if isinstance(item, Mapping)
+            ]
+            usdt_coin = next(
+                (
+                    item
+                    for item in coins
+                    if str(item.get("coin") or "").upper() == "USDT"
+                ),
+                {},
+            )
+            wallet = _optional_float(usdt_coin.get("walletBalance"))
             if wallet is None:
-                try:
-                    coin = dict((account.get("coin") or [{}])[0])
-                except (IndexError, TypeError):
-                    coin = {}
-                wallet = _optional_float(coin.get("walletBalance"))
+                wallet = _optional_float(account.get("totalWalletBalance"))
             total = _optional_float(account.get("totalEquity")) if total is None else total
             available = (
                 _optional_float(account.get("totalAvailableBalance"))

@@ -206,8 +206,9 @@ Pump Live has a separate durable strategy-capital setting on
 - the active live slot remains `$175`;
 - saving strategy capital never resizes an open position, an existing ladder,
   or a future live order in observe mode;
-- the manager reads Bybit wallet balance, excluding unrealized PnL where the
-  exchange exposes wallet balance separately from total equity;
+- the manager reads the exact Bybit USDT `walletBalance`, excluding unrealized
+  PnL and avoiding the fluctuating USD conversion used by
+  `totalWalletBalance`;
 - the entered value is the amount currently eligible for future strategy
   sizing. It may be lower than the wallet when part of the account must remain
   excluded rescue cash, but it cannot exceed the current wallet;

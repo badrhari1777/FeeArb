@@ -1434,6 +1434,49 @@ def test_bybit_full_protection_treats_not_modified_as_success(
     assert result == {"status": "already_set"}
 
 
+def test_bybit_balance_uses_exact_usdt_wallet_not_usd_conversion(
+    monkeypatch: Any,
+) -> None:
+    class BalanceClient:
+        @staticmethod
+        def fetch_balance(params: dict[str, Any]) -> dict[str, Any]:
+            assert params == {"type": "swap", "accountType": "UNIFIED"}
+            return {
+                "USDT": {
+                    "total": 1_043.94342401,
+                    "free": 1_043.94342401,
+                },
+                "info": {
+                    "result": {
+                        "list": [
+                            {
+                                "totalWalletBalance": "1042.5592786",
+                                "totalEquity": "1042.5592786",
+                                "totalAvailableBalance": "1043.94342401",
+                                "coin": [
+                                    {"coin": "ETC", "walletBalance": "0.00001822"},
+                                    {
+                                        "coin": "USDT",
+                                        "walletBalance": "1043.94342401",
+                                    },
+                                ],
+                            }
+                        ]
+                    }
+                },
+            }
+
+    gateway = BybitPumpLiveGateway()
+    monkeypatch.setattr(gateway, "_ensure_client", lambda: BalanceClient())
+
+    balance = gateway.fetch_balance()
+
+    assert balance["total"] == 1_043.94342401
+    assert balance["wallet"] == 1_043.94342401
+    assert balance["available"] == 1_043.94342401
+    assert balance["used"] == 0.0
+
+
 def test_arm_can_resume_fully_tracked_position_after_restart(tmp_path: Path) -> None:
     env_path = tmp_path / "pump_live.env"
     write_env(env_path, entry_cap=4)

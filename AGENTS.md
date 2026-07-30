@@ -107,7 +107,8 @@ Recent Changes
   strategy-capital setting backed by
   `POST /api/pump-short/live/capital` and the exact confirmation
   `SET PUMP STRATEGY CAPITAL`. The declared eligible capital cannot exceed the
-  fresh Bybit wallet; any excluded wallet reserve is persisted as an
+  fresh Bybit USDT `walletBalance` (not the fluctuating USD-converted
+  `totalWalletBalance`); any excluded wallet reserve is persisted as an
   adjustment so realized wallet changes can be observed without silently
   adopting excluded rescue cash. Status shows wallet, effective capital,
   fixed active `$175` slot, proportional `70% / 4` slot rounded down to `$5`,
