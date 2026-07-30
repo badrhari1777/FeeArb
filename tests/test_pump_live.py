@@ -579,6 +579,150 @@ def test_four_slot_cap_can_open_four_distinct_main_signals(tmp_path: Path) -> No
     }
 
 
+def test_four_positions_each_keep_fifty_dollar_rescue_quota(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions(
+        [
+            ready_decision(
+                armed_at + index + 1,
+                symbol=f"TEST{index}USDT",
+                event_id=f"quota-{index}",
+            )
+            for index in range(4)
+        ]
+    )
+    controller.run_cycle()
+    for position in gateway.positions:
+        position["mark_price"] = 13.0
+        position["liq_price"] = 15.0
+
+    controller.run_cycle()
+    for item in controller._state["positions"]:  # pylint: disable=protected-access
+        item["last_topup_at_ms"] = int(time.time() * 1000) - 400_000
+    controller.run_cycle()
+    for item in controller._state["positions"]:  # pylint: disable=protected-access
+        item["last_topup_at_ms"] = int(time.time() * 1000) - 400_000
+    status = controller.run_cycle()
+
+    by_symbol: dict[str, float] = {}
+    for symbol, amount in gateway.margin_adds:
+        by_symbol[symbol] = by_symbol.get(symbol, 0.0) + amount
+    assert by_symbol == {
+        "TEST0USDT": 50.0,
+        "TEST1USDT": 50.0,
+        "TEST2USDT": 50.0,
+        "TEST3USDT": 50.0,
+    }
+    assert status["entry_armed"] is True
+    assert sum(item["margin_topup_usd"] for item in status["positions"]) == 200.0
+
+
+def test_shared_emergency_pool_prioritizes_smallest_liquidation_buffer(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4)
+    gateway = FakePumpGateway()
+    gateway.liq_after_add = 20.0
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions(
+        [
+            ready_decision(
+                armed_at + index + 1,
+                symbol=f"TEST{index}USDT",
+                event_id=f"priority-{index}",
+            )
+            for index in range(4)
+        ]
+    )
+    controller.run_cycle()
+    now = int(time.time() * 1000)
+    for item in controller._state["positions"]:  # pylint: disable=protected-access
+        item["margin_topup_usd"] = 50.0
+        item["last_topup_at_ms"] = now - 400_000
+    marks = {
+        "TEST0USDT": 13.1,
+        "TEST1USDT": 13.2,
+        "TEST2USDT": 13.5,
+        "TEST3USDT": 14.0,
+    }
+    for position in gateway.positions:
+        position["mark_price"] = marks[position["symbol"]]
+        position["liq_price"] = 15.0
+    gateway.margin_adds.clear()
+
+    controller.run_cycle()
+
+    assert gateway.margin_adds[:2] == [
+        ("TEST3USDT", 50.0),
+        ("TEST2USDT", 25.0),
+    ]
+    assert sum(amount for _, amount in gateway.margin_adds) == 75.0
+
+
+def test_new_slot_is_blocked_when_existing_topups_consume_its_rescue_quota(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions(
+        [
+            ready_decision(
+                armed_at + index + 1,
+                symbol=f"TEST{index}USDT",
+                event_id=f"budget-{index}",
+            )
+            for index in range(3)
+        ]
+    )
+    controller.run_cycle()
+    for item in controller._state["positions"]:  # pylint: disable=protected-access
+        item["margin_topup_usd"] = (
+            175.0 if item["symbol"] == "TEST0USDT" else 50.0
+        )
+    controller.submit_decisions(
+        [
+            ready_decision(
+                int(time.time() * 1000),
+                symbol="TEST3USDT",
+                event_id="budget-3",
+            )
+        ]
+    )
+
+    status = controller.run_cycle()
+
+    assert status["open_positions"] == 3
+    assert status["entry_armed"] is False
+    assert status["blocked_reason"] == "rescue_budget_below_new_slot_guard"
+
+
 def test_topup_notification_uses_injected_shared_route(tmp_path: Path) -> None:
     env_path = tmp_path / "pump_live.env"
     write_env(env_path)

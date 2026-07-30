@@ -50,6 +50,7 @@ class PumpLiveConfig:
     margin_topup_chunk_usd: float = 25.0
     max_position_topup_usd: float = 175.0
     max_total_topup_usd: float = 275.0
+    guaranteed_position_topup_usd: float = 50.0
     operating_cash_floor_usd: float = 25.0
     flat_confirm_cycles: int = 2
     topup_cooldown_sec: int = 300
@@ -1033,6 +1034,26 @@ class PumpLiveController:
                 ):
                     self._remove_pending_locked(decision)
                     continue
+                total_topup = sum(
+                    _safe_float(item.get("margin_topup_usd"), 0.0)
+                    for item in open_items
+                )
+                guaranteed_deficit = sum(
+                    max(
+                        0.0,
+                        config.guaranteed_position_topup_usd
+                        - _safe_float(item.get("margin_topup_usd"), 0.0),
+                    )
+                    for item in open_items
+                )
+                rescue_required_after_entry = (
+                    total_topup
+                    + guaranteed_deficit
+                    + config.guaranteed_position_topup_usd
+                )
+            if rescue_required_after_entry > config.max_total_topup_usd + 1e-9:
+                self.disarm("rescue_budget_below_new_slot_guard")
+                break
             required_available = config.reserve_usd + config.slot_margin_usd
             if _safe_float(balance.get("available"), 0.0) + 1e-9 < required_available:
                 self.disarm("available_balance_below_new_slot_guard")
@@ -1195,6 +1216,15 @@ class PumpLiveController:
     def _maintain_positions(self, config: PumpLiveConfig) -> None:
         with self._lock:
             items = [item for item in self._state.get("positions") or [] if item.get("status") not in {"closed"}]
+
+        def risk_key(item: Mapping[str, Any]) -> float:
+            buffer_pct = _short_liq_buffer_pct(
+                _safe_float(item.get("mark_price"), 0.0),
+                _optional_float(item.get("liq_price")),
+            )
+            return buffer_pct if buffer_pct is not None else math.inf
+
+        items.sort(key=risk_key)
         for item in items:
             self._maintain_single_position(item, config)
 
@@ -1378,9 +1408,19 @@ class PumpLiveController:
             return
         position_topup = _safe_float(item.get("margin_topup_usd"), 0.0)
         with self._lock:
+            open_items = self._open_positions(self._state)
             total_topup = sum(
                 _safe_float(row.get("margin_topup_usd"), 0.0)
-                for row in self._open_positions(self._state)
+                for row in open_items
+            )
+            reserved_for_other_positions = sum(
+                max(
+                    0.0,
+                    config.guaranteed_position_topup_usd
+                    - _safe_float(row.get("margin_topup_usd"), 0.0),
+                )
+                for row in open_items
+                if row is not item
             )
         balance = self.gateway.fetch_balance()
         available = _safe_float(balance.get("available"), 0.0)
@@ -1389,10 +1429,23 @@ class PumpLiveController:
             if buffer_pct <= config.panic_liq_buffer_pct
             else config.margin_topup_chunk_usd
         )
+        position_cap = (
+            config.max_position_topup_usd
+            if buffer_pct <= config.panic_liq_buffer_pct
+            else min(
+                config.max_position_topup_usd,
+                config.guaranteed_position_topup_usd,
+            )
+        )
         allowed = min(
             desired,
-            max(0.0, config.max_position_topup_usd - position_topup),
-            max(0.0, config.max_total_topup_usd - total_topup),
+            max(0.0, position_cap - position_topup),
+            max(
+                0.0,
+                config.max_total_topup_usd
+                - total_topup
+                - reserved_for_other_positions,
+            ),
             max(0.0, available - config.operating_cash_floor_usd),
         )
         if allowed >= 1.0:
@@ -1435,6 +1488,11 @@ class PumpLiveController:
                 self._close_position(item, "emergency_buffer_after_topup", config)
                 return
             self._sync_full_protection(item, config, force=True)
+            return
+        if (
+            buffer_pct > config.panic_liq_buffer_pct
+            and position_topup + 1e-9 >= config.guaranteed_position_topup_usd
+        ):
             return
         if buffer_pct <= config.emergency_liq_buffer_pct:
             self._close_position(item, "emergency_liq_buffer", config)
