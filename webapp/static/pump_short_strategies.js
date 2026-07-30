@@ -177,6 +177,7 @@
     var preflight = live.last_preflight || {};
     var keyInfo = preflight.key || {};
     var balance = live.last_balance || (preflight.account || {});
+    var capital = live.capital_manager || {};
     var open = Number(live.open_positions || 0);
     var cap = Number(config.entry_cap || 1);
     setText('pss-live-status', live.status || 'disabled');
@@ -193,6 +194,43 @@
     setText('pss-live-slots', open + ' / ' + cap + ' (max ' + Number(config.max_active_positions || 4) + ')');
     setText('pss-live-reserve', money(config.reserve_usd || 300));
     setText('pss-live-cycle', shortTime(live.last_cycle_at_ms));
+    setText(
+      'pss-live-capital-mode',
+      (capital.mode || 'observe') + (capital.application_enabled ? ' / active' : ' / calculation only')
+    );
+    setText('pss-live-capital-wallet', money(capital.account_wallet_usd || balance.wallet || balance.total || 0));
+    setText('pss-live-capital-effective', money(capital.effective_strategy_capital_usd || 0));
+    setText('pss-live-capital-active-slot', money(capital.active_slot_margin_usd || config.slot_margin_usd || 0));
+    setText('pss-live-capital-recommended-slot', money(capital.recommended_slot_margin_usd || 0));
+    setText('pss-live-capital-next-slot', money(capital.next_capped_slot_margin_usd || 0));
+    setText(
+      'pss-live-capital-progress',
+      fmt(capital.observation_elapsed_days || 0, 1) + 'd / ' +
+        Number(capital.observation_closed_trades || 0) + ' trades'
+    );
+    var capitalInput = $('pss-live-capital-input');
+    if (capitalInput && document.activeElement !== capitalInput) {
+      capitalInput.value = Number(
+        capital.declared_strategy_capital_usd ||
+        capital.effective_strategy_capital_usd ||
+        balance.wallet ||
+        balance.total ||
+        1000
+      ).toFixed(2);
+    }
+    var recommendationLabels = {
+      increase_ready: 'Growth threshold reached; the capped next slot is calculated but not applied.',
+      decrease_ready: 'Reduction threshold reached; the smaller slot is calculated but not applied in observe mode.',
+      hold_band: 'Capital remains inside the 10% growth / 5% reduction hold band.'
+    };
+    setText(
+      'pss-live-capital-hint',
+      (recommendationLabels[capital.recommendation] || 'Capital observation is waiting for data.') +
+        ' Activation requires at least ' + Number(capital.observation_min_days || 14) +
+        ' days and ' + Number(capital.observation_min_trades || 10) +
+        ' newly closed live trades, followed by a separate operator decision.'
+    );
+    setDisabled('pss-live-capital-save', Number(capital.account_wallet_usd || balance.wallet || balance.total || 0) <= 0);
 
     var warnings = [];
     if (live.blocked_reason) warnings.push('Blocked: ' + live.blocked_reason);
@@ -270,6 +308,34 @@
         return;
       }
       setStatus('Pump live armed for new signals', false);
+      refresh();
+    });
+  }
+
+  function liveSetCapital() {
+    var input = $('pss-live-capital-input');
+    var amount = Number((input && input.value) || 0);
+    if (!isFinite(amount) || amount < 100) {
+      setStatus('Strategy capital must be at least 100 USDT', true);
+      return;
+    }
+    var confirmation = window.prompt(
+      'OBSERVE ONLY: this records sizing-eligible strategy capital but does not change live orders. Type: SET PUMP STRATEGY CAPITAL'
+    );
+    if (confirmation !== 'SET PUMP STRATEGY CAPITAL') {
+      setStatus('Capital update canceled', true);
+      return;
+    }
+    requestJson('POST', '/api/pump-short/live/capital', {
+      strategy_capital_usd: amount,
+      note: String((($('pss-live-capital-note') || {}).value) || '').trim(),
+      confirmation: confirmation
+    }, function (err) {
+      if (err) {
+        setStatus(err.message, true);
+        return;
+      }
+      setStatus('Observed strategy capital saved; live slot remains unchanged', false);
       refresh();
     });
   }
@@ -894,6 +960,7 @@
     if ($('pss-live-preflight')) $('pss-live-preflight').addEventListener('click', livePreflight);
     if ($('pss-live-prepare')) $('pss-live-prepare').addEventListener('click', livePrepare);
     if ($('pss-live-arm')) $('pss-live-arm').addEventListener('click', liveArm);
+    if ($('pss-live-capital-save')) $('pss-live-capital-save').addEventListener('click', liveSetCapital);
     if ($('pss-live-disarm')) $('pss-live-disarm').addEventListener('click', liveDisarm);
     if ($('pss-live-emergency')) $('pss-live-emergency').addEventListener('click', liveEmergencyClose);
   }

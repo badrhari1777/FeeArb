@@ -416,6 +416,18 @@ class BybitPumpShortLab:
     def pump_live_arm(self, confirmation: str) -> dict[str, Any]:
         return self._pump_live.arm(confirmation)
 
+    def pump_live_set_strategy_capital(
+        self,
+        strategy_capital_usd: float,
+        confirmation: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        return self._pump_live.set_strategy_capital(
+            strategy_capital_usd,
+            confirmation,
+            note,
+        )
+
     def pump_live_disarm(self) -> dict[str, Any]:
         return self._pump_live.disarm()
 

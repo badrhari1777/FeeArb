@@ -52,7 +52,7 @@ from execution.pump_live import PumpLiveController
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-07-30-pump-margin-01"
+STATIC_VERSION = "v2026-07-30-pump-capital-observe-01"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -346,6 +346,12 @@ class BybitPumpShortShadowSchedulePayload(BybitPumpShortShadowStartPayload):
 
 class PumpLiveConfirmationPayload(BaseModel):
     confirmation: str
+
+
+class PumpLiveCapitalPayload(BaseModel):
+    strategy_capital_usd: float = Field(ge=100.0, le=1_000_000.0)
+    confirmation: str
+    note: Optional[str] = Field(default=None, max_length=200)
 
 
 class NotificationTestPayload(BaseModel):
@@ -703,6 +709,21 @@ async def pump_short_live_prepare_api(payload: PumpLiveConfirmationPayload) -> J
 async def pump_short_live_arm_api(payload: PumpLiveConfirmationPayload) -> JSONResponse:
     try:
         result = bybit_pump_short_lab.pump_live_arm(payload.confirmation)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/pump-short/live/capital")
+async def pump_short_live_capital_api(payload: PumpLiveCapitalPayload) -> JSONResponse:
+    try:
+        result = bybit_pump_short_lab.pump_live_set_strategy_capital(
+            payload.strategy_capital_usd,
+            payload.confirmation,
+            payload.note,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

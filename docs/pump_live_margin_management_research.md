@@ -202,3 +202,24 @@ The next research step is a historical PnL replay comparing:
 
 That replay remains useful for future sizing decisions, but the approved live
 implementation keeps current `$175` sizing and every strategy ladder.
+
+## Capital observation without live resizing
+
+On 2026-07-30 a separate capital observation layer was approved. It records
+the amount of the Bybit Pump wallet that the operator considers eligible for
+strategy sizing and calculates three values:
+
+- the active slot, still fixed at `$175`;
+- the proportional slot from `70% / 4`, rounded down to `$5`;
+- a capped next slot, limited to at most `+25%` in one future promotion.
+
+Growth is only recommended above `+10%` relative to the active `$1000`
+capital; reduction is recommended below `-5%`. The manager uses wallet balance
+rather than unrealized equity and persists any operator-declared excluded
+reserve. It requires at least 14 observation days and 10 newly closed live
+trades before reporting the observation gate complete.
+
+This layer is calculation-only. It cannot change live slot size, tier,
+ladder count, price, weight, TP, hold, existing orders, or margin policy.
+Capital application and automatic master/sub transfer remain separate future
+changes requiring explicit approval.

@@ -89,6 +89,33 @@
         <div class="pump-dashboard-stat"><span>Reserve floor</span><strong id="pss-live-reserve">$300.00</strong></div>
         <div class="pump-dashboard-stat"><span>Last cycle</span><strong id="pss-live-cycle">-</strong></div>
       </div>
+      <div class="panel-heading">
+        <div>
+          <h3>Capital observation</h3>
+          <p class="muted">The declared capital is recorded separately from the Bybit wallet. Observe mode calculates sizing but never changes live orders or the active $175 slot.</p>
+        </div>
+      </div>
+      <form class="research-form" id="pss-live-capital-form">
+        <label>
+          Strategy capital, USDT
+          <input id="pss-live-capital-input" type="number" min="100" max="1000000" step="0.01" inputmode="decimal" />
+        </label>
+        <label>
+          Note
+          <input id="pss-live-capital-note" type="text" maxlength="200" placeholder="Permanent deposit or excluded rescue reserve" />
+        </label>
+        <button type="button" class="button button--ghost" id="pss-live-capital-save">Save observed capital</button>
+      </form>
+      <div class="pump-dashboard-band">
+        <div class="pump-dashboard-stat"><span>Capital mode</span><strong id="pss-live-capital-mode">observe</strong></div>
+        <div class="pump-dashboard-stat"><span>Wallet</span><strong id="pss-live-capital-wallet">$0.00</strong></div>
+        <div class="pump-dashboard-stat"><span>Effective capital</span><strong id="pss-live-capital-effective">$0.00</strong></div>
+        <div class="pump-dashboard-stat"><span>Active slot</span><strong id="pss-live-capital-active-slot">$175.00</strong></div>
+        <div class="pump-dashboard-stat"><span>Calculated slot</span><strong id="pss-live-capital-recommended-slot">$175.00</strong></div>
+        <div class="pump-dashboard-stat"><span>Next capped slot</span><strong id="pss-live-capital-next-slot">$175.00</strong></div>
+        <div class="pump-dashboard-stat"><span>Observation</span><strong id="pss-live-capital-progress">0d / 0 trades</strong></div>
+      </div>
+      <p id="pss-live-capital-hint" class="muted"></p>
       <p id="pss-live-warning" class="settings-status"></p>
       <div class="table-wrapper table-wrapper--wide">
         <table class="table table--compact">

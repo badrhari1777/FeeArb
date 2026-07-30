@@ -29,8 +29,15 @@ PUMP_ORDER_LINK_PREFIX = "FAP"
 ARM_CONFIRMATION = "ARM PUMP LIVE 1000"
 PREPARE_CONFIRMATION = "PREPARE PUMP SUBACCOUNT"
 EMERGENCY_CONFIRMATION = "CLOSE ALL PUMP POSITIONS"
+CAPITAL_SET_CONFIRMATION = "SET PUMP STRATEGY CAPITAL"
 TRANSIENT_RECOVERY_CYCLES = 2
 STATE_REPLACE_RETRY_DELAYS_SEC = (0.0, 0.05, 0.1, 0.2, 0.4, 0.8)
+CAPITAL_OBSERVATION_DAYS = 14
+CAPITAL_OBSERVATION_TRADES = 10
+CAPITAL_GROWTH_TRIGGER_PCT = 10.0
+CAPITAL_REDUCTION_TRIGGER_PCT = 5.0
+CAPITAL_MAX_INCREASE_STEP_PCT = 25.0
+CAPITAL_SLOT_ROUND_USD = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,6 +395,13 @@ class BybitPumpLiveGateway:
                 account = dict(((info.get("result") or {}).get("list") or [{}])[0])
             except (AttributeError, IndexError, TypeError):
                 account = {}
+            wallet = _optional_float(account.get("totalWalletBalance"))
+            if wallet is None:
+                try:
+                    coin = dict((account.get("coin") or [{}])[0])
+                except (IndexError, TypeError):
+                    coin = {}
+                wallet = _optional_float(coin.get("walletBalance"))
             total = _optional_float(account.get("totalEquity")) if total is None else total
             available = (
                 _optional_float(account.get("totalAvailableBalance"))
@@ -396,6 +410,7 @@ class BybitPumpLiveGateway:
             )
             return {
                 "total": total or 0.0,
+                "wallet": wallet if wallet is not None else (total or 0.0),
                 "available": available or 0.0,
                 "used": max(0.0, (total or 0.0) - (available or 0.0)),
             }
@@ -693,6 +708,7 @@ class PumpLiveController:
         config = self.config()
         payload["config"] = asdict(config)
         payload["config"]["slot_margin_usd"] = round(config.slot_margin_usd, 6)
+        payload["capital_manager"] = build_capital_manager_status(payload, config)
         payload["credentials"] = self.gateway.credentials_status()
         payload["monitor_thread_alive"] = bool(self._thread and self._thread.is_alive())
         payload["state_file"] = str(self.state_path)
@@ -707,6 +723,56 @@ class PumpLiveController:
         }
         payload["recent_events"] = _read_latest_jsonl(self.events_path, limit=30)
         return payload
+
+    def set_strategy_capital(
+        self,
+        strategy_capital_usd: float,
+        confirmation: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Declare sizing-eligible capital without changing live order sizes."""
+        if confirmation != CAPITAL_SET_CONFIRMATION:
+            raise ValueError("pump_live_capital_confirmation_invalid")
+        capital = _safe_float(strategy_capital_usd, 0.0)
+        if not math.isfinite(capital) or capital < 100.0 or capital > 1_000_000.0:
+            raise ValueError("pump_live_strategy_capital_out_of_range")
+        balance = self.gateway.fetch_balance()
+        wallet = _capital_wallet_balance(balance)
+        if wallet <= 0:
+            raise RuntimeError("pump_live_capital_wallet_balance_missing")
+        if capital > wallet + 0.01:
+            raise RuntimeError("pump_live_strategy_capital_exceeds_wallet_balance")
+        clean_note = str(note or "").strip()[:200] or None
+        now = _now_ms()
+        with self._lock:
+            manager = dict(self._state.get("capital_manager") or {})
+            manager.update(
+                {
+                    "mode": "observe",
+                    "application_enabled": False,
+                    "declared_strategy_capital_usd": round(capital, 6),
+                    "declared_account_wallet_usd": round(wallet, 6),
+                    "equity_adjustment_usd": round(capital - wallet, 6),
+                    "declared_at_ms": now,
+                    "declared_note": clean_note,
+                    "declared_source": "operator",
+                }
+            )
+            self._state["capital_manager"] = manager
+            self._state["last_balance"] = balance
+            self._state["updated_at_ms"] = now
+            self._save_state_locked()
+        self._event(
+            "capital_declared",
+            {
+                "strategy_capital_usd": round(capital, 6),
+                "account_wallet_usd": round(wallet, 6),
+                "equity_adjustment_usd": round(capital - wallet, 6),
+                "mode": "observe",
+                "active_slot_margin_usd": round(self.config().slot_margin_usd, 6),
+            },
+        )
+        return self.status()
 
     def preflight(self) -> dict[str, Any]:
         result = self.gateway.preflight(self.config())
@@ -2032,6 +2098,31 @@ class PumpLiveController:
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
+        last_balance = payload.get("last_balance")
+        manager = dict(payload.get("capital_manager") or {})
+        if not manager:
+            observed_wallet = _capital_wallet_balance(
+                last_balance if isinstance(last_balance, Mapping) else {}
+            )
+            initial_capital = observed_wallet if observed_wallet > 0 else 1_000.0
+            now = _now_ms()
+            manager = {
+                "mode": "observe",
+                "application_enabled": False,
+                "active_strategy_capital_usd": 1_000.0,
+                "declared_strategy_capital_usd": round(initial_capital, 6),
+                "declared_account_wallet_usd": round(initial_capital, 6),
+                "equity_adjustment_usd": 0.0,
+                "observation_started_at_ms": now,
+                "closed_trades_baseline": sum(
+                    1
+                    for item in payload.get("positions") or []
+                    if item.get("status") == "closed"
+                ),
+                "declared_at_ms": now,
+                "declared_note": "automatic migration to observe mode",
+                "declared_source": "migration",
+            }
         return {
             "schema": "pump_live_state_v1",
             "status": payload.get("status") or "disabled",
@@ -2043,7 +2134,7 @@ class PumpLiveController:
             "seen_events": list(payload.get("seen_events") or []),
             "pending_signals": [],
             "last_preflight": payload.get("last_preflight"),
-            "last_balance": payload.get("last_balance"),
+            "last_balance": last_balance,
             "last_exchange_positions": payload.get("last_exchange_positions") or [],
             "last_open_orders": payload.get("last_open_orders") or [],
             "last_cycle_at_ms": payload.get("last_cycle_at_ms"),
@@ -2059,6 +2150,7 @@ class PumpLiveController:
             "last_notification_status": payload.get("last_notification_status"),
             "last_notification_at_ms": payload.get("last_notification_at_ms"),
             "last_notification_error": payload.get("last_notification_error"),
+            "capital_manager": manager,
         }
 
     def _save_state_locked(self) -> None:
@@ -2412,6 +2504,107 @@ def build_live_legs(
     return result
 
 
+def build_capital_manager_status(
+    state: Mapping[str, Any],
+    config: PumpLiveConfig,
+    *,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Build the read-only capital-sizing recommendation shown during observation."""
+    manager = dict(state.get("capital_manager") or {})
+    balance = state.get("last_balance")
+    wallet = _capital_wallet_balance(balance if isinstance(balance, Mapping) else {})
+    adjustment = _safe_float(manager.get("equity_adjustment_usd"), 0.0)
+    declared = _safe_float(
+        manager.get("declared_strategy_capital_usd"),
+        wallet if wallet > 0 else config.total_capital_usd,
+    )
+    observed_capital = wallet + adjustment if wallet > 0 else declared
+    observed_capital = max(0.0, observed_capital)
+    active_capital = _safe_float(
+        manager.get("active_strategy_capital_usd"),
+        config.total_capital_usd,
+    )
+    active_slot = config.slot_margin_usd
+    deployable_ratio = (
+        config.deployable_capital_usd / max(config.total_capital_usd, 1e-9)
+    )
+    raw_slot = (
+        observed_capital
+        * deployable_ratio
+        / max(config.max_active_positions, 1)
+    )
+    recommended_slot = _round_down_increment(raw_slot, CAPITAL_SLOT_ROUND_USD)
+    growth_threshold = active_capital * (1.0 + CAPITAL_GROWTH_TRIGGER_PCT / 100.0)
+    reduction_threshold = active_capital * (1.0 - CAPITAL_REDUCTION_TRIGGER_PCT / 100.0)
+    if observed_capital >= growth_threshold:
+        max_next = _round_down_increment(
+            active_slot * (1.0 + CAPITAL_MAX_INCREASE_STEP_PCT / 100.0),
+            CAPITAL_SLOT_ROUND_USD,
+        )
+        next_slot = min(recommended_slot, max_next)
+        recommendation = "increase_ready"
+    elif observed_capital <= reduction_threshold:
+        next_slot = recommended_slot
+        recommendation = "decrease_ready"
+    else:
+        next_slot = active_slot
+        recommendation = "hold_band"
+    started_at = _safe_int(manager.get("observation_started_at_ms"), 0)
+    current_ms = now_ms if now_ms is not None else _now_ms()
+    elapsed_days = (
+        max(0.0, (current_ms - started_at) / 86_400_000.0)
+        if started_at
+        else 0.0
+    )
+    closed_total = sum(
+        1
+        for item in state.get("positions") or []
+        if item.get("status") == "closed"
+    )
+    baseline = _safe_int(manager.get("closed_trades_baseline"), closed_total)
+    observed_trades = max(0, closed_total - baseline)
+    observation_ready = (
+        elapsed_days >= CAPITAL_OBSERVATION_DAYS
+        and observed_trades >= CAPITAL_OBSERVATION_TRADES
+    )
+    return {
+        **manager,
+        "mode": "observe",
+        "application_enabled": False,
+        "account_wallet_usd": round(wallet, 6),
+        "effective_strategy_capital_usd": round(observed_capital, 6),
+        "active_strategy_capital_usd": round(active_capital, 6),
+        "active_slot_margin_usd": round(active_slot, 6),
+        "recommended_slot_margin_usd": round(recommended_slot, 6),
+        "next_capped_slot_margin_usd": round(max(0.0, next_slot), 6),
+        "recommendation": recommendation,
+        "growth_trigger_capital_usd": round(growth_threshold, 6),
+        "reduction_trigger_capital_usd": round(reduction_threshold, 6),
+        "growth_trigger_pct": CAPITAL_GROWTH_TRIGGER_PCT,
+        "reduction_trigger_pct": CAPITAL_REDUCTION_TRIGGER_PCT,
+        "max_increase_step_pct": CAPITAL_MAX_INCREASE_STEP_PCT,
+        "slot_round_usd": CAPITAL_SLOT_ROUND_USD,
+        "observation_min_days": CAPITAL_OBSERVATION_DAYS,
+        "observation_min_trades": CAPITAL_OBSERVATION_TRADES,
+        "observation_elapsed_days": round(elapsed_days, 3),
+        "observation_closed_trades": observed_trades,
+        "observation_ready": observation_ready,
+    }
+
+
+def _capital_wallet_balance(balance: Mapping[str, Any]) -> float:
+    wallet = _safe_float(balance.get("wallet"), 0.0)
+    if wallet > 0:
+        return wallet
+    return _safe_float(balance.get("total"), 0.0)
+
+
+def _round_down_increment(value: float, increment: float) -> float:
+    step = max(0.0001, increment)
+    return math.floor(max(0.0, value) / step + 1e-12) * step
+
+
 def _normalize_order(row: Mapping[str, Any]) -> dict[str, Any]:
     status_map = {
         "New": "open",
@@ -2599,11 +2792,13 @@ def _now_ms() -> int:
 __all__ = [
     "ARM_CONFIRMATION",
     "BybitPumpLiveGateway",
+    "CAPITAL_SET_CONFIRMATION",
     "EMERGENCY_CONFIRMATION",
     "PREPARE_CONFIRMATION",
     "PUMP_LIVE_ENV_PATH",
     "PumpLiveConfig",
     "PumpLiveController",
+    "build_capital_manager_status",
     "build_live_legs",
     "load_pump_live_config",
     "required_entry_prefund_usd",

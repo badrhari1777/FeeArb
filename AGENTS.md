@@ -102,6 +102,23 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live capital observation was added on 2026-07-30 without enabling
+  dynamic live sizing. `/pump-short-strategies` now has a separate durable
+  strategy-capital setting backed by
+  `POST /api/pump-short/live/capital` and the exact confirmation
+  `SET PUMP STRATEGY CAPITAL`. The declared eligible capital cannot exceed the
+  fresh Bybit wallet; any excluded wallet reserve is persisted as an
+  adjustment so realized wallet changes can be observed without silently
+  adopting excluded rescue cash. Status shows wallet, effective capital,
+  fixed active `$175` slot, proportional `70% / 4` slot rounded down to `$5`,
+  and the capped next slot. Recommendations use `+10%` growth, `-5%`
+  reduction, maximum `+25%` per future promotion, and readiness of at least
+  14 days plus 10 newly closed live trades. `mode=observe` and
+  `application_enabled=false` are hard outputs: no live position, ladder, or
+  future order sizing changes from this setting. Manual/automatic rescue
+  transfers must remain excluded; actual activation is a separate future
+  operator-approved change.
+
 - Pump Live entry-prefund margin control was implemented on 2026-07-30 after
   operator approval, without changing the trading strategy. Slot margin stays
   `$175`; tier selection, 2/3/5 ladder count, prices, weights, TP, and hold

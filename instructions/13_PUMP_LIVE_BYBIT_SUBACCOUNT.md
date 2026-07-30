@@ -197,6 +197,41 @@ There is still no automatic promotion or sizing growth. Any change above four
 slots, above `$175` per slot, or any automated master/sub transfer requires a
 new explicit operator decision.
 
+## Capital Observation Setting
+
+Pump Live has a separate durable strategy-capital setting on
+`/pump-short-strategies`. It is intentionally deployed in `observe` mode:
+
+- the active live capital remains `$1000`;
+- the active live slot remains `$175`;
+- saving strategy capital never resizes an open position, an existing ladder,
+  or a future live order in observe mode;
+- the manager reads Bybit wallet balance, excluding unrealized PnL where the
+  exchange exposes wallet balance separately from total equity;
+- the entered value is the amount currently eligible for future strategy
+  sizing. It may be lower than the wallet when part of the account must remain
+  excluded rescue cash, but it cannot exceed the current wallet;
+- the difference between entered strategy capital and current wallet is
+  persisted, so later realized balance changes remain visible without turning
+  the excluded reserve into strategy capital;
+- every change is written as `capital_declared` in `live_events.jsonl`.
+
+The page shows active slot, calculated slot, and the maximum next slot after
+the agreed `+25%` growth cap. Calculation uses the existing `70% deployable /
+30% reserve / 4 slots` allocation, rounds down to `$5`, waits for `+10%`
+capital before recommending growth, and recommends reduction after `-5%`.
+
+Observation readiness requires at least `14` days and `10` newly closed live
+trades. Even after those gates, application remains disabled until a separate
+operator-approved implementation. A daily/event-driven activation policy is
+therefore not yet capable of changing live size.
+
+If capital is manually deposited during observation, first complete the
+deposit, then save the exact portion that should count as strategy capital.
+Leave emergency/rescue funds outside that value. The future automatic
+master-to-sub transfer layer must update this exclusion itself so a rescue
+transfer can never be mistaken for profit.
+
 ## Emergency Controls
 
 - `Disarm entries` stops new positions but keeps monitoring existing ones.

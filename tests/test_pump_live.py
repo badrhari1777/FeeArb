@@ -8,8 +8,10 @@ from typing import Any
 from execution.pump_live import (
     ARM_CONFIRMATION,
     BybitPumpLiveGateway,
+    CAPITAL_SET_CONFIRMATION,
     PumpLiveConfig,
     PumpLiveController,
+    build_capital_manager_status,
     build_live_legs,
     load_pump_live_config,
     required_entry_prefund_usd,
@@ -18,7 +20,12 @@ from execution.pump_live import (
 
 class FakePumpGateway:
     def __init__(self) -> None:
-        self.balance = {"total": 1_000.0, "available": 1_000.0, "used": 0.0}
+        self.balance = {
+            "total": 1_000.0,
+            "wallet": 1_000.0,
+            "available": 1_000.0,
+            "used": 0.0,
+        }
         self.positions: list[dict[str, Any]] = []
         self.orders: list[dict[str, Any]] = []
         self.take_profits: list[tuple[str, float]] = []
@@ -288,6 +295,161 @@ def test_1000_plan_has_four_175_slots_and_orders_clear_bybit_minimum() -> None:
     assert round(sum(item["margin_usd"] for item in legs), 6) == 175.0
     assert min(item["notional_usd"] for item in legs) == 87.5
     assert min(item["notional_usd"] for item in legs) > 5.0
+
+
+def test_capital_observation_reports_growth_without_changing_active_slot(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4)
+    gateway = FakePumpGateway()
+    gateway.balance.update(
+        {"total": 1_043.943424, "wallet": 1_043.943424, "available": 1_043.943424}
+    )
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+
+    status = controller.run_cycle()
+    capital = status["capital_manager"]
+
+    assert capital["mode"] == "observe"
+    assert capital["application_enabled"] is False
+    assert capital["effective_strategy_capital_usd"] == 1_043.943424
+    assert capital["active_slot_margin_usd"] == 175.0
+    assert capital["recommended_slot_margin_usd"] == 180.0
+    assert capital["next_capped_slot_margin_usd"] == 175.0
+    assert capital["recommendation"] == "hold_band"
+    assert status["config"]["slot_margin_usd"] == 175.0
+
+
+def test_operator_capital_declaration_tracks_wallet_delta_and_persists(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4)
+    state_dir = tmp_path / "state"
+    gateway = FakePumpGateway()
+    gateway.balance.update(
+        {"total": 1_500.0, "wallet": 1_500.0, "available": 1_500.0}
+    )
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=state_dir,
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+
+    status = controller.set_strategy_capital(
+        1_400.0,
+        CAPITAL_SET_CONFIRMATION,
+        "keep 100 as excluded reserve",
+    )
+    capital = status["capital_manager"]
+
+    assert capital["declared_strategy_capital_usd"] == 1_400.0
+    assert capital["declared_account_wallet_usd"] == 1_500.0
+    assert capital["equity_adjustment_usd"] == -100.0
+    assert capital["effective_strategy_capital_usd"] == 1_400.0
+    assert capital["recommended_slot_margin_usd"] == 245.0
+    assert capital["next_capped_slot_margin_usd"] == 215.0
+    assert capital["recommendation"] == "increase_ready"
+    assert status["config"]["slot_margin_usd"] == 175.0
+    assert any(row["event"] == "capital_declared" for row in status["recent_events"])
+
+    gateway.balance.update(
+        {"total": 1_550.0, "wallet": 1_550.0, "available": 1_550.0}
+    )
+    controller.run_cycle()
+    recovered = PumpLiveController(
+        gateway=gateway,
+        state_dir=state_dir,
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    ).status()
+
+    assert recovered["capital_manager"]["effective_strategy_capital_usd"] == 1_450.0
+    assert recovered["capital_manager"]["equity_adjustment_usd"] == -100.0
+    assert recovered["capital_manager"]["active_slot_margin_usd"] == 175.0
+
+
+def test_capital_declaration_cannot_exceed_exchange_wallet(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    controller = PumpLiveController(
+        gateway=FakePumpGateway(),
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+
+    try:
+        controller.set_strategy_capital(1_100.0, CAPITAL_SET_CONFIRMATION)
+    except RuntimeError as exc:
+        assert str(exc) == "pump_live_strategy_capital_exceeds_wallet_balance"
+    else:  # pragma: no cover - regression guard
+        raise AssertionError("capital above wallet was unexpectedly accepted")
+
+
+def test_observation_readiness_requires_time_and_new_closed_trades() -> None:
+    now = int(time.time() * 1000)
+    state = {
+        "last_balance": {"wallet": 1_100.0, "total": 1_100.0},
+        "positions": [
+            {"status": "closed", "closed_at_ms": now - index}
+            for index in range(10)
+        ],
+        "capital_manager": {
+            "active_strategy_capital_usd": 1_000.0,
+            "declared_strategy_capital_usd": 1_100.0,
+            "declared_account_wallet_usd": 1_100.0,
+            "equity_adjustment_usd": 0.0,
+            "observation_started_at_ms": now - 15 * 86_400_000,
+            "closed_trades_baseline": 0,
+        },
+    }
+
+    result = build_capital_manager_status(state, PumpLiveConfig(), now_ms=now)
+
+    assert result["observation_ready"] is True
+    assert result["observation_closed_trades"] == 10
+    assert result["recommendation"] == "increase_ready"
+    assert result["recommended_slot_margin_usd"] == 190.0
+    assert result["next_capped_slot_margin_usd"] == 190.0
+
+
+def test_observed_capital_never_resizes_live_strategy_legs(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4)
+    gateway = FakePumpGateway()
+    gateway.balance.update(
+        {"total": 1_500.0, "wallet": 1_500.0, "available": 1_500.0}
+    )
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller.set_strategy_capital(1_500.0, CAPITAL_SET_CONFIRMATION)
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+
+    status = controller.run_cycle()
+    position = next(item for item in status["positions"] if item["status"] != "closed")
+
+    assert sum(float(leg["margin_usd"]) for leg in position["legs"]) == 175.0
+    assert status["capital_manager"]["recommended_slot_margin_usd"] == 260.0
+    assert status["capital_manager"]["next_capped_slot_margin_usd"] == 215.0
+    assert status["config"]["slot_margin_usd"] == 175.0
 
 
 def test_arm_ignores_old_signal_and_opens_new_main_signal(tmp_path: Path) -> None:
