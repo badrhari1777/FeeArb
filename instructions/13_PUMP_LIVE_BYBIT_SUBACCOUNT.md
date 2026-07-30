@@ -246,3 +246,19 @@ position is about `2360` BANK at average `0.220919`, with liquidation/stop near
 This is a deterministic policy regression, not a promise that an exchange order
 will fill before a stop in a price gap. The exchange-side Mark Price stop remains
 the final protection for moves faster than the 15-second monitor.
+
+## Historical Spike Research (Not Active Policy)
+
+The offline report `docs/pump_spike_risk_research.md` analyzes the archived
+Bybit universe from 2024. It found 849 market-wide hourly surge episodes of at
+least 30%, including 428 wick-like episodes, but only one 30%+ active
+15-minute burst among 39 reconstructed entries that pass the current main
+filters. One main-gated super-pump case remains inside the 15-minute
+warning-to-stop uncertainty bucket, and one case crossed the initial stop and
+L2 in the same 15-minute candle.
+
+The leading research candidate is to keep L2 absent until `$50` added margin
+and refreshed protection are confirmed, with `$50` pre-funded at entry for
+pump >=250% only. This is not implemented in live code. Before implementation,
+collect targeted 1-minute evidence and replay the missed-fill/PnL cost of a
+gated L2.
