@@ -262,3 +262,26 @@ and refreshed protection are confirmed, with `$50` pre-funded at entry for
 pump >=250% only. This is not implemented in live code. Before implementation,
 collect targeted 1-minute evidence and replay the missed-fill/PnL cost of a
 gated L2.
+
+## Margin Management Research (Not Active Policy)
+
+`docs/pump_live_margin_management_research.md` and
+`scripts/pump_live_margin_stress.py` compare immediate margin, free capital,
+stop loss, and sequential-ladder protection under the `$1000` four-slot
+budget. The deterministic result is that `$50` is the smallest practical
+current-size BANK protection before L2; `$60+` leaves too little shared cash
+at four positions and increases the catastrophic-stop loss.
+
+The capital-aware research candidate is to compute the minimum top-up required
+to place the stop above the next ladder, round it upward, confirm the exchange
+position/protection, and only then expose that ladder. Approximate current-size
+L2 amounts are `$30 / $50 / $25 / $50` for ordinary, strong `80–100%`, strong
+`100–250%`, and super tiers. A separate balanced candidate reduces trade
+margin to `$150` and uses the same tier-aware protection, leaving at least
+`$200` with four positions.
+
+Deep ladders need a portfolio gate: one protected L3 can fit the shared pool,
+while ordinary L4/L5 cannot fit the current position/portfolio limits. These
+findings are research only. Do not change live sizing, pre-fund positions, or
+gate orders until the historical PnL/drawdown replay is complete and the
+operator explicitly approves the policy.

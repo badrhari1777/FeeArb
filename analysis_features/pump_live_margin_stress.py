@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,330 @@ def combined_short_position(
         taker_fee_rate=first.taker_fee_rate,
         maintenance_margin_deduction=first.maintenance_margin_deduction,
     )
+
+
+def round_up_usd(value: float, *, increment_usd: float = 5.0) -> float:
+    if increment_usd <= 0:
+        raise ValueError("increment_usd must be positive")
+    return math.ceil(max(0.0, value) / increment_usd - 1e-12) * increment_usd
+
+
+def build_bank_prefund_rows(
+    *,
+    first: ShortPosition,
+    combined: ShortPosition,
+    second_price: float,
+    stop_gap_pct: float,
+    base_portfolio_margin_usd: float,
+    total_capital_usd: float,
+    operating_cash_floor_usd: float,
+    max_positions: int,
+    topup_levels_usd: tuple[float, ...] = (
+        0.0,
+        25.0,
+        45.0,
+        50.0,
+        60.0,
+        75.0,
+        100.0,
+    ),
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for extra in topup_levels_usd:
+        first_liq = short_liquidation_price_usdt(
+            first,
+            extra_margin_usd=extra,
+        )
+        first_stop = emergency_stop_price(
+            first_liq,
+            gap_from_liquidation_pct=stop_gap_pct,
+        )
+        combined_liq = short_liquidation_price_usdt(
+            combined,
+            extra_margin_usd=extra,
+        )
+        combined_stop = emergency_stop_price(
+            combined_liq,
+            gap_from_liquidation_pct=stop_gap_pct,
+        )
+        committed = base_portfolio_margin_usd + max_positions * extra
+        free_capital = total_capital_usd - committed
+        rows.append(
+            {
+                "upfront_topup_usd": round(extra, 8),
+                "first_leg_liq_price": round(first_liq, 12),
+                "first_leg_stop_price": round(first_stop, 12),
+                "stop_clearance_above_l2_pct": round(
+                    (first_stop / second_price - 1.0) * 100.0,
+                    6,
+                ),
+                "l2_reachable_before_stop": first_stop > second_price,
+                "first_leg_stop_loss_usd": round(
+                    first.qty * (first_stop - first.avg_entry_price),
+                    6,
+                ),
+                "post_l2_stop_price": round(combined_stop, 12),
+                "post_l2_stop_loss_usd": round(
+                    combined.qty
+                    * (combined_stop - combined.avg_entry_price),
+                    6,
+                ),
+                "post_l2_stop_loss_account_pct": round(
+                    combined.qty
+                    * (combined_stop - combined.avg_entry_price)
+                    / total_capital_usd
+                    * 100.0,
+                    6,
+                ),
+                "four_position_committed_usd": round(committed, 6),
+                "free_capital_after_four_usd": round(free_capital, 6),
+                "free_after_operating_floor_usd": round(
+                    free_capital - operating_cash_floor_usd,
+                    6,
+                ),
+                "operating_floor_preserved": (
+                    free_capital + 1e-9 >= operating_cash_floor_usd
+                ),
+            }
+        )
+    return rows
+
+
+def build_tier_ladder_protection_rows(
+    *,
+    slot_margin_usd: float,
+    leverage: float,
+    maintenance_margin_rate: float,
+    taker_fee_rate: float,
+    stop_gap_pct: float,
+    safety_above_next_ladder_pct: float,
+    max_position_topup_usd: float,
+    max_total_topup_usd: float,
+    guaranteed_position_topup_usd: float,
+    max_positions: int,
+    base_portfolio_margin_usd: float,
+    total_capital_usd: float,
+    operating_cash_floor_usd: float,
+) -> list[dict[str, Any]]:
+    tiers = (
+        ("ordinary_lt80", (1.0, 1.0, 1.0, 1.0, 1.0)),
+        ("strong_80_100", (1.0, 2.0)),
+        ("strong_100_250", (1.0, 2.0, 3.0)),
+        ("super_250_plus", (1.0, 2.0)),
+    )
+    rows: list[dict[str, Any]] = []
+    for tier, weights in tiers:
+        position: ShortPosition | None = None
+        weight_sum = sum(weights)
+        for leg_index, weight in enumerate(weights):
+            leg_price = 1.0 + 0.5 * leg_index
+            leg_margin = slot_margin_usd * weight / weight_sum
+            leg_qty = leg_margin * leverage / leg_price
+            if position is None:
+                position = ShortPosition(
+                    qty=leg_qty,
+                    avg_entry_price=leg_price,
+                    leverage=leverage,
+                    maintenance_margin_rate=maintenance_margin_rate,
+                    taker_fee_rate=taker_fee_rate,
+                )
+            else:
+                position = combined_short_position(
+                    position,
+                    added_qty=leg_qty,
+                    added_price=leg_price,
+                )
+            if leg_index + 1 >= len(weights):
+                continue
+            next_price = 1.0 + 0.5 * (leg_index + 1)
+            target_stop = next_price * (
+                1.0 + safety_above_next_ladder_pct / 100.0
+            )
+            required = required_extra_margin_for_stop(
+                position,
+                target_stop_price=target_stop,
+                gap_from_liquidation_pct=stop_gap_pct,
+            )
+            rounded = round_up_usd(required, increment_usd=5.0)
+            other_guarantees = (
+                max_positions - 1
+            ) * guaranteed_position_topup_usd
+            portfolio_topup = rounded + other_guarantees
+            free_capital = (
+                total_capital_usd
+                - base_portfolio_margin_usd
+                - portfolio_topup
+            )
+            protected_stop = emergency_stop_price(
+                short_liquidation_price_usdt(
+                    position,
+                    extra_margin_usd=rounded,
+                ),
+                gap_from_liquidation_pct=stop_gap_pct,
+            )
+            rows.append(
+                {
+                    "tier": tier,
+                    "filled_through_leg": leg_index + 1,
+                    "next_leg": leg_index + 2,
+                    "next_ladder_pct_from_first": round(
+                        (next_price - 1.0) * 100.0,
+                        6,
+                    ),
+                    "target_stop_safety_above_next_pct": (
+                        safety_above_next_ladder_pct
+                    ),
+                    "required_total_topup_usd": round(required, 8),
+                    "rounded_total_topup_usd": round(rounded, 8),
+                    "protected_stop_pct_from_first": round(
+                        (protected_stop - 1.0) * 100.0,
+                        6,
+                    ),
+                    "within_position_topup_cap": (
+                        rounded <= max_position_topup_usd + 1e-9
+                    ),
+                    "portfolio_topup_with_three_other_guarantees_usd": round(
+                        portfolio_topup,
+                        6,
+                    ),
+                    "within_portfolio_topup_cap": (
+                        portfolio_topup <= max_total_topup_usd + 1e-9
+                    ),
+                    "free_capital_after_four_slot_capacity_usd": round(
+                        free_capital,
+                        6,
+                    ),
+                    "free_after_operating_floor_usd": round(
+                        free_capital - operating_cash_floor_usd,
+                        6,
+                    ),
+                }
+            )
+    return rows
+
+
+def build_portfolio_policy_rows(
+    *,
+    leverage: float,
+    maintenance_margin_rate: float,
+    taker_fee_rate: float,
+    stop_gap_pct: float,
+    total_capital_usd: float,
+    max_positions: int,
+    operating_cash_floor_usd: float,
+) -> list[dict[str, Any]]:
+    policies = (
+        (
+            "current_on_demand_175_plus_0",
+            175.0,
+            0.0,
+            "maximum free cash; L2 is unreachable unless the monitor tops up first",
+        ),
+        (
+            "same_size_prefund_45",
+            175.0,
+            45.0,
+            "minimum rounded amount above L2, but only about 1% BANK clearance",
+        ),
+        (
+            "same_size_prefund_50",
+            175.0,
+            50.0,
+            "simple current-size protection with about 2.5% target clearance",
+        ),
+        (
+            "same_size_prefund_60",
+            175.0,
+            60.0,
+            "more gap tolerance, but little shared reserve remains at four positions",
+        ),
+        (
+            "same_size_prefund_75",
+            175.0,
+            75.0,
+            "uses the entire account at four positions and violates the cash floor",
+        ),
+        (
+            "rebudget_150_trade_plus_50_protection",
+            150.0,
+            50.0,
+            "14.3% less trade exposure than current and twice the free cash of flat 50",
+        ),
+        (
+            "rebudget_125_trade_plus_50_protection",
+            125.0,
+            50.0,
+            "28.6% less trade exposure; keeps the original 300 USDT reserve free",
+        ),
+    )
+    rows: list[dict[str, Any]] = []
+    for policy, trade_margin, prefund, note in policies:
+        first_notional = trade_margin
+        second_notional = trade_margin * 2.0
+        first = ShortPosition(
+            qty=first_notional,
+            avg_entry_price=1.0,
+            leverage=leverage,
+            maintenance_margin_rate=maintenance_margin_rate,
+            taker_fee_rate=taker_fee_rate,
+        )
+        combined = combined_short_position(
+            first,
+            added_qty=second_notional / 1.5,
+            added_price=1.5,
+        )
+        first_stop = emergency_stop_price(
+            short_liquidation_price_usdt(
+                first,
+                extra_margin_usd=prefund,
+            ),
+            gap_from_liquidation_pct=stop_gap_pct,
+        )
+        combined_stop = emergency_stop_price(
+            short_liquidation_price_usdt(
+                combined,
+                extra_margin_usd=prefund,
+            ),
+            gap_from_liquidation_pct=stop_gap_pct,
+        )
+        committed = max_positions * (trade_margin + prefund)
+        free_capital = total_capital_usd - committed
+        rows.append(
+            {
+                "policy": policy,
+                "trade_margin_per_position_usd": trade_margin,
+                "upfront_protection_per_position_usd": prefund,
+                "trade_notional_per_position_usd": trade_margin * leverage,
+                "committed_per_position_usd": trade_margin + prefund,
+                "committed_at_four_positions_usd": committed,
+                "free_capital_at_four_positions_usd": free_capital,
+                "free_after_operating_floor_usd": (
+                    free_capital - operating_cash_floor_usd
+                ),
+                "operating_floor_preserved": (
+                    free_capital + 1e-9 >= operating_cash_floor_usd
+                ),
+                "l2_reachable_before_stop": first_stop > 1.5,
+                "stop_clearance_above_l2_pct": round(
+                    (first_stop / 1.5 - 1.0) * 100.0,
+                    6,
+                ),
+                "post_l2_stop_loss_usd": round(
+                    combined.qty
+                    * (combined_stop - combined.avg_entry_price),
+                    6,
+                ),
+                "post_l2_stop_loss_account_pct": round(
+                    combined.qty
+                    * (combined_stop - combined.avg_entry_price)
+                    / total_capital_usd
+                    * 100.0,
+                    6,
+                ),
+                "note": note,
+            }
+        )
+    return rows
 
 
 def simulate_bank_rise(
@@ -404,8 +729,42 @@ def build_bank_margin_stress(
             ("spike_30s", 30),
         )
     ]
+    bank_prefund_rows = build_bank_prefund_rows(
+        first=first,
+        combined=combined,
+        second_price=second_price,
+        stop_gap_pct=stop_gap_pct,
+        base_portfolio_margin_usd=base_portfolio_margin_usd,
+        total_capital_usd=total_capital_usd,
+        operating_cash_floor_usd=operating_cash_floor_usd,
+        max_positions=max_positions,
+    )
+    tier_ladder_protection_rows = build_tier_ladder_protection_rows(
+        slot_margin_usd=base_portfolio_margin_usd / max_positions,
+        leverage=leverage,
+        maintenance_margin_rate=maintenance_margin_rate,
+        taker_fee_rate=taker_fee_rate,
+        stop_gap_pct=stop_gap_pct,
+        safety_above_next_ladder_pct=2.5,
+        max_position_topup_usd=max_position_topup_usd,
+        max_total_topup_usd=max_total_topup_usd,
+        guaranteed_position_topup_usd=guaranteed_per_position,
+        max_positions=max_positions,
+        base_portfolio_margin_usd=base_portfolio_margin_usd,
+        total_capital_usd=total_capital_usd,
+        operating_cash_floor_usd=operating_cash_floor_usd,
+    )
+    portfolio_policy_rows = build_portfolio_policy_rows(
+        leverage=leverage,
+        maintenance_margin_rate=maintenance_margin_rate,
+        taker_fee_rate=taker_fee_rate,
+        stop_gap_pct=stop_gap_pct,
+        total_capital_usd=total_capital_usd,
+        max_positions=max_positions,
+        operating_cash_floor_usd=operating_cash_floor_usd,
+    )
     return {
-        "schema": "pump_live_margin_stress_v1",
+        "schema": "pump_live_margin_stress_v2",
         "inputs": {
             "first_position": asdict(first),
             "second_qty": second_qty,
@@ -446,6 +805,9 @@ def build_bank_margin_stress(
             ),
         },
         "margin_rows": margin_rows,
+        "bank_prefund_rows": bank_prefund_rows,
+        "tier_ladder_protection_rows": tier_ladder_protection_rows,
+        "portfolio_policy_rows": portfolio_policy_rows,
         "portfolio_rows": portfolio_rows,
         "rise_scenarios": rise_scenarios,
     }
@@ -462,6 +824,18 @@ def write_bank_margin_stress(
         encoding="utf-8",
     )
     _write_csv(output_dir / "bank_margin_levels.csv", report["margin_rows"])
+    _write_csv(
+        output_dir / "bank_prefund_comparison.csv",
+        report["bank_prefund_rows"],
+    )
+    _write_csv(
+        output_dir / "tier_ladder_protection.csv",
+        report["tier_ladder_protection_rows"],
+    )
+    _write_csv(
+        output_dir / "portfolio_policy_comparison.csv",
+        report["portfolio_policy_rows"],
+    )
     _write_csv(output_dir / "portfolio_capacity.csv", report["portfolio_rows"])
     _write_csv(
         output_dir / "rise_scenarios.csv",
@@ -492,10 +866,14 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 __all__ = [
     "ShortPosition",
+    "build_bank_prefund_rows",
     "build_bank_margin_stress",
+    "build_portfolio_policy_rows",
+    "build_tier_ladder_protection_rows",
     "combined_short_position",
     "emergency_stop_price",
     "required_extra_margin_for_stop",
+    "round_up_usd",
     "simulate_bank_rise",
     "short_liquidation_price_usdt",
     "write_bank_margin_stress",
