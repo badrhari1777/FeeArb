@@ -8,12 +8,16 @@ data class MobilePositionsResponse(
     val last_updated: String? = null,
     val account_last_updated: String? = null,
     val balances: List<BalanceDto> = emptyList(),
+    val balance_summary: BalanceSummaryDto = BalanceSummaryDto(),
     val cards: List<PositionCardDto> = emptyList(),
     val filters: Map<String, Int> = emptyMap(),
 )
 
 data class BalanceDto(
     val exchange: String = "",
+    val account_alias: String? = null,
+    val account_label: String? = null,
+    val account_type: String? = null,
     val asset: String? = null,
     val total: Double? = null,
     val available: Double? = null,
@@ -22,6 +26,23 @@ data class BalanceDto(
     val status: String? = null,
     val error: String? = null,
     val updated_at: String? = null,
+)
+
+data class BalanceAggregateDto(
+    val asset: String? = "USDT",
+    val total: Double? = null,
+    val available: Double? = null,
+    val used: Double? = null,
+    val reporting_accounts: Int = 0,
+    val healthy_accounts: Int = 0,
+)
+
+data class BalanceSummaryDto(
+    val asset: String? = "USDT",
+    val overall: BalanceAggregateDto = BalanceAggregateDto(),
+    val bybit_main: BalanceAggregateDto = BalanceAggregateDto(),
+    val bybit_pump: BalanceAggregateDto = BalanceAggregateDto(),
+    val bybit_combined: BalanceAggregateDto = BalanceAggregateDto(),
 )
 
 data class PositionCardDto(

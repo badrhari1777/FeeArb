@@ -26,6 +26,7 @@ from .services import (
 )
 from .manual_stream import ManualSpreadStream
 from .manual_trade_stream import ManualTradeStream
+from .balance_views import with_pump_account_balances
 from .positions_overview import build_positions_overview
 from .ws_trade_raw import WsTradeRawStream
 from .ws_trade_private_raw import WsTradePrivateRawStream
@@ -52,7 +53,7 @@ from execution.pump_live import PumpLiveController
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-07-30-pump-capital-observe-01"
+STATIC_VERSION = "v2026-07-30-account-balances-01"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -76,6 +77,14 @@ if os.getenv("FEEARB_TESTING") == "1":
 else:
     bybit_pump_short_lab = BybitPumpShortLab(notifier=service.notification_router)
 logger = logging.getLogger(__name__)
+
+
+def _ui_state_payload() -> dict[str, object]:
+    return with_pump_account_balances(
+        service.state_payload(),
+        bybit_pump_short_lab.pump_live_status(),
+        accounts_key="accounts",
+    )
 
 
 @app.middleware("http")
@@ -443,7 +452,7 @@ async def favicon() -> FileResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
-    state = service.state_payload()
+    state = _ui_state_payload()
     return templates.TemplateResponse(
         "index.html",
         {
@@ -637,7 +646,7 @@ async def spread_monitor_page(request: Request) -> HTMLResponse:
 
 @app.get("/api/snapshot")
 async def snapshot_api() -> JSONResponse:
-    return JSONResponse(service.state_payload())
+    return JSONResponse(jsonable_encoder(_ui_state_payload()))
 
 
 @app.get("/api/positions/overview")
@@ -1293,7 +1302,7 @@ async def coin_paper_action_api(payload: CoinPaperActionPayload) -> JSONResponse
 @app.post("/api/refresh")
 async def refresh_snapshot() -> JSONResponse:
     result = await service.refresh_snapshot(force_accounts=True)
-    return JSONResponse({"status": result, "state": service.state_payload()})
+    return JSONResponse({"status": result, "state": _ui_state_payload()})
 
 @app.get("/api/settings")
 async def get_settings() -> JSONResponse:
@@ -1302,7 +1311,11 @@ async def get_settings() -> JSONResponse:
 
 @app.get("/api/mobile/positions")
 async def mobile_positions() -> JSONResponse:
-    return JSONResponse(jsonable_encoder(service.mobile_positions_payload()))
+    payload = with_pump_account_balances(
+        service.mobile_positions_payload(),
+        bybit_pump_short_lab.pump_live_status(),
+    )
+    return JSONResponse(jsonable_encoder(payload))
 
 
 @app.get("/api/mobile/manual-defaults")
@@ -1596,7 +1609,7 @@ async def update_settings(payload: SettingsPayload) -> JSONResponse:
     return JSONResponse(
         {
             "settings": settings_manager.as_dict(),
-            "state": service.state_payload(),
+            "state": _ui_state_payload(),
         }
     )
 

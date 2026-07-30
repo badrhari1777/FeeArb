@@ -279,6 +279,14 @@
     accountLastUpdated: document.getElementById('account-last-updated'),
     accountStatusTable: document.getElementById('account-status-body'),
     accountBalanceTable: document.getElementById('account-balance-body'),
+    balanceSummaryOverall: document.getElementById('balance-summary-overall'),
+    balanceSummaryOverallAvailable: document.getElementById('balance-summary-overall-available'),
+    balanceSummaryBybitMain: document.getElementById('balance-summary-bybit-main'),
+    balanceSummaryBybitMainAvailable: document.getElementById('balance-summary-bybit-main-available'),
+    balanceSummaryBybitPump: document.getElementById('balance-summary-bybit-pump'),
+    balanceSummaryBybitPumpAvailable: document.getElementById('balance-summary-bybit-pump-available'),
+    balanceSummaryBybitCombined: document.getElementById('balance-summary-bybit-combined'),
+    balanceSummaryBybitCombinedAvailable: document.getElementById('balance-summary-bybit-combined-available'),
     symbolPositionsTable: document.getElementById('symbol-positions-body'),
     symbolPositionsMeta: document.getElementById('symbol-positions-meta'),
     symbolPositionsDiffs: document.getElementById('symbol-positions-diffs'),
@@ -1090,6 +1098,7 @@
       var noteText = row.error || row.message || '-';
       html += '<tr>' +
         '<td>' + escapeHtml(row.exchange || '-') + '</td>' +
+        '<td>' + escapeHtml(row.account_label || 'Main account') + '</td>' +
         '<td>' + escapeHtml(row.asset || '-') + '</td>' +
         '<td>' + formatNumber(row.total, 2) + '</td>' +
         '<td>' + formatNumber(row.available, 2) + '</td>' +
@@ -1099,13 +1108,36 @@
         '<td>' + bufferText + '</td>' +
         '<td>' + escapeHtml(statusText) + '</td>' +
         '<td>' + escapeHtml(noteText) + '</td>' +
-        '<td>' + escapeHtml(formatDate(row.timestamp)) + '</td>' +
+        '<td>' + escapeHtml(formatDate(row.timestamp || row.updated_at)) + '</td>' +
       '</tr>';
     }
     if (!html) {
-      html = '<tr><td colspan="11" class="muted">Balances will appear after the first refresh.</td></tr>';
+      html = '<tr><td colspan="12" class="muted">Balances will appear after the first refresh.</td></tr>';
     }
     elements.accountBalanceTable.innerHTML = html;
+  }
+
+  function renderBalanceSummary(summary) {
+    var data = summary || {};
+    var mappings = [
+      [elements.balanceSummaryOverall, elements.balanceSummaryOverallAvailable, data.overall],
+      [elements.balanceSummaryBybitMain, elements.balanceSummaryBybitMainAvailable, data.bybit_main],
+      [elements.balanceSummaryBybitPump, elements.balanceSummaryBybitPumpAvailable, data.bybit_pump],
+      [elements.balanceSummaryBybitCombined, elements.balanceSummaryBybitCombinedAvailable, data.bybit_combined]
+    ];
+    mappings.forEach(function (mapping) {
+      var totalNode = mapping[0];
+      var availableNode = mapping[1];
+      var row = mapping[2] || {};
+      if (totalNode) {
+        totalNode.textContent = typeof row.total === 'number' ? formatNumber(row.total, 2) : '-';
+      }
+      if (availableNode) {
+        availableNode.textContent = 'Available ' +
+          (typeof row.available === 'number' ? formatNumber(row.available, 2) : '-') +
+          ' USDT';
+      }
+    });
   }
 
   function renderMarginDiagnostics(entries) {
@@ -2523,6 +2555,7 @@
   function renderAccounts(accounts) {
     var data = accounts || defaultAccounts;
     renderAccountStatus(data.status || []);
+    renderBalanceSummary(data.balance_summary || {});
     renderAccountBalances(data.balances || []);
     renderSymbolPositions(data.positions_by_symbol || []);
     renderSymbolPositionsDiagnostics(data.positions_market || null);

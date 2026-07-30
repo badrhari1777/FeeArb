@@ -102,6 +102,16 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Unified main/Pump account balances were added on 2026-07-30 without changing
+  trading logic. The main web balance panel and Android `Balances` tab now use
+  the same read-only aggregation: every ordinary venue row is labelled
+  `Main account`, Bybit Pump is a distinct `Pump subaccount`, and summaries
+  expose all-account total plus Bybit main/Pump/combined amounts. Pump uses the
+  cached exact USDT `walletBalance`; unavailable Pump data stays unavailable
+  rather than becoming a healthy zero, and idempotent augmentation prevents
+  double counting. Android version is `0.4.0` / code `4` and its row key
+  includes account alias so both Bybit accounts render. Canonical operator
+  behavior is documented in `instructions/15_ANDROID_MAIN_PUMP_POSITIONS.md`.
 - Pump Live capital observation was added on 2026-07-30 without enabling
   dynamic live sizing. `/pump-short-strategies` now has a separate durable
   strategy-capital setting backed by

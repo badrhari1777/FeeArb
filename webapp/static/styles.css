@@ -417,6 +417,41 @@ a {
   background: #0f1825;
 }
 
+.balance-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 10px;
+  margin: 0.85rem 0 1rem;
+}
+
+.balance-summary-card {
+  display: grid;
+  gap: 5px;
+  padding: 13px 14px;
+  border: 1px solid #26364c;
+  border-radius: 9px;
+  background: #0f1825;
+}
+
+.balance-summary-card span,
+.balance-summary-card small {
+  color: #9eacc0;
+}
+
+.balance-summary-card strong {
+  color: #e6edf7;
+  font-size: 1.25rem;
+}
+
+.balance-summary-card--pump {
+  border-color: rgba(168, 85, 247, 0.65);
+}
+
+.balance-summary-card--combined {
+  border-color: rgba(47, 129, 247, 0.8);
+  background: rgba(47, 129, 247, 0.1);
+}
+
 .position-detail-card details {
   margin-top: 0.7rem;
 }

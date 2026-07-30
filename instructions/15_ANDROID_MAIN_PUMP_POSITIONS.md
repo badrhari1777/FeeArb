@@ -75,3 +75,21 @@
 - Pump-карточка не переиспользует Main trade actions.
 - API overview не передаёт Android-приложению ключи, секреты, UID или
   preflight identity.
+
+## Balance view (Android 0.4.0)
+
+The `Balances` tab uses `GET /api/mobile/positions` as its single read-only
+source and includes the Pump Live subaccount without mixing trading ownership:
+
+- every regular exchange row is labelled `Main account`;
+- Bybit has separate `Main account` and `Pump subaccount` rows;
+- the Bybit summary card shows `Main`, `Pump sub`, `Combined`, and combined
+  available USDT;
+- the overall balance includes all reporting main accounts plus Pump exactly
+  once;
+- a missing Pump snapshot is displayed as unavailable and is never converted
+  into a healthy zero balance.
+
+The same account labels and aggregates are returned under `accounts` for the
+desktop main-page balance table. This view is display-only: it does not change
+Pump sizing, margin management, order placement, or transfers.

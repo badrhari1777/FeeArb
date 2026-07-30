@@ -30,6 +30,11 @@
   {% set auto_exit_policy = manual_settings.get('auto_exit_policy', {}) %}
   {% set account_status_rows = accounts.get('status', []) %}
   {% set account_balance_rows = accounts.get('balances', []) %}
+  {% set balance_summary = accounts.get('balance_summary', {}) %}
+  {% set balance_overall = balance_summary.get('overall', {}) %}
+  {% set balance_bybit_main = balance_summary.get('bybit_main', {}) %}
+  {% set balance_bybit_pump = balance_summary.get('bybit_pump', {}) %}
+  {% set balance_bybit_combined = balance_summary.get('bybit_combined', {}) %}
   {% set symbol_position_rows = accounts.get('positions_by_symbol', []) %}
   {% set account_last_checked = accounts.get('last_updated') %}
   <script>
@@ -704,10 +709,33 @@
 
     <section class="panel" id="perp-balances">
       <h2>Perpetual Account Balances</h2>
+      <div class="balance-summary-grid" id="balance-summary-grid">
+        <article class="balance-summary-card">
+          <span>All accounts</span>
+          <strong id="balance-summary-overall">{{ balance_overall.get('total') | round(2) if balance_overall.get('total') is number else "-" }}</strong>
+          <small id="balance-summary-overall-available">Available {{ balance_overall.get('available') | round(2) if balance_overall.get('available') is number else "-" }} USDT</small>
+        </article>
+        <article class="balance-summary-card">
+          <span>Bybit main</span>
+          <strong id="balance-summary-bybit-main">{{ balance_bybit_main.get('total') | round(2) if balance_bybit_main.get('total') is number else "-" }}</strong>
+          <small id="balance-summary-bybit-main-available">Available {{ balance_bybit_main.get('available') | round(2) if balance_bybit_main.get('available') is number else "-" }} USDT</small>
+        </article>
+        <article class="balance-summary-card balance-summary-card--pump">
+          <span>Bybit Pump subaccount</span>
+          <strong id="balance-summary-bybit-pump">{{ balance_bybit_pump.get('total') | round(2) if balance_bybit_pump.get('total') is number else "-" }}</strong>
+          <small id="balance-summary-bybit-pump-available">Available {{ balance_bybit_pump.get('available') | round(2) if balance_bybit_pump.get('available') is number else "-" }} USDT</small>
+        </article>
+        <article class="balance-summary-card balance-summary-card--combined">
+          <span>Bybit combined</span>
+          <strong id="balance-summary-bybit-combined">{{ balance_bybit_combined.get('total') | round(2) if balance_bybit_combined.get('total') is number else "-" }}</strong>
+          <small id="balance-summary-bybit-combined-available">Available {{ balance_bybit_combined.get('available') | round(2) if balance_bybit_combined.get('available') is number else "-" }} USDT</small>
+        </article>
+      </div>
       <table class="data-table">
         <thead>
           <tr>
             <th>Exchange</th>
+            <th>Account</th>
             <th>Asset</th>
             <th>Total</th>
             <th>Available</th>
@@ -724,6 +752,7 @@
           {% for row in account_balance_rows %}
             <tr>
                 <td>{{ row.exchange }}</td>
+                <td>{{ row.account_label or "Main account" }}</td>
                 <td>{{ row.asset }}</td>
                 <td>{{ row.total if row.total is not none else "-" }}</td>
                 <td>{{ row.available if row.available is not none else "-" }}</td>
@@ -750,12 +779,12 @@
                 {% endif %}
                 </td>
                 <td>{{ row.status or "ok" }}</td>
-                <td>{{ row.error or "-" }}</td>
+                <td>{{ row.error or row.message or "-" }}</td>
                 <td>{{ row.timestamp or "-" }}</td>
             </tr>
           {% endfor %}
           {% if account_balance_rows | length == 0 %}
-            <tr><td colspan="11" class="muted">Balances will appear after the first refresh.</td></tr>
+            <tr><td colspan="12" class="muted">Balances will appear after the first refresh.</td></tr>
           {% endif %}
         </tbody>
       </table>

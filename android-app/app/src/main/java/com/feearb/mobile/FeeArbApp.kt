@@ -219,6 +219,7 @@ fun FeeArbApp(viewModel: MobileViewModel) {
             when (currentTab) {
                 AppTab.Balances -> BalancesScreen(
                     balances = state.positionsResponse.balances,
+                    balanceSummary = state.positionsResponse.balance_summary,
                     loading = state.positionsLoading,
                     errorText = state.positionsErrorText,
                     lastUpdated = state.positionsResponse.account_last_updated ?: state.positionsResponse.last_updated,
@@ -288,17 +289,19 @@ fun FeeArbApp(viewModel: MobileViewModel) {
 @Composable
 private fun BalancesScreen(
     balances: List<BalanceDto>,
+    balanceSummary: BalanceSummaryDto,
     loading: Boolean,
     errorText: String?,
     lastUpdated: String?,
     modifier: Modifier = Modifier,
 ) {
-    val totalBalance = balances.mapNotNull { it.total }.sum()
-    val availableBalance = balances.mapNotNull { it.available }.sum()
-    val usedBalance = balances.mapNotNull { it.used }.sum()
+    val totalBalance = balanceTotal(balanceSummary.overall.total, balances) { it.total }
+    val availableBalance = balanceTotal(balanceSummary.overall.available, balances) { it.available }
+    val usedBalance = balanceTotal(balanceSummary.overall.used, balances) { it.used }
     val assets = balances.mapNotNull { it.asset?.uppercase() }.distinct()
     val totalLabel = if (assets.size == 1) "Total ${assets.first()}" else "Total balance"
-    val healthyCount = balances.count { it.status == "ok" }
+    val healthyCount = balanceSummary.overall.healthy_accounts.takeIf { it > 0 }
+        ?: balances.count { it.status == "ok" }
 
     LazyColumn(
         modifier = modifier.fillMaxSize(),
@@ -319,7 +322,7 @@ private fun BalancesScreen(
                         MetricBlock("Available", formatMoney(availableBalance), Modifier.weight(1f))
                         MetricBlock("Used", formatMoney(usedBalance), Modifier.weight(1f))
                     }
-                    KeyValue("Exchanges reporting", "${balances.size}")
+                    KeyValue("Accounts reporting", "${balances.size}")
                     KeyValue("Healthy", "$healthyCount / ${balances.size}")
                     if (!lastUpdated.isNullOrBlank()) {
                         Text(
@@ -330,6 +333,9 @@ private fun BalancesScreen(
                     }
                 }
             }
+        }
+        item {
+            BybitAccountsCard(balanceSummary)
         }
         if (loading) {
             item {
@@ -351,7 +357,7 @@ private fun BalancesScreen(
                 )
             }
         }
-        items(balances, key = { "${it.exchange}-${it.asset}" }) { balance ->
+        items(balances, key = ::balanceRowKey) { balance ->
             BalanceCard(balance)
         }
     }
@@ -776,7 +782,11 @@ private fun BalanceCard(balance: BalanceDto) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Column {
                 Text(balance.exchange.uppercase(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                Text(balance.asset ?: "USDT", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    "${balance.account_label ?: "Main account"} • ${balance.asset ?: "USDT"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             StatusPill(balance.status ?: "unknown")
         }
@@ -800,6 +810,28 @@ private fun BalanceCard(balance: BalanceDto) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        }
+    }
+}
+
+@Composable
+private fun BybitAccountsCard(summary: BalanceSummaryDto) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f),
+        ),
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Bybit accounts", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock("Main", formatMoney(summary.bybit_main.total), Modifier.weight(1f))
+                MetricBlock("Pump sub", formatMoney(summary.bybit_pump.total), Modifier.weight(1f))
+            }
+            HorizontalDivider()
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock("Combined", formatMoney(summary.bybit_combined.total), Modifier.weight(1f))
+                MetricBlock("Available", formatMoney(summary.bybit_combined.available), Modifier.weight(1f))
+            }
         }
     }
 }
