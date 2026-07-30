@@ -327,3 +327,27 @@ or cancellation from this margin policy. Automatic master-to-subaccount
 transfer is a separate future layer; current position/portfolio top-up caps,
 other-position guarantees, shared emergency pool, and `$25` hard floor remain
 in force until that layer is implemented and approved.
+
+## Bybit Timestamp Recovery
+
+Pump Live uses a long-lived synchronous CCXT client. A system-clock correction
+can make the client's cached `timeDifference` stale and cause Bybit
+`retCode=10002` even when the current Windows clock is correct.
+
+Every authenticated Pump operation now uses the same guarded request path:
+
+1. execute the request normally;
+2. only for a confirmed Bybit timestamp/`recv_window` error, call
+   `load_time_difference()`;
+3. retry that rejected operation exactly once;
+4. propagate the second failure or any unrelated error unchanged.
+
+This applies to account reads, positions/orders, entry and ladder orders,
+cancellation, leverage, TP/SL, and isolated-margin add/remove. Network
+timeouts are not automatically replayed as orders because their exchange
+outcome may be unknown.
+
+The monitor remains fail-closed while an error is unresolved. After two full
+healthy cycles it restores `armed` and sends a recovery notification. Repeated
+errors use a stable error-family key for notification cooldown, so changing
+request/server timestamps cannot create a message every 15 seconds.

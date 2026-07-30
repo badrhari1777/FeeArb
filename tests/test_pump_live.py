@@ -1477,6 +1477,196 @@ def test_bybit_balance_uses_exact_usdt_wallet_not_usd_conversion(
     assert balance["used"] == 0.0
 
 
+def test_bybit_private_read_resyncs_time_and_retries_once(
+    monkeypatch: Any,
+) -> None:
+    class TimeSyncBalanceClient:
+        def __init__(self) -> None:
+            self.options = {"timeDifference": -1_170}
+            self.calls = 0
+            self.sync_calls = 0
+
+        def load_time_difference(self) -> int:
+            self.sync_calls += 1
+            self.options["timeDifference"] = 25
+            return 25
+
+        def fetch_balance(self, params: dict[str, Any]) -> dict[str, Any]:
+            assert params == {"type": "swap", "accountType": "UNIFIED"}
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError(
+                    'bybit {"retCode":10002,"retMsg":"invalid request, please check '
+                    "your server timestamp or recv_window param: "
+                    'req_timestamp[2000],server_timestamp[830],recv_window[5000]"}'
+                )
+            return {
+                "USDT": {"total": 1000.0, "free": 1000.0},
+                "info": {
+                    "result": {
+                        "list": [
+                            {
+                                "totalAvailableBalance": "1000",
+                                "coin": [
+                                    {"coin": "USDT", "walletBalance": "1000"},
+                                ],
+                            }
+                        ]
+                    }
+                },
+            }
+
+    client = TimeSyncBalanceClient()
+    gateway = BybitPumpLiveGateway()
+    monkeypatch.setattr(gateway, "_ensure_client", lambda: client)
+
+    balance = gateway.fetch_balance()
+
+    assert balance["wallet"] == 1000.0
+    assert client.calls == 2
+    assert client.sync_calls == 1
+    assert client.options["timeDifference"] == 25
+
+
+def test_bybit_private_write_resyncs_before_retrying_rejected_order(
+    monkeypatch: Any,
+) -> None:
+    class TimeSyncOrderClient:
+        def __init__(self) -> None:
+            self.options = {"timeDifference": -1_170}
+            self.calls = 0
+            self.sync_calls = 0
+
+        @staticmethod
+        def price_to_precision(symbol: str, value: float) -> str:
+            del symbol
+            return str(value)
+
+        @staticmethod
+        def amount_to_precision(symbol: str, value: float) -> str:
+            del symbol
+            return str(value)
+
+        def load_time_difference(self) -> int:
+            self.sync_calls += 1
+            self.options["timeDifference"] = 20
+            return 20
+
+        def create_order(self, *args: Any) -> dict[str, Any]:
+            del args
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError(
+                    'bybit {"retCode":10002,"retMsg":"invalid request, please check '
+                    "your server timestamp or recv_window param: "
+                    'req_timestamp[2000],server_timestamp[830],recv_window[5000]"}'
+                )
+            return {
+                "id": "order-1",
+                "status": "open",
+                "filled": 0.0,
+                "average": None,
+            }
+
+    client = TimeSyncOrderClient()
+    gateway = BybitPumpLiveGateway()
+    monkeypatch.setattr(gateway, "_ensure_client", lambda: client)
+    monkeypatch.setattr(
+        gateway,
+        "_market",
+        lambda symbol: {"id": symbol, "symbol": f"{symbol[:-4]}/USDT:USDT"},
+    )
+
+    order = gateway.create_ladder_order(
+        symbol="TESTUSDT",
+        notional_usd=100.0,
+        price=10.0,
+        order_link_id="FAP-test",
+    )
+
+    assert order["id"] == "order-1"
+    assert client.calls == 2
+    assert client.sync_calls == 1
+
+
+def test_bybit_private_request_does_not_retry_unrelated_error(
+    monkeypatch: Any,
+) -> None:
+    class InvalidCredentialsClient:
+        def __init__(self) -> None:
+            self.options = {"timeDifference": 0}
+            self.calls = 0
+            self.sync_calls = 0
+
+        def load_time_difference(self) -> None:
+            self.sync_calls += 1
+
+        def fetch_balance(self, params: dict[str, Any]) -> dict[str, Any]:
+            del params
+            self.calls += 1
+            raise RuntimeError("bybit invalid credentials")
+
+    client = InvalidCredentialsClient()
+    gateway = BybitPumpLiveGateway()
+    monkeypatch.setattr(gateway, "_ensure_client", lambda: client)
+
+    try:
+        gateway.fetch_balance()
+    except RuntimeError as exc:
+        assert "invalid credentials" in str(exc)
+    else:  # pragma: no cover - regression guard
+        raise AssertionError("unrelated error was unexpectedly swallowed")
+
+    assert client.calls == 1
+    assert client.sync_calls == 0
+
+
+def test_monitor_time_errors_share_notification_dedupe_key_and_recovery_notifies(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    notifier = FakePumpNotifier()
+    controller = PumpLiveController(
+        gateway=FakePumpGateway(),
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+        notifier=notifier,
+        background_notifications=False,
+    )
+    first_error = (
+        'bybit {"retCode":10002,"retMsg":"invalid request, please check your '
+        "server timestamp or recv_window param: "
+        'req_timestamp[2000],server_timestamp[830],recv_window[5000]"}'
+    )
+    second_error = (
+        'bybit {"retCode":10002,"retMsg":"invalid request, please check your '
+        "server timestamp or recv_window param: "
+        'req_timestamp[3000],server_timestamp[1830],recv_window[5000]"}'
+    )
+
+    controller._event("monitor_error", {"error": first_error})  # pylint: disable=protected-access
+    controller._event("monitor_error", {"error": second_error})  # pylint: disable=protected-access
+    controller._event("monitor_recovered", {"healthy_cycles": 2})  # pylint: disable=protected-access
+
+    assert len(notifier.messages) == 2
+    assert "ошибка мониторинга" in notifier.messages[0][0].lower()
+    assert "восстановлен" in notifier.messages[1][0].lower()
+    status = controller.status()
+    assert status["notifications"]["last_event"] == "monitor_recovered"
+    deliveries = [
+        row
+        for row in status["recent_events"]
+        if row.get("event") == "notification_delivery"
+    ]
+    assert [row["source_event"] for row in deliveries] == [
+        "monitor_error",
+        "monitor_recovered",
+    ]
+
+
 def test_arm_can_resume_fully_tracked_position_after_restart(tmp_path: Path) -> None:
     env_path = tmp_path / "pump_live.env"
     write_env(env_path, entry_cap=4)

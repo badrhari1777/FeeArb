@@ -102,6 +102,17 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live Bybit timestamp recovery was added on 2026-07-30 after a long-lived
+  CCXT client kept a stale `timeDifference` and Bybit returned `retCode=10002`
+  every 15 seconds. All authenticated Pump operations now detect only confirmed
+  timestamp/`recv_window` errors, reload server-time difference, and retry the
+  rejected operation exactly once; unrelated errors and network-unknown order
+  outcomes are not replayed. The guard covers reads, order placement/cancel,
+  leverage, TP/SL, and margin add/remove. Monitor errors now dedupe by stable
+  error family instead of dynamic request timestamps, and `monitor_recovered`
+  sends a recovery notification after the existing two healthy-cycle gate.
+  The fail-closed strategy behavior remains unchanged. Canonical behavior is
+  documented in `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`.
 - Unified main/Pump account balances were added on 2026-07-30 without changing
   trading logic. The main web balance panel and Android `Balances` tab now use
   the same read-only aggregation: every ordinary venue row is labelled

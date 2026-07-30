@@ -5,11 +5,12 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
 from config import BASE_DIR
@@ -224,6 +225,7 @@ class BybitPumpLiveGateway:
                     "defaultType": "swap",
                     "defaultSettle": "USDT",
                     "adjustForTimeDifference": True,
+                    "recvWindow": 10_000,
                 },
             }
         )
@@ -234,6 +236,28 @@ class BybitPumpLiveGateway:
         self._client = client
         self._signature = signature
         return client
+
+    def _private_request(
+        self,
+        operation: str,
+        callback: Callable[[], Any],
+    ) -> Any:
+        try:
+            return callback()
+        except Exception as exc:  # pylint: disable=broad-except
+            if not _is_bybit_time_sync_error(exc):
+                raise
+            client = self._ensure_client()
+            previous = _optional_float((getattr(client, "options", {}) or {}).get("timeDifference"))
+            client.load_time_difference()
+            current = _optional_float((getattr(client, "options", {}) or {}).get("timeDifference"))
+            logger.warning(
+                "Pump live Bybit time sync retry operation=%s previous_ms=%s current_ms=%s",
+                operation,
+                previous,
+                current,
+            )
+            return callback()
 
     def _market(self, symbol: str) -> dict[str, Any]:
         client = self._ensure_client()
@@ -266,7 +290,10 @@ class BybitPumpLiveGateway:
             warnings: list[str] = []
             try:
                 client = self._ensure_client()
-                key_payload = client.private_get_v5_user_query_api({})
+                key_payload = self._private_request(
+                    "query_api_key",
+                    lambda: client.private_get_v5_user_query_api({}),
+                )
                 key_info = dict((key_payload or {}).get("result") or {})
                 permissions = dict(key_info.get("permissions") or {})
                 contract_permissions = {str(item) for item in permissions.get("ContractTrade") or []}
@@ -296,7 +323,10 @@ class BybitPumpLiveGateway:
                 balance = self.fetch_balance()
                 positions = self.fetch_positions()
                 open_orders = self.fetch_open_orders()
-                account_payload = client.private_get_v5_account_info({})
+                account_payload = self._private_request(
+                    "account_info",
+                    lambda: client.private_get_v5_account_info({}),
+                )
                 account_info = dict((account_payload or {}).get("result") or {})
                 margin_mode = str(account_info.get("marginMode") or "")
                 if margin_mode != "ISOLATED_MARGIN":
@@ -361,8 +391,11 @@ class BybitPumpLiveGateway:
             if positions or open_orders:
                 raise RuntimeError("pump_live_prepare_requires_flat_account_without_orders")
             try:
-                margin_result = client.private_post_v5_account_set_margin_mode(
-                    {"setMarginMode": "ISOLATED_MARGIN"}
+                margin_result = self._private_request(
+                    "set_margin_mode",
+                    lambda: client.private_post_v5_account_set_margin_mode(
+                        {"setMarginMode": "ISOLATED_MARGIN"}
+                    ),
                 )
             except Exception as exc:
                 message = str(exc).lower()
@@ -371,7 +404,14 @@ class BybitPumpLiveGateway:
                 margin_result = {"status": "already_isolated"}
             position_mode_result: Any = None
             try:
-                position_mode_result = client.set_position_mode(False, None, {"category": "linear", "coin": "USDT"})
+                position_mode_result = self._private_request(
+                    "set_position_mode",
+                    lambda: client.set_position_mode(
+                        False,
+                        None,
+                        {"category": "linear", "coin": "USDT"},
+                    ),
+                )
             except Exception as exc:  # Bybit returns a harmless not-modified error when already one-way.
                 message = str(exc).lower()
                 if "not modified" not in message and "same position mode" not in message and "110025" not in message:
@@ -386,7 +426,12 @@ class BybitPumpLiveGateway:
     def fetch_balance(self) -> dict[str, Any]:
         with self._lock:
             client = self._ensure_client()
-            payload = client.fetch_balance({"type": "swap", "accountType": "UNIFIED"})
+            payload = self._private_request(
+                "fetch_balance",
+                lambda: client.fetch_balance(
+                    {"type": "swap", "accountType": "UNIFIED"}
+                ),
+            )
             asset = dict(payload.get("USDT") or {})
             total = _optional_float(asset.get("total"))
             available = _optional_float(asset.get("free"))
@@ -427,7 +472,13 @@ class BybitPumpLiveGateway:
     def fetch_positions(self) -> list[dict[str, Any]]:
         with self._lock:
             client = self._ensure_client()
-            rows = client.fetch_positions(None, {"category": "linear", "settleCoin": "USDT"})
+            rows = self._private_request(
+                "fetch_positions",
+                lambda: client.fetch_positions(
+                    None,
+                    {"category": "linear", "settleCoin": "USDT"},
+                ),
+            )
             result: list[dict[str, Any]] = []
             for row in rows or []:
                 qty = abs(_safe_float(row.get("contracts"), 0.0))
@@ -456,20 +507,25 @@ class BybitPumpLiveGateway:
             params: dict[str, Any] = {"category": "linear", "settleCoin": "USDT", "openOnly": 0}
             if symbol:
                 params["symbol"] = self._market(symbol).get("id")
-            payload = client.private_get_v5_order_realtime(params)
+            payload = self._private_request(
+                "fetch_open_orders",
+                lambda: client.private_get_v5_order_realtime(params),
+            )
             rows = ((payload or {}).get("result") or {}).get("list") or []
             return [_normalize_order(row) for row in rows]
 
     def fetch_order(self, order_id: str, symbol: str) -> dict[str, Any]:
         with self._lock:
             client = self._ensure_client()
-            payload = client.private_get_v5_order_realtime(
-                {
-                    "category": "linear",
-                    "symbol": self._market(symbol).get("id"),
-                    "orderId": order_id,
-                    "openOnly": 1,
-                }
+            params = {
+                "category": "linear",
+                "symbol": self._market(symbol).get("id"),
+                "orderId": order_id,
+                "openOnly": 1,
+            }
+            payload = self._private_request(
+                "fetch_order",
+                lambda: client.private_get_v5_order_realtime(params),
             )
             rows = ((payload or {}).get("result") or {}).get("list") or []
             return _normalize_order(rows[0]) if rows else {"id": order_id, "status": "unknown"}
@@ -488,10 +544,13 @@ class BybitPumpLiveGateway:
             client = self._ensure_client()
             ccxt_symbol = self._ccxt_symbol(symbol)
             try:
-                client.set_leverage(
-                    leverage,
-                    ccxt_symbol,
-                    {"category": "linear"},
+                self._private_request(
+                    "set_leverage",
+                    lambda: client.set_leverage(
+                        leverage,
+                        ccxt_symbol,
+                        {"category": "linear"},
+                    ),
                 )
             except Exception as exc:
                 message = str(exc).lower()
@@ -551,7 +610,17 @@ class BybitPumpLiveGateway:
                 "reduceOnly": bool(reduce_only),
                 "orderLinkId": order_link_id[:36],
             }
-            order = client.create_order(ccxt_symbol, "market", side, amount, None, params)
+            order = self._private_request(
+                "create_market_order",
+                lambda: client.create_order(
+                    ccxt_symbol,
+                    "market",
+                    side,
+                    amount,
+                    None,
+                    params,
+                ),
+            )
             normalized = _normalize_ccxt_order(order)
             normalized["estimated_slippage_bps"] = round(slippage_bps, 6)
             normalized["requested_qty"] = amount
@@ -572,20 +641,24 @@ class BybitPumpLiveGateway:
             qty = float(client.amount_to_precision(ccxt_symbol, notional_usd / order_price))
             if qty <= 0:
                 raise RuntimeError("pump_live_ladder_amount_rounds_to_zero")
-            order = client.create_order(
-                ccxt_symbol,
-                "limit",
-                "sell",
-                qty,
-                order_price,
-                {
-                    "category": "linear",
-                    "positionIdx": 0,
-                    "reduceOnly": False,
-                    "postOnly": True,
-                    "timeInForce": "PostOnly",
-                    "orderLinkId": order_link_id[:36],
-                },
+            params = {
+                "category": "linear",
+                "positionIdx": 0,
+                "reduceOnly": False,
+                "postOnly": True,
+                "timeInForce": "PostOnly",
+                "orderLinkId": order_link_id[:36],
+            }
+            order = self._private_request(
+                "create_ladder_order",
+                lambda: client.create_order(
+                    ccxt_symbol,
+                    "limit",
+                    "sell",
+                    qty,
+                    order_price,
+                    params,
+                ),
             )
             return _normalize_ccxt_order(order)
 
@@ -593,10 +666,13 @@ class BybitPumpLiveGateway:
         with self._lock:
             client = self._ensure_client()
             try:
-                client.cancel_order(
-                    order_id,
-                    self._ccxt_symbol(symbol),
-                    {"category": "linear", "orderId": order_id},
+                self._private_request(
+                    "cancel_order",
+                    lambda: client.cancel_order(
+                        order_id,
+                        self._ccxt_symbol(symbol),
+                        {"category": "linear", "orderId": order_id},
+                    ),
                 )
             except Exception as exc:
                 message = str(exc).lower()
@@ -617,19 +693,21 @@ class BybitPumpLiveGateway:
             take_trigger = client.price_to_precision(ccxt_symbol, take_profit_price)
             stop_trigger = client.price_to_precision(ccxt_symbol, stop_loss_price)
             try:
-                payload = client.private_post_v5_position_trading_stop(
-                    {
-                        "category": "linear",
-                        "symbol": market.get("id"),
-                        "takeProfit": str(take_trigger),
-                        "stopLoss": str(stop_trigger),
-                        "tpTriggerBy": "MarkPrice",
-                        "slTriggerBy": "MarkPrice",
-                        "tpslMode": "Full",
-                        "tpOrderType": "Market",
-                        "slOrderType": "Market",
-                        "positionIdx": 0,
-                    }
+                params = {
+                    "category": "linear",
+                    "symbol": market.get("id"),
+                    "takeProfit": str(take_trigger),
+                    "stopLoss": str(stop_trigger),
+                    "tpTriggerBy": "MarkPrice",
+                    "slTriggerBy": "MarkPrice",
+                    "tpslMode": "Full",
+                    "tpOrderType": "Market",
+                    "slOrderType": "Market",
+                    "positionIdx": 0,
+                }
+                payload = self._private_request(
+                    "set_full_protection",
+                    lambda: client.private_post_v5_position_trading_stop(params),
                 )
             except Exception as exc:
                 message = str(exc).lower()
@@ -641,26 +719,32 @@ class BybitPumpLiveGateway:
     def add_margin(self, symbol: str, amount_usd: float) -> dict[str, Any]:
         with self._lock:
             market = self._market(symbol)
-            payload = self._ensure_client().private_post_v5_position_add_margin(
-                {
-                    "category": "linear",
-                    "symbol": market.get("id"),
-                    "margin": str(round(amount_usd, 4)),
-                    "positionIdx": 0,
-                }
+            client = self._ensure_client()
+            params = {
+                "category": "linear",
+                "symbol": market.get("id"),
+                "margin": str(round(amount_usd, 4)),
+                "positionIdx": 0,
+            }
+            payload = self._private_request(
+                "add_margin",
+                lambda: client.private_post_v5_position_add_margin(params),
             )
             return _compact_exchange_result(payload)
 
     def remove_margin(self, symbol: str, amount_usd: float) -> dict[str, Any]:
         with self._lock:
             market = self._market(symbol)
-            payload = self._ensure_client().private_post_v5_position_add_margin(
-                {
-                    "category": "linear",
-                    "symbol": market.get("id"),
-                    "margin": str(round(-abs(amount_usd), 4)),
-                    "positionIdx": 0,
-                }
+            client = self._ensure_client()
+            params = {
+                "category": "linear",
+                "symbol": market.get("id"),
+                "margin": str(round(-abs(amount_usd), 4)),
+                "positionIdx": 0,
+            }
+            payload = self._private_request(
+                "remove_margin",
+                lambda: client.private_post_v5_position_add_margin(params),
             )
             return _compact_exchange_result(payload)
 
@@ -2438,12 +2522,24 @@ def _pump_live_notification(
             "emergency_submitted",
             60,
         )
+    if event == "monitor_recovered":
+        healthy_cycles = _safe_int(payload.get("healthy_cycles"), 0)
+        return (
+            "FeeArb Pump Live восстановлен",
+            (
+                "Pump Live: защитный монитор снова работает штатно.\n"
+                f"Успешных контрольных циклов: {healthy_cycles}\n"
+                "Новые входы снова разрешены."
+            ),
+            "monitor_recovered",
+            60,
+        )
     if event == "monitor_error":
         error = str(payload.get("error") or "unknown")
         return (
             "FeeArb Pump Live ошибка мониторинга",
             f"Pump Live: защитный цикл завершился ошибкой\nОшибка: {error}\nНовые входы отключены.",
-            f"monitor_error:{error}",
+            _monitor_error_dedupe_key(error),
             300,
         )
     return None
@@ -2719,7 +2815,34 @@ def _is_retryable_state_replace_error(exc: OSError) -> bool:
     }
 
 
+def _is_bybit_time_sync_error(exc: Any) -> bool:
+    message = str(exc).lower()
+    return (
+        ("10002" in message and "bybit" in message)
+        or "please check your server timestamp" in message
+        or (
+            "req_timestamp" in message
+            and ("recv_window" in message or "recvwindow" in message)
+        )
+    )
+
+
+def _monitor_error_dedupe_key(error: str) -> str:
+    if _is_bybit_time_sync_error(error):
+        return "monitor_error:bybit_time_sync"
+    message = str(error or "unknown").lower()
+    if "10006" in message and "rate limit" in message:
+        return "monitor_error:bybit_rate_limit"
+    if "winerror 5" in message or "winerror 32" in message or "winerror 33" in message:
+        return "monitor_error:state_file_lock"
+    normalized = re.sub(r"\d+", "#", message)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return f"monitor_error:{normalized[:160]}"
+
+
 def _is_transient_monitor_error(exc: Exception) -> bool:
+    if _is_bybit_time_sync_error(exc):
+        return True
     if isinstance(exc, (TimeoutError, ConnectionError, PermissionError)):
         return True
     network_error = getattr(ccxt, "NetworkError", None) if ccxt is not None else None
