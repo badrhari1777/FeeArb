@@ -130,6 +130,13 @@ Risk-limit блок является направленным. Недостат�
 свой cooldown и не использует общий `next_eligible_ts`, поэтому ожидающий
 повторной проверки вход не задерживает выход при достижении exit-триггера.
 
+Для Bybit Full TP/SL поле `qty` условного market-ордера может быть ограничено
+контрактным `maxMktOrderQty`, даже когда позиция больше. Признаки полного
+покрытия — `tpslMode=Full` и `closeOnTrigger=true`; Bybit привязывает такой
+Stop/Take ко всей позиции и управляет объемом при срабатывании. Проверка защиты
+обязана различать `stopOrderType=StopLoss` и `TakeProfit` и не трактовать
+ограниченный отображаемый `qty` как частичную защиту Full-позиции.
+
 KuCoin позволяет менять isolated risk-limit level приватным API
 `POST /api/v1/position/risk-limit-level/change`. Backend умеет определить, что
 этот endpoint доступен, но не вызывает его автоматически: KuCoin отменяет все

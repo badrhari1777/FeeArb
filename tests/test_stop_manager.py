@@ -223,6 +223,87 @@ class StopManagerTriggerBasisParamsTestCase(unittest.TestCase):
         self.assertEqual(stop_params.get("slTriggerBy"), "MarkPrice")
         self.assertEqual(take_params.get("tpTriggerBy"), "MarkPrice")
 
+    def test_bybit_full_position_orders_use_explicit_kind_and_close_all(self) -> None:
+        class _BybitFullClient:
+            async def fetch_open_orders(self, _symbol, params=None):  # noqa: ARG002
+                return [
+                    {
+                        "id": "bybit-sl",
+                        "symbol": "COTI/USDT:USDT",
+                        "type": "market",
+                        "side": "buy",
+                        "amount": 221900.0,
+                        "stopPrice": 0.021215,
+                        "reduceOnly": True,
+                        "info": {
+                            "symbol": "COTIUSDT",
+                            "stopOrderType": "StopLoss",
+                            "triggerPrice": "0.021215",
+                            "reduceOnly": True,
+                            "closeOnTrigger": True,
+                            "tpslMode": "Full",
+                        },
+                    },
+                    {
+                        "id": "bybit-tp",
+                        "symbol": "COTI/USDT:USDT",
+                        "type": "market",
+                        "side": "buy",
+                        "amount": 221900.0,
+                        "stopPrice": 0.009411,
+                        "reduceOnly": True,
+                        "info": {
+                            "symbol": "COTIUSDT",
+                            "stopOrderType": "TakeProfit",
+                            "triggerPrice": "0.009411",
+                            "reduceOnly": True,
+                            "closeOnTrigger": True,
+                            "tpslMode": "Full",
+                        },
+                    },
+                ]
+
+        class _BybitFullGateway:
+            slug = "bybit"
+
+            def __init__(self) -> None:
+                self.client = _BybitFullClient()
+
+            def map_symbol(self, symbol: str) -> str:
+                return symbol
+
+        manager = ProtectiveOrderManager(RiskConfig())
+
+        async def _run() -> dict:
+            return await manager._fetch_existing(
+                _BybitFullGateway(),
+                "COTI/USDT:USDT",
+                None,
+                "short",
+                mark_price=0.0156,
+                entry_price=0.0158,
+                force_fetch=True,
+            )
+
+        existing = asyncio.run(_run())
+        stops = existing.get("stop_orders") or []
+        takes = existing.get("take_orders") or []
+        self.assertEqual([item.get("id") for item in stops], ["bybit-sl"])
+        self.assertEqual([item.get("id") for item in takes], ["bybit-tp"])
+        self.assertTrue(stops[0]["close_all"])
+        self.assertTrue(takes[0]["close_all"])
+        self.assertFalse(
+            manager._needs_stop_update(stops, 0.021215, 426814.0, 0.001, 0.01)[0]
+        )
+        self.assertFalse(
+            manager._needs_take_update(
+                takes,
+                [TakeTarget(price=0.009411, quantity=426814.0)],
+                0.001,
+                0.01,
+            )[0]
+        )
+
     def test_okx_stop_and_take_use_mark_trigger_type(self) -> None:
         manager = ProtectiveOrderManager(RiskConfig())
         client = _RecordingOrderClient()

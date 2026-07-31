@@ -1766,6 +1766,14 @@ class ProtectiveOrderManager:
                     if stop_px is None and take_px is not None:
                         stop_px = take_px
                     take_px = None
+            if gateway.slug == "bybit":
+                stop_order_type = str(info.get("stopOrderType") or "").lower()
+                if stop_order_type == "takeprofit":
+                    take_px = take_px or stop_px
+                    stop_px = None
+                elif stop_order_type == "stoploss":
+                    stop_px = stop_px or take_px
+                    take_px = None
             reduce_flag = (
                 info.get("reduceOnly")
                 if info.get("reduceOnly") is not None
@@ -1824,8 +1832,14 @@ class ProtectiveOrderManager:
                 "close_all": bool(
                     info.get("closeOrder")
                     or info.get("closePosition")
+                    or info.get("closeOnTrigger")
                     or order.get("closeOrder")
                     or order.get("closePosition")
+                    or order.get("closeOnTrigger")
+                    or (
+                        gateway.slug == "bybit"
+                        and str(info.get("tpslMode") or "").lower() == "full"
+                    )
                 ),
             }
             if kind == "take":

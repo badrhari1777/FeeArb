@@ -102,6 +102,14 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Bybit Full-position protection parsing was corrected on 2026-07-31 during
+  the COTI Grid restart. Bybit reports system TP/SL orders with generic market
+  type plus `stopOrderType`, and caps their displayed quantity at the
+  contract's `maxMktOrderQty` even when `tpslMode=Full` and
+  `closeOnTrigger=true` cover a larger position. The protective verifier now
+  classifies `StopLoss`/`TakeProfit` explicitly and treats those Full orders as
+  close-all instead of repeatedly replacing valid protection. Targeted
+  stop/Grid regression passed (`79`).
 - Grid KuCoin risk-limit blocking became directional on 2026-07-31. An
   insufficient isolated tier still blocks every `enter` before the primary
   order, but Live ownership may be armed for an already balanced position so
