@@ -2508,6 +2508,86 @@ class ManualTradeOrphanCleanupTestCase(unittest.TestCase):
         self.assertTrue(any("orphan residual" in item for item in (result.get("warnings") or [])))
 
 
+class _KucoinRiskLimitClient:
+    id = "kucoinfutures"
+
+    def __init__(self) -> None:
+        self.markets = {
+            "COTI/USDT:USDT": {
+                "id": "COTIUSDTM",
+                "symbol": "COTI/USDT:USDT",
+                "base": "COTI",
+                "quote": "USDT",
+                "type": "swap",
+                "swap": True,
+                "contractSize": 10.0,
+            }
+        }
+
+    def market(self, symbol):
+        return self.markets[symbol]
+
+    async def fetch_positions(self, symbols):
+        return [
+            {
+                "symbol": symbols[0],
+                "contracts": 34689.0,
+                "info": {"riskLimit": 5000, "markValue": 5450.0},
+            }
+        ]
+
+    async def fetch_ticker(self, _symbol):
+        return {"last": 0.01572, "info": {"markPrice": 0.01572}}
+
+    async def futuresPublicGetContractsRiskLimitSymbol(self, _params):
+        return {
+            "code": "200000",
+            "data": [
+                {"level": 1, "maxRiskLimit": 5000, "maxLeverage": 50},
+                {"level": 2, "maxRiskLimit": 10000, "maxLeverage": 30},
+            ],
+        }
+
+    async def futuresPrivatePostPositionRiskLimitLevelChange(self, _params):
+        raise AssertionError("preflight must never change the risk level")
+
+
+class _KucoinRiskLimitGateway:
+    def __init__(self) -> None:
+        self.client = _KucoinRiskLimitClient()
+
+    async def refresh_credentials_async(self, force_env=False):
+        return None
+
+    async def ensure_client(self):
+        return None
+
+    async def close(self):
+        return None
+
+
+class ManualTradeRiskLimitPreflightTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_kucoin_preflight_reports_required_tier_without_changing_it(self) -> None:
+        manager = ManualTradeManager()
+        manager._gateways["kucoin"] = _KucoinRiskLimitGateway()
+
+        result = await manager.entry_risk_limit_preflight(
+            symbol="COTIUSDT",
+            long_exchange="kucoin",
+            short_exchange="bybit",
+            target_position_qty=362307.0,
+            leverage=3.0,
+        )
+
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["selected_level"], 1)
+        self.assertEqual(result["selected_max_risk_limit_usd"], 5000.0)
+        self.assertEqual(result["required_level"], 2)
+        self.assertTrue(result["change_supported"])
+        self.assertTrue(result["change_cancels_open_orders"])
+        self.assertGreater(result["projected_notional_usd"], 5000.0)
+
+
 class ProtectivePreflightTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_agent_rebalance_submits_limit_order(self) -> None:
         manager = ManualTradeManager()

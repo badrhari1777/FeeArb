@@ -102,6 +102,23 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Grid KuCoin risk-limit safety was hardened on 2026-07-31 after the COTI
+  canary repeatedly filled a Bybit short while KuCoin rejected the hedge with
+  `300005 maximum risk limit 5000 USDT`. Live activation now reads the selected
+  Classic Futures isolated tier and the public tier table, checks the full Grid
+  target at fresh mark price with 1% headroom, and fails before any order when
+  the selected tier is insufficient. Every enter transition repeats the same
+  check before the primary order and records `blocked_risk_limit` with the
+  required tier. KuCoin exposes
+  `POST /api/v1/position/risk-limit-level/change`, but automatic mutation is
+  deliberately disabled because a level change cancels all open orders. Pause
+  now gates a transition that is still starting, and disabled rules reconcile
+  already-finished executions and safety repairs without starting a new entry.
+  The COTI Grid was paused, its raced `15,410`-coin Bybit orphan was closed
+  reduce-only, and both legs were verified balanced at `346,890 / 346,890`.
+  Pump Live passed a fresh empty-account preflight and was rearmed with a
+  healthy monitor. Targeted Grid/manual regression passed (`135`), and the
+  complete suite passed (`575`, `11 warnings`).
 - Pump Live/paper fidelity was tightened on 2026-07-31 without increasing the
   broad scanner cadence. Entry-ready rows are now submitted to Pump Live as
   each symbol finishes inside the existing `1h` scan, so a live signal no

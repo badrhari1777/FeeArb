@@ -8416,7 +8416,10 @@ class DataService:
             rule = (self._auto_arb.get("rules") or {}).get(rule_id)
             if not isinstance(rule, dict):
                 raise ValueError("Auto-arbitrage rule not found.")
-            if not enabled and rule.get("active_execution_id"):
+            if not enabled and (
+                rule.get("active_execution_id")
+                or rule.get("transition_starting")
+            ):
                 raise ValueError("Wait for the active grid execution to finish before pausing.")
             if enabled and rule.get("mode") == "live":
                 raise ValueError(
@@ -8741,6 +8744,54 @@ class DataService:
             short_exchange=str(rule.get("short_exchange") or ""),
         )
 
+    async def _auto_arb_entry_risk_limit_preflight(
+        self,
+        rule: Mapping[str, Any],
+        *,
+        target_position_qty: float,
+    ) -> dict[str, Any]:
+        checker = getattr(self._manual, "entry_risk_limit_preflight", None)
+        if not callable(checker):
+            return {
+                "ready": False,
+                "checked": False,
+                "reason": "risk_limit_preflight_unavailable",
+                "errors": ["Grid risk-limit preflight is unavailable."],
+            }
+        result = await checker(
+            symbol=str(rule.get("symbol") or ""),
+            long_exchange=str(rule.get("long_exchange") or ""),
+            short_exchange=str(rule.get("short_exchange") or ""),
+            target_position_qty=max(0.0, float(target_position_qty or 0.0)),
+            leverage=3.0,
+            reference_price=None,
+        )
+        if not isinstance(result, Mapping):
+            return {
+                "ready": False,
+                "checked": False,
+                "reason": "risk_limit_preflight_invalid",
+                "errors": ["Grid risk-limit preflight returned an invalid response."],
+            }
+        return dict(result)
+
+    @staticmethod
+    def _auto_arb_risk_limit_error(preflight: Mapping[str, Any]) -> str:
+        errors = [str(item) for item in (preflight.get("errors") or []) if item]
+        message = "; ".join(errors) or str(
+            preflight.get("reason") or "risk_limit_preflight_failed"
+        )
+        required_level = preflight.get("required_level")
+        required_limit = _safe_float(preflight.get("required_max_risk_limit_usd"))
+        if required_level is not None and required_limit is not None:
+            message += (
+                f". KuCoin isolated level {int(required_level)} "
+                f"({required_limit:g} USDT) or a smaller Grid is required"
+            )
+        if preflight.get("change_cancels_open_orders"):
+            message += ". Changing the KuCoin level cancels open orders"
+        return message
+
     async def arm_auto_arb_live(self, rule_id: str, confirmation: str) -> dict[str, Any]:
         expected_confirmation = f"LIVE {rule_id}"
         if str(confirmation or "").strip() != expected_confirmation:
@@ -8800,6 +8851,16 @@ class DataService:
                 "Long and short quantities are imbalanced; Live Grid cannot take ownership."
             )
 
+        risk_limit_preflight = await self._auto_arb_entry_risk_limit_preflight(
+            rule_copy,
+            target_position_qty=float(rule_copy.get("max_qty") or 0.0),
+        )
+        if not bool(risk_limit_preflight.get("ready")):
+            raise ValueError(
+                "Grid risk-limit preflight failed: "
+                + self._auto_arb_risk_limit_error(risk_limit_preflight)
+            )
+
         now_iso = datetime.now(timezone.utc).isoformat()
         async with self._auto_arb_lock:
             rule = (self._auto_arb.get("rules") or {}).get(rule_id)
@@ -8826,6 +8887,7 @@ class DataService:
             rule["blocked_reason"] = None
             rule["pending_action"] = None
             rule["pending_samples"] = 0
+            rule["risk_limit_preflight"] = risk_limit_preflight
             rule["updated_at"] = now_iso
             self._save_auto_arb_config()
             result = dict(rule)
@@ -8917,11 +8979,10 @@ class DataService:
             repair_quantities: dict[str, float] | None = None
             reconcile_error = None
             quantities: dict[str, float] | None = None
-            if str(rule_copy.get("active_action") or "") == "repair":
-                try:
-                    quantities = await self._auto_arb_refresh_quantities(rule_copy)
-                except Exception as exc:  # pylint: disable=broad-except
-                    reconcile_error = str(exc)
+            try:
+                quantities = await self._auto_arb_refresh_quantities(rule_copy)
+            except Exception as exc:  # pylint: disable=broad-except
+                reconcile_error = str(exc)
             now_iso = datetime.now(timezone.utc).isoformat()
             event: dict[str, Any] = {
                 "event": "live_execution_state_missing",
@@ -8933,7 +8994,7 @@ class DataService:
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
                 if isinstance(current, dict):
-                    if quantities is not None and str(current.get("active_action") or "") == "repair":
+                    if quantities is not None:
                         hedged_qty = float(quantities.get("hedged_qty") or 0.0)
                         imbalance_qty = float(quantities.get("imbalance_qty") or 0.0)
                         tolerance = self._auto_arb_hedge_imbalance_tolerance(
@@ -8962,7 +9023,9 @@ class DataService:
                                 current,
                                 hedged_qty,
                             )
-                            if flat_repair_reset:
+                            if not current.get("enabled"):
+                                current["status"] = "paused"
+                            elif flat_repair_reset:
                                 current["status"] = "waiting_entry"
                             else:
                                 current["status"] = (
@@ -8976,7 +9039,7 @@ class DataService:
                                 )
                             current["blocked_reason"] = None
                             current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
-                            event["event"] = "live_hedge_repair_missing_but_balanced"
+                            event["event"] = "live_execution_missing_but_balanced"
                             event["flat_repair_reset"] = flat_repair_reset
                         else:
                             current["status"] = "hedge_repair_required"
@@ -9211,6 +9274,14 @@ class DataService:
                     current["status"] = "monitoring"
                     current["blocked_reason"] = None
                     completed = True
+                if (
+                    not current.get("enabled")
+                    and imbalance_qty <= hedge_tolerance
+                    and repair_quantities is None
+                ):
+                    current["status"] = "paused"
+                    current["blocked_reason"] = None
+                    current["next_eligible_ts"] = 0.0
             else:
                 current["active_execution_id"] = exec_id
                 current["active_action"] = rule_copy.get("active_action")
@@ -9246,7 +9317,12 @@ class DataService:
             return
         async with self._auto_arb_lock:
             rule = (self._auto_arb.get("rules") or {}).get(rule_id)
-            if not isinstance(rule, dict) or not rule.get("enabled"):
+            if not isinstance(rule, dict):
+                return
+            if not rule.get("enabled") and str(rule.get("status") or "") not in {
+                "hedge_repair_required",
+                "hedge_repair_retry",
+            }:
                 return
             rule_copy = dict(rule)
         long_qty = float(quantities.get("long_qty") or 0.0)
@@ -9616,6 +9692,39 @@ class DataService:
                     current["updated_at"] = datetime.now(timezone.utc).isoformat()
                     self._save_auto_arb_config()
             return
+        if action == "enter":
+            risk_limit_preflight = await self._auto_arb_entry_risk_limit_preflight(
+                rule_copy,
+                target_position_qty=current_hedged_qty + qty,
+            )
+            if not bool(risk_limit_preflight.get("ready")):
+                now_iso = datetime.now(timezone.utc).isoformat()
+                blocked_reason = self._auto_arb_risk_limit_error(
+                    risk_limit_preflight
+                )
+                async with self._auto_arb_lock:
+                    current = (self._auto_arb.get("rules") or {}).get(rule_id)
+                    if isinstance(current, dict):
+                        current["status"] = "blocked_risk_limit"
+                        current["blocked_reason"] = blocked_reason
+                        current["risk_limit_preflight"] = risk_limit_preflight
+                        current["pending_action"] = None
+                        current["pending_samples"] = 0
+                        current["next_eligible_ts"] = time.time() + 300.0
+                        current["updated_at"] = now_iso
+                        self._save_auto_arb_config()
+                self._auto_arb_history_store.append(
+                    {
+                        "event": "live_entry_risk_limit_blocked",
+                        "rule_id": rule_id,
+                        "from_level": from_level,
+                        "to_level": to_level,
+                        "target_position_qty": current_hedged_qty + qty,
+                        "risk_limit_preflight": risk_limit_preflight,
+                        "ts": now_iso,
+                    }
+                )
+                return
         worst_tier = max(
             venue_liquidity_tier(str(rule_copy.get("long_exchange") or "")),
             venue_liquidity_tier(str(rule_copy.get("short_exchange") or "")),
@@ -9663,17 +9772,42 @@ class DataService:
             "auto_arb_rule_id": rule_id,
             "auto_arb_rule_generation": int(rule_copy.get("generation") or 0),
         }
-        result = (
-            await self.manual_enter(payload)
-            if action == "enter"
-            else await self.manual_exit(payload)
-        )
+        async with self._auto_arb_lock:
+            current = (self._auto_arb.get("rules") or {}).get(rule_id)
+            if (
+                not isinstance(current, dict)
+                or not current.get("enabled")
+                or current.get("mode") != "live"
+                or int(current.get("generation") or 0)
+                != int(rule_copy.get("generation") or 0)
+            ):
+                if isinstance(current, dict) and not current.get("enabled"):
+                    current["status"] = "paused"
+                    current["pending_action"] = None
+                    current["pending_samples"] = 0
+                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    self._save_auto_arb_config()
+                return
+            current["transition_starting"] = True
+        try:
+            result = (
+                await self.manual_enter(payload)
+                if action == "enter"
+                else await self.manual_exit(payload)
+            )
+        except Exception:
+            async with self._auto_arb_lock:
+                current = (self._auto_arb.get("rules") or {}).get(rule_id)
+                if isinstance(current, dict):
+                    current.pop("transition_starting", None)
+            raise
         exec_id = str((result or {}).get("execution_id") or "")
         now_iso = datetime.now(timezone.utc).isoformat()
         async with self._auto_arb_lock:
             current = (self._auto_arb.get("rules") or {}).get(rule_id)
             if not isinstance(current, dict):
                 return
+            current.pop("transition_starting", None)
             current["pending_action"] = None
             current["pending_samples"] = 0
             if exec_id:
@@ -9720,7 +9854,8 @@ class DataService:
             rules = [
                 dict(rule)
                 for rule in (self._auto_arb.get("rules") or {}).values()
-                if isinstance(rule, dict) and rule.get("enabled")
+                if isinstance(rule, dict)
+                and (rule.get("enabled") or rule.get("active_execution_id"))
             ]
         for rule in rules:
             rule_id = str(rule.get("id") or "")

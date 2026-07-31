@@ -29,6 +29,7 @@ DEFAULT_MANUAL_LEVERAGE = 3.0
 DEFAULT_MIN_LEVEL_NOTIONAL = 50.0
 DEFAULT_MIN_LEVEL_CHUNK_PCT = 0.01
 DEFAULT_LIMIT_IMPROVE_TICKS = 1
+KUCOIN_RISK_LIMIT_HEADROOM_PCT = 0.01
 PRECHECK_RETRIES = 3
 PRECHECK_RETRY_DELAY_SEC = 0.75
 PRECHECK_BALANCE_BUFFER_PCT = 0.05
@@ -1208,6 +1209,191 @@ class ManualTradeManager:
             *(gateway.close() for gateway in self._gateways.values()),
             return_exceptions=True,
         )
+
+    async def entry_risk_limit_preflight(
+        self,
+        *,
+        symbol: str,
+        long_exchange: str,
+        short_exchange: str,
+        target_position_qty: float,
+        leverage: float = DEFAULT_MANUAL_LEVERAGE,
+        reference_price: float | None = None,
+    ) -> dict[str, Any]:
+        """Fail closed when a KuCoin isolated entry would exceed its selected tier."""
+        exchanges = {
+            normalize_exchange_name(long_exchange),
+            normalize_exchange_name(short_exchange),
+        }
+        if "kucoin" not in exchanges:
+            return {
+                "ready": True,
+                "checked": False,
+                "exchange": None,
+                "reason": "risk_limit_preflight_not_required",
+                "errors": [],
+            }
+
+        errors: list[str] = []
+        client = await self._ensure_client("kucoin", errors)
+        if client is None:
+            return {
+                "ready": False,
+                "checked": True,
+                "exchange": "kucoin",
+                "reason": "risk_limit_client_unavailable",
+                "errors": errors or ["kucoin: client unavailable"],
+            }
+        ccxt_symbol = await self._resolve_market_symbol(client, symbol)
+        if not ccxt_symbol:
+            return {
+                "ready": False,
+                "checked": True,
+                "exchange": "kucoin",
+                "reason": "risk_limit_symbol_unavailable",
+                "errors": [f"kucoin: unable to resolve symbol {symbol}"],
+            }
+
+        try:
+            market = client.market(ccxt_symbol)
+            market_id = str((market or {}).get("id") or "")
+            contract_size = _safe_float((market or {}).get("contractSize")) or 1.0
+            positions = await _fetch_positions_compat(client, "kucoin", [ccxt_symbol])
+            position = next(
+                (
+                    item
+                    for item in (positions or [])
+                    if abs(_safe_float(item.get("contracts")) or 0.0) > 0
+                ),
+                {},
+            )
+            info = position.get("info") or {}
+            current_contracts = abs(_safe_float(position.get("contracts")) or 0.0)
+            current_qty = current_contracts * contract_size
+            current_mark_value = abs(_safe_float(info.get("markValue")) or 0.0)
+            current_risk_limit = _safe_float(info.get("riskLimit"))
+
+            public_method = getattr(
+                client,
+                "futuresPublicGetContractsRiskLimitSymbol",
+                None,
+            ) or getattr(
+                client,
+                "futurespublic_get_contracts_risk_limit_symbol",
+                None,
+            )
+            if not callable(public_method):
+                raise RuntimeError("KuCoin risk-limit endpoint is unavailable in the client")
+            response = await public_method({"symbol": market_id})
+            raw_tiers = response.get("data") if isinstance(response, Mapping) else None
+            tiers = [dict(item) for item in (raw_tiers or []) if isinstance(item, Mapping)]
+            tiers.sort(key=lambda item: int(_safe_float(item.get("level")) or 0))
+            if not tiers:
+                raise RuntimeError("KuCoin returned no isolated risk-limit tiers")
+
+            if current_risk_limit is None or current_risk_limit <= 0:
+                current_risk_limit = _safe_float(tiers[0].get("maxRiskLimit"))
+            selected_tier = next(
+                (
+                    item
+                    for item in tiers
+                    if math.isclose(
+                        _safe_float(item.get("maxRiskLimit")) or 0.0,
+                        current_risk_limit or 0.0,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                ),
+                tiers[0],
+            )
+
+            price = _safe_float(reference_price)
+            if price is None or price <= 0:
+                ticker = await client.fetch_ticker(ccxt_symbol)
+                ticker_info = ticker.get("info") or {}
+                price = (
+                    _safe_float(ticker_info.get("markPrice"))
+                    or _safe_float(ticker.get("last"))
+                    or _safe_float(ticker.get("close"))
+                )
+            if price is None or price <= 0:
+                raise RuntimeError("KuCoin mark price is unavailable for risk-limit preflight")
+
+            target_qty = max(0.0, float(target_position_qty or 0.0), current_qty)
+            projected_notional = max(current_mark_value, target_qty * price)
+            max_risk_limit = _safe_float(selected_tier.get("maxRiskLimit")) or 0.0
+            usable_risk_limit = max_risk_limit * (1.0 - KUCOIN_RISK_LIMIT_HEADROOM_PCT)
+            ready = projected_notional <= usable_risk_limit + 1e-9
+            required_tier = next(
+                (
+                    item
+                    for item in tiers
+                    if (_safe_float(item.get("maxRiskLimit")) or 0.0)
+                    * (1.0 - KUCOIN_RISK_LIMIT_HEADROOM_PCT)
+                    >= projected_notional
+                    and (_safe_float(item.get("maxLeverage")) or 0.0) >= float(leverage)
+                ),
+                None,
+            )
+            result_errors = []
+            if not ready:
+                result_errors.append(
+                    "kucoin: projected isolated exposure "
+                    f"{projected_notional:.2f} USDT exceeds usable risk limit "
+                    f"{usable_risk_limit:.2f} USDT (level "
+                    f"{int(_safe_float(selected_tier.get('level')) or 0)})"
+                )
+            return {
+                "ready": ready,
+                "checked": True,
+                "exchange": "kucoin",
+                "symbol": normalize_symbol(symbol),
+                "market_id": market_id,
+                "margin_mode": "isolated",
+                "current_position_qty": current_qty,
+                "target_position_qty": target_qty,
+                "reference_price": price,
+                "current_mark_value_usd": current_mark_value,
+                "projected_notional_usd": projected_notional,
+                "selected_level": int(_safe_float(selected_tier.get("level")) or 0),
+                "selected_max_risk_limit_usd": max_risk_limit,
+                "usable_risk_limit_usd": usable_risk_limit,
+                "headroom_pct": KUCOIN_RISK_LIMIT_HEADROOM_PCT * 100.0,
+                "required_level": (
+                    int(_safe_float(required_tier.get("level")) or 0)
+                    if required_tier is not None
+                    else None
+                ),
+                "required_max_risk_limit_usd": (
+                    _safe_float(required_tier.get("maxRiskLimit"))
+                    if required_tier is not None
+                    else None
+                ),
+                "change_supported": callable(
+                    getattr(
+                        client,
+                        "futuresPrivatePostPositionRiskLimitLevelChange",
+                        None,
+                    )
+                    or getattr(
+                        client,
+                        "futuresprivate_post_position_risk_limit_level_change",
+                        None,
+                    )
+                ),
+                "change_cancels_open_orders": True,
+                "reason": "ok" if ready else "risk_limit_exceeded",
+                "errors": result_errors,
+            }
+        except Exception as exc:  # pylint: disable=broad-except
+            return {
+                "ready": False,
+                "checked": True,
+                "exchange": "kucoin",
+                "symbol": normalize_symbol(symbol),
+                "reason": "risk_limit_preflight_failed",
+                "errors": [f"kucoin: risk-limit preflight failed: {exc}"],
+            }
 
     def _contract_sizes_from_constraints(self, constraints: Mapping[str, Any]) -> dict[str, float | None]:
         sizes: dict[str, float | None] = {}

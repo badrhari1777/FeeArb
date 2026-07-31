@@ -29,6 +29,14 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
         for patcher in self.patchers:
             patcher.start()
         self.service = DataService(settings_manager=SettingsManager(path=root / "settings.json"))
+        self.service._manual.entry_risk_limit_preflight = AsyncMock(
+            return_value={
+                "ready": True,
+                "checked": False,
+                "reason": "risk_limit_preflight_not_required",
+                "errors": [],
+            }
+        )
 
     def tearDown(self) -> None:
         for patcher in reversed(self.patchers):
@@ -659,6 +667,89 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["rule"]["live_level"], 0)
         self.assertEqual(result["rule"]["status"], "waiting_entry")
         self.assertTrue(result["rule"]["enabled"])
+
+    async def test_live_arm_blocks_before_orders_when_risk_limit_is_too_small(self) -> None:
+        self.service._auto_arb["rules"]["risk-blocked"] = {
+            "id": "risk-blocked",
+            "generation": 1,
+            "enabled": False,
+            "mode": "shadow",
+            "symbol": "COTIUSDT",
+            "long_exchange": "kucoin",
+            "short_exchange": "bybit",
+            "max_qty": 650000.0,
+            "chunk_qty": 325000.0,
+            "levels": [
+                {"level": 1, "qty": 325000.0, "cumulative_qty": 325000.0},
+                {"level": 2, "qty": 325000.0, "cumulative_qty": 650000.0},
+            ],
+        }
+        self.service._accounts.refresh_now_for_protective = AsyncMock(return_value=None)
+        self.service._accounts.snapshot = MagicMock(return_value={"positions": []})
+        self.service._manual.entry_risk_limit_preflight = AsyncMock(
+            return_value={
+                "ready": False,
+                "checked": True,
+                "reason": "risk_limit_exceeded",
+                "errors": ["kucoin: projected isolated exposure exceeds usable risk limit"],
+                "required_level": 2,
+                "required_max_risk_limit_usd": 10000.0,
+                "change_cancels_open_orders": True,
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "Grid risk-limit preflight failed"):
+            await self.service.arm_auto_arb_live(
+                "risk-blocked",
+                "LIVE risk-blocked",
+            )
+
+        rule = self.service._auto_arb["rules"]["risk-blocked"]
+        self.assertFalse(rule["enabled"])
+        self.assertEqual(rule["mode"], "shadow")
+
+    async def test_paused_active_execution_is_reconciled_to_paused_when_balanced(self) -> None:
+        rule = {
+            "id": "paused-race",
+            "generation": 1,
+            "enabled": False,
+            "mode": "live",
+            "symbol": "COTIUSDT",
+            "long_exchange": "kucoin",
+            "short_exchange": "bybit",
+            "chunk_qty": 1000.0,
+            "live_level": 10,
+            "active_execution_id": "missing-after-pause",
+            "active_action": "enter",
+            "active_from_level": 10,
+            "active_to_level": 11,
+            "active_start_hedged_qty": 346890.0,
+            "pending_transition": {
+                "action": "enter",
+                "from_level": 10,
+                "to_level": 11,
+                "target_qty": 15410.0,
+                "filled_qty": 0.0,
+                "remaining_qty": 15410.0,
+            },
+        }
+        self.service._auto_arb["rules"][rule["id"]] = rule
+        self.service._auto_arb_refresh_quantities = AsyncMock(
+            return_value={
+                "long_qty": 346890.0,
+                "short_qty": 346890.0,
+                "hedged_qty": 346890.0,
+                "imbalance_qty": 0.0,
+                "imbalance_pct": 0.0,
+            }
+        )
+
+        await self.service._auto_arb_cycle()
+
+        self.assertFalse(rule["enabled"])
+        self.assertEqual(rule["status"], "paused")
+        self.assertIsNone(rule["active_execution_id"])
+        self.assertIsNone(rule["active_action"])
 
     async def test_live_accepts_budget_above_old_restricted_limits(self) -> None:
         self.service._auto_arb["rules"]["large"] = {
@@ -1429,6 +1520,71 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(payload["qty"], 1000.0)
         self.assertEqual(rule["active_execution_id"], "grid-continue")
         self.assertEqual(rule["pending_transition"]["remaining_qty"], 1000.0)
+
+    async def test_live_entry_rechecks_risk_limit_before_primary_order(self) -> None:
+        rule = {
+            "id": "runtime-risk-block",
+            "generation": 1,
+            "enabled": True,
+            "mode": "live",
+            "symbol": "COTIUSDT",
+            "long_exchange": "kucoin",
+            "short_exchange": "bybit",
+            "max_qty": 20000.0,
+            "chunk_qty": 10000.0,
+            "levels": [
+                {
+                    "level": 1,
+                    "entry_spread_pct": -2.0,
+                    "exit_spread_pct": -1.5,
+                    "qty": 10000.0,
+                    "cumulative_qty": 10000.0,
+                },
+                {
+                    "level": 2,
+                    "entry_spread_pct": -4.0,
+                    "exit_spread_pct": -3.5,
+                    "qty": 10000.0,
+                    "cumulative_qty": 20000.0,
+                },
+            ],
+            "live_level": 1,
+            "actual_hedged_qty": 10000.0,
+        }
+        self.service._auto_arb["rules"][rule["id"]] = rule
+        self.service._auto_arb_refresh_quantities = AsyncMock(
+            return_value={
+                "long_qty": 10000.0,
+                "short_qty": 10000.0,
+                "hedged_qty": 10000.0,
+                "imbalance_qty": 0.0,
+                "imbalance_pct": 0.0,
+            }
+        )
+        self.service._manual.entry_risk_limit_preflight = AsyncMock(
+            return_value={
+                "ready": False,
+                "checked": True,
+                "reason": "risk_limit_exceeded",
+                "errors": ["kucoin: projected exposure exceeds level 1"],
+                "required_level": 2,
+                "required_max_risk_limit_usd": 10000.0,
+                "change_cancels_open_orders": True,
+            }
+        )
+        self.service.manual_enter = AsyncMock()
+
+        await self.service._start_auto_arb_live_transition(
+            rule["id"],
+            "enter",
+            1,
+            2,
+        )
+
+        self.service.manual_enter.assert_not_awaited()
+        self.assertEqual(rule["status"], "blocked_risk_limit")
+        self.assertIn("KuCoin isolated level 2", rule["blocked_reason"])
+        self.assertGreater(rule["next_eligible_ts"], time.time() + 290.0)
 
     async def test_live_exit_sizes_new_transition_from_actual_hedged_qty(self) -> None:
         levels = [
