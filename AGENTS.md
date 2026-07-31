@@ -102,6 +102,13 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Grid KuCoin risk-limit blocking became directional on 2026-07-31. An
+  insufficient isolated tier still blocks every `enter` before the primary
+  order, but Live ownership may be armed for an already balanced position so
+  `exit` remains available. The retry cooldown is now entry-only rather than
+  the rule-wide `next_eligible_ts`; therefore a Grid can reduce exposure and
+  run reduce-only hedge repair while further increases remain blocked. Focused
+  Auto-Arb regression passed (`47`).
 - Grid KuCoin risk-limit safety was hardened on 2026-07-31 after the COTI
   canary repeatedly filled a Bybit short while KuCoin rejected the hedge with
   `300005 maximum risk limit 5000 USDT`. Live activation now reads the selected

@@ -8855,11 +8855,11 @@ class DataService:
             rule_copy,
             target_position_qty=float(rule_copy.get("max_qty") or 0.0),
         )
-        if not bool(risk_limit_preflight.get("ready")):
-            raise ValueError(
-                "Grid risk-limit preflight failed: "
-                + self._auto_arb_risk_limit_error(risk_limit_preflight)
-            )
+        entry_blocked_reason = (
+            None
+            if bool(risk_limit_preflight.get("ready"))
+            else self._auto_arb_risk_limit_error(risk_limit_preflight)
+        )
 
         now_iso = datetime.now(timezone.utc).isoformat()
         async with self._auto_arb_lock:
@@ -8888,6 +8888,8 @@ class DataService:
             rule["pending_action"] = None
             rule["pending_samples"] = 0
             rule["risk_limit_preflight"] = risk_limit_preflight
+            rule["entry_blocked_reason"] = entry_blocked_reason
+            rule["entry_next_eligible_ts"] = 0.0
             rule["updated_at"] = now_iso
             self._save_auto_arb_config()
             result = dict(rule)
@@ -8898,6 +8900,8 @@ class DataService:
                 "generation": result.get("generation"),
                 "live_level": live_level,
                 "actual_hedged_qty": quantities.get("hedged_qty"),
+                "entry_risk_limited": bool(entry_blocked_reason),
+                "entry_blocked_reason": entry_blocked_reason,
                 "ts": now_iso,
             }
         )
@@ -9707,10 +9711,11 @@ class DataService:
                     if isinstance(current, dict):
                         current["status"] = "blocked_risk_limit"
                         current["blocked_reason"] = blocked_reason
+                        current["entry_blocked_reason"] = blocked_reason
                         current["risk_limit_preflight"] = risk_limit_preflight
                         current["pending_action"] = None
                         current["pending_samples"] = 0
-                        current["next_eligible_ts"] = time.time() + 300.0
+                        current["entry_next_eligible_ts"] = time.time() + 300.0
                         current["updated_at"] = now_iso
                         self._save_auto_arb_config()
                 self._auto_arb_history_store.append(
@@ -9725,6 +9730,12 @@ class DataService:
                     }
                 )
                 return
+            async with self._auto_arb_lock:
+                current = (self._auto_arb.get("rules") or {}).get(rule_id)
+                if isinstance(current, dict):
+                    current["risk_limit_preflight"] = risk_limit_preflight
+                    current["entry_blocked_reason"] = None
+                    current["entry_next_eligible_ts"] = 0.0
         worst_tier = max(
             venue_liquidity_tier(str(rule_copy.get("long_exchange") or "")),
             venue_liquidity_tier(str(rule_copy.get("short_exchange") or "")),
@@ -10335,7 +10346,20 @@ class DataService:
                     action = decision["action"]
                     current["last_decision"] = decision
                     current["blocked_reason"] = None
-                    if action == "none":
+                    entry_risk_cooldown = (
+                        action == "enter"
+                        and time.time()
+                        < float(current.get("entry_next_eligible_ts") or 0.0)
+                    )
+                    if entry_risk_cooldown:
+                        current["pending_action"] = None
+                        current["pending_samples"] = 0
+                        current["status"] = "blocked_risk_limit"
+                        current["blocked_reason"] = str(
+                            current.get("entry_blocked_reason")
+                            or "KuCoin entry risk-limit preflight is cooling down"
+                        )
+                    elif action == "none":
                         current["pending_action"] = None
                         current["pending_samples"] = 0
                         current["status"] = (

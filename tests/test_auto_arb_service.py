@@ -668,7 +668,7 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["rule"]["status"], "waiting_entry")
         self.assertTrue(result["rule"]["enabled"])
 
-    async def test_live_arm_blocks_before_orders_when_risk_limit_is_too_small(self) -> None:
+    async def test_live_arm_allows_exit_monitoring_when_entry_risk_limit_is_too_small(self) -> None:
         self.service._auto_arb["rules"]["risk-blocked"] = {
             "id": "risk-blocked",
             "generation": 1,
@@ -698,15 +698,17 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        with self.assertRaisesRegex(ValueError, "Grid risk-limit preflight failed"):
-            await self.service.arm_auto_arb_live(
-                "risk-blocked",
-                "LIVE risk-blocked",
-            )
+        result = await self.service.arm_auto_arb_live(
+            "risk-blocked",
+            "LIVE risk-blocked",
+        )
 
         rule = self.service._auto_arb["rules"]["risk-blocked"]
-        self.assertFalse(rule["enabled"])
-        self.assertEqual(rule["mode"], "shadow")
+        self.assertTrue(rule["enabled"])
+        self.assertEqual(rule["mode"], "live")
+        self.assertEqual(rule["status"], "waiting_entry")
+        self.assertIn("KuCoin isolated level 2", rule["entry_blocked_reason"])
+        self.assertFalse(result["rule"]["risk_limit_preflight"]["ready"])
 
     async def test_paused_active_execution_is_reconciled_to_paused_when_balanced(self) -> None:
         rule = {
@@ -1584,7 +1586,59 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
         self.service.manual_enter.assert_not_awaited()
         self.assertEqual(rule["status"], "blocked_risk_limit")
         self.assertIn("KuCoin isolated level 2", rule["blocked_reason"])
-        self.assertGreater(rule["next_eligible_ts"], time.time() + 290.0)
+        self.assertGreater(rule["entry_next_eligible_ts"], time.time() + 290.0)
+        self.assertEqual(float(rule.get("next_eligible_ts") or 0.0), 0.0)
+
+    async def test_entry_risk_cooldown_does_not_block_grid_exit(self) -> None:
+        rule = {
+            "id": "directional-risk-block",
+            "generation": 1,
+            "enabled": True,
+            "mode": "live",
+            "symbol": "COTIUSDT",
+            "long_exchange": "kucoin",
+            "short_exchange": "bybit",
+            "max_qty": 20000.0,
+            "chunk_qty": 10000.0,
+            "levels": [
+                {
+                    "level": 1,
+                    "entry_spread_pct": -2.0,
+                    "exit_spread_pct": -1.5,
+                    "qty": 10000.0,
+                    "cumulative_qty": 10000.0,
+                },
+                {
+                    "level": 2,
+                    "entry_spread_pct": -4.0,
+                    "exit_spread_pct": -3.5,
+                    "qty": 10000.0,
+                    "cumulative_qty": 20000.0,
+                },
+            ],
+            "live_level": 1,
+            "actual_hedged_qty": 10000.0,
+            "confirm_samples": 1,
+            "max_levels_per_cycle": 1,
+            "entry_blocked_reason": "kucoin: entry exceeds risk limit",
+            "entry_next_eligible_ts": time.time() + 300.0,
+            "next_eligible_ts": 0.0,
+        }
+        self.service._auto_arb["rules"][rule["id"]] = rule
+        self.service.auto_arb_spreads = AsyncMock(
+            return_value={"entry_spread_pct": -1.0, "exit_spread_pct": -1.0}
+        )
+        self.service._start_auto_arb_live_transition = AsyncMock()
+
+        await self.service._auto_arb_cycle()
+
+        self.service._start_auto_arb_live_transition.assert_awaited_once_with(
+            rule["id"],
+            "exit",
+            1,
+            0,
+        )
+        self.assertEqual(rule["status"], "queued_exit")
 
     async def test_live_exit_sizes_new_transition_from_actual_hedged_qty(self) -> None:
         levels = [
