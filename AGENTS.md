@@ -102,6 +102,20 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live/paper fidelity was tightened on 2026-07-31 without increasing the
+  broad scanner cadence. Entry-ready rows are now submitted to Pump Live as
+  each symbol finishes inside the existing `1h` scan, so a live signal no
+  longer waits for the entire universe. Closed Pump Live positions now persist
+  exchange-derived average entry/exit, fees, funding, gross/net PnL, and return
+  from Bybit fills plus transaction history; startup performs a one-shot
+  backfill for older owned closes missing that accounting. Open main-cycle and
+  candidate-cycle paper positions are now monitored from complete public Bybit
+  `1m` candles every `60s`, deduplicated by symbol and capped at `12` symbols,
+  with a bounded `24h` startup backfill, minute-level ladder/TP/SL/time exits,
+  MAE/MFE and gap evidence, and conservative stop-first handling when TP and SL
+  share one candle. This adds no recurring private API polling; normal public
+  load is one kline request per unique open paper symbol per minute. Targeted
+  regression passed (`78`), and the complete suite passed (`571`).
 - Pump Live Bybit timestamp recovery was added on 2026-07-30 after a long-lived
   CCXT client kept a stale `timeDifference` and Bybit returned `retCode=10002`
   every 15 seconds. All authenticated Pump operations now detect only confirmed

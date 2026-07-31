@@ -95,6 +95,14 @@ class PumpGateway(Protocol):
 
     def fetch_ticker(self, symbol: str) -> dict[str, Any]: ...
 
+    def fetch_closed_trade_summary(
+        self,
+        symbol: str,
+        *,
+        opened_at_ms: int,
+        closed_at_ms: int,
+    ) -> dict[str, Any]: ...
+
     def set_leverage(self, symbol: str, leverage: float) -> None: ...
 
     def guarded_market_order(
@@ -539,6 +547,117 @@ class BybitPumpLiveGateway:
                 "ask": _safe_float(ticker.get("ask"), 0.0),
             }
 
+    def fetch_closed_trade_summary(
+        self,
+        symbol: str,
+        *,
+        opened_at_ms: int,
+        closed_at_ms: int,
+    ) -> dict[str, Any]:
+        with self._lock:
+            client = self._ensure_client()
+            market_id = str(self._market(symbol).get("id") or _normalize_symbol(symbol))
+            ccxt_symbol = self._ccxt_symbol(symbol)
+            start_ms = max(0, int(opened_at_ms) - 60_000)
+            end_ms = max(start_ms, int(closed_at_ms) + 60_000)
+            trades = self._private_request(
+                "fetch_closed_trade_summary_trades",
+                lambda: client.fetch_my_trades(
+                    ccxt_symbol,
+                    start_ms,
+                    200,
+                    {"category": "linear"},
+                ),
+            )
+            matching_trades = [
+                dict(item)
+                for item in trades or []
+                if start_ms <= _safe_int(item.get("timestamp"), 0) <= end_ms
+                and _normalize_symbol(item.get("symbol") or market_id) == _normalize_symbol(symbol)
+            ]
+            transactions: list[dict[str, Any]] = []
+            cursor = ""
+            for _ in range(10):
+                params: dict[str, Any] = {
+                    "accountType": "UNIFIED",
+                    "category": "linear",
+                    "currency": "USDT",
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                    "limit": 50,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                payload = self._private_request(
+                    "fetch_closed_trade_summary_transactions",
+                    lambda params=params: client.private_get_v5_account_transaction_log(params),
+                )
+                result = (payload or {}).get("result") or {}
+                rows = result.get("list") or []
+                transactions.extend(
+                    dict(item)
+                    for item in rows
+                    if _normalize_symbol(item.get("symbol")) == _normalize_symbol(symbol)
+                )
+                next_cursor = str(result.get("nextPageCursor") or "")
+                if not next_cursor or next_cursor == cursor:
+                    break
+                cursor = next_cursor
+
+            sells = [item for item in matching_trades if str(item.get("side") or "").lower() == "sell"]
+            buys = [item for item in matching_trades if str(item.get("side") or "").lower() == "buy"]
+
+            def aggregate(items: list[dict[str, Any]]) -> tuple[float, float, float]:
+                qty = sum(_safe_float(item.get("amount"), 0.0) for item in items)
+                cost = sum(_safe_float(item.get("cost"), 0.0) for item in items)
+                fees = sum(
+                    _safe_float((item.get("fee") or {}).get("cost"), 0.0)
+                    for item in items
+                    if isinstance(item.get("fee"), Mapping)
+                )
+                return qty, cost, fees
+
+            entry_qty, entry_cost, entry_fees = aggregate(sells)
+            exit_qty, exit_cost, exit_fees = aggregate(buys)
+            funding_pnl = sum(
+                _safe_float(item.get("funding"), 0.0)
+                for item in transactions
+                if str(item.get("type") or "").upper() == "SETTLEMENT"
+            )
+            transaction_net = sum(_safe_float(item.get("change"), 0.0) for item in transactions)
+            gross_pnl = entry_cost - exit_cost
+            calculated_net = gross_pnl - entry_fees - exit_fees + funding_pnl
+            complete = entry_qty > 0 and exit_qty >= entry_qty - max(1e-8, entry_qty * 1e-8)
+            return {
+                "status": "complete" if complete else "partial",
+                "symbol": _normalize_symbol(symbol),
+                "opened_at_ms": opened_at_ms,
+                "closed_at_ms": closed_at_ms,
+                "entry_qty": round(entry_qty, 12),
+                "exit_qty": round(exit_qty, 12),
+                "entry_notional_usd": round(entry_cost, 12),
+                "exit_notional_usd": round(exit_cost, 12),
+                "avg_entry_price": round(entry_cost / entry_qty, 12) if entry_qty > 0 else None,
+                "avg_exit_price": round(exit_cost / exit_qty, 12) if exit_qty > 0 else None,
+                "entry_fees_usd": round(entry_fees, 12),
+                "exit_fees_usd": round(exit_fees, 12),
+                "fees_usd": round(entry_fees + exit_fees, 12),
+                "funding_pnl_usd": round(funding_pnl, 12),
+                "gross_pnl_usd": round(gross_pnl, 12),
+                "calculated_net_pnl_usd": round(calculated_net, 12),
+                "net_pnl_usd": round(transaction_net, 12),
+                "net_return_on_entry_notional_pct": (
+                    round(transaction_net / entry_cost * 100.0, 9)
+                    if entry_cost > 0
+                    else None
+                ),
+                "entry_fill_count": len(sells),
+                "exit_fill_count": len(buys),
+                "transaction_count": len(transactions),
+                "entry_order_ids": sorted({str(item.get("order") or "") for item in sells if item.get("order")}),
+                "exit_order_ids": sorted({str(item.get("order") or "") for item in buys if item.get("order")}),
+            }
+
     def set_leverage(self, symbol: str, leverage: float) -> None:
         with self._lock:
             client = self._ensure_client()
@@ -776,6 +895,7 @@ class PumpLiveController:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        self._accounting_thread: threading.Thread | None = None
         self._state = self._load_state()
         self._state["entry_armed"] = False
         self._state["transient_recovery_pending"] = False
@@ -791,6 +911,21 @@ class PumpLiveController:
             self._state["status"] = "disarmed_after_restart"
             self._state["blocked_reason"] = "backend_restart"
             self._save_state_locked()
+        if (
+            self._background_monitor
+            and start_recovery_monitor
+            and any(
+                item.get("status") == "closed"
+                and item.get("close_accounting_status") != "complete"
+                for item in self._state.get("positions") or []
+            )
+        ):
+            self._accounting_thread = threading.Thread(
+                target=self._backfill_close_accounting_safe,
+                name="bybit-pump-live-close-accounting",
+                daemon=True,
+            )
+            self._accounting_thread.start()
 
     def config(self) -> PumpLiveConfig:
         return load_pump_live_config(self.env_path)
@@ -804,6 +939,9 @@ class PumpLiveController:
         payload["capital_manager"] = build_capital_manager_status(payload, config)
         payload["credentials"] = self.gateway.credentials_status()
         payload["monitor_thread_alive"] = bool(self._thread and self._thread.is_alive())
+        payload["accounting_thread_alive"] = bool(
+            self._accounting_thread and self._accounting_thread.is_alive()
+        )
         payload["state_file"] = str(self.state_path)
         payload["events_file"] = str(self.events_path)
         payload["open_positions"] = len(self._open_positions(payload))
@@ -816,6 +954,92 @@ class PumpLiveController:
         }
         payload["recent_events"] = _read_latest_jsonl(self.events_path, limit=30)
         return payload
+
+    def backfill_close_accounting(self, *, limit: int = 20) -> dict[str, Any]:
+        fetch_summary = getattr(self.gateway, "fetch_closed_trade_summary", None)
+        if not callable(fetch_summary):
+            return {"attempted": 0, "completed": 0, "failed": 0, "unsupported": True}
+        with self._lock:
+            candidates = [
+                item
+                for item in reversed(list(self._state.get("positions") or []))
+                if item.get("status") == "closed"
+                and item.get("close_accounting_status") != "complete"
+                and _safe_int(item.get("opened_at_ms"), 0) > 0
+                and _safe_int(item.get("closed_at_ms"), 0) > 0
+            ][: max(0, int(limit))]
+        completed = 0
+        failed = 0
+        for item in candidates:
+            symbol = _normalize_symbol(item.get("symbol"))
+            accounting: dict[str, Any] = {}
+            error: str | None = None
+            try:
+                accounting = dict(
+                    fetch_summary(
+                        symbol,
+                        opened_at_ms=_safe_int(item.get("opened_at_ms"), 0),
+                        closed_at_ms=_safe_int(item.get("closed_at_ms"), 0),
+                    )
+                    or {}
+                )
+                if accounting.get("status") == "complete":
+                    completed += 1
+                else:
+                    failed += 1
+            except Exception as exc:  # pylint: disable=broad-except
+                error = _clean_error(exc)
+                failed += 1
+            with self._lock:
+                self._apply_close_accounting(item, accounting, error)
+                self._state["updated_at_ms"] = _now_ms()
+                self._save_state_locked()
+            self._event(
+                "close_accounting_backfilled",
+                {
+                    "symbol": symbol,
+                    "accounting_status": item.get("close_accounting_status"),
+                    "realized_pnl_usd": item.get("realized_pnl_usd"),
+                    "accounting_error": error,
+                },
+            )
+        return {
+            "attempted": len(candidates),
+            "completed": completed,
+            "failed": failed,
+            "unsupported": False,
+        }
+
+    def _backfill_close_accounting_safe(self) -> None:
+        try:
+            result = self.backfill_close_accounting()
+            logger.info("Pump live close accounting backfill: %s", result)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Pump live close accounting backfill failed")
+
+    @staticmethod
+    def _apply_close_accounting(
+        item: dict[str, Any],
+        accounting: Mapping[str, Any],
+        error: str | None,
+    ) -> None:
+        item["close_accounting_status"] = (
+            str(accounting.get("status") or "unavailable")
+            if not error
+            else "error"
+        )
+        item["close_accounting_error"] = error
+        if not accounting:
+            return
+        item["close_accounting"] = dict(accounting)
+        item["avg_exit_price"] = accounting.get("avg_exit_price")
+        item["realized_gross_pnl_usd"] = accounting.get("gross_pnl_usd")
+        item["fees_usd"] = accounting.get("fees_usd")
+        item["funding_pnl_usd"] = accounting.get("funding_pnl_usd")
+        item["realized_pnl_usd"] = accounting.get("net_pnl_usd")
+        item["realized_return_on_entry_notional_pct"] = accounting.get(
+            "net_return_on_entry_notional_pct"
+        )
 
     def set_strategy_capital(
         self,
@@ -2101,18 +2325,49 @@ class PumpLiveController:
                 item["updated_at_ms"] = _now_ms()
                 self._save_state_locked()
             if count >= config.flat_confirm_cycles:
+                closed_at_ms = _now_ms()
+                accounting: dict[str, Any] = {}
+                accounting_error: str | None = None
+                fetch_summary = getattr(self.gateway, "fetch_closed_trade_summary", None)
+                if callable(fetch_summary):
+                    try:
+                        accounting = dict(
+                            fetch_summary(
+                                symbol,
+                                opened_at_ms=_safe_int(item.get("opened_at_ms"), closed_at_ms),
+                                closed_at_ms=closed_at_ms,
+                            )
+                            or {}
+                        )
+                    except Exception as exc:  # closure remains authoritative even if accounting is delayed
+                        accounting_error = _clean_error(exc)
+                        logger.warning(
+                            "Pump live close accounting unavailable symbol=%s error=%s",
+                            symbol,
+                            accounting_error,
+                        )
                 with self._lock:
                     item["status"] = "closed"
-                    item["closed_at_ms"] = _now_ms()
+                    item["closed_at_ms"] = closed_at_ms
                     item["close_reason"] = item.get("close_reason") or "exchange_position_flat"
                     item["qty"] = 0.0
+                    self._apply_close_accounting(item, accounting, accounting_error)
                     if not self._open_positions(self._state) and not self._state.get("entry_armed"):
                         self._state["monitor_enabled"] = False
                         self._state["status"] = "disarmed_flat"
                     self._save_state_locked()
                 self._event(
                     "position_confirmed_flat",
-                    {"symbol": symbol, "reason": item.get("close_reason")},
+                    {
+                        "symbol": symbol,
+                        "reason": item.get("close_reason"),
+                        "accounting_status": item.get("close_accounting_status"),
+                        "avg_exit_price": item.get("avg_exit_price"),
+                        "realized_pnl_usd": item.get("realized_pnl_usd"),
+                        "fees_usd": item.get("fees_usd"),
+                        "funding_pnl_usd": item.get("funding_pnl_usd"),
+                        "accounting_error": accounting_error,
+                    },
                 )
 
     def _cancel_position_orders(self, item: dict[str, Any]) -> None:

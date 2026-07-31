@@ -351,3 +351,22 @@ The monitor remains fail-closed while an error is unresolved. After two full
 healthy cycles it restores `armed` and sends a recovery notification. Repeated
 errors use a stable error-family key for notification cooldown, so changing
 request/server timestamps cannot create a message every 15 seconds.
+
+## Live/Paper Fidelity and Close Accounting
+
+The broad `1h` scanner remains the discovery source, but an entry-ready row is
+now handed to Pump Live immediately after that symbol is processed. Pump Live
+therefore no longer waits for the remaining hundreds of symbols in the same
+scan. The normal ownership, slot, liquidity, risk, and duplicate-entry guards
+still decide whether the signal can become an order.
+
+After a live position is confirmed flat, Pump Live reads Bybit fills and the
+account transaction log for that position window. It persists exchange-derived
+entry/exit quantities and average prices, trading fees, funding, gross PnL, net
+PnL, and return in `live_state.json`. A one-shot startup backfill fills these
+fields for older closed Pump-owned positions that do not yet have close
+accounting. The exchange records are authoritative; ticker snapshots are not
+used as realized-PnL substitutes.
+
+This adds no recurring private API polling. Private history is requested only
+when a close needs accounting or a missing historical close is backfilled.

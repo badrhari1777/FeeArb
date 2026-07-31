@@ -41,6 +41,7 @@ class FakePumpGateway:
         self.preflight_existing_state_errors = False
         self.initial_liq_price = 15.0
         self.operations: list[str] = []
+        self.closed_trade_summary: dict[str, Any] = {"status": "unavailable"}
 
     def credentials_status(self) -> dict[str, Any]:
         return {
@@ -103,6 +104,20 @@ class FakePumpGateway:
     def fetch_ticker(self, symbol: str) -> dict[str, Any]:
         del symbol
         return {"last": 10.0, "bid": 9.99, "ask": 10.01}
+
+    def fetch_closed_trade_summary(
+        self,
+        symbol: str,
+        *,
+        opened_at_ms: int,
+        closed_at_ms: int,
+    ) -> dict[str, Any]:
+        return {
+            **self.closed_trade_summary,
+            "symbol": symbol,
+            "opened_at_ms": opened_at_ms,
+            "closed_at_ms": closed_at_ms,
+        }
 
     def set_leverage(self, symbol: str, leverage: float) -> None:
         self.leverage_calls.append((symbol, leverage))
@@ -766,6 +781,48 @@ def test_flat_position_needs_two_cycles_then_cancels_ladder(tmp_path: Path) -> N
     second = controller.run_cycle()
     assert second["open_positions"] == 0
     assert len(gateway.canceled) == 2
+
+
+def test_flat_position_persists_exact_exchange_accounting(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    gateway.closed_trade_summary = {
+        "status": "complete",
+        "entry_qty": 17.5,
+        "exit_qty": 17.5,
+        "entry_notional_usd": 175.0,
+        "avg_entry_price": 10.0,
+        "avg_exit_price": 7.49,
+        "gross_pnl_usd": 43.925,
+        "fees_usd": 0.33,
+        "funding_pnl_usd": -0.25,
+        "net_pnl_usd": 43.345,
+        "net_return_on_entry_notional_pct": 24.768571,
+    }
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    gateway.positions = []
+
+    controller.run_cycle()
+    status = controller.run_cycle()
+
+    closed = next(item for item in status["positions"] if item["status"] == "closed")
+    assert closed["close_accounting_status"] == "complete"
+    assert closed["avg_exit_price"] == 7.49
+    assert closed["realized_pnl_usd"] == 43.345
+    assert closed["fees_usd"] == 0.33
+    assert closed["funding_pnl_usd"] == -0.25
+    event = next(row for row in status["recent_events"] if row["event"] == "position_confirmed_flat")
+    assert event["realized_pnl_usd"] == 43.345
 
 
 def test_restart_disarms_entries_but_keeps_recovery_monitor_state(tmp_path: Path) -> None:

@@ -283,6 +283,33 @@ Current combined pump-cycle result for `long_broad + short_clean_p100_l3`:
   They use independent paper slots per track (`4` short slots or `2` long slots), same entry/exit accounting as cycle paper, and do not affect the main `4 short + 2 long` portfolio.
 - The online long logic is `1h` shadow-scan based, not the exact `5m` historical research logic. Treat it as operational paper/shadow first; use its logs to decide whether a dedicated `5m` active-window scanner is worth adding.
 
+## Open Paper Position Monitor
+
+- Discovery and entry selection still use the broad `1h` scan.
+- Once a main-cycle or candidate-cycle paper position is open, a separate
+  read-only public monitor checks complete Bybit `1m` candles every `60`
+  seconds. It does not create live orders.
+- The monitor deduplicates symbols shared by several paper tracks and is capped
+  at `12` unique open symbols. Normal load is at most one public kline request
+  per open symbol per minute.
+- On startup it backfills no more than `24h`, then continues from the last
+  processed complete minute. Bounded-gap and ambiguous-candle markers are
+  persisted with the paper position.
+- Short ladder fills use candle highs; long ladder fills use candle lows.
+  TP/SL/time exits, MAE, MFE, exit time, and exit price are updated at minute
+  resolution. If both TP and SL are crossed inside the same `1m` candle and
+  intrabar order cannot be known, the result is conservative: the stop is
+  applied first and the ambiguity is recorded.
+- The monitor covers the shared main `pump_cycle_paper` and independent
+  candidate paper portfolios. The older legacy strategy-paper layer remains
+  scan-driven and is not used as the live-like portfolio.
+- `paper_monitor` in the Pump strategy/shadow API is the operational health
+  record: inspect `running`, `last_cycle_ts`, symbol/request counts, errors,
+  backfill/gap counts, and next run.
+- Paper `topup` remains a capital/rescue accounting model. Minute MAE/MFE makes
+  the comparison materially more accurate, but it is not a replay of Bybit's
+  exact isolated-margin engine or liquidation queue.
+
 ## Slow Pump Watch
 
 - `slow_pump_watch` is a research-only discovery path for gradual parabolic moves that do not satisfy the fast-pump thresholds.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import re
 import threading
 import time
@@ -91,6 +92,13 @@ PUMP_ACTIVE_WINDOW_PRE_HOURS = 6
 PUMP_ACTIVE_WINDOW_LOOKBACK_HOURS = 24
 PUMP_ACTIVE_WINDOW_MAX_SYMBOLS = 20
 PUMP_ACTIVE_WINDOW_SLOW_WATCH_MAX_SYMBOLS = 5
+PUMP_PAPER_MONITOR_INTERVAL_SEC = 60
+PUMP_PAPER_MONITOR_BAR_INTERVAL = "1"
+PUMP_PAPER_MONITOR_BAR_MS = 60_000
+PUMP_PAPER_MONITOR_BACKFILL_HOURS = 24
+PUMP_PAPER_MONITOR_MAX_SYMBOLS = 12
+
+logger = logging.getLogger(__name__)
 
 PUMP_STRATEGY_CATALOG: tuple[dict[str, Any], ...] = (
     {
@@ -211,22 +219,34 @@ class BybitPumpShortLab:
         self,
         *,
         restore_shadow_schedule: bool = True,
+        start_paper_monitor: bool | None = None,
         pump_live_controller: PumpLiveController | None = None,
         notifier: PumpLiveNotifier | None = None,
     ) -> None:
         self._lock = threading.Lock()
+        self._paper_lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._shadow_thread: threading.Thread | None = None
         self._shadow_schedule_thread: threading.Thread | None = None
+        self._paper_monitor_thread: threading.Thread | None = None
         self._stop_requested = threading.Event()
         self._shadow_schedule_stop_requested = threading.Event()
+        self._paper_monitor_stop_requested = threading.Event()
         self._state: dict[str, Any] = self._initial_state()
         self._shadow_state: dict[str, Any] = self._initial_shadow_state()
         self._shadow_schedule_state: dict[str, Any] = self._initial_shadow_schedule_state()
+        self._paper_monitor_state: dict[str, Any] = self._initial_paper_monitor_state()
         self._strategy_monitor_last_audit_key: str | None = None
         self._pump_live = pump_live_controller or PumpLiveController(notifier=notifier)
         if restore_shadow_schedule:
             self._restore_shadow_schedule_if_enabled()
+        paper_monitor_enabled = (
+            start_paper_monitor
+            if start_paper_monitor is not None
+            else restore_shadow_schedule
+        )
+        if paper_monitor_enabled:
+            self._start_paper_monitor()
 
     def start(self, config: BybitPumpShortRunConfig) -> dict[str, Any]:
         with self._lock:
@@ -341,6 +361,7 @@ class BybitPumpShortLab:
         payload["strategy_paper"] = read_strategy_paper_summary(output_dir=output_dir, limit=200)
         payload["cycle_paper"] = read_cycle_paper_summary(output_dir=output_dir, limit=200)
         payload["active_window"] = read_active_window_summary(output_dir=output_dir)
+        payload["paper_monitor"] = self.paper_monitor_status()
         payload["latest_errors"] = read_latest_jsonl(output_dir / "shadow_errors.jsonl", limit=20)
         payload["files"] = output_files_payload_for_names(
             output_dir,
@@ -402,6 +423,15 @@ class BybitPumpShortLab:
         audit = payload.get("audit") if isinstance(payload.get("audit"), dict) else {}
         audit["latest"] = read_latest_jsonl(output_dir / PUMP_STRATEGY_MONITOR_AUDIT_FILE, limit=20)
         payload["pump_live"] = self._pump_live.status()
+        payload["paper_monitor"] = self.paper_monitor_status()
+        return payload
+
+    def paper_monitor_status(self) -> dict[str, Any]:
+        with self._lock:
+            payload = json.loads(json.dumps(self._paper_monitor_state, ensure_ascii=True))
+        payload["thread_alive"] = bool(
+            self._paper_monitor_thread and self._paper_monitor_thread.is_alive()
+        )
         return payload
 
     def pump_live_status(self) -> dict[str, Any]:
@@ -433,6 +463,193 @@ class BybitPumpShortLab:
 
     def pump_live_emergency_close(self, confirmation: str) -> dict[str, Any]:
         return self._pump_live.emergency_close_all(confirmation)
+
+    def shutdown(self) -> None:
+        self._paper_monitor_stop_requested.set()
+
+    def _start_paper_monitor(self) -> None:
+        with self._lock:
+            if self._paper_monitor_thread and self._paper_monitor_thread.is_alive():
+                return
+            self._paper_monitor_stop_requested.clear()
+            self._paper_monitor_state.update(
+                {
+                    "enabled": True,
+                    "status": "starting",
+                    "started_at_ms": now_ms(),
+                    "updated_at_ms": now_ms(),
+                    "last_error": None,
+                }
+            )
+            self._paper_monitor_thread = threading.Thread(
+                target=self._paper_monitor_loop,
+                name="bybit-pump-paper-position-monitor",
+                daemon=True,
+            )
+            self._paper_monitor_thread.start()
+
+    def _paper_monitor_loop(self) -> None:
+        while not self._paper_monitor_stop_requested.is_set():
+            try:
+                self._run_paper_monitor_cycle()
+            except Exception as exc:  # pylint: disable=broad-except
+                error = str(exc)
+                logger.exception("Pump paper position monitor failed: %s", error)
+                with self._lock:
+                    self._paper_monitor_state.update(
+                        {
+                            "status": "error",
+                            "updated_at_ms": now_ms(),
+                            "last_finished_at_ms": now_ms(),
+                            "last_error": error,
+                            "runs_failed": int(
+                                self._paper_monitor_state.get("runs_failed") or 0
+                            )
+                            + 1,
+                        }
+                    )
+            self._paper_monitor_stop_requested.wait(PUMP_PAPER_MONITOR_INTERVAL_SEC)
+        with self._lock:
+            self._paper_monitor_state.update(
+                {
+                    "enabled": False,
+                    "status": "stopped",
+                    "updated_at_ms": now_ms(),
+                }
+            )
+
+    def _run_paper_monitor_cycle(self) -> dict[str, Any]:
+        started_at = now_ms()
+        with self._lock:
+            self._paper_monitor_state.update(
+                {
+                    "status": "running",
+                    "last_started_at_ms": started_at,
+                    "updated_at_ms": started_at,
+                    "runs_started": int(
+                        self._paper_monitor_state.get("runs_started") or 0
+                    )
+                    + 1,
+                }
+            )
+        with self._paper_lock:
+            main_state = load_cycle_paper_state(
+                DEFAULT_SHADOW_OUTPUT_DIR / PUMP_CYCLE_PAPER_STATE_FILE
+            )
+            candidate_state = load_cycle_candidate_paper_state(
+                DEFAULT_SHADOW_OUTPUT_DIR / PUMP_CYCLE_CANDIDATE_PAPER_STATE_FILE
+            )
+            open_positions = [
+                item
+                for item in list(main_state.get("positions") or [])
+                + list(candidate_state.get("positions") or [])
+                if item.get("status") == "open"
+            ]
+
+        positions_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        for position in open_positions:
+            symbol = normalize_symbol(str(position.get("symbol") or ""))
+            if symbol:
+                positions_by_symbol.setdefault(symbol, []).append(position)
+        selected_symbols = sorted(positions_by_symbol)[:PUMP_PAPER_MONITOR_MAX_SYMBOLS]
+        dropped_symbols = max(0, len(positions_by_symbol) - len(selected_symbols))
+        if not selected_symbols:
+            finished_at = now_ms()
+            result = {
+                "symbols": 0,
+                "positions": 0,
+                "bars": 0,
+                "events": 0,
+                "requests_made": 0,
+                "errors": [],
+            }
+            with self._lock:
+                self._paper_monitor_state.update(
+                    {
+                        "status": "waiting",
+                        "updated_at_ms": finished_at,
+                        "last_finished_at_ms": finished_at,
+                        "last_error": None,
+                        "last_result": result,
+                        "runs_completed": int(
+                            self._paper_monitor_state.get("runs_completed") or 0
+                        )
+                        + 1,
+                    }
+                )
+            return result
+
+        end_ms = (started_at // PUMP_PAPER_MONITOR_BAR_MS) * PUMP_PAPER_MONITOR_BAR_MS - 1
+        backfill_floor = end_ms - PUMP_PAPER_MONITOR_BACKFILL_HOURS * 3_600_000
+        collector = BybitPumpShortCollector(
+            BybitCollectorConfig(
+                output_dir=DEFAULT_SHADOW_OUTPUT_DIR,
+                lookback_days=1,
+                sleep_sec=0.05,
+                stop_on_403=True,
+            )
+        )
+        bars_by_symbol: dict[str, list[dict[str, Any]]] = {}
+        errors: list[dict[str, Any]] = []
+        for symbol in selected_symbols:
+            symbol_positions = positions_by_symbol[symbol]
+            starts: list[int] = []
+            for position in symbol_positions:
+                checkpoint = to_int(position.get("paper_monitor_last_bar_ts_ms"))
+                opened_at = to_int(position.get("opened_at_ms"))
+                starts.append(
+                    checkpoint + PUMP_PAPER_MONITOR_BAR_MS
+                    if checkpoint
+                    else max(opened_at, backfill_floor)
+                )
+            start_ms = max(backfill_floor, min(starts or [backfill_floor]))
+            if start_ms > end_ms:
+                bars_by_symbol[symbol] = []
+                continue
+            try:
+                bars_by_symbol[symbol] = collector.fetch_klines(
+                    symbol,
+                    interval=PUMP_PAPER_MONITOR_BAR_INTERVAL,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                errors.append({"symbol": symbol, "error": str(exc)})
+
+        with self._paper_lock:
+            applied = apply_pump_cycle_paper_bars(
+                bars_by_symbol,
+                output_dir=DEFAULT_SHADOW_OUTPUT_DIR,
+                updated_at_ms=end_ms,
+            )
+        finished_at = now_ms()
+        result = {
+            **applied,
+            "symbols": len(selected_symbols),
+            "positions": len(open_positions),
+            "bars": sum(len(items) for items in bars_by_symbol.values()),
+            "requests_made": collector.stats.requests_made,
+            "dropped_symbols": dropped_symbols,
+            "errors": errors,
+        }
+        with self._lock:
+            self._paper_monitor_state.update(
+                {
+                    "status": "waiting" if not errors else "degraded",
+                    "updated_at_ms": finished_at,
+                    "last_finished_at_ms": finished_at,
+                    "last_error": "; ".join(
+                        f"{item['symbol']}: {item['error']}" for item in errors
+                    )
+                    or None,
+                    "last_result": result,
+                    "runs_completed": int(
+                        self._paper_monitor_state.get("runs_completed") or 0
+                    )
+                    + 1,
+                }
+            )
+        return result
 
     def _restore_shadow_schedule_if_enabled(self) -> None:
         state = load_shadow_schedule_state(DEFAULT_SHADOW_OUTPUT_DIR / PUMP_SHADOW_SCHEDULE_STATE_FILE)
@@ -783,6 +1000,26 @@ class BybitPumpShortLab:
         return False
 
     def _execute_shadow_scan(self, run_config: BybitPumpShortShadowConfig) -> dict[str, Any]:
+        main_strategy = next(
+            (
+                strategy
+                for strategy in PUMP_STRATEGY_CATALOG
+                if strategy.get("strategy_id") == "main_pullback_tier"
+            ),
+            None,
+        )
+        early_live_accepted = 0
+
+        def submit_live_row(row: dict[str, Any]) -> None:
+            nonlocal early_live_accepted
+            if not main_strategy:
+                return
+            decision = classify_strategy_signal(main_strategy, row)
+            if decision.get("state") != "entry_ready":
+                return
+            result = self._pump_live.submit_decisions([decision])
+            early_live_accepted += int(result.get("accepted") or 0)
+
         metadata = run_shadow_scan(
             ShadowScanConfig(
                 output_dir=run_config.output_dir,
@@ -792,18 +1029,15 @@ class BybitPumpShortLab:
                 symbols=run_config.symbols,
                 newest_first=run_config.newest_first,
                 recent_event_hours=run_config.recent_event_hours,
+                row_callback=submit_live_row,
             )
         )
         rows = read_first_csv_rows(run_config.output_dir / "shadow_scan_latest.csv", limit=10_000)
-        strategy_paper = apply_pump_strategy_paper_rows(rows, output_dir=run_config.output_dir)
-        main_strategy = next(
-            (
-                strategy
-                for strategy in PUMP_STRATEGY_CATALOG
-                if strategy.get("strategy_id") == "main_pullback_tier"
-            ),
-            None,
-        )
+        with self._paper_lock:
+            strategy_paper = apply_pump_strategy_paper_rows(
+                rows,
+                output_dir=run_config.output_dir,
+            )
         live_signal_result = (
             self._pump_live.submit_decisions(
                 [classify_strategy_signal(main_strategy, row) for row in rows]
@@ -811,7 +1045,13 @@ class BybitPumpShortLab:
             if main_strategy
             else {"accepted": 0, "armed": False}
         )
-        cycle_paper = apply_pump_cycle_paper_rows(rows, output_dir=run_config.output_dir)
+        live_signal_result["accepted"] = int(live_signal_result.get("accepted") or 0) + early_live_accepted
+        live_signal_result["accepted_early"] = early_live_accepted
+        with self._paper_lock:
+            cycle_paper = apply_pump_cycle_paper_rows(
+                rows,
+                output_dir=run_config.output_dir,
+            )
         active_window = apply_pump_active_window_scan(
             rows,
             output_dir=run_config.output_dir,
@@ -995,6 +1235,30 @@ class BybitPumpShortLab:
                 "interval_sec": 3600,
                 "run_immediately": True,
                 "max_runs": None,
+            },
+        }
+
+    @staticmethod
+    def _initial_paper_monitor_state() -> dict[str, Any]:
+        return {
+            "enabled": False,
+            "status": "idle",
+            "started_at_ms": None,
+            "updated_at_ms": None,
+            "last_started_at_ms": None,
+            "last_finished_at_ms": None,
+            "runs_started": 0,
+            "runs_completed": 0,
+            "runs_failed": 0,
+            "last_error": None,
+            "last_result": {},
+            "config": {
+                "interval_sec": PUMP_PAPER_MONITOR_INTERVAL_SEC,
+                "bar_interval": PUMP_PAPER_MONITOR_BAR_INTERVAL,
+                "backfill_hours": PUMP_PAPER_MONITOR_BACKFILL_HOURS,
+                "max_symbols": PUMP_PAPER_MONITOR_MAX_SYMBOLS,
+                "deduplicate_symbols": True,
+                "public_market_data_only": True,
             },
         }
 
@@ -1626,6 +1890,17 @@ def flatten_strategy_paper_position(position: dict[str, Any]) -> dict[str, Any]:
         "combined_pnl_usd": position.get("combined_pnl_usd"),
         "current_topup_needed_usd": position.get("current_topup_needed_usd"),
         "peak_topup_needed_usd": position.get("peak_topup_needed_usd"),
+        "mae_pct": position.get("mae_pct"),
+        "mfe_pct": position.get("mfe_pct"),
+        "paper_peak_price": position.get("paper_peak_price"),
+        "paper_trough_price": position.get("paper_trough_price"),
+        "paper_monitor_last_bar_ts_ms": position.get("paper_monitor_last_bar_ts_ms"),
+        "paper_monitor_bars_processed": position.get("paper_monitor_bars_processed"),
+        "paper_monitor_backfill_limited": position.get("paper_monitor_backfill_limited"),
+        "paper_exit_observed_price": position.get("paper_exit_observed_price"),
+        "paper_exit_bar_ts_ms": position.get("paper_exit_bar_ts_ms"),
+        "paper_exit_time_resolution_ms": position.get("paper_exit_time_resolution_ms"),
+        "paper_bar_path_ambiguous": position.get("paper_bar_path_ambiguous"),
         "exit_reason": position.get("exit_reason"),
     }
 
@@ -2486,6 +2761,350 @@ def maybe_close_cycle_paper_position(position: dict[str, Any], *, current_price:
         }
     )
     return {"event": "cycle_close", "ts_ms": now_ms_value, "paper_id": position.get("paper_id"), "side": side, "symbol": position.get("symbol"), "reason": reason, "net_pnl_usd": round(net_pnl, 6)}
+
+
+def update_cycle_paper_position_from_bars(
+    position: dict[str, Any],
+    bars: list[dict[str, Any]],
+    *,
+    bar_interval_ms: int = PUMP_PAPER_MONITOR_BAR_MS,
+) -> list[dict[str, Any]]:
+    if position.get("status") != "open":
+        return []
+    events: list[dict[str, Any]] = []
+    checkpoint = to_int(position.get("paper_monitor_last_bar_ts_ms")) or 0
+    opened_at = to_int(position.get("opened_at_ms")) or 0
+    first_full_bar = (
+        ((opened_at + bar_interval_ms - 1) // bar_interval_ms) * bar_interval_ms
+        if opened_at
+        else 0
+    )
+    ordered = sorted(bars, key=lambda item: to_int(item.get("ts_ms")))
+    for bar in ordered:
+        bar_ts = to_int(bar.get("ts_ms"))
+        if not bar_ts or bar_ts <= checkpoint or bar_ts < first_full_bar:
+            continue
+        bar_open = to_number(bar.get("open"))
+        bar_high = to_number(bar.get("high"))
+        bar_low = to_number(bar.get("low"))
+        bar_close = to_number(bar.get("close"))
+        if min(bar_open, bar_high, bar_low, bar_close) <= 0:
+            continue
+        if not position.get("paper_monitor_coverage_started_at_ms"):
+            position["paper_monitor_coverage_started_at_ms"] = bar_ts
+            if opened_at and bar_ts - opened_at > bar_interval_ms * 2:
+                position["paper_monitor_backfill_limited"] = True
+                position["paper_monitor_gap_before_ms"] = bar_ts
+
+        side = str(position.get("side") or "")
+        position["paper_monitor_last_bar_ts_ms"] = bar_ts
+        position["paper_monitor_bar_interval"] = str(
+            max(1, bar_interval_ms // 60_000)
+        )
+        position["paper_monitor_bars_processed"] = int(
+            position.get("paper_monitor_bars_processed") or 0
+        ) + 1
+        position["paper_peak_price"] = round(
+            max(to_number(position.get("paper_peak_price")), bar_high),
+            12,
+        )
+        previous_trough = to_number(position.get("paper_trough_price"))
+        position["paper_trough_price"] = round(
+            min(previous_trough, bar_low) if previous_trough > 0 else bar_low,
+            12,
+        )
+        position["updated_at_ms"] = bar_ts
+
+        new_leg_hit = False
+        if side == "short":
+            for leg in position.get("legs") or []:
+                if leg.get("filled") or leg.get("closed"):
+                    continue
+                trigger = to_number(leg.get("trigger_price"))
+                if trigger > 0 and bar_high >= trigger:
+                    leg["filled"] = True
+                    leg["entry_price"] = round(trigger, 10)
+                    leg["filled_at_ms"] = bar_ts
+                    new_leg_hit = True
+                    events.append(
+                        {
+                            "event": "cycle_add_short_leg",
+                            "ts_ms": bar_ts,
+                            "paper_id": position.get("paper_id"),
+                            "symbol": position.get("symbol"),
+                            "step": leg.get("step"),
+                            "source": "open_position_1m",
+                        }
+                    )
+
+        previous_peak_topup = to_number(position.get("peak_topup_needed_usd"))
+        adverse_price = bar_high if side == "short" else bar_low
+        recompute_cycle_paper_position_metrics(
+            position,
+            current_price=adverse_price,
+            now_ms_value=bar_ts,
+        )
+        adverse_topup = to_number(position.get("current_topup_needed_usd"))
+        if adverse_topup > previous_peak_topup:
+            position["peak_topup_needed_usd"] = round(adverse_topup, 6)
+            events.append(
+                {
+                    "event": "cycle_topup_peak",
+                    "ts_ms": bar_ts,
+                    "paper_id": position.get("paper_id"),
+                    "symbol": position.get("symbol"),
+                    "topup_needed_usd": round(adverse_topup, 6),
+                    "source": "open_position_1m",
+                }
+            )
+
+        close_event: dict[str, Any] | None = None
+        if side == "short":
+            target = to_number(position.get("target_price"))
+            if target > 0 and bar_low <= target:
+                recompute_cycle_paper_position_metrics(
+                    position,
+                    current_price=bar_low,
+                    now_ms_value=bar_ts,
+                )
+                close_event = maybe_close_cycle_paper_position(
+                    position,
+                    current_price=bar_low,
+                    now_ms_value=bar_ts,
+                )
+                if new_leg_hit:
+                    position["paper_bar_path_ambiguous"] = True
+        else:
+            target = to_number(position.get("target_price"))
+            stop = to_number(position.get("stop_price"))
+            hit_stop = stop > 0 and bar_low <= stop
+            hit_target = target > 0 and bar_high >= target
+            if hit_stop:
+                close_event = maybe_close_cycle_paper_position(
+                    position,
+                    current_price=bar_low,
+                    now_ms_value=bar_ts,
+                )
+                if hit_target:
+                    position["paper_bar_path_ambiguous"] = True
+            elif hit_target:
+                recompute_cycle_paper_position_metrics(
+                    position,
+                    current_price=bar_high,
+                    now_ms_value=bar_ts,
+                )
+                close_event = maybe_close_cycle_paper_position(
+                    position,
+                    current_price=bar_high,
+                    now_ms_value=bar_ts,
+                )
+
+        if close_event:
+            observed_price = bar_low if (
+                side == "short" or close_event.get("reason") == "long_stop_loss"
+            ) else bar_high
+            position["current_price"] = round(observed_price, 12)
+            position["paper_exit_observed_price"] = round(observed_price, 12)
+            position["paper_exit_bar_ts_ms"] = bar_ts
+            position["paper_exit_time_resolution_ms"] = bar_interval_ms
+            close_event.update(
+                {
+                    "source": "open_position_1m",
+                    "observed_price": round(observed_price, 12),
+                    "time_resolution_ms": bar_interval_ms,
+                    "bar_path_ambiguous": bool(
+                        position.get("paper_bar_path_ambiguous")
+                    ),
+                }
+            )
+            events.append(close_event)
+            checkpoint = bar_ts
+            break
+
+        favorable_price = bar_low if side == "short" else bar_high
+        recompute_cycle_paper_position_metrics(
+            position,
+            current_price=favorable_price,
+            now_ms_value=bar_ts,
+        )
+        recompute_cycle_paper_position_metrics(
+            position,
+            current_price=bar_close,
+            now_ms_value=bar_ts,
+        )
+        position["current_price"] = round(bar_close, 12)
+        time_close = maybe_close_cycle_paper_position(
+            position,
+            current_price=bar_close,
+            now_ms_value=bar_ts,
+        )
+        if time_close:
+            position["paper_exit_observed_price"] = round(bar_close, 12)
+            position["paper_exit_bar_ts_ms"] = bar_ts
+            position["paper_exit_time_resolution_ms"] = bar_interval_ms
+            time_close.update(
+                {
+                    "source": "open_position_1m",
+                    "observed_price": round(bar_close, 12),
+                    "time_resolution_ms": bar_interval_ms,
+                    "bar_path_ambiguous": False,
+                }
+            )
+            events.append(time_close)
+            checkpoint = bar_ts
+            break
+        checkpoint = bar_ts
+    return events
+
+
+def apply_pump_cycle_paper_bars(
+    bars_by_symbol: dict[str, list[dict[str, Any]]],
+    *,
+    output_dir: Path = DEFAULT_SHADOW_OUTPUT_DIR,
+    updated_at_ms: int | None = None,
+) -> dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    effective_updated_at = updated_at_ms or max(
+        (
+            to_int(bar.get("ts_ms"))
+            for bars in bars_by_symbol.values()
+            for bar in bars
+        ),
+        default=now_ms(),
+    )
+
+    candidate_path = output_dir / PUMP_CYCLE_CANDIDATE_PAPER_STATE_FILE
+    candidate_state = load_cycle_candidate_paper_state(candidate_path)
+    candidate_positions = list(candidate_state.get("positions") or [])
+    candidate_events: list[dict[str, Any]] = []
+    for position in candidate_positions:
+        if position.get("status") != "open":
+            continue
+        symbol = normalize_symbol(str(position.get("symbol") or ""))
+        candidate_events.extend(
+            update_cycle_paper_position_from_bars(
+                position,
+                bars_by_symbol.get(symbol, []),
+            )
+        )
+    previous_candidate_summary = (
+        candidate_state.get("summary")
+        if isinstance(candidate_state.get("summary"), dict)
+        else {}
+    )
+    candidate_summary = build_cycle_candidate_paper_summary(candidate_positions)
+    candidate_summary["peak_topup_needed_usd"] = round(
+        max(
+            to_number(previous_candidate_summary.get("peak_topup_needed_usd")),
+            to_number(candidate_summary.get("peak_topup_needed_usd")),
+            to_number(candidate_summary.get("current_topup_needed_usd")),
+        ),
+        6,
+    )
+    candidate_state.update(
+        {
+            "updated_at_ms": effective_updated_at,
+            "positions": candidate_positions,
+            "summary": candidate_summary,
+            "track_summaries": build_cycle_track_summaries(candidate_positions),
+        }
+    )
+    save_cycle_candidate_paper_state(candidate_path, candidate_state)
+    write_cycle_paper_csv(
+        output_dir / PUMP_CYCLE_CANDIDATE_PAPER_CSV_FILE,
+        candidate_positions,
+    )
+    for event in candidate_events:
+        append_jsonl_file(
+            output_dir / PUMP_CYCLE_CANDIDATE_PAPER_EVENTS_FILE,
+            event,
+        )
+    candidate_payload = {
+        "schema": candidate_state.get("schema"),
+        "updated_at_ms": effective_updated_at,
+        "config": candidate_state.get("config") or {},
+        "summary": candidate_summary,
+        "track_summaries": candidate_state.get("track_summaries") or {},
+        "skip_summary": candidate_state.get("skip_summary") or {},
+        "positions": candidate_positions,
+        "open_positions": candidate_summary.get("open_positions"),
+        "closed_positions": candidate_summary.get("closed_positions"),
+        "events": len(candidate_events),
+    }
+
+    main_path = output_dir / PUMP_CYCLE_PAPER_STATE_FILE
+    main_state = load_cycle_paper_state(main_path)
+    main_positions = list(main_state.get("positions") or [])
+    main_events: list[dict[str, Any]] = []
+    for position in main_positions:
+        if position.get("status") != "open":
+            continue
+        symbol = normalize_symbol(str(position.get("symbol") or ""))
+        main_events.extend(
+            update_cycle_paper_position_from_bars(
+                position,
+                bars_by_symbol.get(symbol, []),
+            )
+        )
+    previous_summary = (
+        main_state.get("cycle_summary")
+        if isinstance(main_state.get("cycle_summary"), dict)
+        else {}
+    )
+    summary = build_cycle_paper_summary(main_positions)
+    summary["peak_topup_needed_usd"] = round(
+        max(
+            to_number(previous_summary.get("peak_topup_needed_usd")),
+            to_number(summary.get("peak_topup_needed_usd")),
+            to_number(summary.get("current_topup_needed_usd")),
+        ),
+        6,
+    )
+    previous_peak_equity = (
+        to_number(previous_summary.get("peak_equity_mark_usd"))
+        or PUMP_CYCLE_CAPITAL_USD
+    )
+    summary["peak_equity_mark_usd"] = round(
+        max(previous_peak_equity, to_number(summary.get("equity_mark_usd"))),
+        6,
+    )
+    current_drawdown = max(
+        0.0,
+        to_number(summary.get("peak_equity_mark_usd"))
+        - to_number(summary.get("equity_mark_usd")),
+    )
+    summary["max_drawdown_usd"] = round(
+        max(to_number(previous_summary.get("max_drawdown_usd")), current_drawdown),
+        6,
+    )
+    summary["max_drawdown_pct"] = round(
+        summary["max_drawdown_usd"] / PUMP_CYCLE_CAPITAL_USD * 100.0,
+        6,
+    )
+    main_state.update(
+        {
+            "updated_at_ms": effective_updated_at,
+            "positions": main_positions,
+            "cycle_summary": summary,
+            "track_summaries": build_cycle_track_summaries(main_positions),
+            "candidate_paper": candidate_payload,
+        }
+    )
+    save_cycle_paper_state(main_path, main_state)
+    write_cycle_paper_csv(
+        output_dir / PUMP_CYCLE_PAPER_CSV_FILE,
+        main_positions,
+    )
+    for event in main_events:
+        append_jsonl_file(output_dir / PUMP_CYCLE_PAPER_EVENTS_FILE, event)
+    return {
+        "events": len(main_events) + len(candidate_events),
+        "main_events": len(main_events),
+        "candidate_events": len(candidate_events),
+        "main_open_positions": summary.get("open_positions"),
+        "candidate_open_positions": candidate_summary.get("open_positions"),
+        "updated_at_ms": effective_updated_at,
+    }
 
 
 def build_cycle_paper_summary(positions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3484,7 +4103,8 @@ def classify_strategy_signal(strategy: dict[str, Any], row: dict[str, Any]) -> d
         "source_reason": row.get("reason"),
         "state": state,
         "reason": reason,
-        "ts_ms": row.get("ts_ms"),
+        "ts_ms": row.get("observed_at_ms") or row.get("ts_ms"),
+        "scan_ts_ms": row.get("ts_ms"),
         "pump_pct": round_optional(pump_pct, 3),
         "pullback_from_high_pct": round_optional(pullback, 3),
         "funding_prev_24h_pct": round_optional(funding, 6),

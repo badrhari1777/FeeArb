@@ -14,6 +14,7 @@ from webapp.bybit_pump_short_lab import (
     BybitPumpShortLab,
     PUMP_SHADOW_SCHEDULE_STATE_FILE,
     PUMP_STRATEGY_CATALOG,
+    apply_pump_cycle_paper_bars,
     apply_pump_cycle_paper_rows,
     apply_pump_strategy_paper_rows,
     build_active_window_summary,
@@ -147,6 +148,80 @@ class BybitPumpShortLabTestCase(unittest.TestCase):
         self.assertFalse(persisted["enabled"])
         self.assertEqual(persisted["status"], "complete")
         scanner.assert_called_once()
+
+    def test_shadow_scan_submits_entry_ready_row_before_final_batch(self) -> None:
+        class RecordingPumpLive:
+            def __init__(self) -> None:
+                self.calls: list[list[dict[str, object]]] = []
+
+            def submit_decisions(
+                self,
+                decisions: list[dict[str, object]],
+            ) -> dict[str, object]:
+                self.calls.append(decisions)
+                return {
+                    "accepted": 1 if len(self.calls) == 1 else 0,
+                    "armed": True,
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            recorder = RecordingPumpLive()
+            lab = BybitPumpShortLab(
+                restore_shadow_schedule=False,
+                start_paper_monitor=False,
+                pump_live_controller=recorder,  # type: ignore[arg-type]
+            )
+            config = normalize_shadow_config(output_dir=tmp, max_symbols=1)
+            row = {
+                "ts_ms": "1900000000000",
+                "observed_at_ms": "1900000123456",
+                "status": "entry_candidate",
+                "symbol": "EARLYUSDT",
+                "event_id": "EARLY-1",
+                "trigger_pump_pct": "140",
+                "pullback_from_high_pct": "21",
+                "funding_prev_24h_pct": "-0.2",
+                "oi_change_24h_pct": "12",
+                "long_ratio": "0.52",
+                "last_close": "1.0",
+            }
+
+            def fake_scan(scan_config: object) -> dict[str, object]:
+                callback = getattr(scan_config, "row_callback")
+                callback(dict(row))
+                (output_dir / "shadow_scan_latest.csv").write_text(
+                    ",".join(row) + "\n"
+                    + ",".join(str(row[key]) for key in row)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                return {"rows": 1, "entry_candidates": 1, "errors": 0}
+
+            with (
+                patch(
+                    "webapp.bybit_pump_short_lab.run_shadow_scan",
+                    side_effect=fake_scan,
+                ),
+                patch(
+                    "webapp.bybit_pump_short_lab.apply_pump_strategy_paper_rows",
+                    return_value={},
+                ),
+                patch(
+                    "webapp.bybit_pump_short_lab.apply_pump_cycle_paper_rows",
+                    return_value={},
+                ),
+                patch(
+                    "webapp.bybit_pump_short_lab.apply_pump_active_window_scan",
+                    return_value={},
+                ),
+            ):
+                metadata = lab._execute_shadow_scan(config)  # pylint: disable=protected-access
+
+        self.assertEqual(len(recorder.calls), 2)
+        self.assertEqual(recorder.calls[0][0]["symbol"], "EARLYUSDT")
+        self.assertEqual(recorder.calls[0][0]["ts_ms"], "1900000123456")
+        self.assertEqual(metadata["pump_live_signals_accepted"], 1)
 
     def test_shadow_schedule_restores_from_persisted_enabled_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -451,6 +526,186 @@ class BybitPumpShortLabTestCase(unittest.TestCase):
         self.assertLess(position["avg_entry_price"], 1.3334)
         self.assertLess(position["current_pnl_pct"], 0.0)
         self.assertLess(position["combined_pnl_usd"], 0.0)
+
+    def test_cycle_paper_minute_bars_fill_ladder_and_close_at_first_tp_cross(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            opened_at = 1_900_000_000_000
+            open_rows = [
+                {
+                    "ts_ms": str(opened_at),
+                    "observed_at_ms": str(opened_at),
+                    "status": "entry_candidate",
+                    "symbol": "SHORTUSDT",
+                    "event_id": "SHORT-BARS",
+                    "trigger_pump_pct": "140",
+                    "pullback_from_high_pct": "21",
+                    "funding_prev_24h_pct": "-0.2",
+                    "oi_change_24h_pct": "12",
+                    "long_ratio": "0.52",
+                    "hours_since_trigger": "1",
+                    "last_close": "1.0",
+                }
+            ]
+            apply_pump_cycle_paper_rows(open_rows, output_dir=output_dir)
+            bars = [
+                {
+                    "ts_ms": opened_at + 120_000,
+                    "open": 1.1,
+                    "high": 1.6,
+                    "low": 1.3,
+                    "close": 1.4,
+                },
+                {
+                    "ts_ms": opened_at + 180_000,
+                    "open": 1.2,
+                    "high": 1.25,
+                    "low": 0.9,
+                    "close": 0.95,
+                },
+            ]
+
+            result = apply_pump_cycle_paper_bars(
+                {"SHORTUSDT": bars},
+                output_dir=output_dir,
+                updated_at_ms=opened_at + 240_000,
+            )
+            summary = read_cycle_paper_summary(output_dir=output_dir)
+
+        position = next(
+            item
+            for item in summary["positions"]
+            if item.get("track_id") == "short_main_tiered"
+        )
+        self.assertEqual(position["filled_steps"], 2)
+        self.assertEqual(position["status"], "closed")
+        self.assertEqual(position["closed_at_ms"], opened_at + 180_000)
+        self.assertEqual(position["exit_reason"], "short_take_profit")
+        self.assertEqual(position["paper_exit_observed_price"], 0.9)
+        self.assertGreater(position["mae_pct"], 20.0)
+        self.assertGreater(position["mfe_pct"], 20.0)
+        self.assertEqual(position["paper_monitor_bars_processed"], 2)
+        self.assertGreaterEqual(result["main_events"], 2)
+
+    def test_cycle_paper_long_same_bar_tp_and_stop_uses_conservative_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            opened_at = 1_900_000_000_000
+            open_rows = [
+                {
+                    "ts_ms": str(opened_at),
+                    "observed_at_ms": str(opened_at),
+                    "status": "entry_candidate",
+                    "symbol": "LONGUSDT",
+                    "event_id": "LONG-BARS",
+                    "trigger_pump_pct": "80",
+                    "hours_since_trigger": "1",
+                    "premium_latest_pct": "-2.0",
+                    "premium_min_24h_pct": "-3.0",
+                    "premium_relief_1h_pct": "0.5",
+                    "oi_change_4h_pct": "25",
+                    "oi_change_24h_pct": "30",
+                    "volume_z_24h": "2.0",
+                    "last_close": "10.0",
+                }
+            ]
+            apply_pump_cycle_paper_rows(open_rows, output_dir=output_dir)
+            apply_pump_cycle_paper_bars(
+                {
+                    "LONGUSDT": [
+                        {
+                            "ts_ms": opened_at + 120_000,
+                            "open": 10.0,
+                            "high": 13.5,
+                            "low": 7.0,
+                            "close": 11.0,
+                        }
+                    ]
+                },
+                output_dir=output_dir,
+                updated_at_ms=opened_at + 180_000,
+            )
+            summary = read_cycle_paper_summary(output_dir=output_dir)
+
+        position = next(
+            item
+            for item in summary["positions"]
+            if item.get("side") == "long"
+        )
+        self.assertEqual(position["status"], "closed")
+        self.assertEqual(position["exit_reason"], "long_stop_loss")
+        self.assertTrue(position["paper_bar_path_ambiguous"])
+        self.assertEqual(position["paper_exit_observed_price"], 7.0)
+
+    def test_classify_strategy_signal_uses_per_symbol_observation_time(self) -> None:
+        decision = classify_strategy_signal(
+            PUMP_STRATEGY_CATALOG[0],
+            {
+                "ts_ms": "1900000000000",
+                "observed_at_ms": "1900000123456",
+                "status": "entry_candidate",
+                "symbol": "FASTUSDT",
+                "event_id": "FAST-1",
+                "trigger_pump_pct": "140",
+                "pullback_from_high_pct": "21",
+                "funding_prev_24h_pct": "-0.2",
+                "oi_change_24h_pct": "12",
+                "long_ratio": "0.52",
+                "last_close": "1.0",
+            },
+        )
+
+        self.assertEqual(decision["ts_ms"], "1900000123456")
+        self.assertEqual(decision["scan_ts_ms"], "1900000000000")
+
+    def test_paper_monitor_fetches_one_public_series_per_unique_symbol(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            current_ms = int(time.time() * 1000)
+            opened_at = (current_ms // 60_000) * 60_000 - 180_000
+            open_rows = [
+                {
+                    "ts_ms": str(opened_at),
+                    "observed_at_ms": str(opened_at),
+                    "status": "entry_candidate",
+                    "symbol": "DEDUPEUSDT",
+                    "event_id": "DEDUPE-1",
+                    "trigger_pump_pct": "140",
+                    "pullback_from_high_pct": "21",
+                    "funding_prev_24h_pct": "-0.2",
+                    "oi_change_24h_pct": "12",
+                    "long_ratio": "0.52",
+                    "hours_since_trigger": "1",
+                    "last_close": "1.0",
+                }
+            ]
+            apply_pump_cycle_paper_rows(open_rows, output_dir=output_dir)
+            bar = {
+                "ts_ms": opened_at + 60_000,
+                "open": 1.0,
+                "high": 1.1,
+                "low": 0.95,
+                "close": 1.02,
+            }
+            lab = BybitPumpShortLab(
+                restore_shadow_schedule=False,
+                start_paper_monitor=False,
+            )
+            with (
+                patch(
+                    "webapp.bybit_pump_short_lab.DEFAULT_SHADOW_OUTPUT_DIR",
+                    output_dir,
+                ),
+                patch(
+                    "webapp.bybit_pump_short_lab.BybitPumpShortCollector.fetch_klines",
+                    return_value=[bar],
+                ) as fetch_klines,
+            ):
+                result = lab._run_paper_monitor_cycle()  # pylint: disable=protected-access
+
+        self.assertEqual(result["symbols"], 1)
+        self.assertGreaterEqual(result["positions"], 2)
+        self.assertEqual(fetch_klines.call_count, 1)
 
     def test_active_window_summary_and_monitor_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

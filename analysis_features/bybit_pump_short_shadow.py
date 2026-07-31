@@ -6,7 +6,7 @@ import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from analysis_collectors.bybit_pump_short import (
     BybitCollectorConfig,
@@ -50,6 +50,7 @@ class ShadowScanConfig:
     symbols: list[str] = field(default_factory=list)
     newest_first: bool = True
     recent_event_hours: int = 168
+    row_callback: Callable[[dict[str, Any]], None] | None = None
 
 
 def run_shadow_scan(config: ShadowScanConfig | None = None) -> dict[str, Any]:
@@ -81,6 +82,18 @@ def run_shadow_scan(config: ShadowScanConfig | None = None) -> dict[str, Any]:
             row["scan_index"] = index
             row["requests_made"] = collector.stats.requests_made
             rows.append(row)
+            if cfg.row_callback is not None:
+                try:
+                    cfg.row_callback(dict(row))
+                except Exception as exc:  # pylint: disable=broad-except
+                    errors.append(
+                        {
+                            "ts_ms": now_ms(),
+                            "symbol": instrument.symbol,
+                            "stage": "row_callback",
+                            "error": str(exc),
+                        }
+                    )
         except Exception as exc:  # pylint: disable=broad-except
             errors.append({"ts_ms": now_ms(), "symbol": instrument.symbol, "error": str(exc)})
 
@@ -145,6 +158,7 @@ def classify_shadow_sample(
     summary = sample.get("summary") if isinstance(sample.get("summary"), dict) else {}
     base = {
         "ts_ms": scan_ts,
+        "observed_at_ms": sample.get("ts_ms"),
         "symbol": series.symbol,
         "last_close": summary.get("last_close"),
         "return_24h_pct": summary.get("return_24h_pct"),

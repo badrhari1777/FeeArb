@@ -443,6 +443,7 @@ async def startup_event() -> None:
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
+    bybit_pump_short_lab.shutdown()
     await service.shutdown()
 
 
