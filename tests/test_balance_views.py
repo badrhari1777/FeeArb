@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
 from webapp.balance_views import with_pump_account_balances
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _pump_status(**overrides: object) -> dict[str, object]:
@@ -112,3 +116,14 @@ def test_web_accounts_payload_keeps_other_account_state() -> None:
     assert payload["accounts"]["balance_summary"]["bybit_combined"]["total"] == pytest.approx(
         1093.94
     )
+
+
+def test_web_account_normalizer_preserves_balance_summary() -> None:
+    app_js = (PROJECT_ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
+    normalizer = app_js.split("function normalizeAccounts(accounts)", maxsplit=1)[1].split(
+        "function normalizeAutoExit(config)", maxsplit=1
+    )[0]
+
+    assert "balance_summary: {}" in app_js
+    assert "accounts.balance_summary && typeof accounts.balance_summary === 'object'" in normalizer
+    assert "normalized.balance_summary = clone(accounts.balance_summary) || {};" in normalizer

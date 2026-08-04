@@ -102,6 +102,7 @@
 
   var defaultAccounts = {
     balances: [],
+    balance_summary: {},
     status: [],
     positions: [],
     positions_by_symbol: [],
@@ -511,6 +512,7 @@
   function normalizeAccounts(accounts) {
     var normalized = clone(defaultAccounts) || {
       balances: [],
+      balance_summary: {},
       status: [],
       positions: [],
       positions_by_symbol: [],
@@ -528,6 +530,9 @@
     }
     if (Array.isArray(accounts.balances)) {
       normalized.balances = clone(accounts.balances) || [];
+    }
+    if (accounts.balance_summary && typeof accounts.balance_summary === 'object') {
+      normalized.balance_summary = clone(accounts.balance_summary) || {};
     }
     if (Array.isArray(accounts.status)) {
       normalized.status = clone(accounts.status) || [];

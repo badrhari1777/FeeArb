@@ -102,6 +102,14 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Desktop aggregate balance cards were fixed on 2026-08-04. The backend and
+  server-rendered page already contained fresh all-account and Bybit
+  main/Pump/combined totals, but `webapp/static/app.js` dropped
+  `accounts.balance_summary` while normalizing every snapshot and then replaced
+  the four cards with `-`. The normalizer now preserves that object and the
+  static cache version was advanced. A focused frontend-contract regression was
+  added alongside the existing balance aggregation tests; trading, sizing,
+  transfers, and exchange polling are unchanged.
 - Binance futures protective-order parsing was corrected on 2026-08-04 after
   the COTI Grid verifier treated a valid raw `TAKE_PROFIT_MARKET` algo order as
   unknown. Binance exposes its trigger in `stopPrice`; after promoting that
