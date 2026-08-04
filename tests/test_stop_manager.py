@@ -96,6 +96,53 @@ class StopManagerBinanceAlgoSideTestCase(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_fetch_existing_classifies_binance_take_profit_algo_order(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+
+        async def _fake_fetch_algo(_gateway, _symbol):
+            return [
+                {
+                    "algoId": "1000002490064612",
+                    "symbol": "COTIUSDT",
+                    "side": "BUY",
+                    "orderType": "TAKE_PROFIT_MARKET",
+                    "quantity": "435681.0",
+                    "triggerPrice": "0.009373",
+                    "reduceOnly": True,
+                    "positionSide": "BOTH",
+                },
+                {
+                    "algoId": "1000002490060686",
+                    "symbol": "COTIUSDT",
+                    "side": "BUY",
+                    "orderType": "STOP_MARKET",
+                    "quantity": "435681.0",
+                    "triggerPrice": "0.017443",
+                    "reduceOnly": True,
+                    "positionSide": "BOTH",
+                },
+            ]
+
+        manager._fetch_binance_open_algo_orders = _fake_fetch_algo  # type: ignore[method-assign]
+
+        async def _run() -> None:
+            existing = await manager._fetch_existing(
+                _FakeGateway(),
+                "COTIUSDT",
+                None,
+                "short",
+                mark_price=0.01355,
+                entry_price=0.01345,
+            )
+            self.assertFalse(existing.get("invalid_side"))
+            self.assertEqual(len(existing.get("stop_orders") or []), 1)
+            self.assertEqual(len(existing.get("take_orders") or []), 1)
+            self.assertEqual(len(existing.get("unknown_orders") or []), 0)
+            self.assertAlmostEqual(float(existing.get("stop")), 0.017443)
+            self.assertAlmostEqual(float(existing.get("take")), 0.009373)
+
+        asyncio.run(_run())
+
     def test_place_binance_algo_conditional_uses_mark_price_and_price_protect(self) -> None:
         manager = ProtectiveOrderManager(RiskConfig())
         gateway = _FakeGateway()

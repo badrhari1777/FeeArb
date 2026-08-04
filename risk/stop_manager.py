@@ -1813,6 +1813,7 @@ class ProtectiveOrderManager:
                 invalid_side = True
             if "take_profit" in otype and not take_px and stop_px:
                 take_px = stop_px
+                stop_px = None
             order_price = take_px or stop_px
             order_qty = self._order_quantity(order, info)
             kind = self._classify_protective_kind(

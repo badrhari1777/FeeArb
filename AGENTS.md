@@ -102,6 +102,16 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Binance futures protective-order parsing was corrected on 2026-08-04 after
+  the COTI Grid verifier treated a valid raw `TAKE_PROFIT_MARKET` algo order as
+  unknown. Binance exposes its trigger in `stopPrice`; after promoting that
+  value to the internal take-profit price, the parser now clears the stop-price
+  field so the order cannot be classified as both stop and take. This prevents
+  false `missing:take` / `take_mismatch` repair churn while retaining the real
+  exchange-side TP. A raw-format regression covers paired Binance
+  `STOP_MARKET` and `TAKE_PROFIT_MARKET` algo orders. Verified stop-manager
+  tests (`33`), the related protection/Grid/manual set (`169`), Python
+  compilation, and the complete suite (`578`, `11 warnings`).
 - Bybit Full-position protection parsing was corrected on 2026-07-31 during
   the COTI Grid restart. Bybit reports system TP/SL orders with generic market
   type plus `stopOrderType`, and caps their displayed quantity at the
