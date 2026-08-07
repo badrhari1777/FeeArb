@@ -322,15 +322,35 @@ Shadow -> live:
 - Проверки: Event Lake fixture `14 passed`; профильная Strategy Lab/Pump/coin
   регрессия `157 passed`, `4 warnings`; полный regression `612 passed`,
   `11 warnings`.
-- Пользователь подтвердил полный public-only сбор. До его запуска остаются
-  diff/secret audit и отдельный commit исходников.
+- Пользователь подтвердил полный public-only сбор; diff/secret audit пройден,
+  исходники зафиксированы отдельным commit `5169080`.
+
+### 2026-08-07 — Полный public-only сбор запущен
+
+- Исходники exact-window runner зафиксированы commit `5169080` при чистом
+  рабочем дереве после полного regression `612 passed`.
+- Запуск начат `2026-08-07 13:03 MSK` в
+  `data/research/strategy_lab_event_lake_v4_full/` командой:
+
+  ```powershell
+  .\.venv\Scripts\python.exe scripts\strategy_lab_event_lake.py --output-dir data\research\strategy_lab_event_lake_v4_full --all-events --max-events 999999 --execute-public
+  ```
+
+- Preflight запуска: `1 540` events, `3 080` logical tasks, `2 216` physical
+  windows, оценка `35 456` public calls.
+- Ранний checkpoint на `13:05 MSK`: `22` immutable windows и `30` logical
+  ledger records, collector stderr пуст. Pump Live одновременно оставался
+  `armed`, monitor cycle age `0.1s`, `last_error=null`; исследовательский поток
+  не меняет и не переARM-ивает live-модуль.
+- Сбор resumable: повтор той же команды валидирует и повторно использует
+  готовые physical windows и не дублирует ledger records.
+- Финальный gate после завершения: `2 216` window-файлов, `3 080` уникальных
+  ledger `record_id`, coverage для `3 080` logical tasks, отсутствие cache/JSON
+  identity errors, затем полный zero-call replay и обновление этого журнала.
 
 ## Точный следующий шаг
 
-1. завершить профильную и полную регрессии exact-window блока;
-2. зафиксировать исходники, тесты и эту документацию отдельным commit;
-3. запустить resumable public-only сбор командой из
-   `instructions/16_STRATEGY_LAB.md` с `--execute-public`;
-4. проверить coverage, ledger uniqueness и zero-call replay;
-5. зафиксировать итог сбора в этом журнале, затем перейти к Этапу 2
+1. дождаться завершения активного resumable public-only сбора;
+2. проверить coverage, ledger uniqueness и zero-call replay;
+3. зафиксировать итог сбора в этом журнале, затем перейти к Этапу 2
    `Funding Forecast v1`.

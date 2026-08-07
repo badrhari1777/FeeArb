@@ -106,6 +106,18 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- The operator-approved Strategy Lab full public collection started on
+  2026-08-07 at 13:03 MSK from committed exact-window code `5169080`. Its
+  ignored resumable output is
+  `data/research/strategy_lab_event_lake_v4_full/`; preflight scope is 1,540
+  events, 3,080 logical tasks, 2,216 physical windows and about 35,456 public
+  calls. The 13:05 checkpoint had 22 windows / 30 ledger records, empty stderr,
+  and a simultaneously fresh healthy `armed` Pump Live cycle. Do not start a
+  second full collector: find the existing Python command first. If it stopped,
+  repeat the canonical command in `instructions/17_STRATEGY_LAB_ROADMAP.md`;
+  cache and ledger are resumable. Completion requires exactly 2,216 windows,
+  3,080 unique ledger records, complete coverage and a zero-call replay before
+  moving to Funding Forecast v1.
 - Strategy Lab exact-window caching was implemented on 2026-08-07 before the
   operator-approved full public collection. Event Lake v4 keeps all 1,540
   logical event IDs and 3,080 per-exchange ledger tasks while storing only
