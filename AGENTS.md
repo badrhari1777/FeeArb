@@ -115,9 +115,13 @@ Recent Changes
   and a simultaneously fresh healthy `armed` Pump Live cycle. Do not start a
   second full collector: find the existing Python command first. If it stopped,
   repeat the canonical command in `instructions/17_STRATEGY_LAB_ROADMAP.md`;
-  cache and ledger are resumable. Completion requires exactly 2,216 windows,
-  3,080 unique ledger records, complete coverage and a zero-call replay before
-  moving to Funding Forecast v1.
+  cache and ledger are resumable. A new fail-closed validator checks every
+  window hash and manifest/coverage/ledger reference; its in-progress check
+  passed at 59 windows / 85 records, and the focused regression passed (`160`,
+  `4 warnings`), with the full suite at `615 passed`, `11 warnings`. Completion
+  requires exactly 2,216 windows, 3,080 unique ledger records, strict
+  validation, complete coverage and a zero-call replay before moving to
+  Funding Forecast v1.
 - Strategy Lab exact-window caching was implemented on 2026-08-07 before the
   operator-approved full public collection. Event Lake v4 keeps all 1,540
   logical event IDs and 3,080 per-exchange ledger tasks while storing only

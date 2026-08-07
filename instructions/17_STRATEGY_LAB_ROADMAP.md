@@ -344,6 +344,11 @@ Shadow -> live:
   не меняет и не переARM-ивает live-модуль.
 - Сбор resumable: повтор той же команды валидирует и повторно использует
   готовые physical windows и не дублирует ledger records.
+- Пока сбор работал, добавлен отдельный fail-closed validator manifest/cache/
+  coverage/ledger provenance. На checkpoint `59` windows / `85` ledger records
+  режим `--allow-in-progress` подтвердил структурную согласованность; fixture и
+  Event Lake tests прошли (`17 passed`), профильная регрессия — `160 passed`,
+  `4 warnings`, полный regression — `615 passed`, `11 warnings`.
 - Финальный gate после завершения: `2 216` window-файлов, `3 080` уникальных
   ledger `record_id`, coverage для `3 080` logical tasks, отсутствие cache/JSON
   identity errors, затем полный zero-call replay и обновление этого журнала.
@@ -351,6 +356,7 @@ Shadow -> live:
 ## Точный следующий шаг
 
 1. дождаться завершения активного resumable public-only сбора;
-2. проверить coverage, ledger uniqueness и zero-call replay;
+2. выполнить строгий `strategy_lab_validate_event_lake.py`, затем проверить
+   zero-call replay;
 3. зафиксировать итог сбора в этом журнале, затем перейти к Этапу 2
    `Funding Forecast v1`.

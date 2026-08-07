@@ -131,6 +131,20 @@ Ledger append защищён коротким межпроцессным lock и
 `record_id` непосредственно перед `fsync`. Одновременный одинаковый запуск не
 должен создавать дубли; stale lock удаляется только если его PID уже не жив.
 
+Структурная проверка активного checkpoint без ожидания завершения:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\strategy_lab_validate_event_lake.py data\research\strategy_lab_event_lake_v4_full --allow-in-progress
+```
+
+После завершения флаг `--allow-in-progress` убирается. Строгий validator читает
+каждый physical window, пересчитывает его hash и проверяет manifest, coverage,
+logical event/exchange ledger key, `features_ref`, `record_id`, run/config/source
+identity и итоговые metadata counts. Любая недостающая или лишняя cache-запись,
+битый JSON, duplicate identity или несоответствие hash завершает проверку
+ошибкой; missing market/dataset остаётся честным исследовательским coverage, а
+не структурной ошибкой.
+
 Локальный reader пишет в `data/research/strategy_lab_local_archive/`:
 
 - `archive_index.json` — offsets, длины, SHA-256 и identity 1 707 записей;
