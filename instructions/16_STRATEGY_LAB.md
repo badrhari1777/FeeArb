@@ -28,6 +28,24 @@
 .\.venv\Scripts\python.exe scripts\strategy_lab.py --enrich-public-api --max-api-events 8
 ```
 
+### Event Lake preflight и bounded pilot
+
+Preflight не создаёт биржевые клиенты и заранее показывает задачи и оценку
+публичных запросов:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\strategy_lab_event_lake.py --symbols COTIUSDT,HFTUSDT,SIRENUSDT --exchanges binance,bybit --max-events 3
+```
+
+Ограниченный публичный replay тех же трёх событий:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\strategy_lab_event_lake.py --symbols COTIUSDT,HFTUSDT,SIRENUSDT --exchanges binance,bybit --max-events 3 --execute-public
+```
+
+Повторный запуск обязан использовать `windows/` cache, показать
+`public_calls_this_run=0` и не добавлять дубли в `ledger.jsonl`.
+
 Результат создаётся в `data/research/strategy_lab/`. Каталог игнорируется Git и
 может безопасно пересоздаваться. Исходная SQLite база открывается в режиме
 `mode=ro`, а логи и Pump-выгрузки только читаются.
@@ -46,6 +64,18 @@
 - `arbitrage_api_summary.csv` — сопоставление локальной и API цены;
 - `hypothesis_registry.csv` — приоритет, стадия и следующий тест;
 - `metadata.json` — конфигурация и счётчики прогона.
+
+Event Lake пишет отдельный пакет в `data/research/strategy_lab_event_lake/`:
+
+- `manifest.json` — immutable event/task identity и оценка API-бюджета;
+- `windows/<task_id>.json` — versioned public-only cache;
+- `coverage.csv` — market/contract/OHLCV/funding/OI coverage и ошибки;
+- `ledger.jsonl` — append-only `strategy_lab_ledger_v1`;
+- `index.md` и `metadata.json` — проверяемая сводка запуска.
+
+Ledger не заменяет и не переписывает существующие Pump Live, auto-exit,
+auto-arb, de-risk или protective-shadow журналы. Их нормализация будет отдельным
+read-only этапом; новые operational поля допускаются только backward-compatible.
 
 ## Трактовка API-погрешности
 

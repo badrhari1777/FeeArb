@@ -147,6 +147,32 @@ walk-forward проверки по бирже, интервалу ставки �
 
 Переход к live требует отдельного решения оператора и отдельного safety-аудита.
 
+## Event Lake bounded pilot 2026-08-07
+
+Первый этап дальнейшего плана реализовал `strategy_lab_event_lake.py`:
+
+- deterministic manifest и hashes для event/config/source;
+- preflight без создания API-клиентов;
+- public-only CCXT provider;
+- paginated 5m OHLCV/funding/OI;
+- versioned cache с task identity;
+- append-only research ledger с запретом `live` mode;
+- fail-closed `VETO` при отсутствии market/OHLCV;
+- coverage и фактический API call budget.
+
+Пилот COTI/HFT/SIREN на Binance и Bybit дал шесть окон по 1 152 свечи,
+100% OHLCV coverage. Funding получен в пяти из шести окон: `12/12`, `12/11` и
+`78/0` строк соответственно. Historical OI для старых дат не получен: Binance
+вернул ограничение старого `startTime`, Bybit — пустые ряды. Generic provider
+не предоставляет historical mark/index/premium, поэтому они остались missing.
+
+Preflight оценивал 42 запроса, фактически понадобилось 30. Повторный запуск
+использовал все шесть cache-файлов, сделал ноль запросов и сохранил ровно шесть
+уникальных ledger records. Следующий шаг — сначала использовать локальный
+многобиржевой архив, затем добавить source-specific public endpoints для
+mark/index/premium и доступного OI; масштабирование на 1 540 событий пока не
+разрешено.
+
 ## Ограничения
 
 - Pump-архив имеет current-listing survivor bias.

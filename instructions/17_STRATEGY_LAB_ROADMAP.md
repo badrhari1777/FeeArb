@@ -15,7 +15,7 @@
 артефакты, затем исправить roadmap в том же логическом коммите.
 
 Последнее обновление: `2026-08-07`.
-Текущий этап: `Этап 1 — Event Lake и единая research/shadow телеметрия`.
+Текущий этап: `Этап 1.1 — source-specific feature completion`.
 Текущий режим: `research_only_no_trading`.
 
 ## Цель
@@ -111,20 +111,29 @@
 
 ## Пошаговый план
 
-### Этап 1. Event Lake и research/shadow телеметрия — IN PROGRESS
+### Этап 1. Event Lake и research/shadow телеметрия — CORE COMPLETE
 
 - [x] Инвентаризация Pump-архива, обычной базы и operational logs.
 - [x] Причинная нормализация 203 арбитражных событий.
 - [x] Единый каталог 1 540 Pump event rows.
-- [ ] Версионированный enrichment manifest с оценкой запросов и размера.
-- [ ] Resumable публичное обогащение с cache/checkpoint и явными ошибками.
-- [ ] Единая schema Strategy Lab ledger и валидатор записей.
-- [ ] Bounded pilot на небольшом числе событий/бирж.
-- [ ] Coverage report по бирже, полю и историческому периоду.
+- [x] Версионированный enrichment manifest с оценкой запросов и размера.
+- [x] Resumable публичное обогащение с cache/checkpoint и явными ошибками.
+- [x] Единая schema Strategy Lab ledger и валидатор записей.
+- [x] Bounded pilot на небольшом числе событий/бирж.
+- [x] Coverage report по бирже, полю и историческому периоду.
 
 Критерий завершения: один deterministic pilot повторяется без дубликатов,
 не делает приватных запросов, не трогает live state и даёт manifest, coverage,
 ledger и hash-проверяемые артефакты.
+
+Критерий core выполнен bounded-пилотом. До масштабирования остаётся Stage 1.1:
+
+- [ ] Инвентаризировать поля 3,397 GiB локального multi-exchange архива.
+- [ ] Читать локальный архив первым, публичный API использовать для пробелов.
+- [ ] Добавить source-specific mark/index/premium endpoints.
+- [ ] Зафиксировать доступную глубину historical OI и причины retention gaps.
+- [ ] Посчитать calls/disk/time для 1 540 событий и получить отдельное решение
+  перед долгим запуском.
 
 ### Этап 2. Funding Forecast v1 — PENDING
 
@@ -218,13 +227,33 @@ Shadow -> live:
 - Проверки: `5 passed`; полный набор `590 passed`, `11 warnings`.
 - Решение: продолжать с Event Lake/enrichment manifest; live не менять.
 
+### 2026-08-07 — Event Lake bounded pilot
+
+- Реализованы `analysis_features/strategy_lab_event_lake.py`, CLI и шесть новых
+  unit/end-to-end тестов.
+- Manifest: 3 Pump events × Binance/Bybit = 6 задач; окно `-24h..+72h`, 5m;
+  preflight estimate `42` публичных запроса.
+- Первый канонический запуск: `30` фактических запросов, `6/6 completed`, по
+  `1 152` OHLCV строк и `100%` coverage на каждую задачу.
+- Funding rows: COTI `12/12`, HFT `12/11`, SIREN `78/0` для Binance/Bybit.
+- Historical OI: `0/6`; Binance отклоняет старый `startTime`, Bybit возвращает
+  пустую историю. Generic mark/index/premium явно отмечены missing.
+- Повторный запуск: `6/6 cache_reused`, `0` API calls, ledger сохранил ровно
+  `6` уникальных записей.
+- Решение по логам: существующие operational/live JSONL не менять; новый
+  `strategy_lab_ledger_v1` хранит research/paper/shadow provenance отдельно.
+- Проверки: профильные `11 passed`; полный regression `596 passed`,
+  `11 warnings`; live/ARM не затронуты.
+- Коммит этого блока: `Add resumable Strategy Lab Event Lake` (см. Git history).
+
 ## Точный следующий шаг
 
-Реализовать Этап 1:
+Реализовать Этап 1.1 без долгого сетевого запуска:
 
-1. enrichment manifest для Pump event catalog с `run_id`, hashes и оценкой calls;
-2. versioned Strategy Lab ledger schema/validator;
-3. resumable cache без повторных API-вызовов;
-4. unit и deterministic end-to-end tests;
-5. bounded pilot на 3 событиях и 2 биржах;
-6. записать coverage и результаты сюда до коммита.
+1. описать schema 42 файлов локального multi-exchange Pump-архива;
+2. построить local-first reader по `event_id/symbol/window/exchange`;
+3. измерить покрытие OHLCV/funding/OI/premium/mark/index в архиве;
+4. добавить source-specific API только для реально отсутствующих полей;
+5. повторить bounded pilot и проверить cache/ledger identity;
+6. подготовить оценку полного запуска: tasks, calls, disk, runtime, gaps;
+7. запросить отдельное подтверждение перед сбором всех 1 540 событий.

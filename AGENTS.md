@@ -106,6 +106,21 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab Event Lake core was added on 2026-08-07 without touching live
+  services. It builds a deterministic public-only enrichment manifest, hashes
+  event/config/source identity, estimates calls before execution, paginates
+  OHLCV/funding/OI, caches each event/exchange window, validates an append-only
+  `strategy_lab_ledger_v1`, rejects non-public providers and `live` mode, and
+  emits coverage plus actual request budgets. The bounded COTI/HFT/SIREN pilot
+  used Binance and Bybit: six `-24h..+72h` 5m windows, 1,152 OHLCV rows and
+  100% candle coverage each, 30 actual calls versus 42 estimated. Funding was
+  present for five windows; old-date OI was unavailable and generic historical
+  mark/index/premium remain explicit gaps. A repeat used all six caches, made
+  zero calls, and kept six unique current-schema ledger records. Existing
+  Pump/auto-exit/auto-arb/de-risk logs were deliberately not rewritten. The
+  canonical handoff is `instructions/17_STRATEGY_LAB_ROADMAP.md`. Verified
+  focused Strategy Lab regression (`11 passed`), Python compilation, and the
+  complete suite (`596 passed`, `11 warnings`).
 - Strategy Lab phase 1 was added on 2026-08-07 as a research-only bridge
   between the archived Pump/Dump datasets and ordinary coin-arbitrage evidence.
   `analysis_features/strategy_lab.py` and `scripts/strategy_lab.py` normalize
