@@ -44,6 +44,8 @@
   [`15_ANDROID_MAIN_PUMP_POSITIONS.md`](15_ANDROID_MAIN_PUMP_POSITIONS.md)
 - Исследовательский Strategy Lab для Pump/Dump, арбитражных перекосов и публичного API:
   [`16_STRATEGY_LAB.md`](16_STRATEGY_LAB.md)
+- Живой пошаговый roadmap и журнал Strategy Lab для следующих ИИ-агентов:
+  [`17_STRATEGY_LAB_ROADMAP.md`](17_STRATEGY_LAB_ROADMAP.md)
 
 ## Важно
 

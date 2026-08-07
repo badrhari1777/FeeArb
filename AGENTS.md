@@ -9,6 +9,10 @@ Project Instructions
 - Add new instructions there, or update the existing topic file instead of creating duplicates elsewhere.
 - Use clear task-based filenames and keep `instructions/00_README_ИНСТРУКЦИИ.md` as the index.
 - `docs/` remains suitable for technical plans, subsystem history, and internal design notes.
+- Strategy Lab work must follow and update
+  `instructions/17_STRATEGY_LAB_ROADMAP.md` after every meaningful block so the
+  current stage, evidence, tests, limitations, and exact next step survive into
+  the next AI session.
 
 Git Discipline (Mandatory)
 - Codex is the single automation writer for this checkout unless the user explicitly authorizes another writer.
