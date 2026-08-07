@@ -121,7 +121,11 @@ Recent Changes
   `4 warnings`), with the full suite at `615 passed`, `11 warnings`. Completion
   requires exactly 2,216 windows, 3,080 unique ledger records, strict
   validation, complete coverage and a zero-call replay before moving to
-  Funding Forecast v1.
+  Funding Forecast v1. Because HEAD advanced after launch, that replay must
+  pass the full original manifest commit via `--code-commit`; otherwise the
+  cache would remain unchanged but provenance would be overwritten. The pin is
+  regression-covered (`18` Event Lake/validator tests; full suite `616`,
+  `11 warnings`).
 - Strategy Lab exact-window caching was implemented on 2026-08-07 before the
   operator-approved full public collection. Event Lake v4 keeps all 1,540
   logical event IDs and 3,080 per-exchange ledger tasks while storing only

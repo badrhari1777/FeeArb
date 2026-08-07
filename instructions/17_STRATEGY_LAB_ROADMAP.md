@@ -351,7 +351,10 @@ Shadow -> live:
   `4 warnings`, полный regression — `615 passed`, `11 warnings`.
 - Финальный gate после завершения: `2 216` window-файлов, `3 080` уникальных
   ledger `record_id`, coverage для `3 080` logical tasks, отсутствие cache/JSON
-  identity errors, затем полный zero-call replay и обновление этого журнала.
+  identity errors, затем полный zero-call replay с исходным
+  `--code-commit 5169080...` и обновление этого журнала.
+- CLI pin исходного collector commit покрыт регрессией: Event Lake/validator
+  `18 passed`; полный regression `616 passed`, `11 warnings`.
 
 ## Точный следующий шаг
 

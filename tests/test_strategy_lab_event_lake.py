@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -225,6 +226,36 @@ def test_plan_only_run_renders_all_dataset_columns(tmp_path: Path) -> None:
     assert result["status_counts"] == {"planned": 1}
     assert result["physical_status_counts"] == {"planned": 1}
     assert "not_executed" in (tmp_path / "index.md").read_text(encoding="utf-8")
+
+
+def test_cli_can_pin_original_code_commit_for_audited_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import strategy_lab_event_lake as cli
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "strategy_lab_event_lake.py",
+            "--output-dir",
+            str(tmp_path),
+            "--symbols",
+            "COTIUSDT",
+            "--exchanges",
+            "binance",
+            "--max-events",
+            "1",
+            "--code-commit",
+            "original-collector-commit",
+        ],
+    )
+
+    cli.main()
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["code_commit"] == "original-collector-commit"
 
 
 def test_exact_window_cache_preserves_logical_event_ledger_records(tmp_path: Path) -> None:

@@ -145,6 +145,18 @@ identity и итоговые metadata counts. Любая недостающая 
 ошибкой; missing market/dataset остаётся честным исследовательским coverage, а
 не структурной ошибкой.
 
+Zero-call replay обязан сохранить provenance исходного collector commit, даже
+если документация или validator уже создали новые Git commits:
+
+```powershell
+$eventLakeManifest = Get-Content -Raw data\research\strategy_lab_event_lake_v4_full\manifest.json | ConvertFrom-Json
+.\.venv\Scripts\python.exe scripts\strategy_lab_event_lake.py --output-dir data\research\strategy_lab_event_lake_v4_full --all-events --max-events 999999 --execute-public --code-commit $eventLakeManifest.code_commit
+```
+
+Ожидается `public_calls_this_run=0`, `status_counts.cache_reused=3080` и те же
+`3 080` ledger records. Не запускать audited replay без `--code-commit` после
+изменения HEAD: cache останется тем же, но manifest provenance будет переписан.
+
 Локальный reader пишет в `data/research/strategy_lab_local_archive/`:
 
 - `archive_index.json` — offsets, длины, SHA-256 и identity 1 707 записей;

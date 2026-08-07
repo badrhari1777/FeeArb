@@ -40,6 +40,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--estimate-full-catalog", action="store_true")
     parser.add_argument("--pilot-calls", type=int, default=0)
     parser.add_argument("--pilot-elapsed-sec", type=float, default=0.0)
+    parser.add_argument(
+        "--code-commit",
+        default="",
+        help="Pin provenance to the original collector commit during an audited replay.",
+    )
     return parser.parse_args()
 
 
@@ -92,6 +97,7 @@ def main() -> None:
         output_dir=args.output_dir,
         config=config,
         execute_public=args.execute_public,
+        code_commit=args.code_commit or None,
     )
     print(metadata)
 
