@@ -162,6 +162,12 @@ keeping the trading strategy unchanged:
   margin required to put the exchange stop `2.5%` above the actual L2 price;
 - the amount is rounded upward to `$5`, added through the isolated-position
   margin API, then verified from a fresh Bybit position read;
+- verification accepts at most `2%` of the requested clearance, so a `2.5%`
+  target may resolve no lower than `2.45%` above L2; this tolerance is not a
+  percentage of coin price;
+- a shortfall outside tolerance triggers repeated position reads and at most
+  three additional `$5` corrections, each gated by confirmed outward movement
+  of the exchange liquidation price and by all existing reserve/cap limits;
 - the verified entry prefund becomes a non-removable bot-margin floor;
 - later warning/panic top-ups continue above that floor, and only the excess
   can be returned by the existing safe-removal hysteresis;
@@ -172,6 +178,12 @@ If the entry prefund cannot be added or confirmed, the already-filled L1 keeps
 its exchange TP/SL, new entries are disarmed, and remaining ladders are not
 submitted under uncertain protection. This is an execution fail-safe, not a
 strategy rule.
+
+The exact persisted `opening_uncertain / target_unconfirmed` failure can be
+reconciled during an explicit ARM operation. Recovery requires a known filled
+L1, no submitted later ladder, owned exchange state, and successful bounded
+prefund verification. It then submits the original planned ladders
+idempotently before arming; unrelated degraded states remain blocked.
 
 Automatic transfer from the master account is deliberately separate and is
 not implemented by this change. Until it exists, the existing per-position,

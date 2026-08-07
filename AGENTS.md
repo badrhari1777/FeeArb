@@ -102,6 +102,19 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live entry-prefund verification was hardened on 2026-08-07 after the
+  HEI canary filled L1 and added `$70`, but Bybit returned an exchange stop
+  `0.31934175` versus target `0.319753875`. The fixed model now remains only
+  an initial estimate: verification rereads Bybit, accepts at most `2%` of the
+  requested clearance (`2.45%` minimum for a `2.5%` target), and may add at
+  most three `$5` corrections only after confirmed outward liquidation-price
+  movement and fresh reserve/cap checks. Explicit ARM can reconcile only the
+  exact `opening_uncertain + target_unconfirmed` shape with filled L1 and
+  wholly unsubmitted planned ladders, then sync protection and place each
+  ladder once before enabling entries. Unknown/degraded state still fails
+  closed; manual state edits remain forbidden. Verified Python compilation,
+  focused Pump/API regression (`80 passed`, `6 warnings`), and the complete
+  suite (`585 passed`, `11 warnings`).
 - Desktop aggregate balance cards were fixed on 2026-08-04. The backend and
   server-rendered page already contained fresh all-account and Bybit
   main/Pump/combined totals, but `webapp/static/app.js` dropped

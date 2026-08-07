@@ -316,11 +316,31 @@ Approximate current-tier amounts are `$30 / $50 / $25 / $50` for ordinary,
 strong `80–100%`, strong `100–250%`, and super tiers. Actual fill, liquidation,
 quantity, and L2 price drive the live calculation.
 
+Verification allows at most `2%` of the requested clearance as calculation
+tolerance. This is not `2%` of coin price: for the requested `2.5%` stop
+clearance above L2, the minimum accepted clearance is `2.45%`. If the refreshed
+Bybit liquidation remains below that boundary, Pump Live rereads the position
+before changing margin. It may add at most three correction steps of `$5`, and
+only after the preceding add produced a confirmed outward liquidation-price
+move. Every step repeats the position, portfolio, other-position guarantee,
+available-balance, and `$25` operating-floor limits. Missing/stale position
+confirmation or exhausted capacity remains fail-closed.
+
 The confirmed entry prefund is stored as a non-removable bot-margin floor.
 Warning/panic top-ups continue above it; safe reduction may return only the
 excess. If prefund or verification fails, L1 remains exchange-protected,
 entries are disarmed, and remaining ladders are not submitted under uncertain
 execution.
+
+An explicit `ARM PUMP LIVE 1000` may recover only the exact durable failure
+shape `opening_uncertain + target_unconfirmed +
+pump_live_margin_prefund_target_unconfirmed`: L1 must be confirmed filled,
+every later ladder must still be unsubmitted `planned`, exchange positions and
+orders must belong to Pump Live, and all normal preflight errors except expected
+tracked-position/order warnings must be absent. ARM then rechecks/adds bounded
+prefund, refreshes full TP/SL, submits each still-planned ladder once, records
+the recovery, and only then enables new entries. Any other degraded or unknown
+state still blocks ARM; do not edit `live_state.json` manually.
 
 All normal 2/3/5 ladders remain unchanged. There is no L3–L5 portfolio gate
 or cancellation from this margin policy. Automatic master-to-subaccount

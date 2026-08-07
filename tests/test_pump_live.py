@@ -13,6 +13,7 @@ from execution.pump_live import (
     PumpLiveController,
     build_capital_manager_status,
     build_live_legs,
+    entry_prefund_target_check,
     load_pump_live_config,
     required_entry_prefund_usd,
 )
@@ -36,6 +37,7 @@ class FakePumpGateway:
         self.canceled: list[str] = []
         self.fail_market = False
         self.liq_after_add: float | None = None
+        self.liq_after_add_sequence: list[float] = []
         self.liq_after_remove: float | None = None
         self.balance_failures: list[Exception] = []
         self.preflight_existing_state_errors = False
@@ -213,10 +215,15 @@ class FakePumpGateway:
         self.operations.append(f"add_margin:{symbol}:{amount_usd}")
         self.margin_adds.append((symbol, amount_usd))
         self.balance["available"] -= amount_usd
-        if self.liq_after_add is not None:
+        liq_after_add = (
+            self.liq_after_add_sequence.pop(0)
+            if self.liq_after_add_sequence
+            else self.liq_after_add
+        )
+        if liq_after_add is not None:
             for position in self.positions:
                 if position.get("symbol") == symbol:
-                    position["liq_price"] = self.liq_after_add
+                    position["liq_price"] = liq_after_add
         return {"status": "ok"}
 
     def remove_margin(self, symbol: str, amount_usd: float) -> dict[str, Any]:
@@ -262,6 +269,7 @@ def write_env(
                     else "PUMP_LIVE_MARGIN_PREFUND_ENABLED=0"
                 ),
                 "PUMP_LIVE_MARGIN_PREFUND_SAFETY_PCT=2.5",
+                "PUMP_LIVE_MARGIN_PREFUND_TOLERANCE_PCT=2.0",
             ]
         ),
         encoding="utf-8",
@@ -297,6 +305,7 @@ def ready_decision(
 def test_1000_plan_has_four_175_slots_and_orders_clear_bybit_minimum() -> None:
     config = PumpLiveConfig()
     assert config.slot_margin_usd == 175.0
+    assert config.entry_margin_prefund_tolerance_pct == 2.0
     legs = build_live_legs(
         tier={
             "ladder_legs": 3,
@@ -570,6 +579,188 @@ def test_prefund_formula_matches_current_tier_l2_amounts() -> None:
         "strong_100_250": 25.0,
         "super_250_plus": 50.0,
     }
+
+
+def test_prefund_tolerance_is_two_percent_of_required_clearance() -> None:
+    accepted = entry_prefund_target_check(
+        verified_stop_price=102.45,
+        target_stop_price=102.5,
+        next_ladder_price=100.0,
+        tolerance_pct=2.0,
+    )
+    rejected = entry_prefund_target_check(
+        verified_stop_price=102.449,
+        target_stop_price=102.5,
+        next_ladder_price=100.0,
+        tolerance_pct=2.0,
+    )
+
+    assert accepted["ready"] is True
+    assert accepted["tolerance_used"] is True
+    assert accepted["minimum_clearance_pct"] == 2.45
+    assert rejected["ready"] is False
+
+
+def test_prefund_adds_bounded_five_dollar_correction_after_confirmed_move(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, prefund_enabled=True)
+    gateway = FakePumpGateway()
+    gateway.initial_liq_price = 13.0
+    gateway.liq_after_add_sequence = [15.7, 16.0]
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+
+    status = controller.run_cycle()
+    item = status["positions"][0]
+
+    assert item["status"] == "open"
+    assert item["margin_prefund_status"] == "confirmed"
+    assert item["margin_topup_usd"] == 30.0
+    assert item["margin_prefund_floor_usd"] == 30.0
+    assert item["margin_prefund_verification"]["ready"] is True
+    assert gateway.margin_adds == [("TESTUSDT", 25.0), ("TESTUSDT", 5.0)]
+    assert len(gateway.orders) == 2
+
+
+def test_prefund_accepts_only_clearance_relative_tolerance_without_correction(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, prefund_enabled=True)
+    gateway = FakePumpGateway()
+    gateway.initial_liq_price = 13.0
+    gateway.liq_after_add = 15.762
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+
+    status = controller.run_cycle()
+    verification = status["positions"][0]["margin_prefund_verification"]
+
+    assert status["positions"][0]["margin_topup_usd"] == 25.0
+    assert verification["ready"] is True
+    assert verification["tolerance_used"] is True
+    assert gateway.margin_adds == [("TESTUSDT", 25.0)]
+
+
+def test_prefund_correction_is_bounded_to_three_confirmed_steps(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, prefund_enabled=True)
+    gateway = FakePumpGateway()
+    gateway.initial_liq_price = 13.0
+    gateway.liq_after_add_sequence = [15.0, 15.1, 15.2, 15.3]
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+
+    status = controller.run_cycle()
+
+    assert status["entry_armed"] is False
+    assert status["positions"][0]["status"] == "opening_uncertain"
+    assert status["positions"][0]["margin_topup_usd"] == 40.0
+    assert gateway.margin_adds == [
+        ("TESTUSDT", 25.0),
+        ("TESTUSDT", 5.0),
+        ("TESTUSDT", 5.0),
+        ("TESTUSDT", 5.0),
+    ]
+    assert gateway.orders == []
+
+
+def test_arm_recovers_exact_prefund_failure_without_duplicate_ladders(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, prefund_enabled=True)
+    gateway = FakePumpGateway()
+    gateway.initial_liq_price = 13.0
+    gateway.liq_after_add_sequence = [15.7, 15.7]
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+
+    failed = controller.run_cycle()
+    assert failed["positions"][0]["status"] == "opening_uncertain"
+    assert failed["positions"][0]["margin_topup_usd"] == 30.0
+    assert gateway.orders == []
+
+    gateway.preflight_existing_state_errors = True
+    gateway.liq_after_add_sequence = [16.0]
+    recovered = controller.arm(ARM_CONFIRMATION)
+
+    assert recovered["entry_armed"] is True
+    assert recovered["blocked_reason"] is None
+    assert recovered["positions"][0]["status"] == "open"
+    assert recovered["positions"][0]["margin_topup_usd"] == 35.0
+    assert recovered["positions"][0]["last_error"] is None
+    assert len(gateway.orders) == 2
+    assert all(leg["status"] == "open" for leg in recovered["positions"][0]["legs"][1:])
+
+    controller.arm(ARM_CONFIRMATION)
+    assert len(gateway.orders) == 2
+
+
+def test_arm_does_not_recover_unrecognized_opening_uncertain_state(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, prefund_enabled=True)
+    gateway = FakePumpGateway()
+    gateway.initial_liq_price = 13.0
+    gateway.liq_after_add = 13.0
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    position = controller._state["positions"][0]  # pylint: disable=protected-access
+    position["last_error"] = "unrecognized_failure"
+    gateway.preflight_existing_state_errors = True
+    margin_adds_before = list(gateway.margin_adds)
+
+    try:
+        controller.arm(ARM_CONFIRMATION)
+    except RuntimeError as exc:
+        assert "pump_live_resume_unknown_exchange_state" in str(exc)
+    else:  # pragma: no cover - regression guard
+        raise AssertionError("unrecognized degraded position was unexpectedly recovered")
+
+    assert gateway.margin_adds == margin_adds_before
+    assert gateway.orders == []
 
 
 def test_prefund_keeps_all_five_strategy_ladders(tmp_path: Path) -> None:

@@ -39,6 +39,8 @@ CAPITAL_GROWTH_TRIGGER_PCT = 10.0
 CAPITAL_REDUCTION_TRIGGER_PCT = 5.0
 CAPITAL_MAX_INCREASE_STEP_PCT = 25.0
 CAPITAL_SLOT_ROUND_USD = 5.0
+PREFUND_VERIFY_READ_DELAYS_SEC = (0.0, 0.05, 0.1)
+PREFUND_MAX_CORRECTION_STEPS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +63,7 @@ class PumpLiveConfig:
     guaranteed_position_topup_usd: float = 50.0
     entry_margin_prefund_enabled: bool = True
     entry_margin_prefund_safety_pct: float = 2.5
+    entry_margin_prefund_tolerance_pct: float = 2.0
     entry_margin_prefund_round_usd: float = 5.0
     entry_margin_prefund_mmr: float = 0.025
     entry_margin_prefund_taker_fee_rate: float = 0.00055
@@ -175,6 +178,10 @@ def load_pump_live_config(path: Path = PUMP_LIVE_ENV_PATH) -> PumpLiveConfig:
         values.get("PUMP_LIVE_MARGIN_PREFUND_SAFETY_PCT"),
         2.5,
     )
+    prefund_tolerance = _safe_float(
+        values.get("PUMP_LIVE_MARGIN_PREFUND_TOLERANCE_PCT"),
+        2.0,
+    )
     return PumpLiveConfig(
         entry_cap=max(1, min(4, entry_cap)),
         poll_interval_sec=max(5, min(60, poll_interval)),
@@ -183,6 +190,10 @@ def load_pump_live_config(path: Path = PUMP_LIVE_ENV_PATH) -> PumpLiveConfig:
         entry_margin_prefund_safety_pct=max(
             0.0,
             min(10.0, prefund_safety),
+        ),
+        entry_margin_prefund_tolerance_pct=max(
+            0.0,
+            min(2.0, prefund_tolerance),
         ),
     )
 
@@ -1174,7 +1185,6 @@ class PumpLiveController:
         tracked_symbols = {
             _normalize_symbol(item.get("symbol"))
             for item in open_items
-            if item.get("status") == "open"
         }
         exchange_symbols = {
             _normalize_symbol(item.get("symbol"))
@@ -1186,6 +1196,7 @@ class PumpLiveController:
             _normalize_symbol(item.get("symbol"))
             for item in open_items
             if item.get("status") != "open"
+            and not self._is_recoverable_prefund_position(item)
         ]
         if unknown_positions or unknown_orders or missing_symbols or degraded:
             raise RuntimeError(
@@ -1206,7 +1217,10 @@ class PumpLiveController:
                 item,
                 exchange_by_symbol[_normalize_symbol(item.get("symbol"))],
             )
-            self._sync_full_protection(item, config, force=True)
+            if self._is_recoverable_prefund_position(item):
+                self._recover_prefund_position(item, config)
+            else:
+                self._sync_full_protection(item, config, force=True)
         resume_preflight = dict(preflight)
         resume_preflight.update(
             {
@@ -1225,6 +1239,65 @@ class PumpLiveController:
             self._state["last_preflight"] = resume_preflight
             self._state["updated_at_ms"] = _now_ms()
             self._save_state_locked()
+
+    @staticmethod
+    def _is_recoverable_prefund_position(item: Mapping[str, Any]) -> bool:
+        if item.get("status") != "opening_uncertain":
+            return False
+        if item.get("margin_prefund_status") != "target_unconfirmed":
+            return False
+        if item.get("last_error") != "pump_live_margin_prefund_target_unconfirmed":
+            return False
+        legs = list(item.get("legs") or [])
+        if len(legs) < 2 or legs[0].get("status") != "filled":
+            return False
+        return all(
+            leg.get("status") == "planned"
+            and not leg.get("order_id")
+            and not leg.get("order_link_id")
+            for leg in legs[1:]
+        )
+
+    def _recover_prefund_position(
+        self,
+        item: dict[str, Any],
+        config: PumpLiveConfig,
+    ) -> None:
+        symbol = _normalize_symbol(item.get("symbol"))
+        self._event(
+            "margin_prefund_recovery_started",
+            {
+                "symbol": symbol,
+                "margin_topup_usd": _safe_float(item.get("margin_topup_usd"), 0.0),
+            },
+        )
+        self._ensure_entry_margin_prefund(item, config)
+        ladder_errors = self._place_planned_ladders(item)
+        if ladder_errors:
+            raise RuntimeError(
+                "pump_live_prefund_recovery_ladder_error:" + ";".join(ladder_errors)
+            )
+        with self._lock:
+            item["status"] = "open"
+            item["last_error"] = None
+            item["updated_at_ms"] = _now_ms()
+            self._save_state_locked()
+        self._event(
+            "margin_prefund_recovered",
+            {
+                "symbol": symbol,
+                "margin_topup_usd": _safe_float(item.get("margin_topup_usd"), 0.0),
+                "margin_prefund_floor_usd": _safe_float(
+                    item.get("margin_prefund_floor_usd"),
+                    0.0,
+                ),
+                "ladders_open": sum(
+                    1
+                    for leg in list(item.get("legs") or [])[1:]
+                    if leg.get("status") == "open"
+                ),
+            },
+        )
 
     def disarm(self, reason: str = "operator_disarm") -> dict[str, Any]:
         with self._lock:
@@ -1581,40 +1654,7 @@ class PumpLiveController:
                 self._save_state_locked()
             self._maintain_single_position(position, config)
             self._ensure_entry_margin_prefund(position, config)
-            ladder_errors: list[str] = []
-            for index, leg in enumerate(legs[1:], start=2):
-                ladder_link_id = _order_link(live_id, f"L{index}")
-                leg["order_link_id"] = ladder_link_id
-                with self._lock:
-                    self._save_state_locked()
-                try:
-                    ladder_order = self.gateway.create_ladder_order(
-                        symbol=symbol,
-                        notional_usd=_safe_float(leg.get("notional_usd"), 0.0),
-                        price=_safe_float(leg.get("trigger_price"), 0.0),
-                        order_link_id=ladder_link_id,
-                    )
-                    leg.update(
-                        {
-                            "status": "open",
-                            "order_id": ladder_order.get("id"),
-                            "order_link_id": ladder_order.get("order_link_id") or ladder_link_id,
-                        }
-                    )
-                except Exception as exc:  # keep the real first leg protected and disarm new entries
-                    leg["status"] = "error"
-                    leg["error"] = _clean_error(exc)
-                    ladder_errors.append(leg["error"])
-            with self._lock:
-                position["updated_at_ms"] = _now_ms()
-                if ladder_errors:
-                    position["status"] = "open_degraded"
-                    position["last_error"] = ";".join(ladder_errors)
-                    self._state["entry_armed"] = False
-                    self._state["blocked_reason"] = "ladder_order_error"
-                    self._state["transient_recovery_pending"] = False
-                    self._state["healthy_recovery_cycles"] = 0
-                self._save_state_locked()
+            ladder_errors = self._place_planned_ladders(position)
             self._event(
                 "live_position_opened",
                 {
@@ -1645,6 +1685,56 @@ class PumpLiveController:
                 self._save_state_locked()
             self.disarm("entry_execution_error")
             self._event("live_entry_failed", {"symbol": symbol, "event_key": key, "error": error})
+
+    def _place_planned_ladders(self, item: dict[str, Any]) -> list[str]:
+        symbol = _normalize_symbol(item.get("symbol"))
+        live_id = str(item.get("live_id") or "")
+        ladder_errors: list[str] = []
+        for index, leg in enumerate(list(item.get("legs") or [])[1:], start=2):
+            status = str(leg.get("status") or "")
+            if status in {"open", "submitted", "filled"}:
+                continue
+            if status != "planned" or leg.get("order_id"):
+                error = f"pump_live_ladder_recovery_state_invalid:L{index}:{status or 'missing'}"
+                leg["error"] = error
+                ladder_errors.append(error)
+                continue
+            ladder_link_id = str(
+                leg.get("order_link_id") or _order_link(live_id, f"L{index}")
+            )
+            leg["order_link_id"] = ladder_link_id
+            with self._lock:
+                self._save_state_locked()
+            try:
+                ladder_order = self.gateway.create_ladder_order(
+                    symbol=symbol,
+                    notional_usd=_safe_float(leg.get("notional_usd"), 0.0),
+                    price=_safe_float(leg.get("trigger_price"), 0.0),
+                    order_link_id=ladder_link_id,
+                )
+                leg.update(
+                    {
+                        "status": "open",
+                        "order_id": ladder_order.get("id"),
+                        "order_link_id": ladder_order.get("order_link_id") or ladder_link_id,
+                    }
+                )
+                leg.pop("error", None)
+            except Exception as exc:  # keep the real first leg protected and disarm new entries
+                leg["status"] = "error"
+                leg["error"] = _clean_error(exc)
+                ladder_errors.append(leg["error"])
+        with self._lock:
+            item["updated_at_ms"] = _now_ms()
+            if ladder_errors:
+                item["status"] = "open_degraded"
+                item["last_error"] = ";".join(ladder_errors)
+                self._state["entry_armed"] = False
+                self._state["blocked_reason"] = "ladder_order_error"
+                self._state["transient_recovery_pending"] = False
+                self._state["healthy_recovery_cycles"] = 0
+            self._save_state_locked()
+        return ladder_errors
 
     def _maintain_positions(self, config: PumpLiveConfig) -> None:
         with self._lock:
@@ -1942,6 +2032,101 @@ class PumpLiveController:
                 },
             )
 
+    def _entry_prefund_capacity(
+        self,
+        item: dict[str, Any],
+        config: PumpLiveConfig,
+    ) -> tuple[float, float, float]:
+        position_topup = _safe_float(item.get("margin_topup_usd"), 0.0)
+        with self._lock:
+            open_items = self._open_positions(self._state)
+            total_topup = sum(
+                _safe_float(row.get("margin_topup_usd"), 0.0)
+                for row in open_items
+            )
+            reserved_for_other_positions = sum(
+                max(
+                    0.0,
+                    config.guaranteed_position_topup_usd
+                    - _safe_float(row.get("margin_topup_usd"), 0.0),
+                )
+                for row in open_items
+                if row is not item
+            )
+        balance = self.gateway.fetch_balance()
+        available = _safe_float(balance.get("available"), 0.0)
+        allowed = min(
+            max(0.0, config.max_position_topup_usd - position_topup),
+            max(
+                0.0,
+                config.max_total_topup_usd
+                - total_topup
+                - reserved_for_other_positions,
+            ),
+            max(0.0, available - config.operating_cash_floor_usd),
+        )
+        return allowed, available, total_topup
+
+    def _verify_entry_prefund_target(
+        self,
+        item: dict[str, Any],
+        config: PumpLiveConfig,
+        *,
+        symbol: str,
+        target_stop: float,
+        next_ladder: float,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        verified: dict[str, Any] | None = None
+        check = entry_prefund_target_check(
+            verified_stop_price=None,
+            target_stop_price=target_stop,
+            next_ladder_price=next_ladder,
+            tolerance_pct=config.entry_margin_prefund_tolerance_pct,
+        )
+        for delay in PREFUND_VERIFY_READ_DELAYS_SEC:
+            if delay > 0:
+                time.sleep(delay)
+            verified = self._fetch_exchange_short(symbol)
+            if verified is None:
+                continue
+            self._apply_exchange_position(item, verified)
+            check = entry_prefund_target_check(
+                verified_stop_price=self._desired_emergency_stop(
+                    _optional_float(item.get("liq_price")),
+                    config,
+                ),
+                target_stop_price=target_stop,
+                next_ladder_price=next_ladder,
+                tolerance_pct=config.entry_margin_prefund_tolerance_pct,
+            )
+            with self._lock:
+                item["margin_prefund_verification"] = check
+                self._save_state_locked()
+            if check["ready"]:
+                break
+        return verified, check
+
+    def _record_entry_prefund_add(
+        self,
+        item: dict[str, Any],
+        *,
+        amount_usd: float,
+        status: str,
+    ) -> float:
+        now = _now_ms()
+        position_topup_after = (
+            _safe_float(item.get("margin_topup_usd"), 0.0) + amount_usd
+        )
+        with self._lock:
+            item["margin_topup_usd"] = position_topup_after
+            item["margin_prefund_floor_usd"] = position_topup_after
+            item["margin_prefund_status"] = status
+            item["last_topup_at_ms"] = now
+            item["margin_reduce_confirm_count"] = 0
+            item["updated_at_ms"] = now
+            self._save_state_locked()
+        return position_topup_after
+
     def _ensure_entry_margin_prefund(
         self,
         item: dict[str, Any],
@@ -1971,61 +2156,44 @@ class PumpLiveController:
             _safe_float(item.get("mark_price"), 0.0),
             liq,
         )
-        required = required_entry_prefund_usd(
-            qty=qty,
-            current_liq_price=liq,
+        current_check = entry_prefund_target_check(
+            verified_stop_price=self._desired_emergency_stop(liq, config),
+            target_stop_price=target_stop,
             next_ladder_price=next_ladder,
-            stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
-            safety_above_next_ladder_pct=(
-                config.entry_margin_prefund_safety_pct
-            ),
-            maintenance_margin_rate=config.entry_margin_prefund_mmr,
-            taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
-            round_up_usd=config.entry_margin_prefund_round_usd,
+            tolerance_pct=config.entry_margin_prefund_tolerance_pct,
         )
         position_topup = _safe_float(item.get("margin_topup_usd"), 0.0)
-        if required < 1e-9:
+        with self._lock:
+            item["margin_prefund_target_stop_price"] = target_stop
+            item["margin_prefund_next_ladder_price"] = next_ladder
+            item["margin_prefund_verification"] = current_check
+            self._save_state_locked()
+        if current_check["ready"]:
             with self._lock:
                 item["margin_prefund_floor_usd"] = position_topup
-                item["margin_prefund_target_stop_price"] = target_stop
-                item["margin_prefund_next_ladder_price"] = next_ladder
                 item["margin_prefund_confirmed_at_ms"] = _now_ms()
                 item["margin_prefund_status"] = "already_protected"
                 item["updated_at_ms"] = _now_ms()
                 self._save_state_locked()
             return
-        with self._lock:
-            open_items = self._open_positions(self._state)
-            total_topup = sum(
-                _safe_float(row.get("margin_topup_usd"), 0.0)
-                for row in open_items
-            )
-            reserved_for_other_positions = sum(
-                max(
-                    0.0,
-                    config.guaranteed_position_topup_usd
-                    - _safe_float(row.get("margin_topup_usd"), 0.0),
-                )
-                for row in open_items
-                if row is not item
-            )
-        balance = self.gateway.fetch_balance()
-        available = _safe_float(balance.get("available"), 0.0)
-        allowed = min(
-            max(0.0, config.max_position_topup_usd - position_topup),
-            max(
-                0.0,
-                config.max_total_topup_usd
-                - total_topup
-                - reserved_for_other_positions,
-            ),
-            max(0.0, available - config.operating_cash_floor_usd),
+
+        required = required_entry_prefund_usd(
+            qty=qty,
+            current_liq_price=liq,
+            next_ladder_price=next_ladder,
+            stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
+            safety_above_next_ladder_pct=config.entry_margin_prefund_safety_pct,
+            maintenance_margin_rate=config.entry_margin_prefund_mmr,
+            taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
+            round_up_usd=config.entry_margin_prefund_round_usd,
         )
+        if required < 1e-9:
+            required = config.entry_margin_prefund_round_usd
+        allowed, available, total_topup_before = self._entry_prefund_capacity(item, config)
+        available_before = available
         if required > allowed + 1e-9:
             with self._lock:
                 item["margin_prefund_status"] = "reserve_insufficient"
-                item["margin_prefund_target_stop_price"] = target_stop
-                item["margin_prefund_next_ladder_price"] = next_ladder
                 item["updated_at_ms"] = _now_ms()
                 self._save_state_locked()
             self._event(
@@ -2038,37 +2206,80 @@ class PumpLiveController:
                 },
             )
             raise RuntimeError("pump_live_margin_prefund_reserve_insufficient")
+
+        previous_liq = liq
+        total_added = required
+        correction_steps = 0
         self.gateway.add_margin(symbol, required)
-        now = _now_ms()
-        position_topup_after = position_topup + required
-        with self._lock:
-            item["margin_topup_usd"] = position_topup_after
-            item["margin_prefund_floor_usd"] = position_topup_after
-            item["margin_prefund_target_stop_price"] = target_stop
-            item["margin_prefund_next_ladder_price"] = next_ladder
-            item["margin_prefund_status"] = "verifying"
-            item["last_topup_at_ms"] = now
-            item["margin_reduce_confirm_count"] = 0
-            item["updated_at_ms"] = now
-            self._save_state_locked()
-        verified = self._fetch_exchange_short(symbol)
+        position_topup_after = self._record_entry_prefund_add(
+            item,
+            amount_usd=required,
+            status="verifying",
+        )
+        verified, check = self._verify_entry_prefund_target(
+            item,
+            config,
+            symbol=symbol,
+            target_stop=target_stop,
+            next_ladder=next_ladder,
+        )
+        while not check["ready"] and correction_steps < PREFUND_MAX_CORRECTION_STEPS:
+            verified_liq = _optional_float(item.get("liq_price"))
+            if verified is None or verified_liq is None or verified_liq <= previous_liq + 1e-12:
+                break
+            previous_liq = verified_liq
+            correction = max(0.0001, config.entry_margin_prefund_round_usd)
+            allowed, correction_available, _ = self._entry_prefund_capacity(item, config)
+            if correction > allowed + 1e-9:
+                with self._lock:
+                    item["margin_prefund_status"] = "correction_reserve_insufficient"
+                    item["updated_at_ms"] = _now_ms()
+                    self._save_state_locked()
+                self._event(
+                    "margin_prefund_correction_blocked",
+                    {
+                        "symbol": symbol,
+                        "required_usd": correction,
+                        "allowed_usd": allowed,
+                        "available_usd": correction_available,
+                        "correction_steps": correction_steps,
+                    },
+                )
+                raise RuntimeError("pump_live_margin_prefund_reserve_insufficient")
+            self.gateway.add_margin(symbol, correction)
+            correction_steps += 1
+            total_added += correction
+            position_topup_after = self._record_entry_prefund_add(
+                item,
+                amount_usd=correction,
+                status="verifying_correction",
+            )
+            self._event(
+                "margin_prefund_correction_added",
+                {
+                    "symbol": symbol,
+                    "amount_usd": correction,
+                    "correction_step": correction_steps,
+                    "position_topup_usd": position_topup_after,
+                },
+            )
+            verified, check = self._verify_entry_prefund_target(
+                item,
+                config,
+                symbol=symbol,
+                target_stop=target_stop,
+                next_ladder=next_ladder,
+            )
+
+        verified_stop = check.get("verified_stop_price")
         if verified is None:
             self.disarm("margin_prefund_position_unconfirmed")
             self._event(
                 "margin_prefund_verification_failed",
-                {"symbol": symbol, "amount_usd": required},
+                {"symbol": symbol, "amount_usd": total_added},
             )
             raise RuntimeError("pump_live_margin_prefund_position_unconfirmed")
-        self._apply_exchange_position(item, verified)
-        verified_stop = self._desired_emergency_stop(
-            _optional_float(item.get("liq_price")),
-            config,
-        )
-        verified_buffer = _short_liq_buffer_pct(
-            _safe_float(item.get("mark_price"), 0.0),
-            _optional_float(item.get("liq_price")),
-        )
-        if verified_stop is None or verified_stop + 1e-9 < target_stop:
+        if not check["ready"]:
             with self._lock:
                 item["margin_prefund_status"] = "target_unconfirmed"
                 item["updated_at_ms"] = _now_ms()
@@ -2078,12 +2289,19 @@ class PumpLiveController:
                 "margin_prefund_verification_failed",
                 {
                     "symbol": symbol,
-                    "amount_usd": required,
+                    "amount_usd": total_added,
                     "target_stop_price": target_stop,
                     "verified_stop_price": verified_stop,
+                    "correction_steps": correction_steps,
+                    "verification": check,
                 },
             )
             raise RuntimeError("pump_live_margin_prefund_target_unconfirmed")
+
+        verified_buffer = _short_liq_buffer_pct(
+            _safe_float(item.get("mark_price"), 0.0),
+            _optional_float(item.get("liq_price")),
+        )
         with self._lock:
             item["margin_prefund_confirmed_at_ms"] = _now_ms()
             item["margin_prefund_status"] = "confirmed"
@@ -2094,15 +2312,19 @@ class PumpLiveController:
             {
                 "symbol": symbol,
                 "reason": "entry_prefund",
-                "amount_usd": required,
+                "amount_usd": total_added,
+                "initial_amount_usd": required,
+                "correction_amount_usd": total_added - required,
+                "correction_steps": correction_steps,
                 "position_topup_usd": position_topup_after,
                 "margin_prefund_floor_usd": position_topup_after,
                 "target_stop_price": target_stop,
                 "verified_stop_price": verified_stop,
+                "verification": check,
                 "liq_buffer_pct_before": buffer_before,
                 "liq_buffer_pct_after": verified_buffer,
-                "total_topup_usd": total_topup + required,
-                "available_after_usd": max(0.0, available - required),
+                "total_topup_usd": total_topup_before + total_added,
+                "available_after_usd": max(0.0, available_before - total_added),
             },
         )
         self._sync_full_protection(item, config, force=True)
@@ -2800,6 +3022,64 @@ def _pump_live_notification(
     return None
 
 
+def entry_prefund_target_check(
+    *,
+    verified_stop_price: float | None,
+    target_stop_price: float,
+    next_ladder_price: float,
+    tolerance_pct: float,
+) -> dict[str, Any]:
+    target_stop = _safe_float(target_stop_price, 0.0)
+    next_ladder = _safe_float(next_ladder_price, 0.0)
+    verified_stop = _optional_float(verified_stop_price)
+    tolerance = max(0.0, min(2.0, _safe_float(tolerance_pct, 0.0)))
+    target_clearance = (
+        max(0.0, (target_stop / next_ladder - 1.0) * 100.0)
+        if target_stop > 0 and next_ladder > 0
+        else 0.0
+    )
+    allowed_shortfall = target_clearance * tolerance / 100.0
+    minimum_clearance = max(0.0, target_clearance - allowed_shortfall)
+    verified_clearance = (
+        (verified_stop / next_ladder - 1.0) * 100.0
+        if verified_stop is not None and verified_stop > 0 and next_ladder > 0
+        else None
+    )
+    shortfall = (
+        max(0.0, target_clearance - verified_clearance)
+        if verified_clearance is not None
+        else None
+    )
+    ready = bool(
+        verified_clearance is not None
+        and verified_clearance + 1e-9 >= minimum_clearance
+        and verified_stop is not None
+        and verified_stop > next_ladder
+    )
+    return {
+        "ready": ready,
+        "verified_stop_price": verified_stop,
+        "target_stop_price": target_stop,
+        "next_ladder_price": next_ladder,
+        "verified_clearance_pct": (
+            round(verified_clearance, 9)
+            if verified_clearance is not None
+            else None
+        ),
+        "target_clearance_pct": round(target_clearance, 9),
+        "minimum_clearance_pct": round(minimum_clearance, 9),
+        "clearance_shortfall_pct": (
+            round(shortfall, 9) if shortfall is not None else None
+        ),
+        "tolerance_pct_of_target_clearance": tolerance,
+        "tolerance_used": bool(
+            ready
+            and verified_clearance is not None
+            and verified_clearance + 1e-9 < target_clearance
+        ),
+    }
+
+
 def required_entry_prefund_usd(
     *,
     qty: float,
@@ -3187,6 +3467,7 @@ __all__ = [
     "PumpLiveController",
     "build_capital_manager_status",
     "build_live_legs",
+    "entry_prefund_target_check",
     "load_pump_live_config",
     "required_entry_prefund_usd",
 ]
