@@ -35,6 +35,16 @@ FEATURE_NAMES = (
     "funding_change_bps",
     "funding_sign_streak",
     "funding_interval_h",
+    "funding_latest_interval_h",
+    "funding_interval_change_ratio",
+    "current_funding_age_h",
+    "projected_next_funding_in_h",
+    "current_funding_hourly_bps",
+    "funding_realized_1h_bps",
+    "funding_realized_4h_bps",
+    "funding_realized_8h_bps",
+    "funding_realized_24h_bps",
+    "funding_settlements_24h",
     "premium_current_bps",
     "premium_mean_1h_bps",
     "premium_mean_4h_bps",
@@ -50,6 +60,8 @@ FEATURE_NAMES = (
     "oi_change_24h_pct",
     "other_funding_bps",
     "funding_cross_exchange_diff_bps",
+    "other_funding_hourly_bps",
+    "funding_hourly_cross_exchange_diff_bps",
     "other_premium_bps",
     "premium_cross_exchange_diff_bps",
     "other_oi_change_4h_pct",
@@ -72,7 +84,7 @@ class FundingForecastConfig:
     logistic_learning_rate: float = 0.05
     logistic_l2: float = 0.01
     ridge_alpha: float = 2.0
-    economic_cost_scenario_bps: float = 8.0
+    economic_cost_scenarios_bps: tuple[float, ...] = (0.0, 4.0, 8.0, 12.0, 16.0)
     min_train_rows: int = 20
     min_eval_rows: int = 5
     max_windows: int | None = None
@@ -81,8 +93,8 @@ class FundingForecastConfig:
     def validate(self) -> None:
         if self.current_funding_max_age_h <= 0 or self.next_funding_max_wait_h <= 0:
             raise ValueError("funding age/wait limits must be positive")
-        if self.past_funding_h < 1 or self.future_cumulative_h < 1:
-            raise ValueError("funding horizons must be positive")
+        if self.past_funding_h < 1 or self.future_cumulative_h != 24:
+            raise ValueError("past funding must be positive and cumulative horizon must remain 24h")
         if not 0.5 <= self.chronological_train_fraction < 0.9:
             raise ValueError("chronological train fraction must be within 0.5..0.9")
         if not 0.05 <= self.chronological_validation_fraction < 0.3:
@@ -95,11 +107,17 @@ class FundingForecastConfig:
             raise ValueError("invalid logistic configuration")
         if (
             self.ridge_alpha <= 0
-            or self.economic_cost_scenario_bps < 0
             or self.min_train_rows < 2
             or self.min_eval_rows < 1
         ):
             raise ValueError("invalid model/sample configuration")
+        if (
+            not self.economic_cost_scenarios_bps
+            or any(value < 0 for value in self.economic_cost_scenarios_bps)
+            or tuple(sorted(set(self.economic_cost_scenarios_bps)))
+            != self.economic_cost_scenarios_bps
+        ):
+            raise ValueError("economic cost scenarios must be sorted unique non-negative values")
         if self.max_windows is not None and self.max_windows < 1:
             raise ValueError("max_windows must be positive")
 
@@ -217,6 +235,17 @@ def run_funding_forecast(
         "physical_windows_considered": len(physical_rows),
         "eligible_samples": len(samples),
         "vetoed_windows": len(vetoes),
+        "hourly_funding_samples": sum(
+            row.get("current_funding_hourly_bps") is not None for row in samples
+        ),
+        "interval_change_feature_samples": sum(
+            row.get("funding_interval_change_ratio") is not None for row in samples
+        ),
+        "detected_interval_shift_samples": sum(
+            (ratio := finite_float(row.get("funding_interval_change_ratio"))) is not None
+            and (ratio < 0.75 or ratio > 1.25)
+            for row in samples
+        ),
         "symbols": len({str(row["symbol"]) for row in samples}),
         "exchanges": sorted({str(row["exchange"]) for row in samples}),
         "cross_exchange_premium_samples": sum(
@@ -225,6 +254,10 @@ def run_funding_forecast(
         "cross_exchange_funding_samples": sum(
             row.get("funding_cross_exchange_diff_bps") is not None for row in samples
         ),
+        "cross_exchange_hourly_funding_samples": sum(
+            row.get("funding_hourly_cross_exchange_diff_bps") is not None
+            for row in samples
+        ),
         "cross_exchange_oi_samples": sum(
             row.get("oi_cross_exchange_diff_4h_pct") is not None for row in samples
         ),
@@ -232,6 +265,8 @@ def run_funding_forecast(
             row.get("other_oi_change_4h_pct") is not None for row in samples
         ),
         "metric_rows": len(metrics),
+        "economic_horizons_h": [4, 8, 24],
+        "economic_cost_scenarios_bps": list(cfg.economic_cost_scenarios_bps),
         "elapsed_sec": round(time.time() - started, 3),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "final_result_allowed": bool(cfg.require_complete_event_lake),
@@ -300,11 +335,35 @@ def build_funding_sample(
     funding_values = [float(row["funding_rate"]) for row in funding_24]
     current_rate = float(current["funding_rate"])
     previous_rate = float(past_funding[-2]["funding_rate"]) if len(past_funding) >= 2 else current_rate
-    future_24 = [
-        row
-        for row in future_funding
-        if int(row["ts_ms"]) <= event_ts + config.future_cumulative_h * HOUR_MS
-    ]
+    median_interval_h = funding_interval_hours(past_funding)
+    latest_interval_h = latest_funding_interval_hours(past_funding)
+    interval_change_ratio = funding_interval_change_ratio(past_funding)
+    projected_next_funding_in_h = (
+        max(0.0, latest_interval_h - current_age_h)
+        if latest_interval_h is not None
+        else None
+    )
+    current_funding_hourly_bps = (
+        current_rate * 10_000.0 / latest_interval_h
+        if latest_interval_h not in (None, 0.0)
+        else None
+    )
+    next_interval_h = normalize_funding_interval_hours(
+        (int(next_row["ts_ms"]) - int(current["ts_ms"])) / HOUR_MS
+    )
+    next_funding_hourly_bps = (
+        float(next_row["funding_rate"]) * 10_000.0 / next_interval_h
+        if next_interval_h > 0
+        else None
+    )
+    future_by_horizon = {
+        hours: [
+            row
+            for row in future_funding
+            if int(row["ts_ms"]) <= event_ts + hours * HOUR_MS
+        ]
+        for hours in (4, 8, 24)
+    }
     current_sign = rate_sign(current_rate)
     next_rate = float(next_row["funding_rate"])
     duration_observed_until_ts_ms = min(end_ms, int(future_funding[-1]["ts_ms"]))
@@ -347,7 +406,24 @@ def build_funding_sample(
         "funding_std_24h_bps": std_or_none(funding_values, multiplier=10_000.0),
         "funding_change_bps": (current_rate - previous_rate) * 10_000.0,
         "funding_sign_streak": funding_sign_streak(past_funding),
-        "funding_interval_h": funding_interval_hours(past_funding),
+        "funding_interval_h": median_interval_h,
+        "funding_latest_interval_h": latest_interval_h,
+        "funding_interval_change_ratio": interval_change_ratio,
+        "projected_next_funding_in_h": projected_next_funding_in_h,
+        "current_funding_hourly_bps": current_funding_hourly_bps,
+        "funding_realized_1h_bps": trailing_sum(
+            past_funding, event_ts, 1, "funding_rate", 10_000.0
+        ),
+        "funding_realized_4h_bps": trailing_sum(
+            past_funding, event_ts, 4, "funding_rate", 10_000.0
+        ),
+        "funding_realized_8h_bps": trailing_sum(
+            past_funding, event_ts, 8, "funding_rate", 10_000.0
+        ),
+        "funding_realized_24h_bps": trailing_sum(
+            past_funding, event_ts, 24, "funding_rate", 10_000.0
+        ),
+        "funding_settlements_24h": trailing_count(past_funding, event_ts, 24),
         "premium_current_bps": optional_mul(premium_current, 10_000.0),
         "premium_mean_1h_bps": trailing_mean(premium, event_ts, 1, "close", 10_000.0),
         "premium_mean_4h_bps": trailing_mean(premium, event_ts, 4, "close", 10_000.0),
@@ -363,6 +439,8 @@ def build_funding_sample(
         "oi_change_24h_pct": trailing_return(oi, event_ts, 24, "open_interest"),
         "other_funding_bps": None,
         "funding_cross_exchange_diff_bps": None,
+        "other_funding_hourly_bps": None,
+        "funding_hourly_cross_exchange_diff_bps": None,
         "other_premium_bps": None,
         "premium_cross_exchange_diff_bps": None,
         "other_oi_change_4h_pct": None,
@@ -372,14 +450,23 @@ def build_funding_sample(
         "target_next_positive": 1 if next_rate > 0 else 0,
         "target_sign_persisted": 1 if rate_sign(next_rate) == current_sign else 0,
         "target_next_funding_bps": next_rate * 10_000.0,
+        "target_next_interval_h": next_interval_h,
+        "target_next_funding_hourly_bps": next_funding_hourly_bps,
         "target_weakened": 1 if abs(next_rate) < abs(current_rate) else 0,
         "target_same_sign_duration_h": same_sign_duration_h,
         "target_same_sign_settlements": same_sign_settlements,
         "target_duration_censored": 1 if duration_censored else 0,
         "target_duration_observed_until_ts_ms": duration_observed_until_ts_ms,
-        "target_cumulative_funding_24h_bps": sum(float(row["funding_rate"]) for row in future_24)
-        * 10_000.0,
-        "target_future_settlements_24h": len(future_24),
+        "target_cumulative_funding_4h_bps": funding_rows_sum_bps(future_by_horizon[4]),
+        "target_cumulative_funding_8h_bps": funding_rows_sum_bps(future_by_horizon[8]),
+        "target_cumulative_funding_24h_bps": funding_rows_sum_bps(
+            future_by_horizon[24]
+        ),
+        "target_future_settlements_4h": len(future_by_horizon[4]),
+        "target_future_settlements_8h": len(future_by_horizon[8]),
+        "target_future_settlements_24h": len(
+            future_by_horizon[24]
+        ),
     }
     return sample
 
@@ -398,11 +485,15 @@ def build_cross_exchange_context(
     funding = sorted_finite_rows(series.get("funding"), "funding_rate")
     past_funding = [row for row in funding if int(row["ts_ms"]) <= event_ts]
     current_funding_bps: float | None = None
+    current_funding_hourly_bps: float | None = None
     if past_funding:
         current = past_funding[-1]
         age_h = (event_ts - int(current["ts_ms"])) / HOUR_MS
         if age_h <= config.current_funding_max_age_h:
             current_funding_bps = float(current["funding_rate"]) * 10_000.0
+            latest_interval_h = latest_funding_interval_hours(past_funding)
+            if latest_interval_h not in (None, 0.0):
+                current_funding_hourly_bps = current_funding_bps / latest_interval_h
     premium = sorted_finite_rows(series.get("premium"), "close")
     oi = sorted_finite_rows(series.get("open_interest"), "open_interest")
     return {
@@ -410,6 +501,7 @@ def build_cross_exchange_context(
         "exchange": str(task.get("exchange") or window.get("exchange") or ""),
         "event_ts_ms": event_ts,
         "current_funding_bps": current_funding_bps,
+        "current_funding_hourly_bps": current_funding_hourly_bps,
         "premium_current_bps": optional_mul(
             latest_at_or_before(premium, event_ts, "close"), 10_000.0
         ),
@@ -436,12 +528,18 @@ def add_cross_exchange_features(
             continue
         other_funding = finite_float(other.get("current_funding_bps"))
         own_funding = finite_float(row.get("current_funding_bps"))
+        other_funding_hourly = finite_float(other.get("current_funding_hourly_bps"))
+        own_funding_hourly = finite_float(row.get("current_funding_hourly_bps"))
         other_premium = finite_float(other.get("premium_current_bps"))
         own_premium = finite_float(row.get("premium_current_bps"))
         other_oi = finite_float(other.get("oi_change_4h_pct"))
         own_oi = finite_float(row.get("oi_change_4h_pct"))
         row["other_funding_bps"] = other_funding
         row["funding_cross_exchange_diff_bps"] = optional_diff(own_funding, other_funding)
+        row["other_funding_hourly_bps"] = other_funding_hourly
+        row["funding_hourly_cross_exchange_diff_bps"] = optional_diff(
+            own_funding_hourly, other_funding_hourly
+        )
         row["other_premium_bps"] = other_premium
         row["premium_cross_exchange_diff_bps"] = optional_diff(own_premium, other_premium)
         row["other_oi_change_4h_pct"] = other_oi
@@ -508,34 +606,28 @@ def evaluate_forecasts(
                     }
                 )
                 calibration.extend(calibration_rows(split_name, eval_y, probabilities))
-                metrics.append(
-                    {
-                        "split": split_name,
-                        "target": "funding_capture_24h_bps_proxy",
-                        "model": "logistic_sign_direction",
-                        "train_rows": len(train),
-                        "eval_rows": len(evaluation),
-                        **economic_proxy_metrics(
-                            evaluation,
-                            probabilities,
-                            cost_bps=config.economic_cost_scenario_bps,
-                        ),
-                    }
-                )
-                metrics.append(
-                    {
-                        "split": split_name,
-                        "target": "funding_capture_24h_bps_proxy",
-                        "model": "current_sign_direction",
-                        "train_rows": len(train),
-                        "eval_rows": len(evaluation),
-                        **economic_proxy_metrics(
-                            evaluation,
-                            persistence,
-                            cost_bps=config.economic_cost_scenario_bps,
-                        ),
-                    }
-                )
+                for horizon_h in (4, 8, 24):
+                    target_field = f"target_cumulative_funding_{horizon_h}h_bps"
+                    for cost_bps in config.economic_cost_scenarios_bps:
+                        for model_name, directions in (
+                            ("logistic_sign_direction", probabilities),
+                            ("current_sign_direction", persistence),
+                        ):
+                            metrics.append(
+                                {
+                                    "split": split_name,
+                                    "target": f"funding_capture_{horizon_h}h_bps_proxy",
+                                    "model": model_name,
+                                    "train_rows": len(train),
+                                    "eval_rows": len(evaluation),
+                                    **economic_proxy_metrics(
+                                        evaluation,
+                                        directions,
+                                        target_field=target_field,
+                                        cost_bps=cost_bps,
+                                    ),
+                                }
+                            )
             for feature, coefficient in zip(["intercept", *expanded_names], model):
                 coefficients.append(
                     {
@@ -557,12 +649,50 @@ def evaluate_forecasts(
                 )
                 predictions.append(prediction)
 
-        for target, label, baseline_field in (
-            ("target_next_funding_bps", "next_magnitude_bps", "current_funding_bps"),
-            ("target_same_sign_duration_h", "same_sign_duration_h", None),
+        for target, label, baseline_field, baseline_name in (
+            (
+                "target_next_funding_bps",
+                "next_magnitude_bps",
+                "current_funding_bps",
+                "current_funding_rate",
+            ),
+            (
+                "target_next_funding_hourly_bps",
+                "next_hourly_magnitude_bps",
+                "current_funding_hourly_bps",
+                "current_hourly_funding_rate",
+            ),
+            (
+                "target_next_interval_h",
+                "next_interval_h",
+                "funding_latest_interval_h",
+                "current_funding_interval",
+            ),
+            (
+                "target_same_sign_duration_h",
+                "same_sign_duration_h",
+                None,
+                "train_median_duration",
+            ),
         ):
-            train_indices = list(range(len(train)))
-            eval_indices = list(range(len(evaluation)))
+            train_indices = [
+                index
+                for index, row in enumerate(train)
+                if finite_float(row.get(target)) is not None
+                and (
+                    baseline_field is None
+                    or finite_float(row.get(baseline_field)) is not None
+                )
+            ]
+            eval_indices = [
+                index
+                for index, row in enumerate(evaluation)
+                if finite_float(row.get(target)) is not None
+                and (
+                    baseline_field is None
+                    or finite_float(row.get(baseline_field)) is not None
+                )
+            ]
             excluded_censored = 0
             if target == "target_same_sign_duration_h":
                 train_indices = [
@@ -612,11 +742,9 @@ def evaluate_forecasts(
             )
             if baseline_field:
                 baseline = [float(row[baseline_field]) for row in target_evaluation]
-                baseline_name = "current_funding_rate"
             else:
                 median_duration = statistics.median(train_y)
-                baseline = [median_duration] * len(evaluation)
-                baseline_name = "train_median_duration"
+                baseline = [median_duration] * len(target_evaluation)
             metrics.append(
                 {
                     "split": split_name,
@@ -821,11 +949,12 @@ def economic_proxy_metrics(
     rows: Sequence[Mapping[str, Any]],
     sign_probabilities: Sequence[float],
     *,
+    target_field: str,
     cost_bps: float,
 ) -> dict[str, float]:
     gross = [
         (1.0 if probability >= 0.5 else -1.0)
-        * float(row["target_cumulative_funding_24h_bps"])
+        * float(row[target_field])
         for row, probability in zip(rows, sign_probabilities)
     ]
     net = [value - cost_bps for value in gross]
@@ -902,6 +1031,30 @@ def trailing_values(
     ]
 
 
+def trailing_sum(
+    rows: Sequence[Mapping[str, Any]],
+    ts_ms: int,
+    hours: int,
+    key: str,
+    multiplier: float,
+) -> float | None:
+    start = ts_ms - hours * HOUR_MS
+    values = [
+        value
+        for row in rows
+        if start < int(row["ts_ms"]) <= ts_ms
+        if (value := finite_float(row.get(key))) is not None
+    ]
+    return sum(values) * multiplier if values else None
+
+
+def trailing_count(
+    rows: Sequence[Mapping[str, Any]], ts_ms: int, hours: int
+) -> int:
+    start = ts_ms - hours * HOUR_MS
+    return sum(1 for row in rows if start < int(row["ts_ms"]) <= ts_ms)
+
+
 def trailing_mean(
     rows: Sequence[Mapping[str, Any]], ts_ms: int, hours: int, key: str, multiplier: float
 ) -> float | None:
@@ -966,11 +1119,56 @@ def funding_interval_hours(rows: Sequence[Mapping[str, Any]]) -> float | None:
         return None
     recent = list(rows[-6:])
     deltas = [
-        (int(right["ts_ms"]) - int(left["ts_ms"])) / HOUR_MS
+        normalize_funding_interval_hours(
+            (int(right["ts_ms"]) - int(left["ts_ms"])) / HOUR_MS
+        )
         for left, right in zip(recent, recent[1:])
         if int(right["ts_ms"]) > int(left["ts_ms"])
     ]
     return statistics.median(deltas) if deltas else None
+
+
+def latest_funding_interval_hours(
+    rows: Sequence[Mapping[str, Any]],
+) -> float | None:
+    if len(rows) < 2:
+        return None
+    delta_h = normalize_funding_interval_hours(
+        (int(rows[-1]["ts_ms"]) - int(rows[-2]["ts_ms"])) / HOUR_MS
+    )
+    return delta_h if delta_h > 0 else None
+
+
+def funding_interval_change_ratio(
+    rows: Sequence[Mapping[str, Any]],
+) -> float | None:
+    if len(rows) < 4:
+        return None
+    recent = list(rows[-7:])
+    deltas = [
+        normalize_funding_interval_hours(
+            (int(right["ts_ms"]) - int(left["ts_ms"])) / HOUR_MS
+        )
+        for left, right in zip(recent, recent[1:])
+        if int(right["ts_ms"]) > int(left["ts_ms"])
+    ]
+    if len(deltas) < 3:
+        return None
+    latest = deltas[-1]
+    prior_deltas = deltas[:-1]
+    baseline = statistics.median(prior_deltas) if prior_deltas else None
+    return latest / baseline if latest is not None and baseline not in (None, 0.0) else None
+
+
+def funding_rows_sum_bps(rows: Sequence[Mapping[str, Any]]) -> float:
+    return sum(float(row["funding_rate"]) for row in rows) * 10_000.0
+
+
+def normalize_funding_interval_hours(value: float) -> float:
+    for common in (0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0):
+        if abs(value - common) <= 1.0 / 60.0:
+            return common
+    return round(value, 6)
 
 
 def rate_sign(value: float) -> int:
@@ -1047,20 +1245,22 @@ def render_report(
         f"- Physical windows considered: {metadata.get('physical_windows_considered')}",
         f"- Eligible samples: {metadata.get('eligible_samples')}",
         f"- Vetoed windows: {metadata.get('vetoed_windows')}",
+        f"- Hourly-normalized funding samples: {metadata.get('hourly_funding_samples')}",
+        f"- Detected interval shifts: {metadata.get('detected_interval_shift_samples')}",
         f"- Symbols: {metadata.get('symbols')}",
         "",
         "## Metrics",
         "",
-        "| Split | Target | Model | Train | Eval | Accuracy | Brier | Log loss | MAE | RMSE | Gross bps | Net bps |",
-        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Split | Target | Model | Cost bps | Train | Eval | Accuracy | Brier | Log loss | MAE | RMSE | Gross bps | Net bps |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in metrics:
         lines.append(
-            "| {split} | {target} | {model} | {train_rows} | {eval_rows} | {accuracy} | "
+            "| {split} | {target} | {model} | {cost_scenario_bps} | {train_rows} | {eval_rows} | {accuracy} | "
             "{brier} | {log_loss} | {mae} | {rmse} | {mean_gross_funding_bps} | "
             "{mean_net_after_cost_scenario_bps} |".format(
                 **{key: row.get(key, "") for key in (
-                    "split", "target", "model", "train_rows", "eval_rows", "accuracy",
+                    "split", "target", "model", "cost_scenario_bps", "train_rows", "eval_rows", "accuracy",
                     "brier", "log_loss", "mae", "rmse", "mean_gross_funding_bps",
                     "mean_net_after_cost_scenario_bps"
                 )}

@@ -106,6 +106,23 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab Funding Forecast became funding-interval aware on 2026-08-07
+  after a read-only HFT audit showed an actual Bybit cadence change from 8h
+  settlements to consecutive hourly `-2%` settlements. Research samples now
+  retain median/latest interval, causal interval-change ratio, hourly-normalized
+  rate, projected next-settlement delay, actual past sums/counts and future
+  `4/8/24h` funding paths. Regression targets include next raw rate, next hourly
+  rate and next interval; the diagnostic economic replay sweeps `4/8/24h` and
+  costs `0/4/8/12/16 bps`. A fixture distinguishes `-25 bps/h` for `-2%/8h`
+  from `-200 bps/h` for `-2%/1h` and detects the `0.125` interval ratio. Do not
+  backfill current instrument metadata into old events: historical cadence is
+  inferred only from timestamps known at the event, so a sudden change becomes
+  visible after its first new-cadence settlement. A moving 120-window pilot had
+  53 eligible rows, 52 hourly features and all five cost scenarios, but remains
+  `final_result_allowed=false`. Interval tests passed (`9`), focused Strategy
+  Lab/Pump/coin regression passed (`148`, `4 warnings`), and the complete suite
+  passed (`625`, `11 warnings`). Pump Live/ARM/Grid/orders/positions and the
+  active collector were not changed.
 - Strategy Lab Funding Forecast v1 causal plumbing was implemented on
   2026-08-07 while the already-approved full Event Lake collection continued.
   The research-only runner separates features at/before the event from future

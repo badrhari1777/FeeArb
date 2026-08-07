@@ -141,6 +141,8 @@ ledger и hash-проверяемые артефакты.
 - [x] Причинные targets: следующий знак, величина, ослабление и длительность.
 - [x] Baseline `next_sign = current_sign`.
 - [x] Features: premium, OI, price, volume, cross-exchange difference, timing.
+- [x] Interval-aware funding: settlement/hour normalization, interval shifts,
+  realized/future `4/8/24h` paths и cost sensitivity.
 - [x] Chronological splits и целые unseen symbols.
 - [x] Calibration, Brier/log loss, sign accuracy и экономический replay.
 - [ ] Paper decisions; shadow только после стабильного holdout.
@@ -389,6 +391,32 @@ Shadow -> live:
   `147 passed`, `4 warnings`; полный regression `624 passed`, `11 warnings`.
 - Live/ARM/Pump Live/Grid/orders/positions не изменялись; активный collector и
   его post-run watcher продолжают прежний public-only процесс.
+
+### 2026-08-07 — Funding interval-aware hardening по HFT
+
+- Read-only HFT audit показал последовательность причин пропуска: сначала
+  недостаточный pullback и long ratio ниже `45%`, затем после PB25 одновременно
+  funding `-2.062154%` за прошедшие 24h и long ratio `43.26%`. Pump Live не
+  получал HFT как entry-ready и не пытался открыть позицию.
+- Bybit history подтвердила смену HFT settlement cadence: после 8h-платежей
+  прошли два последовательных hourly settlement по `-2%`. Это выявило, что
+  одного raw funding per settlement недостаточно для сравнения режимов.
+- Funding Forecast теперь причинно хранит median/latest interval, interval-change
+  ratio, rate `bps/hour`, projected next-settlement delay, actual realized sums
+  и counts за `1/4/8/24h`; targets включают next interval, next hourly rate и
+  actual cumulative funding за `4/8/24h`.
+- Economic proxy расширен до горизонтов `4/8/24h` и costs
+  `0/4/8/12/16 bps`. Это всё ещё не execution replay и не paper approval.
+- HFT-like fixture различает `-2% / 8h = -25 bps/h` и
+  `-2% / 1h = -200 bps/h`, а также причинно обнаруживает переход с ratio
+  `0.125`. Point-in-time metadata старого интервала не подменяется современной.
+- Moving partial pilot (`120` окон) дал `53` eligible / `67` veto:
+  `52` hourly-normalized rows, `47` interval-change features, `81` metric rows,
+  все пять cost scenarios. `final_result_allowed=false`, promotion запрещён.
+- Interval fixture regression: `9 passed`; профильный Strategy Lab/Pump/coin
+  regression `148 passed`, `4 warnings`; полный regression `625 passed`,
+  `11 warnings`.
+- Pump Live/ARM/Grid/orders/positions и активный Event Lake collector не менялись.
 
 ## Точный следующий шаг
 

@@ -181,6 +181,28 @@ funding-метки, но не становится размеченным train 
 конца окна смена знака является right-censored и исключается из обычной
 регрессии длительности.
 
+Funding period учитывается двумя разными способами:
+
+- реализованные ставки суммируются по фактическим settlement timestamps за
+  `1/4/8/24h`, поэтому восемь часовых платежей не равны одному 8h-платежу;
+- ставка одного settlement нормализуется как `bps/hour` по последнему причинно
+  наблюдаемому интервалу. Отдельно сохраняются median interval, latest interval,
+  отношение latest к предыдущей median и причинная оценка времени до следующего
+  settlement.
+
+Targets включают следующую ставку и в `bps/settlement`, и в `bps/hour`, следующий
+фактический интервал, а также cumulative funding за `4/8/24h`. Экономический
+proxy считается по реальным будущим settlement-строкам для costs
+`0/4/8/12/16 bps`. Миллисекундный шум timestamps около стандартных интервалов
+`1/2/4/8h` нормализуется, чтобы модель не учила технический jitter.
+
+Historical Event Lake не содержит достоверной point-in-time instrument metadata.
+Поэтому внезапная смена, например `8h -> 1h`, причинно видна только после первого
+settlement с новым разрывом. Нельзя подставлять современный `fundingInterval` в
+старое событие: это look-ahead. В будущем shadow может использовать свежие
+instrument metadata и exchange `nextFundingTime` как отдельные observed-at
+features.
+
 Пакет `data/research/strategy_lab_funding_forecast_v1/` содержит:
 
 - `samples.csv` и `vetoes.csv` — eligible causal samples и fail-closed причины;
@@ -189,7 +211,7 @@ funding-метки, но не становится размеченным train 
 - `veto_summary.csv`, `metadata.json`, `index.md` — coverage и provenance.
 
 `metadata.final_result_allowed=true` возможно только для строгого полного
-Event Lake. Funding-capture в v1 — диагностический 24h proxy с cost scenario,
+Event Lake. Funding-capture в v1 — диагностический `4/8/24h` proxy с cost sweep,
 а не исполнимый арбитраж: bid/ask, slippage, capacity и lifecycle относятся к
 следующему этапу Executable Spread Timing.
 

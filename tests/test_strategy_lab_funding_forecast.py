@@ -107,6 +107,9 @@ def test_sample_features_are_causal_and_targets_use_only_future_rows() -> None:
     changed_future["series"]["premium"]["rows"].append(
         {"ts_ms": BASE_TS + 1, "close": 99.0}
     )
+    changed_future["series"]["funding"]["rows"].append(
+        {"ts_ms": BASE_TS + 1, "funding_rate": -0.5}
+    )
     changed = build_funding_sample(
         task=logical[0], logical_tasks=logical, window=changed_future, config=config
     )
@@ -114,7 +117,17 @@ def test_sample_features_are_causal_and_targets_use_only_future_rows() -> None:
     assert sample["status"] == "eligible"
     assert sample["logical_event_count"] == 2
     assert sample["current_funding_bps"] == -20.0
+    assert sample["funding_latest_interval_h"] == 7.0
+    assert sample["current_funding_hourly_bps"] == -20.0 / 7.0
+    assert sample["projected_next_funding_in_h"] == 6.0
+    assert sample["funding_realized_8h_bps"] == -20.0
+    assert sample["funding_realized_24h_bps"] == -30.0
     assert sample["target_next_funding_bps"] == -10.0
+    assert sample["target_next_interval_h"] == 5.0
+    assert sample["target_next_funding_hourly_bps"] == -2.0
+    assert sample["target_cumulative_funding_4h_bps"] == -10.0
+    assert sample["target_cumulative_funding_8h_bps"] == 0.0
+    assert sample["target_cumulative_funding_24h_bps"] == 20.0
     assert sample["target_sign_persisted"] == 1
     assert sample["target_weakened"] == 1
     assert sample["target_same_sign_duration_h"] == 8.0
@@ -122,6 +135,9 @@ def test_sample_features_are_causal_and_targets_use_only_future_rows() -> None:
     assert sample["target_duration_censored"] == 0
     assert changed["premium_current_bps"] == sample["premium_current_bps"]
     assert changed["premium_mean_4h_bps"] == sample["premium_mean_4h_bps"]
+    assert changed["funding_latest_interval_h"] == sample["funding_latest_interval_h"]
+    assert changed["current_funding_hourly_bps"] == sample["current_funding_hourly_bps"]
+    assert changed["target_next_funding_bps"] != sample["target_next_funding_bps"]
 
 
 def test_missing_next_funding_is_vetoed_fail_closed() -> None:
@@ -162,6 +178,49 @@ def test_unobserved_sign_change_is_marked_as_censored_duration() -> None:
     assert sample["target_duration_observed_until_ts_ms"] == BASE_TS + 16 * 3_600_000
 
 
+def test_hft_like_interval_shift_distinguishes_two_percent_per_8h_and_per_1h() -> None:
+    config = FundingForecastConfig(min_train_rows=2, min_eval_rows=1)
+    eight_hour = window(window_id="eight-hour")
+    eight_hour["series"]["funding"]["rows"] = [
+        {"ts_ms": BASE_TS - 16 * 3_600_000, "funding_rate": -0.0001},
+        {"ts_ms": BASE_TS - 8 * 3_600_000, "funding_rate": -0.0002},
+        {"ts_ms": BASE_TS, "funding_rate": -0.02},
+        {"ts_ms": BASE_TS + 8 * 3_600_000, "funding_rate": -0.02},
+    ]
+    shifted = window(window_id="shifted")
+    shifted["series"]["funding"]["rows"] = [
+        {"ts_ms": BASE_TS - 17 * 3_600_000, "funding_rate": -0.0001},
+        {"ts_ms": BASE_TS - 9 * 3_600_000, "funding_rate": -0.0002},
+        {"ts_ms": BASE_TS - 1 * 3_600_000, "funding_rate": -0.0004},
+        {"ts_ms": BASE_TS, "funding_rate": -0.02},
+        {"ts_ms": BASE_TS + 1 * 3_600_000, "funding_rate": -0.02},
+        {"ts_ms": BASE_TS + 2 * 3_600_000, "funding_rate": -0.00052006},
+        {"ts_ms": BASE_TS + 3 * 3_600_000, "funding_rate": -0.00225497},
+    ]
+
+    eight_sample = build_funding_sample(
+        task=task(window_id="eight-hour"),
+        logical_tasks=[task(window_id="eight-hour")],
+        window=eight_hour,
+        config=config,
+    )
+    shifted_sample = build_funding_sample(
+        task=task(window_id="shifted"),
+        logical_tasks=[task(window_id="shifted")],
+        window=shifted,
+        config=config,
+    )
+
+    assert eight_sample["funding_latest_interval_h"] == 8.0
+    assert eight_sample["current_funding_hourly_bps"] == -25.0
+    assert eight_sample["target_next_funding_hourly_bps"] == -25.0
+    assert shifted_sample["funding_latest_interval_h"] == 1.0
+    assert shifted_sample["funding_interval_change_ratio"] == 0.125
+    assert shifted_sample["current_funding_hourly_bps"] == -200.0
+    assert shifted_sample["target_next_funding_hourly_bps"] == -200.0
+    assert shifted_sample["target_cumulative_funding_4h_bps"] == -227.7503
+
+
 def test_cross_exchange_features_keep_each_exchange_direction() -> None:
     left = build_funding_sample(
         task=task(exchange="binance", window_id="left"),
@@ -176,6 +235,7 @@ def test_cross_exchange_features_keep_each_exchange_direction() -> None:
             "physical_window_id": "right",
             "exchange": "bybit",
             "current_funding_bps": -5.0,
+            "current_funding_hourly_bps": -1.0,
             "premium_current_bps": -3.0,
         }
     )
@@ -184,6 +244,7 @@ def test_cross_exchange_features_keep_each_exchange_direction() -> None:
 
     assert left["funding_cross_exchange_diff_bps"] == -15.0
     assert right["funding_cross_exchange_diff_bps"] == 15.0
+    assert left["funding_hourly_cross_exchange_diff_bps"] == -20.0 / 7.0 + 1.0
     assert left["premium_cross_exchange_diff_bps"] == left["premium_current_bps"] + 3.0
 
 
@@ -234,11 +295,17 @@ def synthetic_samples(count: int = 120) -> list[dict[str, object]]:
             "exchange": "binance" if index % 2 == 0 else "bybit",
             "event_ts_ms": BASE_TS + index * 3_600_000,
             "current_funding_bps": current,
+            "current_funding_hourly_bps": current,
+            "funding_latest_interval_h": 1.0,
             "premium_current_bps": driver,
             "target_next_positive": target,
             "target_weakened": target,
             "target_next_funding_bps": driver * 3.0,
+            "target_next_funding_hourly_bps": driver * 3.0,
+            "target_next_interval_h": 1.0,
             "target_same_sign_duration_h": 8.0 + driver,
+            "target_cumulative_funding_4h_bps": driver * 2.0,
+            "target_cumulative_funding_8h_bps": driver * 3.0,
             "target_cumulative_funding_24h_bps": driver * 5.0,
         }
         rows.append(row)
@@ -289,6 +356,16 @@ def test_logistic_forecast_beats_current_sign_baseline_on_synthetic_driver() -> 
         and row.get("model") == "logistic_sign_direction"
     )
     assert "mean_net_after_cost_scenario_bps" in economic
+    sensitivity = {
+        row["cost_scenario_bps"]
+        for row in metrics
+        if row.get("split") == "chronological_test"
+        and row.get("target") == "funding_capture_24h_bps_proxy"
+        and row.get("model") == "logistic_sign_direction"
+    }
+    assert sensitivity == {0.0, 4.0, 8.0, 12.0, 16.0}
+    assert any(row.get("target") == "next_hourly_magnitude_bps" for row in metrics)
+    assert any(row.get("target") == "next_interval_h" for row in metrics)
     assert calibration
     assert coefficients
     assert predictions
@@ -351,6 +428,9 @@ def test_complete_event_lake_fixture_writes_research_only_artifacts(tmp_path: Pa
     assert metadata["paper_promotion_allowed"] is False
     assert metadata["shadow_promotion_allowed"] is False
     assert metadata["cross_exchange_premium_samples"] == 2
+    assert metadata["hourly_funding_samples"] == 2
+    assert metadata["economic_horizons_h"] == [4, 8, 24]
+    assert metadata["economic_cost_scenarios_bps"] == [0.0, 4.0, 8.0, 12.0, 16.0]
     assert (output_dir / "samples.csv").exists()
     assert "Partial/in-progress runs" in (output_dir / "index.md").read_text(
         encoding="utf-8"
