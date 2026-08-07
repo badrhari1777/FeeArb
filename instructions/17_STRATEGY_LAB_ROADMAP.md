@@ -296,8 +296,7 @@ Shadow -> live:
 - Без physical-window dedupe: `3 080` задач, примерно `49 280` calls,
   `2,56 GiB`, `5h13m` по скорости pilot.
 - С exact-window dedupe: `2 216` физических задач, примерно `35 456` calls,
-  `1,84 GiB`, `3h45m`. Эта оптимизация ещё не реализована в runner и является
-  обязательным preflight-блоком перед рекомендуемым полным запуском.
+  `1,84 GiB`, `3h45m`.
 - Generated evidence:
   `data/research/strategy_lab_event_lake_v3_clean/full_run_estimate.json` и
   `data/research/strategy_lab_merged_v3_clean/`.
@@ -305,18 +304,33 @@ Shadow -> live:
   `58 passed`, `4 warnings`; полный regression `608 passed`, `11 warnings`.
 - Live, ARM, Pump Live, Grid, Auto Enter/Exit и позиции не затронуты.
 
+### 2026-08-07 — Exact-window cache готов к полному сбору
+
+- Event Lake v4 разделяет `3 080` logical tasks и `2 216` физических окон по
+  `exchange + symbol + start/end + timeframe`; immutable window больше не
+  содержит event-specific identity.
+- Каждый из `1 540` event IDs сохраняет собственные coverage и append-only
+  ledger records. Повторное logical событие ссылается на тот же `features_ref`
+  и hash, не вызывая повторный API download.
+- Zero-network full preflight подтвердил `1 540 / 3 080 / 2 216` и оценки
+  `35 456` calls с dedupe против `49 280` без него.
+- Real-data VELVET duplicate pilot: `2` logical events, `4` logical tasks,
+  `2` physical windows, `32` public calls, `4` ledger records; повторный запуск
+  дал `0` calls и не добавил ledger-дубли.
+- Plan-only report получил отдельную регрессию после найденного до запуска
+  отсутствия пустых mark/index/premium колонок.
+- Проверки: Event Lake fixture `14 passed`; профильная Strategy Lab/Pump/coin
+  регрессия `157 passed`, `4 warnings`; полный regression `612 passed`,
+  `11 warnings`.
+- Пользователь подтвердил полный public-only сбор. До его запуска остаются
+  diff/secret audit и отдельный commit исходников.
+
 ## Точный следующий шаг
 
-Требуется отдельное решение пользователя по ресурсоёмкому продолжению.
-Рекомендуемый вариант после подтверждения:
-
-1. реализовать физический cache по `exchange + symbol + start/end + timeframe`,
-   сохранив отдельные logical `event_id` и ledger decisions;
-2. доказать fixture-тестом, что `1 540` logical events используют `1 108`
-   физических окон без потери provenance и без смешивания событий;
-3. повторить bounded duplicate-window pilot, Strategy Lab regression и полный
-   regression;
-4. отдельным коммитом зафиксировать готовность;
-5. только затем запустить resumable public-only сбор примерно на `3h45m` и
-   `1,84 GiB`, с checkpoint/cache и без live-действий;
-6. после сбора перейти к Этапу 2 `Funding Forecast v1`.
+1. завершить профильную и полную регрессии exact-window блока;
+2. зафиксировать исходники, тесты и эту документацию отдельным commit;
+3. запустить resumable public-only сбор командой из
+   `instructions/16_STRATEGY_LAB.md` с `--execute-public`;
+4. проверить coverage, ledger uniqueness и zero-call replay;
+5. зафиксировать итог сбора в этом журнале, затем перейти к Этапу 2
+   `Funding Forecast v1`.

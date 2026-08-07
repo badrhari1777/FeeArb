@@ -65,12 +65,20 @@ Source-specific public provider собирает также `mark`, `index` и `
 Оценка полного каталога без сетевых запросов:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\strategy_lab_event_lake.py --output-dir data\research\strategy_lab_event_lake_v3_clean --estimate-full-catalog --pilot-calls 96 --pilot-elapsed-sec 36.56
+.\.venv\Scripts\python.exe scripts\strategy_lab_event_lake.py --output-dir data\research\strategy_lab_event_lake_v4_full --all-events --max-events 999999
 ```
 
-Команда пишет `full_run_estimate.json`. Это только preflight; она не является
-разрешением на долгий сбор. Перед полным запуском требуется отдельное решение и
-реализация exact-window cache для повторяющихся `symbol + timestamp` окон.
+Это zero-network preflight полного запуска. Он обязан показать `1 540`
+логических событий, `3 080` logical tasks и `2 216` физических окон. После
+отдельного подтверждения оператора тот же resumable public-only сбор запускается
+с добавлением `--execute-public`.
+
+Event Lake v4 хранит физический cache по
+`exchange + symbol + start/end + timeframe`. Несколько source-specific
+`event_id` могут ссылаться на один immutable window-файл, но для каждого
+logical event сохраняются отдельные task, coverage и ledger record. Флаг
+`--all-events` обязателен для полного каталога; без него сохраняется безопасный
+bounded default — только последнее событие каждого выбранного символа.
 
 Локальный архив без сети:
 
@@ -113,7 +121,7 @@ Merge выбирает источник целиком для каждого dat
 Event Lake пишет отдельный пакет в `data/research/strategy_lab_event_lake/`:
 
 - `manifest.json` — immutable event/task identity и оценка API-бюджета;
-- `windows/<task_id>.json` — versioned public-only cache;
+- `windows/<physical_window_id>.json` — immutable versioned public-only cache;
 - `coverage.csv` — market/contract/OHLCV/funding/OI/mark/index/premium coverage;
 - `ledger.jsonl` — append-only `strategy_lab_ledger_v1`;
 - `index.md` и `metadata.json` — проверяемая сводка запуска.

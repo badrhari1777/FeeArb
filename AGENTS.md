@@ -106,6 +106,20 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab exact-window caching was implemented on 2026-08-07 before the
+  operator-approved full public collection. Event Lake v4 keeps all 1,540
+  logical event IDs and 3,080 per-exchange ledger tasks while storing only
+  2,216 immutable physical windows keyed by exchange, symbol, start/end and
+  timeframe. The zero-network full preflight now reports 35,456 estimated
+  calls versus 49,280 without dedupe. A real VELVET duplicate-window pilot
+  used 32 calls for two physical windows while retaining four logical ledger
+  records; replay used zero calls and added no records. Physical cache writes
+  use a cross-process lock, and the plan-only report contract is regression
+  covered. Verified Event Lake tests (`14`), focused Strategy Lab/Pump/coin
+  regression (`157`, `4 warnings`) and the full suite (`612`, `11 warnings`).
+  Full collection remains public-only research replay and cannot alter ARM,
+  Pump Live, Grid, orders, or positions. Canonical handoff:
+  `instructions/17_STRATEGY_LAB_ROADMAP.md`.
 - Pump Live ladder-fill reconciliation received a direct regression on
   2026-08-07 after the HEI review. The test exercises a two-leg live tier from
   confirmed entry pre-fund through an exchange-filled L2, then verifies that

@@ -42,7 +42,7 @@ class FakePublicProvider:
         self.market_available = market_available
 
     def fetch_window(self, task: Mapping[str, Any]) -> dict[str, Any]:
-        self.calls.append(str(task["task_id"]))
+        self.calls.append(str(task["physical_window_id"]))
         rows = (
             [
                 {
@@ -59,9 +59,8 @@ class FakePublicProvider:
         )
         missing_error = "" if self.market_available else "symbol_unavailable"
         return {
-            "schema": "strategy_lab_public_window_v3",
-            "task_id": task["task_id"],
-            "event_id": task["event_id"],
+            "schema": "strategy_lab_public_window_v4",
+            "physical_window_id": task["physical_window_id"],
             "symbol": task["symbol"],
             "exchange": task["exchange"],
             "start_ms": task["start_ms"],
@@ -114,7 +113,9 @@ def test_manifest_is_deterministic_and_estimates_bounded_calls() -> None:
     assert first["run_id"] == second["run_id"]
     assert first["source_manifest_hash"] == second["source_manifest_hash"]
     assert len(first["tasks"]) == 6
-    assert first["estimated_public_calls"] == 114
+    assert len(first["physical_windows"]) == 6
+    assert first["estimated_public_calls"] == 96
+    assert first["estimated_public_calls_without_window_dedupe"] == 96
     assert {task["expected_candles"] for task in first["tasks"]} == {1152}
 
 
@@ -131,6 +132,25 @@ def test_selection_uses_latest_event_per_requested_symbol_in_requested_order() -
         ("BUSDT", BASE_TS + 2000),
         ("AUSDT", BASE_TS + 1000),
     ]
+
+
+def test_all_events_selection_keeps_distinct_logical_events_for_same_window() -> None:
+    rows = [
+        event("AUSDT", BASE_TS, "pump_lifecycle"),
+        event("AUSDT", BASE_TS, "pump_universe_hourly_spike"),
+        event("AUSDT", BASE_TS + 1000, "pump_premium_window"),
+    ]
+
+    selected = select_catalog_events(
+        rows,
+        symbols=("AUSDT",),
+        max_events=10,
+        selection_mode="all_events",
+    )
+
+    assert {row["pump_event_id"] for row in selected} == {
+        row["pump_event_id"] for row in rows
+    }
 
 
 def test_run_is_resumable_and_does_not_duplicate_ledger(tmp_path: Path) -> None:
@@ -190,6 +210,65 @@ def test_run_is_resumable_and_does_not_duplicate_ledger(tmp_path: Path) -> None:
     assert repaired["status_counts"] == {"completed": 1, "cache_reused": 3}
     assert len(repair_provider.calls) == 1
     assert len((tmp_path / "ledger.jsonl").read_text(encoding="utf-8").splitlines()) == 4
+
+
+def test_plan_only_run_renders_all_dataset_columns(tmp_path: Path) -> None:
+    result = run_event_lake(
+        output_dir=tmp_path,
+        config=EventLakeConfig(exchanges=("binance",), max_events=1),
+        catalog_rows=[event("AUSDT", BASE_TS)],
+        execute_public=False,
+        code_commit="abc",
+    )
+
+    assert result["executed_public"] is False
+    assert result["status_counts"] == {"planned": 1}
+    assert result["physical_status_counts"] == {"planned": 1}
+    assert "not_executed" in (tmp_path / "index.md").read_text(encoding="utf-8")
+
+
+def test_exact_window_cache_preserves_logical_event_ledger_records(tmp_path: Path) -> None:
+    config = EventLakeConfig(
+        exchanges=("binance", "bybit"),
+        max_events=10,
+        selection_mode="all_events",
+    )
+    rows = [
+        event("AUSDT", BASE_TS, "pump_lifecycle"),
+        event("AUSDT", BASE_TS, "pump_universe_hourly_spike"),
+    ]
+    provider = FakePublicProvider()
+
+    result = run_event_lake(
+        output_dir=tmp_path,
+        config=config,
+        catalog_rows=rows,
+        execute_public=True,
+        provider=provider,
+        code_commit="abc",
+    )
+
+    ledger = [
+        json.loads(line)
+        for line in (tmp_path / "ledger.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert result["selected_events"] == 2
+    assert result["logical_tasks"] == 4
+    assert result["physical_windows"] == 2
+    assert result["status_counts"] == {"completed": 2, "cache_reused": 2}
+    assert result["physical_status_counts"] == {"completed": 2}
+    assert result["estimated_public_calls"] == 32
+    assert result["estimated_public_calls_without_window_dedupe"] == 64
+    assert result["source_public_calls"] == 6
+    assert result["public_calls_this_run"] == 6
+    assert len(provider.calls) == 2
+    assert len(list((tmp_path / "windows").glob("*.json"))) == 2
+    assert len(ledger) == 4
+    assert len({row["event_id"] for row in ledger}) == 2
+    assert len({row["record_id"] for row in ledger}) == 4
+    assert len({row["features_ref"] for row in ledger}) == 2
+    assert len(manifest["physical_windows"]) == 2
 
 
 def test_missing_market_creates_fail_closed_veto(tmp_path: Path) -> None:

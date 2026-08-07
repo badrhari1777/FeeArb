@@ -26,9 +26,10 @@ from analysis_features.strategy_lab import (
 DEFAULT_OUTPUT_DIR = BASE_DIR / "data" / "research" / "strategy_lab_event_lake"
 LEDGER_SCHEMA = "strategy_lab_ledger_v1"
 MANIFEST_SCHEMA = "strategy_lab_enrichment_manifest_v1"
-WINDOW_SCHEMA = "strategy_lab_public_window_v3"
+WINDOW_SCHEMA = "strategy_lab_public_window_v4"
 ALLOWED_MODES = {"research_replay", "paper", "shadow"}
 ALLOWED_DECISIONS = {"VETO", "WAIT", "ENTER", "HOLD", "EXIT", "RISK_EXIT"}
+ALLOWED_SELECTION_MODES = {"latest_per_symbol", "all_events"}
 BINANCE_OI_RETENTION_MS = 30 * 86_400_000
 DERIVED_PRICE_KINDS = {
     "mark": "mark",
@@ -48,6 +49,7 @@ class EventLakeConfig:
     request_limit: int = 500
     mode: str = "research_replay"
     hypothesis_id: str = "pump_to_arbitrage_bridge"
+    selection_mode: str = "latest_per_symbol"
 
     def validate(self) -> None:
         if self.mode not in ALLOWED_MODES:
@@ -58,6 +60,8 @@ class EventLakeConfig:
             raise ValueError("event window must include positive post history")
         if self.request_limit < 50 or self.request_limit > 1000:
             raise ValueError("request_limit must be within 50..1000")
+        if self.selection_mode not in ALLOWED_SELECTION_MODES:
+            raise ValueError(f"unsupported selection mode: {self.selection_mode}")
         unsupported = sorted(set(self.exchanges) - set(PUBLIC_EXCHANGE_IDS))
         if unsupported:
             raise ValueError(f"unsupported exchanges: {unsupported}")
@@ -93,7 +97,12 @@ def run_event_lake(
         if catalog_rows is not None
         else load_pump_event_catalog(PUMP_EVENT_SOURCES)
     )
-    selected = select_catalog_events(events, symbols=cfg.symbols, max_events=cfg.max_events)
+    selected = select_catalog_events(
+        events,
+        symbols=cfg.symbols,
+        max_events=cfg.max_events,
+        selection_mode=cfg.selection_mode,
+    )
     if not selected:
         raise ValueError("no Pump events matched the Event Lake selection")
     commit = code_commit or current_git_commit()
@@ -115,8 +124,10 @@ def run_event_lake(
 
     coverage: list[dict[str, Any]] = []
     status_counts: dict[str, int] = {}
+    observed_physical_calls: dict[str, int] = {}
+    physical_statuses: dict[str, str] = {}
     for task in manifest["tasks"]:
-        cache_path = windows_dir / f"{task['task_id']}.json"
+        cache_path = windows_dir / f"{task['physical_window_id']}.json"
         window: dict[str, Any] | None = read_valid_cache(cache_path, task)
         cache_reused = window is not None
         if not execute_public:
@@ -125,13 +136,23 @@ def run_event_lake(
         else:
             if window is None:
                 assert active_provider is not None
-                window = active_provider.fetch_window(task)
-                validate_window(window, task)
-                write_json_atomic(cache_path, window)
+                cache_lock = windows_dir / f".{task['physical_window_id']}.lock"
+                with exclusive_file_lock(cache_lock, timeout_sec=600.0):
+                    window = read_valid_cache(cache_path, task)
+                    cache_reused = window is not None
+                    if window is None:
+                        window = active_provider.fetch_window(task)
+                        validate_window(window, task)
+                        write_json_atomic(cache_path, window)
             task["status"] = "cache_reused" if cache_reused else window_status(window)
             task["cache_path"] = str(cache_path.relative_to(output_dir))
             row = coverage_from_task(task, window, cache_reused=cache_reused)
             coverage.append(row)
+            physical_window_id = str(task["physical_window_id"])
+            observed_physical_calls.setdefault(
+                physical_window_id, int(row.get("source_public_calls") or 0)
+            )
+            physical_statuses.setdefault(physical_window_id, str(task["status"]))
             record = build_ledger_record(
                 manifest=manifest,
                 task=task,
@@ -146,7 +167,17 @@ def run_event_lake(
         status = str(task["status"])
         status_counts[status] = status_counts.get(status, 0) + 1
 
+    for physical in manifest["physical_windows"]:
+        physical_window_id = str(physical["physical_window_id"])
+        physical["status"] = physical_statuses.get(physical_window_id, "planned")
+        if execute_public:
+            physical["cache_path"] = f"windows/{physical_window_id}.json"
     manifest["status_counts"] = status_counts
+    physical_status_counts: dict[str, int] = {}
+    for physical in manifest["physical_windows"]:
+        status = str(physical["status"])
+        physical_status_counts[status] = physical_status_counts.get(status, 0) + 1
+    manifest["physical_status_counts"] = physical_status_counts
     manifest["executed_public"] = bool(execute_public)
     write_json_atomic(output_dir / "manifest.json", manifest)
     write_csv(output_dir / "coverage.csv", coverage)
@@ -159,14 +190,20 @@ def run_event_lake(
         "source_manifest_hash": manifest["source_manifest_hash"],
         "code_commit": commit,
         "selected_events": len(selected),
+        "logical_tasks": len(manifest["tasks"]),
+        "physical_windows": len(manifest["physical_windows"]),
         "tasks": len(manifest["tasks"]),
         "estimated_public_calls": manifest["estimated_public_calls"],
-        "source_public_calls": sum(int(row.get("source_public_calls") or 0) for row in coverage),
+        "estimated_public_calls_without_window_dedupe": manifest[
+            "estimated_public_calls_without_window_dedupe"
+        ],
+        "source_public_calls": sum(observed_physical_calls.values()),
         "public_calls_this_run": sum(
             int(row.get("public_calls_this_run") or 0) for row in coverage
         ),
         "executed_public": bool(execute_public),
         "status_counts": status_counts,
+        "physical_status_counts": physical_status_counts,
         "ledger_records": len(existing_record_ids),
         "coverage_rows": len(coverage),
         "elapsed_sec": round(time.time() - started, 3),
@@ -185,7 +222,10 @@ def select_catalog_events(
     *,
     symbols: Sequence[str],
     max_events: int,
+    selection_mode: str = "latest_per_symbol",
 ) -> list[dict[str, Any]]:
+    if selection_mode not in ALLOWED_SELECTION_MODES:
+        raise ValueError(f"unsupported selection mode: {selection_mode}")
     requested = [normalize_symbol(symbol) for symbol in symbols if normalize_symbol(symbol)]
     requested_order = {symbol: index for index, symbol in enumerate(requested)}
     candidates = [
@@ -208,12 +248,17 @@ def select_catalog_events(
         )
     )
     selected: list[dict[str, Any]] = []
+    seen_event_ids: set[str] = set()
     seen_symbols: set[str] = set()
     for row in candidates:
         symbol = normalize_symbol(row.get("symbol"))
-        if not symbol or symbol in seen_symbols:
+        event_id = str(row.get("pump_event_id") or "")
+        if not symbol or not event_id or event_id in seen_event_ids:
+            continue
+        if selection_mode == "latest_per_symbol" and symbol in seen_symbols:
             continue
         selected.append(row)
+        seen_event_ids.add(event_id)
         seen_symbols.add(symbol)
         if len(selected) >= max_events:
             break
@@ -244,6 +289,8 @@ def build_enrichment_manifest(
     config_hash = stable_hash(config_payload)
     run_id = f"slab-event-lake-{stable_hash({'events': source_hash, 'config': config_hash})[:16]}"
     tasks: list[dict[str, Any]] = []
+    physical_windows: dict[str, dict[str, Any]] = {}
+    estimation_as_of_ms = int(time.time() * 1000)
     tf_ms = timeframe_ms(config.timeframe)
     for event in canonical_events:
         start_ms = event["ts_ms"] - config.pre_hours * 3_600_000
@@ -255,31 +302,57 @@ def build_enrichment_manifest(
             math.ceil(expected_candles / min(config.request_limit, 200)),
         )
         for exchange in config.exchanges:
-            identity = {
+            estimated_oi_pages = expected_oi_pages
+            if (
+                exchange == "binance"
+                and end_ms <= estimation_as_of_ms - BINANCE_OI_RETENTION_MS
+            ):
+                estimated_oi_pages = 0
+            logical_identity = {
                 "event_id": event["event_id"],
                 "exchange": exchange,
                 "start_ms": start_ms,
                 "end_ms": end_ms,
                 "timeframe": config.timeframe,
             }
+            physical_identity = {
+                "exchange": exchange,
+                "symbol": event["symbol"],
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "timeframe": config.timeframe,
+            }
+            physical_window_id = f"window-{stable_hash(physical_identity)[:24]}"
+            estimated_calls = {
+                "ohlcv": expected_pages,
+                "funding": 1,
+                "open_interest": estimated_oi_pages,
+                "mark": expected_pages,
+                "index": expected_pages,
+                "premium": expected_pages,
+                "total": expected_pages * 4 + estimated_oi_pages + 1,
+            }
+            physical_windows.setdefault(
+                physical_window_id,
+                {
+                    "physical_window_id": physical_window_id,
+                    **physical_identity,
+                    "expected_candles": expected_candles,
+                    "estimated_calls": estimated_calls,
+                    "status": "planned",
+                },
+            )
             tasks.append(
                 {
-                    "task_id": f"task-{stable_hash(identity)[:20]}",
-                    **identity,
+                    "task_id": f"task-{stable_hash(logical_identity)[:20]}",
+                    "physical_window_id": physical_window_id,
+                    **logical_identity,
                     "event_type": event["event_type"],
                     "source": event["source"],
                     "symbol": event["symbol"],
                     "event_ts_ms": event["ts_ms"],
                     "expected_candles": expected_candles,
-                    "estimated_calls": {
-                        "ohlcv": expected_pages,
-                        "funding": 1,
-                        "open_interest": expected_oi_pages,
-                        "mark": expected_pages,
-                        "index": expected_pages,
-                        "premium": expected_pages,
-                        "total": expected_pages * 4 + expected_oi_pages + 1,
-                    },
+                    "estimated_calls": estimated_calls,
                     "status": "planned",
                 }
             )
@@ -291,10 +364,17 @@ def build_enrichment_manifest(
         "source_manifest_hash": source_hash,
         "config_hash": config_hash,
         "code_commit": code_commit,
+        "estimation_as_of_ms": estimation_as_of_ms,
         "config": config_payload,
         "events": canonical_events,
         "tasks": tasks,
-        "estimated_public_calls": sum(task["estimated_calls"]["total"] for task in tasks),
+        "physical_windows": list(physical_windows.values()),
+        "estimated_public_calls": sum(
+            window["estimated_calls"]["total"] for window in physical_windows.values()
+        ),
+        "estimated_public_calls_without_window_dedupe": sum(
+            task["estimated_calls"]["total"] for task in tasks
+        ),
     }
 
 
@@ -414,8 +494,7 @@ class CcxtPublicEventProvider:
         market = resolve_public_market(markets, str(task["symbol"]))
         base = {
             "schema": WINDOW_SCHEMA,
-            "task_id": task["task_id"],
-            "event_id": task["event_id"],
+            "physical_window_id": task["physical_window_id"],
             "symbol": task["symbol"],
             "exchange": exchange,
             "start_ms": int(task["start_ms"]),
@@ -794,6 +873,7 @@ def coverage_from_task(
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "run_task_id": task["task_id"],
+        "physical_window_id": task["physical_window_id"],
         "event_id": task["event_id"],
         "symbol": task["symbol"],
         "exchange": task["exchange"],
@@ -812,6 +892,9 @@ def coverage_from_task(
                 "ohlcv_coverage_pct": None,
                 "funding_rows": None,
                 "oi_rows": None,
+                "mark_rows": None,
+                "index_rows": None,
+                "premium_rows": None,
                 "missing_datasets": "not_executed",
                 "errors": "",
             }
@@ -904,6 +987,7 @@ def build_ledger_record(
             "market_available": coverage.get("market_available"),
             "ohlcv_coverage_pct": coverage.get("ohlcv_coverage_pct"),
             "cache_reused": coverage.get("cache_reused"),
+            "physical_window_id": task.get("physical_window_id"),
         },
         "missing_fields": missing_fields,
         "veto_reasons": veto_reasons,
@@ -969,8 +1053,11 @@ def render_event_lake_report(
         "Status: public-only research replay. No keys, orders, ARM changes or live decisions.",
         "",
         f"- Run: `{metadata.get('run_id')}`",
-        f"- Events/tasks: {metadata.get('selected_events')} / {metadata.get('tasks')}",
-        f"- Estimated calls: {metadata.get('estimated_public_calls')}",
+        f"- Events/logical tasks/physical windows: {metadata.get('selected_events')} / "
+        f"{metadata.get('logical_tasks')} / {metadata.get('physical_windows')}",
+        f"- Estimated calls with physical dedupe: {metadata.get('estimated_public_calls')}",
+        "- Estimated calls without physical dedupe: "
+        f"{metadata.get('estimated_public_calls_without_window_dedupe')}",
         f"- Source calls represented by cache: {metadata.get('source_public_calls')}",
         f"- Calls in this invocation: {metadata.get('public_calls_this_run')}",
         f"- Statuses: `{json.dumps(metadata.get('status_counts') or {}, sort_keys=True)}`",
@@ -1002,11 +1089,11 @@ def render_event_lake_report(
 def validate_window(window: Mapping[str, Any], task: Mapping[str, Any]) -> None:
     if window.get("schema") != WINDOW_SCHEMA:
         raise ValueError("invalid Event Lake window schema")
-    if window.get("task_id") != task.get("task_id"):
-        raise ValueError("Event Lake task/cache identity mismatch")
+    if window.get("physical_window_id") != task.get("physical_window_id"):
+        raise ValueError("Event Lake physical window/cache identity mismatch")
     if window.get("public_only") is not True:
         raise ValueError("Event Lake window is not public-only")
-    for key in ("event_id", "symbol", "exchange", "start_ms", "end_ms", "timeframe"):
+    for key in ("symbol", "exchange", "start_ms", "end_ms", "timeframe"):
         if key in task and window.get(key) != task.get(key):
             raise ValueError(f"Event Lake window identity mismatch: {key}")
 
@@ -1215,7 +1302,7 @@ def exclusive_file_lock(path: Path, *, timeout_sec: float = 5.0):
             if remove_stale_lock(path):
                 continue
             if time.monotonic() - started >= timeout_sec:
-                raise TimeoutError(f"timed out waiting for ledger lock: {path.name}")
+                raise TimeoutError(f"timed out waiting for file lock: {path.name}")
             time.sleep(0.05)
             continue
         try:

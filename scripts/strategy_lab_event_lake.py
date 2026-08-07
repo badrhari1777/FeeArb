@@ -32,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--post-hours", type=int, default=72)
     parser.add_argument("--timeframe", default="5m")
     parser.add_argument("--execute-public", action="store_true")
+    parser.add_argument(
+        "--all-events",
+        action="store_true",
+        help="Select every logical event up to --max-events instead of one latest event per symbol.",
+    )
     parser.add_argument("--estimate-full-catalog", action="store_true")
     parser.add_argument("--pilot-calls", type=int, default=0)
     parser.add_argument("--pilot-elapsed-sec", type=float, default=0.0)
@@ -51,6 +56,7 @@ def main() -> None:
         pre_hours=max(0, args.pre_hours),
         post_hours=max(1, args.post_hours),
         timeframe=args.timeframe,
+        selection_mode="all_events" if args.all_events else "latest_per_symbol",
     )
     if args.estimate_full_catalog:
         rows = load_pump_event_catalog(PUMP_EVENT_SOURCES)
