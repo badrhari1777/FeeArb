@@ -15,7 +15,7 @@
 артефакты, затем исправить roadmap в том же логическом коммите.
 
 Последнее обновление: `2026-08-07`.
-Текущий этап: `Gate перед full Event Lake collection — требуется решение`.
+Текущий этап: `Funding Forecast v1 реализован; final evaluation ждёт full Event Lake gate`.
 Текущий режим: `research_only_no_trading`.
 
 ## Цель
@@ -136,13 +136,13 @@ ledger и hash-проверяемые артефакты.
 - [x] Посчитать calls/disk/time для 1 540 событий и получить отдельное решение
   перед долгим запуском.
 
-### Этап 2. Funding Forecast v1 — PENDING
+### Этап 2. Funding Forecast v1 — IMPLEMENTED, FINAL EVALUATION PENDING
 
-- [ ] Причинные targets: следующий знак, величина, ослабление и длительность.
-- [ ] Baseline `next_sign = current_sign`.
-- [ ] Features: premium, OI, price, volume, cross-exchange difference, timing.
-- [ ] Chronological splits и целые unseen symbols.
-- [ ] Calibration, Brier/log loss, sign accuracy и экономический replay.
+- [x] Причинные targets: следующий знак, величина, ослабление и длительность.
+- [x] Baseline `next_sign = current_sign`.
+- [x] Features: premium, OI, price, volume, cross-exchange difference, timing.
+- [x] Chronological splits и целые unseen symbols.
+- [x] Calibration, Brier/log loss, sign accuracy и экономический replay.
 - [ ] Paper decisions; shadow только после стабильного holdout.
 
 ### Этап 3. Executable Spread Timing v1 — PENDING
@@ -365,10 +365,37 @@ Shadow -> live:
   Не запускать второй collector или watcher, пока этот процесс жив; после его
   завершения сначала прочитать `postrun_status.json` и validation/replay logs.
 
+### 2026-08-07 — Funding Forecast v1 causal plumbing
+
+- Добавлены `analysis_features/strategy_lab_funding_forecast.py`, CLI и fixture/
+  model regression. Модуль строит один sample на physical event/exchange window,
+  отделяет признаки `ts <= event_ts` от targets `ts > event_ts` и fail-closed
+  отклоняет missing/stale current или missing/too-far next funding.
+- Реализованы next-sign/weakening logistic, next-magnitude/duration ridge,
+  baseline сохранения текущего знака/ставки, chronological validation/test и
+  детерминированный holdout целых symbols, calibration, Brier/log loss,
+  MAE/RMSE и отдельный неисполняемый 24h funding-capture proxy.
+- Межбиржевой feature-only context отделён от label eligibility: окно Bybit без
+  будущей funding-метки может причинно дать Binance sample известные premium/OI,
+  но не попадает в train как размеченный пример. Не наблюдавшаяся смена знака
+  помечается right-censored и исключается из обычной duration regression.
+- Bounded moving pilot на первых `120` уже загруженных окнах подтвердил запись
+  артефактов и cross-exchange premium для всех eligible samples. Последовательные
+  snapshots меняли состав и метрики по мере прихода окон; один snapshot дал
+  `57` eligible / `63` veto, `57` premium contexts и `56` other-exchange OI
+  contexts. Поэтому `final_result_allowed=false`, а частичные accuracy/ROI не
+  являются результатом стратегии и не дают paper/shadow допуска.
+- Fixture regression: `8 passed`; профильный Strategy Lab/Pump/coin regression
+  `147 passed`, `4 warnings`; полный regression `624 passed`, `11 warnings`.
+- Live/ARM/Pump Live/Grid/orders/positions не изменялись; активный collector и
+  его post-run watcher продолжают прежний public-only процесс.
+
 ## Точный следующий шаг
 
 1. дождаться завершения активного resumable public-only сбора;
-2. выполнить строгий `strategy_lab_validate_event_lake.py`, затем проверить
-   zero-call replay;
-3. зафиксировать итог сбора в этом журнале, затем перейти к Этапу 2
-   `Funding Forecast v1`.
+2. прочитать `postrun_status.json` и потребовать успешные strict validation,
+   pinned zero-call replay и повторную strict validation;
+3. запустить Funding Forecast без `--allow-in-progress`, проверить полный
+   coverage, три временных блока, unseen-symbol holdout и sensitivity к costs;
+4. только после стабильного положительного результата отдельно решить вопрос
+   paper; при слабом holdout оставить гипотезу в research и переработать её.

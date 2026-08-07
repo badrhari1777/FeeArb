@@ -106,6 +106,25 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab Funding Forecast v1 causal plumbing was implemented on
+  2026-08-07 while the already-approved full Event Lake collection continued.
+  The research-only runner separates features at/before the event from future
+  labels, fail-closes missing/stale funding, models next sign, weakening,
+  magnitude and uncensored sign duration, and reports chronological plus whole
+  unseen-symbol holdouts against current-sign/rate baselines with calibration,
+  Brier/log loss, MAE/RMSE and a clearly non-executable 24h funding proxy.
+  Cross-exchange feature context is label-independent: a Bybit window missing
+  its future funding label can still provide causal premium/OI context to an
+  eligible Binance sample without entering training as a label. A moving
+  120-window partial pilot confirmed artifact/coverage plumbing but changed
+  metrics as new earlier windows arrived, so it remains explicitly
+  `final_result_allowed=false` and cannot promote paper/shadow. Canonical
+  commands and the final full-data gate are in
+  `instructions/16_STRATEGY_LAB.md` and
+  `instructions/17_STRATEGY_LAB_ROADMAP.md`. Fixture regression passed (`8`),
+  focused Strategy Lab/Pump/coin regression passed (`147`, `4 warnings`), and
+  the complete suite passed (`624`, `11 warnings`). Live/ARM/Pump Live/Grid/
+  orders/positions were not changed.
 - The operator-approved Strategy Lab full public collection started on
   2026-08-07 at 13:03 MSK from committed exact-window code `5169080`. Its
   ignored resumable output is

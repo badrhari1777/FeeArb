@@ -157,6 +157,42 @@ $eventLakeManifest = Get-Content -Raw data\research\strategy_lab_event_lake_v4_f
 `3 080` ledger records. Не запускать audited replay без `--code-commit` после
 изменения HEAD: cache останется тем же, но manifest provenance будет переписан.
 
+### Funding Forecast v1
+
+Строгий причинный replay запускается только после полного Event Lake и успешного
+post-run gate:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\strategy_lab_funding_forecast.py --input-dir data\research\strategy_lab_event_lake_v4_full --output-dir data\research\strategy_lab_funding_forecast_v1
+```
+
+Для проверки кода на незавершённом collection разрешён только явно ограниченный
+пилот. Его результаты не являются выводом модели и не разрешают paper/shadow:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\strategy_lab_funding_forecast.py --input-dir data\research\strategy_lab_event_lake_v4_full --output-dir data\research\strategy_lab_funding_forecast_v1_partial --allow-in-progress --max-windows 120
+```
+
+Модуль использует только признаки с `ts <= event_ts`, а targets — только строки
+с `ts > event_ts`. Отсутствующие значения не превращаются в нули: для модели
+используются train-only median и отдельный missing-индикатор. Окно другой биржи
+может дать известный на момент события premium/OI-контекст даже без будущей
+funding-метки, но не становится размеченным train sample. Не наблюдавшаяся до
+конца окна смена знака является right-censored и исключается из обычной
+регрессии длительности.
+
+Пакет `data/research/strategy_lab_funding_forecast_v1/` содержит:
+
+- `samples.csv` и `vetoes.csv` — eligible causal samples и fail-closed причины;
+- `metrics.csv` — chronological/unseen-symbol baselines и модели;
+- `calibration.csv`, `coefficients.csv`, `predictions.csv` — аудит прогноза;
+- `veto_summary.csv`, `metadata.json`, `index.md` — coverage и provenance.
+
+`metadata.final_result_allowed=true` возможно только для строгого полного
+Event Lake. Funding-capture в v1 — диагностический 24h proxy с cost scenario,
+а не исполнимый арбитраж: bid/ask, slippage, capacity и lifecycle относятся к
+следующему этапу Executable Spread Timing.
+
 Локальный reader пишет в `data/research/strategy_lab_local_archive/`:
 
 - `archive_index.json` — offsets, длины, SHA-256 и identity 1 707 записей;
