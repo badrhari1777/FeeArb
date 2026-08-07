@@ -125,7 +125,12 @@ Recent Changes
   pass the full original manifest commit via `--code-commit`; otherwise the
   cache would remain unchanged but provenance would be overwritten. The pin is
   regression-covered (`18` Event Lake/validator tests; full suite `616`,
-  `11 warnings`).
+  `11 warnings`). A single hidden post-run watcher was attached to collector
+  PID `5148` at 13:12 MSK. Inspect the ignored
+  `data/research/strategy_lab_event_lake_v4_full/postrun_status.json` first:
+  it waits for collection, runs strict validation, performs the pinned
+  zero-call replay, validates again, and stops fail-closed on any error. Do not
+  launch a duplicate collector or watcher while those processes are alive.
 - Strategy Lab exact-window caching was implemented on 2026-08-07 before the
   operator-approved full public collection. Event Lake v4 keeps all 1,540
   logical event IDs and 3,080 per-exchange ledger tasks while storing only

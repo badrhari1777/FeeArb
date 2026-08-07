@@ -355,6 +355,15 @@ Shadow -> live:
   `--code-commit 5169080...` и обновление этого журнала.
 - CLI pin исходного collector commit покрыт регрессией: Event Lake/validator
   `18 passed`; полный regression `616 passed`, `11 warnings`.
+- В `13:12 MSK` запущен один hidden post-run watcher для исходного collector
+  PID `5148`. Его durable runtime status:
+  `data/research/strategy_lab_event_lake_v4_full/postrun_status.json`.
+  Начальное состояние `waiting / collector`, watcher stderr пуст. После выхода
+  collector он последовательно выполняет strict validation, audited zero-call
+  replay с commit из manifest и повторный strict validation; любая ошибка
+  записывает `status=failed` и не запускает следующий исследовательский этап.
+  Не запускать второй collector или watcher, пока этот процесс жив; после его
+  завершения сначала прочитать `postrun_status.json` и validation/replay logs.
 
 ## Точный следующий шаг
 
