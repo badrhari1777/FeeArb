@@ -15,7 +15,7 @@
 артефакты, затем исправить roadmap в том же логическом коммите.
 
 Последнее обновление: `2026-08-07`.
-Текущий этап: `Этап 1.1 — source-specific feature completion`.
+Текущий этап: `Этап 1.2 — local/public merge и source-specific gaps`.
 Текущий режим: `research_only_no_trading`.
 
 ## Цель
@@ -128,8 +128,9 @@ ledger и hash-проверяемые артефакты.
 
 Критерий core выполнен bounded-пилотом. До масштабирования остаётся Stage 1.1:
 
-- [ ] Инвентаризировать поля 3,397 GiB локального multi-exchange архива.
-- [ ] Читать локальный архив первым, публичный API использовать для пробелов.
+- [x] Инвентаризировать поля 3,397 GiB локального multi-exchange архива.
+- [x] Построить SHA-проверяемый byte-offset local reader.
+- [ ] Объединить local-first reader с public cache без потери 5m точности.
 - [ ] Добавить source-specific mark/index/premium endpoints.
 - [ ] Зафиксировать доступную глубину historical OI и причины retention gaps.
 - [ ] Посчитать calls/disk/time для 1 540 событий и получить отдельное решение
@@ -246,14 +247,30 @@ Shadow -> live:
   `11 warnings`; live/ARM не затронуты.
 - Коммит этого блока: `Add resumable Strategy Lab Event Lake` (см. Git history).
 
+### 2026-08-07 — Local archive index и pilot
+
+- Проинвентаризированы все `42` файла архива объёмом `3,397 GiB`.
+- Timeseries слой: шесть `symbol_samples.jsonl`, около `1,92 GiB`, один JSON
+  object на symbol-exchange; comparison `outcomes.csv` (`1,72 GiB`) для чтения
+  event windows не требуется.
+- Построен byte-offset index `1 707` symbol-exchange записей с проверкой числа
+  строк, SHA-256 исходных JSONL/summary и identity при каждом чтении; первый
+  проход `6,0s`, повторный `0,35s`.
+- Zero-network pilot COTI/HFT/SIREN: `18` задач, `11` доступных символ-биржа,
+  `8` OHLCV окон, `6` funding окон, исторические OI/L-S `0`, mark/index/premium
+  отсутствуют в archive schema.
+- Проверки: Strategy Lab `15 passed`; полный regression `600 passed`,
+  `11 warnings`; live/ARM не затронуты.
+- Коммит этого блока: `Index local Pump archive for Strategy Lab` (см. history).
+
 ## Точный следующий шаг
 
-Реализовать Этап 1.1 без долгого сетевого запуска:
+Реализовать Этап 1.2 без долгого запуска:
 
-1. описать schema 42 файлов локального multi-exchange Pump-архива;
-2. построить local-first reader по `event_id/symbol/window/exchange`;
-3. измерить покрытие OHLCV/funding/OI/premium/mark/index в архиве;
-4. добавить source-specific API только для реально отсутствующих полей;
-5. повторить bounded pilot и проверить cache/ledger identity;
+1. объединить local archive window и public cache по dataset/resolution;
+2. предпочитать полные public 5m OHLCV локальным 1h, но заполнять local gaps;
+3. сохранять per-dataset provenance/hash и не смешивать несовместимые значения;
+4. добавить deterministic merge tests и bounded 3-event replay;
+5. затем добавить source-specific API только для OI/mark/index/premium gaps;
 6. подготовить оценку полного запуска: tasks, calls, disk, runtime, gaps;
-7. запросить отдельное подтверждение перед сбором всех 1 540 событий.
+7. запросить подтверждение перед сбором всех 1 540 событий.

@@ -106,6 +106,19 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab local-archive indexing was added on 2026-08-07 as the next
+  zero-network regression block. The reader verifies summary/JSONL row counts,
+  records byte offsets plus SHA-256 identities, validates symbol/exchange on
+  every extracted object, and builds causal windows without loading or
+  rescanning the 1.92 GiB timeseries layer. The full 3.397 GiB archive contains
+  42 files and 1,707 indexed symbol-exchange rows; the initial index took about
+  6 seconds and reuse about 0.35 seconds. The COTI/HFT/SIREN six-exchange pilot
+  produced 18 tasks: 11 listed combinations, eight 96-row 1h OHLCV windows and
+  six funding windows. OI/L-S were absent in those historical windows and
+  mark/index/premium are absent from the archive schema, so they remain explicit
+  gaps. Verified Strategy Lab regression (`15 passed`), Python compilation and
+  the complete suite (`600 passed`, `11 warnings`). Next is deterministic
+  local/public per-dataset merge; live/ARM remain unchanged.
 - Strategy Lab Event Lake core was added on 2026-08-07 without touching live
   services. It builds a deterministic public-only enrichment manifest, hashes
   event/config/source identity, estimates calls before execution, paginates

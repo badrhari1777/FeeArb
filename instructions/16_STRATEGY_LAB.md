@@ -46,6 +46,16 @@ Preflight не создаёт биржевые клиенты и заранее 
 Повторный запуск обязан использовать `windows/` cache, показать
 `public_calls_this_run=0` и не добавлять дубли в `ledger.jsonl`.
 
+Локальный архив без сети:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\strategy_lab_local_archive.py --symbols COTIUSDT,HFTUSDT,SIRENUSDT --exchanges binance,bitget,bybit,kucoin,mexc,okx
+```
+
+Первый запуск строит SHA-проверяемый byte-offset index примерно 1,92 GiB
+per-symbol JSONL. Повторный запуск должен показать `index_reused=true` и не
+читать гигабайтные строки последовательно заново.
+
 Результат создаётся в `data/research/strategy_lab/`. Каталог игнорируется Git и
 может безопасно пересоздаваться. Исходная SQLite база открывается в режиме
 `mode=ro`, а логи и Pump-выгрузки только читаются.
@@ -72,6 +82,13 @@ Event Lake пишет отдельный пакет в `data/research/strategy_l
 - `coverage.csv` — market/contract/OHLCV/funding/OI coverage и ошибки;
 - `ledger.jsonl` — append-only `strategy_lab_ledger_v1`;
 - `index.md` и `metadata.json` — проверяемая сводка запуска.
+
+Локальный reader пишет в `data/research/strategy_lab_local_archive/`:
+
+- `archive_index.json` — offsets, длины, SHA-256 и identity 1 707 записей;
+- `file_inventory.csv` — роли и размер всех 42 файлов;
+- `windows/*.json` — причинно обрезанные локальные окна;
+- `coverage.csv`, `metadata.json`, `index.md` — фактическое покрытие.
 
 Ledger не заменяет и не переписывает существующие Pump Live, auto-exit,
 auto-arb, de-risk или protective-shadow журналы. Их нормализация будет отдельным
