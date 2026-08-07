@@ -46,6 +46,32 @@ Preflight не создаёт биржевые клиенты и заранее 
 Повторный запуск обязан использовать `windows/` cache, показать
 `public_calls_this_run=0` и не добавлять дубли в `ledger.jsonl`.
 
+Source-specific public provider собирает также `mark`, `index` и `premium`
+5m klines. Для historical OI действуют разные правила:
+
+- Binance `/futures/data/openInterestHist` официально хранит только последний
+  месяц; Event Lake использует консервативный cutoff 30 дней и старые окна
+  помечает `retention_gap` без бесполезного запроса;
+- Bybit `/v5/market/open-interest` допускает историю до запуска символа;
+  запрос обязательно ограничивается `endTime` и листается назад, иначе API
+  возвращает свежий хвост вместо старого окна.
+
+Официальные спецификации: [Binance Futures market data](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data),
+[Bybit OI](https://bybit-exchange.github.io/docs/v5/market/open-interest),
+[Bybit mark](https://bybit-exchange.github.io/docs/v5/market/mark-kline),
+[Bybit index](https://bybit-exchange.github.io/docs/v5/market/index-kline),
+[Bybit premium](https://bybit-exchange.github.io/docs/v5/market/premium-index-kline).
+
+Оценка полного каталога без сетевых запросов:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\strategy_lab_event_lake.py --output-dir data\research\strategy_lab_event_lake_v3_clean --estimate-full-catalog --pilot-calls 96 --pilot-elapsed-sec 36.56
+```
+
+Команда пишет `full_run_estimate.json`. Это только preflight; она не является
+разрешением на долгий сбор. Перед полным запуском требуется отдельное решение и
+реализация exact-window cache для повторяющихся `symbol + timestamp` окон.
+
 Локальный архив без сети:
 
 ```powershell
@@ -88,9 +114,14 @@ Event Lake пишет отдельный пакет в `data/research/strategy_l
 
 - `manifest.json` — immutable event/task identity и оценка API-бюджета;
 - `windows/<task_id>.json` — versioned public-only cache;
-- `coverage.csv` — market/contract/OHLCV/funding/OI coverage и ошибки;
+- `coverage.csv` — market/contract/OHLCV/funding/OI/mark/index/premium coverage;
 - `ledger.jsonl` — append-only `strategy_lab_ledger_v1`;
 - `index.md` и `metadata.json` — проверяемая сводка запуска.
+- `full_run_estimate.json` — calls/disk/runtime для полного каталога без сети.
+
+Ledger append защищён коротким межпроцессным lock и повторно проверяет
+`record_id` непосредственно перед `fsync`. Одновременный одинаковый запуск не
+должен создавать дубли; stale lock удаляется только если его PID уже не жив.
 
 Локальный reader пишет в `data/research/strategy_lab_local_archive/`:
 

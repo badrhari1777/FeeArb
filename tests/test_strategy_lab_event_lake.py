@@ -8,7 +8,11 @@ import pytest
 
 from analysis_features.strategy_lab_event_lake import (
     EventLakeConfig,
+    append_jsonl_once,
     build_enrichment_manifest,
+    estimate_full_catalog_run,
+    fetch_derived_price_pages,
+    fetch_oi_pages,
     fetch_ohlcv_pages,
     run_event_lake,
     select_catalog_events,
@@ -55,7 +59,7 @@ class FakePublicProvider:
         )
         missing_error = "" if self.market_available else "symbol_unavailable"
         return {
-            "schema": "strategy_lab_public_window_v2",
+            "schema": "strategy_lab_public_window_v3",
             "task_id": task["task_id"],
             "event_id": task["event_id"],
             "symbol": task["symbol"],
@@ -110,7 +114,7 @@ def test_manifest_is_deterministic_and_estimates_bounded_calls() -> None:
     assert first["run_id"] == second["run_id"]
     assert first["source_manifest_hash"] == second["source_manifest_hash"]
     assert len(first["tasks"]) == 6
-    assert first["estimated_public_calls"] == 42
+    assert first["estimated_public_calls"] == 114
     assert {task["expected_candles"] for task in first["tasks"]} == {1152}
 
 
@@ -271,3 +275,164 @@ def test_ohlcv_pagination_is_bounded_and_deduplicated() -> None:
     assert [row["ts_ms"] for row in result["rows"]] == sorted(
         row["ts_ms"] for row in result["rows"]
     )
+
+
+def test_derived_price_pagination_uses_confirmed_price_kind() -> None:
+    class FakeClient:
+        has = {"fetchOHLCV": True}
+
+        def __init__(self) -> None:
+            self.params: list[dict[str, str]] = []
+            self.rows = [
+                [BASE_TS + index * 300_000, 1, 2, 0.5, 1.5, 0]
+                for index in range(3)
+            ]
+
+        def fetch_ohlcv(
+            self,
+            symbol: str,
+            timeframe: str,
+            *,
+            since: int,
+            limit: int,
+            params: dict[str, str],
+        ) -> list[list[float]]:
+            del symbol, timeframe
+            self.params.append(params)
+            return [row for row in self.rows if row[0] >= since][:limit]
+
+    client = FakeClient()
+    result = fetch_derived_price_pages(
+        client,
+        symbol="A/USDT:USDT",
+        timeframe="5m",
+        start_ms=BASE_TS,
+        end_ms=BASE_TS + 3 * 300_000,
+        limit=2,
+        price_kind="premiumIndex",
+    )
+
+    assert len(result["rows"]) == 3
+    assert result["endpoint_kind"] == "premiumIndex"
+    assert client.params == [{"price": "premiumIndex"}, {"price": "premiumIndex"}]
+
+
+def test_binance_oi_retention_gap_skips_network_call() -> None:
+    class FakeClient:
+        id = "binanceusdm"
+        has = {"fetchOpenInterestHistory": True}
+
+        def fetch_open_interest_history(self, *args: Any, **kwargs: Any) -> list[Any]:
+            raise AssertionError("retention gap must not call Binance")
+
+    result = fetch_oi_pages(
+        FakeClient(),
+        symbol="A/USDT:USDT",
+        timeframe="5m",
+        start_ms=BASE_TS,
+        end_ms=BASE_TS + 300_000,
+        limit=200,
+        now_ms=BASE_TS + 31 * 86_400_000,
+    )
+
+    assert result["supported"] is True
+    assert result["request_skipped"] is True
+    assert result["calls"] == 0
+    assert result["error"] == "retention_gap:binance_open_interest_latest_1_month"
+
+
+def test_bybit_oi_pages_backwards_with_bounded_end_time() -> None:
+    class FakeClient:
+        id = "bybit"
+        has = {"fetchOpenInterestHistory": True}
+
+        def __init__(self) -> None:
+            self.until: list[int] = []
+            self.rows = [
+                {"timestamp": BASE_TS + index * 300_000, "openInterestAmount": 10 + index}
+                for index in range(5)
+            ]
+
+        def fetch_open_interest_history(
+            self,
+            symbol: str,
+            timeframe: str,
+            *,
+            since: int,
+            limit: int,
+            params: dict[str, int],
+        ) -> list[dict[str, Any]]:
+            del symbol, timeframe
+            self.until.append(params["until"])
+            eligible = [row for row in self.rows if since <= row["timestamp"] <= params["until"]]
+            return list(reversed(eligible[-limit:]))
+
+    client = FakeClient()
+    result = fetch_oi_pages(
+        client,
+        symbol="A/USDT:USDT",
+        timeframe="5m",
+        start_ms=BASE_TS,
+        end_ms=BASE_TS + 5 * 300_000,
+        limit=2,
+        now_ms=BASE_TS + 100 * 86_400_000,
+    )
+
+    assert len(result["rows"]) == 5
+    assert result["calls"] == 3
+    assert client.until == [BASE_TS + 5 * 300_000 - 1, BASE_TS + 3 * 300_000 - 1, BASE_TS + 300_000 - 1]
+    assert [row["ts_ms"] for row in result["rows"]] == sorted(
+        row["ts_ms"] for row in result["rows"]
+    )
+
+
+def test_ledger_append_is_cross_process_idempotent(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.jsonl"
+    payload = {
+        "schema": "strategy_lab_ledger_v1",
+        "run_id": "run-one",
+        "record_id": "record-one",
+        "record_type": "enrichment_result",
+        "mode": "research_replay",
+        "event_id": "event-one",
+        "hypothesis_id": "hypothesis-one",
+        "symbol": "AUSDT",
+        "source_ts_ms": BASE_TS,
+        "decision": "WAIT",
+        "features_hash": "features-one",
+        "code_commit": "commit-one",
+        "config_hash": "config-one",
+        "source_manifest_hash": "source-one",
+    }
+
+    assert append_jsonl_once(path, payload) is True
+    assert append_jsonl_once(path, payload) is False
+    assert len(path.read_text(encoding="utf-8").splitlines()) == 1
+    assert not (tmp_path / ".ledger.jsonl.lock").exists()
+
+
+def test_full_run_estimate_separates_logical_and_physical_windows() -> None:
+    rows = [
+        event("AUSDT", BASE_TS),
+        event("AUSDT", BASE_TS, "pump_universe_hourly_spike"),
+        event("BUSDT", BASE_TS + 300_000),
+    ]
+    config = EventLakeConfig(exchanges=("binance", "bybit"), max_events=1)
+
+    estimate = estimate_full_catalog_run(
+        rows,
+        config,
+        as_of_ms=BASE_TS + 40 * 86_400_000,
+        average_window_bytes=1000,
+        pilot_calls=32,
+        pilot_elapsed_sec=16,
+    )
+
+    assert estimate["logical_events"] == 3
+    assert estimate["unique_symbol_timestamp_windows"] == 2
+    assert estimate["logical_tasks_without_window_dedupe"] == 6
+    assert estimate["physical_tasks_with_exact_window_dedupe"] == 4
+    assert estimate["estimated_calls_with_exact_window_dedupe"] == 64
+    assert estimate["estimated_calls_without_window_dedupe"] == 96
+    assert estimate["estimated_disk_bytes_with_exact_window_dedupe"] == 4000
+    assert estimate["estimated_runtime_sec_with_exact_window_dedupe"] == 32

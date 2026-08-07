@@ -4,9 +4,11 @@ import csv
 import hashlib
 import json
 import math
+import os
 import subprocess
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,9 +26,15 @@ from analysis_features.strategy_lab import (
 DEFAULT_OUTPUT_DIR = BASE_DIR / "data" / "research" / "strategy_lab_event_lake"
 LEDGER_SCHEMA = "strategy_lab_ledger_v1"
 MANIFEST_SCHEMA = "strategy_lab_enrichment_manifest_v1"
-WINDOW_SCHEMA = "strategy_lab_public_window_v2"
+WINDOW_SCHEMA = "strategy_lab_public_window_v3"
 ALLOWED_MODES = {"research_replay", "paper", "shadow"}
 ALLOWED_DECISIONS = {"VETO", "WAIT", "ENTER", "HOLD", "EXIT", "RISK_EXIT"}
+BINANCE_OI_RETENTION_MS = 30 * 86_400_000
+DERIVED_PRICE_KINDS = {
+    "mark": "mark",
+    "index": "index",
+    "premium": "premiumIndex",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +141,7 @@ def run_event_lake(
             )
             validate_ledger_record(record)
             if record["record_id"] not in existing_record_ids:
-                append_jsonl(ledger_path, record)
+                append_jsonl_once(ledger_path, record)
                 existing_record_ids.add(str(record["record_id"]))
         status = str(task["status"])
         status_counts[status] = status_counts.get(status, 0) + 1
@@ -242,6 +250,10 @@ def build_enrichment_manifest(
         end_ms = event["ts_ms"] + config.post_hours * 3_600_000
         expected_candles = max(0, math.ceil((end_ms - start_ms) / tf_ms))
         expected_pages = max(1, math.ceil(expected_candles / config.request_limit))
+        expected_oi_pages = max(
+            1,
+            math.ceil(expected_candles / min(config.request_limit, 200)),
+        )
         for exchange in config.exchanges:
             identity = {
                 "event_id": event["event_id"],
@@ -262,8 +274,11 @@ def build_enrichment_manifest(
                     "estimated_calls": {
                         "ohlcv": expected_pages,
                         "funding": 1,
-                        "open_interest": expected_pages,
-                        "total": expected_pages * 2 + 1,
+                        "open_interest": expected_oi_pages,
+                        "mark": expected_pages,
+                        "index": expected_pages,
+                        "premium": expected_pages,
+                        "total": expected_pages * 4 + expected_oi_pages + 1,
                     },
                     "status": "planned",
                 }
@@ -283,15 +298,113 @@ def build_enrichment_manifest(
     }
 
 
+def estimate_full_catalog_run(
+    rows: Sequence[Mapping[str, Any]],
+    config: EventLakeConfig,
+    *,
+    as_of_ms: int,
+    average_window_bytes: float | None = None,
+    pilot_calls: int | None = None,
+    pilot_elapsed_sec: float | None = None,
+) -> dict[str, Any]:
+    """Estimate the full catalog without constructing clients or making requests."""
+
+    config.validate()
+    logical_events = {
+        str(row.get("pump_event_id") or ""): (
+            normalize_symbol(row.get("symbol")),
+            int(row.get("ts_ms") or 0),
+        )
+        for row in rows
+        if row.get("pump_event_id") and normalize_symbol(row.get("symbol"))
+    }
+    physical_events = set(logical_events.values())
+    tf_ms = timeframe_ms(config.timeframe)
+    expected_candles = math.ceil(
+        (config.pre_hours + config.post_hours) * 3_600_000 / tf_ms
+    )
+    price_pages = max(1, math.ceil(expected_candles / config.request_limit))
+    oi_pages = max(1, math.ceil(expected_candles / min(config.request_limit, 200)))
+    def calls_for_events(exchange: str, events: Sequence[tuple[str, int]]) -> int:
+        total = 0
+        for _, event_ts_ms in events:
+            end_ms = event_ts_ms + config.post_hours * 3_600_000
+            oi_calls = oi_pages
+            if exchange == "binance" and end_ms <= as_of_ms - BINANCE_OI_RETENTION_MS:
+                oi_calls = 0
+            total += price_pages * 4 + oi_calls + 1
+        return total
+
+    physical_event_rows = sorted(physical_events)
+    logical_event_rows = list(logical_events.values())
+    calls_per_exchange = {
+        exchange: calls_for_events(exchange, physical_event_rows)
+        for exchange in config.exchanges
+    }
+    calls_without_dedupe_per_exchange = {
+        exchange: calls_for_events(exchange, logical_event_rows)
+        for exchange in config.exchanges
+    }
+    exact_dedupe_calls = sum(calls_per_exchange.values())
+    no_dedupe_calls = sum(calls_without_dedupe_per_exchange.values())
+    physical_tasks = len(physical_events) * len(config.exchanges)
+    logical_tasks = len(logical_events) * len(config.exchanges)
+    estimate = {
+        "schema": "strategy_lab_full_run_estimate_v1",
+        "public_only": True,
+        "as_of_ms": int(as_of_ms),
+        "logical_events": len(logical_events),
+        "unique_symbol_timestamp_windows": len(physical_events),
+        "duplicate_logical_windows": len(logical_events) - len(physical_events),
+        "logical_tasks_without_window_dedupe": logical_tasks,
+        "physical_tasks_with_exact_window_dedupe": physical_tasks,
+        "expected_candles_per_task": expected_candles,
+        "estimated_calls_per_task": {
+            "binance_retention_gap": price_pages * 4 + 1,
+            "bybit_with_oi": price_pages * 4 + oi_pages + 1,
+            "worst_case": price_pages * 4 + oi_pages + 1,
+        },
+        "estimated_calls_without_window_dedupe": no_dedupe_calls,
+        "estimated_calls_with_exact_window_dedupe": exact_dedupe_calls,
+        "estimated_calls_by_exchange_with_dedupe": calls_per_exchange,
+        "estimated_calls_by_exchange_without_dedupe": calls_without_dedupe_per_exchange,
+        "binance_oi_retention_policy": "latest_1_month_conservative_30d",
+    }
+    if average_window_bytes is not None and average_window_bytes > 0:
+        estimate["estimated_disk_bytes_without_window_dedupe"] = round(
+            logical_tasks * average_window_bytes
+        )
+        estimate["estimated_disk_bytes_with_exact_window_dedupe"] = round(
+            physical_tasks * average_window_bytes
+        )
+    if pilot_calls and pilot_elapsed_sec is not None and pilot_elapsed_sec > 0:
+        seconds_per_call = pilot_elapsed_sec / pilot_calls
+        estimate["pilot_seconds_per_call"] = round(seconds_per_call, 6)
+        estimate["estimated_runtime_sec_without_window_dedupe"] = round(
+            no_dedupe_calls * seconds_per_call
+        )
+        estimate["estimated_runtime_sec_with_exact_window_dedupe"] = round(
+            exact_dedupe_calls * seconds_per_call
+        )
+    return estimate
+
+
 class CcxtPublicEventProvider:
     public_only = True
 
-    def __init__(self, *, request_limit: int, timeframe: str) -> None:
+    def __init__(
+        self,
+        *,
+        request_limit: int,
+        timeframe: str,
+        now_ms: int | None = None,
+    ) -> None:
         import ccxt
 
         self._ccxt = ccxt
         self._request_limit = request_limit
         self._timeframe = timeframe
+        self._now_ms = int(now_ms) if now_ms is not None else int(time.time() * 1000)
         self._clients: dict[str, Any] = {}
         self._markets: dict[str, dict[str, Any]] = {}
 
@@ -351,11 +464,21 @@ class CcxtPublicEventProvider:
                     timeframe=self._timeframe,
                     start_ms=start_ms,
                     end_ms=end_ms,
-                    limit=self._request_limit,
+                    limit=min(self._request_limit, 200),
+                    now_ms=self._now_ms,
                 ),
-                "mark": unavailable_dataset("historical_mark_not_supported_by_generic_provider"),
-                "index": unavailable_dataset("historical_index_not_supported_by_generic_provider"),
-                "premium": unavailable_dataset("historical_premium_not_supported_by_generic_provider"),
+                **{
+                    name: fetch_derived_price_pages(
+                        client,
+                        symbol=symbol,
+                        timeframe=self._timeframe,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                        limit=self._request_limit,
+                        price_kind=price_kind,
+                    )
+                    for name, price_kind in DERIVED_PRICE_KINDS.items()
+                },
             },
         }
 
@@ -475,10 +598,35 @@ def fetch_oi_pages(
     start_ms: int,
     end_ms: int,
     limit: int,
+    now_ms: int | None = None,
 ) -> dict[str, Any]:
     if not client.has.get("fetchOpenInterestHistory"):
         return unavailable_dataset("fetchOpenInterestHistory_not_supported")
+    exchange = str(getattr(client, "id", "") or "").lower()
+    effective_now_ms = int(now_ms) if now_ms is not None else int(time.time() * 1000)
+    query_start_ms = start_ms
+    retention_note = ""
+    if exchange.startswith("binance"):
+        retention_start_ms = effective_now_ms - BINANCE_OI_RETENTION_MS
+        if end_ms <= retention_start_ms:
+            return skipped_dataset(
+                "retention_gap:binance_open_interest_latest_1_month",
+                retention_policy="latest_1_month_conservative_30d",
+            )
+        if start_ms < retention_start_ms:
+            query_start_ms = retention_start_ms
+            retention_note = "retention_partial:binance_open_interest_latest_1_month"
+    if exchange == "bybit":
+        return fetch_bybit_oi_pages(
+            client,
+            symbol=symbol,
+            timeframe=timeframe,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            limit=min(limit, 200),
+        )
     cursor = start_ms
+    cursor = max(cursor, query_start_ms)
     step_ms = timeframe_ms(timeframe)
     by_ts: dict[int, dict[str, Any]] = {}
     calls = 0
@@ -511,7 +659,131 @@ def fetch_oi_pages(
         cursor = next_cursor
         if len(raw or []) < limit:
             break
-    return dataset_payload(by_ts, calls=calls, error=error)
+    return dataset_payload(by_ts, calls=calls, error=error or retention_note)
+
+
+def fetch_bybit_oi_pages(
+    client: Any,
+    *,
+    symbol: str,
+    timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int,
+) -> dict[str, Any]:
+    """Page backwards because Bybit anchors bounded OI history at ``endTime``."""
+
+    step_ms = timeframe_ms(timeframe)
+    cursor_end = end_ms - 1
+    by_ts: dict[int, dict[str, Any]] = {}
+    calls = 0
+    error = ""
+    while cursor_end >= start_ms and calls < 50:
+        calls += 1
+        try:
+            raw = client.fetch_open_interest_history(
+                symbol,
+                timeframe,
+                since=start_ms,
+                limit=limit,
+                params={"until": cursor_end},
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            error = compact_error(exc)
+            break
+        timestamps = [int(row["timestamp"]) for row in raw or [] if row.get("timestamp") is not None]
+        for row in raw or []:
+            ts_ms = row.get("timestamp")
+            if ts_ms is None or not start_ms <= int(ts_ms) < end_ms:
+                continue
+            value = first_finite(
+                row.get("openInterestAmount"),
+                row.get("openInterest"),
+                row.get("baseVolume"),
+                row.get("quoteVolume"),
+            )
+            by_ts[int(ts_ms)] = {"ts_ms": int(ts_ms), "open_interest": value}
+        if not timestamps:
+            break
+        next_end = min(timestamps) - 1
+        if next_end >= cursor_end:
+            error = "pagination_stalled"
+            break
+        cursor_end = next_end
+        if min(timestamps) <= start_ms or len(raw or []) < limit:
+            break
+        if cursor_end < start_ms - step_ms:
+            break
+    return dataset_payload(
+        by_ts,
+        calls=calls,
+        error=error,
+        retention_policy="to_symbol_launch_time",
+    )
+
+
+def fetch_derived_price_pages(
+    client: Any,
+    *,
+    symbol: str,
+    timeframe: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int,
+    price_kind: str,
+) -> dict[str, Any]:
+    if price_kind not in DERIVED_PRICE_KINDS.values():
+        raise ValueError(f"unsupported derived price kind: {price_kind}")
+    if not client.has.get("fetchOHLCV"):
+        return unavailable_dataset("fetchOHLCV_not_supported")
+    cursor = start_ms
+    step_ms = timeframe_ms(timeframe)
+    by_ts: dict[int, dict[str, Any]] = {}
+    calls = 0
+    error = ""
+    while cursor < end_ms and calls < 50:
+        calls += 1
+        try:
+            raw = client.fetch_ohlcv(
+                symbol,
+                timeframe,
+                since=cursor,
+                limit=limit,
+                params={"price": price_kind},
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            error = compact_error(exc)
+            break
+        page_timestamps: list[int] = []
+        for item in raw or []:
+            if not item or item[0] is None:
+                continue
+            ts_ms = int(item[0])
+            page_timestamps.append(ts_ms)
+            if start_ms <= ts_ms < end_ms:
+                by_ts[ts_ms] = {
+                    "ts_ms": ts_ms,
+                    "open": finite_float(item[1]),
+                    "high": finite_float(item[2]),
+                    "low": finite_float(item[3]),
+                    "close": finite_float(item[4]),
+                }
+        if not page_timestamps:
+            break
+        next_cursor = max(page_timestamps) + step_ms
+        if next_cursor <= cursor:
+            error = "pagination_stalled"
+            break
+        cursor = next_cursor
+        if len(raw or []) < limit and cursor < end_ms:
+            break
+    return dataset_payload(
+        by_ts,
+        calls=calls,
+        error=error,
+        endpoint_kind=price_kind,
+        retention_policy="not_limited_in_official_endpoint_docs",
+    )
 
 
 def coverage_from_task(
@@ -704,13 +976,14 @@ def render_event_lake_report(
         f"- Statuses: `{json.dumps(metadata.get('status_counts') or {}, sort_keys=True)}`",
         f"- Ledger records: {metadata.get('ledger_records')}",
         "",
-        "| Symbol | Exchange | Status | OHLCV | Coverage | Funding | OI | Missing |",
-        "|---|---|---|---:|---:|---:|---:|---|",
+        "| Symbol | Exchange | Status | OHLCV | Coverage | Funding | OI | Mark | Index | Premium | Missing |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in coverage:
         lines.append(
             "| {symbol} | {exchange} | {status} | {ohlcv_rows} | {ohlcv_coverage_pct}% | "
-            "{funding_rows} | {oi_rows} | {missing_datasets} |".format(
+            "{funding_rows} | {oi_rows} | {mark_rows} | {index_rows} | {premium_rows} | "
+            "{missing_datasets} |".format(
                 **{key: row.get(key, "") for key in row}
             )
         )
@@ -781,18 +1054,34 @@ def resolve_public_market(markets: Mapping[str, Any], canonical_symbol: str) -> 
 
 
 def dataset_payload(
-    by_ts: Mapping[int, Mapping[str, Any]], *, calls: int, error: str
+    by_ts: Mapping[int, Mapping[str, Any]],
+    *,
+    calls: int,
+    error: str,
+    **metadata: Any,
 ) -> dict[str, Any]:
     return {
         "supported": True,
         "calls": calls,
         "rows": [dict(by_ts[ts]) for ts in sorted(by_ts)],
         "error": error,
+        **metadata,
     }
 
 
 def unavailable_dataset(reason: str) -> dict[str, Any]:
     return {"supported": False, "calls": 0, "rows": [], "error": reason}
+
+
+def skipped_dataset(reason: str, **metadata: Any) -> dict[str, Any]:
+    return {
+        "supported": True,
+        "request_skipped": True,
+        "calls": 0,
+        "rows": [],
+        "error": reason,
+        **metadata,
+    }
 
 
 def empty_series(reason: str) -> dict[str, Any]:
@@ -897,19 +1186,106 @@ def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         writer.writerows(materialized)
 
 
-def append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
+def append_jsonl_once(path: Path, payload: Mapping[str, Any]) -> bool:
+    """Append one unique record under a short cross-process lock."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(dict(payload), ensure_ascii=True, sort_keys=True))
-        handle.write("\n")
+    record_id = str(payload.get("record_id") or "")
+    if not record_id:
+        raise ValueError("JSONL record_id is required")
+    with exclusive_file_lock(path.with_name(f".{path.name}.lock")):
+        if record_id in read_ledger_record_ids(path):
+            return False
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(payload), ensure_ascii=True, sort_keys=True))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    return True
+
+
+@contextmanager
+def exclusive_file_lock(path: Path, *, timeout_sec: float = 5.0):
+    started = time.monotonic()
+    token = {"pid": os.getpid(), "created_at_ms": int(time.time() * 1000)}
+    while True:
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if remove_stale_lock(path):
+                continue
+            if time.monotonic() - started >= timeout_sec:
+                raise TimeoutError(f"timed out waiting for ledger lock: {path.name}")
+            time.sleep(0.05)
+            continue
+        try:
+            os.write(descriptor, json.dumps(token, sort_keys=True).encode("ascii"))
+        finally:
+            os.close(descriptor)
+        break
+    try:
+        yield
+    finally:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def remove_stale_lock(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="ascii"))
+        pid = int(payload.get("pid") or 0)
+    except (OSError, ValueError, json.JSONDecodeError):
+        try:
+            if time.time() - path.stat().st_mtime <= 30:
+                return False
+            path.unlink()
+            return True
+        except (FileNotFoundError, OSError):
+            return False
+    if pid <= 0 or process_is_running(pid):
+        return False
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return True
+
+
+def process_is_running(pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+
+        synchronize = 0x00100000
+        wait_timeout = 0x00000102
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(synchronize, False, pid)
+        if not handle:
+            return ctypes.get_last_error() == 5
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == wait_timeout
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, PermissionError):
+        return True
+    return True
 
 
 __all__ = [
     "CcxtPublicEventProvider",
     "EventLakeConfig",
     "LEDGER_SCHEMA",
+    "append_jsonl_once",
     "build_enrichment_manifest",
     "build_ledger_record",
+    "estimate_full_catalog_run",
+    "fetch_derived_price_pages",
+    "fetch_oi_pages",
     "fetch_ohlcv_pages",
     "run_event_lake",
     "select_catalog_events",

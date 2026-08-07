@@ -15,7 +15,7 @@
 артефакты, затем исправить roadmap в том же логическом коммите.
 
 Последнее обновление: `2026-08-07`.
-Текущий этап: `Этап 1.3 — source-specific OI/mark/index/premium gaps`.
+Текущий этап: `Gate перед full Event Lake collection — требуется решение`.
 Текущий режим: `research_only_no_trading`.
 
 ## Цель
@@ -131,9 +131,9 @@ ledger и hash-проверяемые артефакты.
 - [x] Инвентаризировать поля 3,397 GiB локального multi-exchange архива.
 - [x] Построить SHA-проверяемый byte-offset local reader.
 - [x] Объединить local-first reader с public cache без потери 5m точности.
-- [ ] Добавить source-specific mark/index/premium endpoints.
-- [ ] Зафиксировать доступную глубину historical OI и причины retention gaps.
-- [ ] Посчитать calls/disk/time для 1 540 событий и получить отдельное решение
+- [x] Добавить source-specific mark/index/premium endpoints.
+- [x] Зафиксировать доступную глубину historical OI и причины retention gaps.
+- [x] Посчитать calls/disk/time для 1 540 событий и получить отдельное решение
   перед долгим запуском.
 
 ### Этап 2. Funding Forecast v1 — PENDING
@@ -273,13 +273,50 @@ Shadow -> live:
   `11 warnings`; live/ARM не затронуты.
 - Коммит: `Merge Strategy Lab local and public windows` (см. history).
 
+### 2026-08-07 — Source-specific history и full-run preflight
+
+- Подтверждены и включены public-only historical mark/index/premium klines
+  Binance и Bybit; во всех `6` pilot-окнах получено по `1 152` строк каждого
+  dataset.
+- Binance OI официально ограничен последним месяцем. Старые COTI/HFT/SIREN
+  окна теперь дают явный `retention_gap`, `calls=0`, а не ошибочный запрос.
+- Bybit OI исправлен на обратную пагинацию с bounded `endTime`: во всех трёх
+  окнах получено `1 152/1 152` строк за `6` страниц вместо ложного нуля.
+- Чистый pilot: `3` события × `2` биржи, `6/6 completed`, `96` фактических
+  public calls за `36,56s`, `5,10 MiB` cache. Повтор: `6/6 cache_reused`,
+  `0` calls, ровно `6` ledger records.
+- Zero-network merge повторён: Bybit OI и все mark/index/premium выбраны из
+  public cache; Binance funding по-прежнему берётся из более полного local
+  archive; Binance OI остаётся честным missing.
+- Случайный concurrent pilot выявил дубль append-only ledger. Сгенерированный
+  ledger восстановлен до уникальных записей; запись теперь защищена
+  межпроцессным lock, повторной проверкой `record_id` и `fsync`.
+- Полный каталог содержит `1 540` уникальных logical event IDs, но только
+  `1 108` уникальных `symbol + timestamp` окон (`432` повторных logical окон).
+- Без physical-window dedupe: `3 080` задач, примерно `49 280` calls,
+  `2,56 GiB`, `5h13m` по скорости pilot.
+- С exact-window dedupe: `2 216` физических задач, примерно `35 456` calls,
+  `1,84 GiB`, `3h45m`. Эта оптимизация ещё не реализована в runner и является
+  обязательным preflight-блоком перед рекомендуемым полным запуском.
+- Generated evidence:
+  `data/research/strategy_lab_event_lake_v3_clean/full_run_estimate.json` и
+  `data/research/strategy_lab_merged_v3_clean/`.
+- Проверки: source compilation; профильный Strategy Lab/Pump/coin regression
+  `58 passed`, `4 warnings`; полный regression `608 passed`, `11 warnings`.
+- Live, ARM, Pump Live, Grid, Auto Enter/Exit и позиции не затронуты.
+
 ## Точный следующий шаг
 
-Реализовать Этап 1.3 bounded-режимом:
+Требуется отдельное решение пользователя по ресурсоёмкому продолжению.
+Рекомендуемый вариант после подтверждения:
 
-1. проверить source-specific retention для OI/mark/index/premium;
-2. добавить только подтверждённые исторические endpoints с явным coverage;
-3. не запрашивать поля глубже официально доступного retention;
-4. повторить 3-event pilot и merge regression;
-5. подготовить оценку полного запуска: tasks, calls, disk, runtime, gaps;
-6. запросить подтверждение перед сбором всех 1 540 событий.
+1. реализовать физический cache по `exchange + symbol + start/end + timeframe`,
+   сохранив отдельные logical `event_id` и ledger decisions;
+2. доказать fixture-тестом, что `1 540` logical events используют `1 108`
+   физических окон без потери provenance и без смешивания событий;
+3. повторить bounded duplicate-window pilot, Strategy Lab regression и полный
+   regression;
+4. отдельным коммитом зафиксировать готовность;
+5. только затем запустить resumable public-only сбор примерно на `3h45m` и
+   `1,84 GiB`, с checkpoint/cache и без live-действий;
+6. после сбора перейти к Этапу 2 `Funding Forecast v1`.

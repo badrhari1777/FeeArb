@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,8 +13,11 @@ if str(ROOT) not in sys.path:
 from analysis_features.strategy_lab_event_lake import (
     DEFAULT_OUTPUT_DIR,
     EventLakeConfig,
+    estimate_full_catalog_run,
     run_event_lake,
+    write_json_atomic,
 )
+from analysis_features.strategy_lab import PUMP_EVENT_SOURCES, load_pump_event_catalog
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +32,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--post-hours", type=int, default=72)
     parser.add_argument("--timeframe", default="5m")
     parser.add_argument("--execute-public", action="store_true")
+    parser.add_argument("--estimate-full-catalog", action="store_true")
+    parser.add_argument("--pilot-calls", type=int, default=0)
+    parser.add_argument("--pilot-elapsed-sec", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -44,6 +52,36 @@ def main() -> None:
         post_hours=max(1, args.post_hours),
         timeframe=args.timeframe,
     )
+    if args.estimate_full_catalog:
+        rows = load_pump_event_catalog(PUMP_EVENT_SOURCES)
+        window_files = list((args.output_dir / "windows").glob("*.json"))
+        average_window_bytes = (
+            sum(path.stat().st_size for path in window_files) / len(window_files)
+            if window_files
+            else None
+        )
+        metadata_path = args.output_dir / "metadata.json"
+        pilot_metadata = (
+            json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata_path.exists()
+            else {}
+        )
+        estimate = estimate_full_catalog_run(
+            rows,
+            config,
+            as_of_ms=time.time_ns() // 1_000_000,
+            average_window_bytes=average_window_bytes,
+            pilot_calls=args.pilot_calls
+            or int(pilot_metadata.get("public_calls_this_run") or 0)
+            or None,
+            pilot_elapsed_sec=args.pilot_elapsed_sec
+            or float(pilot_metadata.get("elapsed_sec") or 0)
+            or None,
+        )
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(args.output_dir / "full_run_estimate.json", estimate)
+        print(estimate)
+        return
     metadata = run_event_lake(
         output_dir=args.output_dir,
         config=config,

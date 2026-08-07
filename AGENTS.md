@@ -106,6 +106,24 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab source-specific history preflight was completed on 2026-08-07
+  without touching ARM or live services. Binance and Bybit historical
+  mark/index/premium klines now populate all six COTI/HFT/SIREN 5m windows at
+  1,152 rows each. Binance OI is skipped with an explicit retention gap and
+  zero calls outside its official latest-month history; Bybit OI now paginates
+  backwards with a bounded end time and returns 1,152 rows in all three old
+  windows. Ledger appends use a short cross-process lock, a second record-id
+  check and fsync after a concurrent pilot exposed duplicate appends. The
+  clean pilot used 96 public calls in 36.56 seconds, repeated with zero calls
+  and six unique records, and merged without network. Full-catalog preflight
+  found 1,540 logical events but 1,108 exact symbol/timestamp windows: current
+  no-dedupe cost is about 49,280 calls / 2.56 GiB / 5h13m; the recommended
+  exact-window cache would reduce it to 35,456 calls / 1.84 GiB / 3h45m.
+  Explicit approval is required before the long collection; the next safe
+  code block is physical-window dedupe. Canonical handoff:
+  `instructions/17_STRATEGY_LAB_ROADMAP.md`. Verified source compilation,
+  focused Strategy Lab/Pump/coin regression (`58 passed`, `4 warnings`) and
+  the complete suite (`608 passed`, `11 warnings`).
 - Strategy Lab now merges local archive and public-cache windows
   deterministically per dataset. It selects finer public 5m OHLCV over local
   1h, uses the better-covered funding source, never mixes rows from competing

@@ -154,24 +154,29 @@ walk-forward проверки по бирже, интервалу ставки �
 - deterministic manifest и hashes для event/config/source;
 - preflight без создания API-клиентов;
 - public-only CCXT provider;
-- paginated 5m OHLCV/funding/OI;
+- paginated 5m OHLCV/funding/OI/mark/index/premium;
 - versioned cache с task identity;
 - append-only research ledger с запретом `live` mode;
 - fail-closed `VETO` при отсутствии market/OHLCV;
 - coverage и фактический API call budget.
 
-Пилот COTI/HFT/SIREN на Binance и Bybit дал шесть окон по 1 152 свечи,
-100% OHLCV coverage. Funding получен в пяти из шести окон: `12/12`, `12/11` и
-`78/0` строк соответственно. Historical OI для старых дат не получен: Binance
-вернул ограничение старого `startTime`, Bybit — пустые ряды. Generic provider
-не предоставляет historical mark/index/premium, поэтому они остались missing.
+Первый pilot COTI/HFT/SIREN на Binance и Bybit дал шесть окон по 1 152 свечи и
+100% OHLCV coverage. После source-specific этапа те же шесть окон имеют по
+1 152 строк mark/index/premium. Bybit OI тоже получен полностью: bounded
+`endTime` и обратная пагинация устранили ложный ноль старой forward-схемы.
+Binance документирует только последний месяц historical OI, поэтому старые
+окна теперь помечаются retention gap без сетевого запроса.
 
-Preflight оценивал 42 запроса, фактически понадобилось 30. Повторный запуск
-использовал все шесть cache-файлов, сделал ноль запросов и сохранил ровно шесть
-уникальных ledger records. Следующий шаг — сначала использовать локальный
-многобиржевой архив, затем добавить source-specific public endpoints для
-mark/index/premium и доступного OI; масштабирование на 1 540 событий пока не
-разрешено.
+Чистый расширенный pilot сделал 96 public calls за 36,56 секунды и занял
+5,10 MiB. Повтор использовал шесть cache-файлов, сделал ноль запросов и сохранил
+шесть уникальных ledger records. Append защищён межпроцессным lock, повторной
+проверкой `record_id` и `fsync`.
+
+Full-run preflight нашёл 1 540 logical events, но только 1 108 уникальных
+`symbol + timestamp` окон. Текущий недедуплицированный вариант оценивается в
+49 280 calls, 2,56 GiB и 5h13m; physical exact-window cache снизит оценку до
+35 456 calls, 1,84 GiB и 3h45m. Массовый сбор пока не разрешён: сначала нужен
+отдельный ресурсный выбор и безопасная реализация physical/logical mapping.
 
 ## Local archive pilot 2026-08-07
 
@@ -192,6 +197,11 @@ Local-first слой полезен для OHLCV/funding и сокращает �
 заменяет source-specific enrichment. Следующий блок должен объединить локальные
 1h данные с public 5m cache, сохраняя более точный источник и provenance, после
 чего отдельно закрывать OI/mark/index/premium gaps.
+
+Этот merge выполнен: public 5m всегда выигрывает у local 1h для OHLCV, funding
+выбирается по фактическому покрытию, а rows разных источников не смешиваются.
+После source-specific pilot Bybit OI и mark/index/premium обеих бирж также
+проходят через тот же provenance-preserving merge.
 
 ## Ограничения
 
