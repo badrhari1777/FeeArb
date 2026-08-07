@@ -776,6 +776,17 @@ def build_evaluation_splits(
     ordered = sorted(samples, key=lambda row: (int(row["event_ts_ms"]), str(row["symbol"]), str(row["exchange"])))
     timestamps = sorted({int(row["event_ts_ms"]) for row in ordered})
     train_cut = max(1, min(len(timestamps) - 2, math.floor(len(timestamps) * config.chronological_train_fraction)))
+    initial_train_fraction = (
+        config.chronological_train_fraction
+        - config.chronological_validation_fraction
+    )
+    initial_cut = max(
+        1,
+        min(
+            train_cut - 1,
+            math.floor(len(timestamps) * initial_train_fraction),
+        ),
+    )
     validation_cut = max(
         train_cut + 1,
         min(
@@ -787,9 +798,17 @@ def build_evaluation_splits(
         ),
     )
     train_ts = set(timestamps[:train_cut])
+    initial_train_ts = set(timestamps[:initial_cut])
+    first_block_ts = set(timestamps[initial_cut:train_cut])
     validation_ts = set(timestamps[train_cut:validation_cut])
     test_ts = set(timestamps[validation_cut:])
     chronological_train = [row for row in ordered if int(row["event_ts_ms"]) in train_ts]
+    chronological_initial_train = [
+        row for row in ordered if int(row["event_ts_ms"]) in initial_train_ts
+    ]
+    chronological_first_block = [
+        row for row in ordered if int(row["event_ts_ms"]) in first_block_ts
+    ]
     chronological_validation = [row for row in ordered if int(row["event_ts_ms"]) in validation_ts]
     chronological_test = [row for row in ordered if int(row["event_ts_ms"]) in test_ts]
 
@@ -806,6 +825,11 @@ def build_evaluation_splits(
     symbol_train = [row for row in ordered if str(row["symbol"]) not in holdout_symbols]
     symbol_holdout = [row for row in ordered if str(row["symbol"]) in holdout_symbols]
     return [
+        (
+            "chronological_block_1",
+            chronological_initial_train,
+            chronological_first_block,
+        ),
         ("chronological_validation", chronological_train, chronological_validation),
         ("chronological_test", chronological_train + chronological_validation, chronological_test),
         ("unseen_symbol_holdout", symbol_train, symbol_holdout),
@@ -951,19 +975,44 @@ def economic_proxy_metrics(
     *,
     target_field: str,
     cost_bps: float,
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     gross = [
         (1.0 if probability >= 0.5 else -1.0)
         * float(row[target_field])
         for row, probability in zip(rows, sign_probabilities)
     ]
     net = [value - cost_bps for value in gross]
+    ordered_abs = sorted((abs(value) for value in gross), reverse=True)
+    absolute_total = sum(ordered_abs)
+    top5_count = min(5, len(ordered_abs))
+    top5_values = sorted(gross, key=abs, reverse=True)[:top5_count]
+    remaining_values = sorted(gross, key=abs, reverse=True)[top5_count:]
+    symbol_absolute: dict[str, float] = {}
+    for row, value in zip(rows, gross):
+        symbol = str(row.get("symbol") or "unknown")
+        symbol_absolute[symbol] = symbol_absolute.get(symbol, 0.0) + abs(value)
     return {
         "mean_gross_funding_bps": statistics.fmean(gross),
         "median_gross_funding_bps": statistics.median(gross),
         "mean_net_after_cost_scenario_bps": statistics.fmean(net),
         "net_positive_rate": statistics.fmean(1.0 if value > 0 else 0.0 for value in net),
         "cost_scenario_bps": cost_bps,
+        "top1_abs_contribution_share": (
+            ordered_abs[0] / absolute_total if absolute_total else 0.0
+        ),
+        "top5_abs_contribution_share": (
+            sum(abs(value) for value in top5_values) / absolute_total
+            if absolute_total
+            else 0.0
+        ),
+        "top_symbol_abs_contribution_share": (
+            max(symbol_absolute.values(), default=0.0) / absolute_total
+            if absolute_total
+            else 0.0
+        ),
+        "mean_gross_without_top5_abs_bps": (
+            statistics.fmean(remaining_values) if remaining_values else None
+        ),
     }
 
 

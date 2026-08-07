@@ -173,10 +173,34 @@ Binance документирует только последний месяц hi
 проверкой `record_id` и `fsync`.
 
 Full-run preflight нашёл 1 540 logical events, но только 1 108 уникальных
-`symbol + timestamp` окон. Текущий недедуплицированный вариант оценивается в
-49 280 calls, 2,56 GiB и 5h13m; physical exact-window cache снизит оценку до
-35 456 calls, 1,84 GiB и 3h45m. Массовый сбор пока не разрешён: сначала нужен
-отдельный ресурсный выбор и безопасная реализация physical/logical mapping.
+`symbol + timestamp` окон. Physical exact-window cache снизил оценку с 49 280
+до 35 456 calls. После отдельного подтверждения полный public-only сбор был
+выполнен: `2 216/2 216` физических окон, `3 080` logical tasks/ledger records.
+Строгая validation до и после повторного replay прошла, replay использовал весь
+cache и сделал `0` новых API calls.
+
+## Funding Forecast full evaluation 2026-08-07
+
+На полном Event Lake получено `1 024` eligible causal samples по `283` symbols;
+`1 192` окон отклонены fail-closed, в основном из-за отсутствия текущего
+funding (`1 054`) или недоступного market (`133`). Next-sign logistic улучшила
+accuracy относительно сохранения текущего знака во всех трёх chronological
+OOS-блоках и на unseen symbols:
+
+| Срез | Logistic | Persistence |
+|---|---:|---:|
+| chronological block 1 | 77,48% | 70,20% |
+| chronological validation | 82,28% | 77,22% |
+| chronological test | 91,49% | 88,65% |
+| unseen symbols | 78,16% | 69,42% |
+
+Диагностический `4/8/24h` funding-capture proxy положителен после cost-сценария
+`8 bps` во всех срезах, но это не исполнимый PnL. В нём нет bid/ask, basis,
+slippage, capacity и lifecycle. Кроме того, модель next raw/hourly magnitude
+проигрывает current-rate baseline, а в chronological validation один symbol
+даёт 51,51% абсолютного proxy contribution. Поэтому результат остаётся
+исследовательским: paper/shadow promotion запрещён, sign forecast сохраняется
+как кандидатный carry-признак для execution-aware Stage 3.
 
 ## Local archive pilot 2026-08-07
 

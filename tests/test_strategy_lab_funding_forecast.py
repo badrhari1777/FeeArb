@@ -318,8 +318,20 @@ def test_splits_are_strictly_chronological_and_symbol_disjoint() -> None:
         rows, FundingForecastConfig(min_train_rows=2, min_eval_rows=1)
     )
     by_name = {name: (train, evaluation) for name, train, evaluation in splits}
+    block_one_train, block_one_eval = by_name["chronological_block_1"]
+    validation_train, validation_eval = by_name["chronological_validation"]
     chrono_train, chrono_test = by_name["chronological_test"]
     symbol_train, symbol_test = by_name["unseen_symbol_holdout"]
+
+    assert max(int(row["event_ts_ms"]) for row in block_one_train) < min(
+        int(row["event_ts_ms"]) for row in block_one_eval
+    )
+    assert max(int(row["event_ts_ms"]) for row in block_one_eval) < min(
+        int(row["event_ts_ms"]) for row in validation_eval
+    )
+    assert max(int(row["event_ts_ms"]) for row in validation_train) < min(
+        int(row["event_ts_ms"]) for row in validation_eval
+    )
 
     assert max(int(row["event_ts_ms"]) for row in chrono_train) < min(
         int(row["event_ts_ms"]) for row in chrono_test
@@ -356,6 +368,10 @@ def test_logistic_forecast_beats_current_sign_baseline_on_synthetic_driver() -> 
         and row.get("model") == "logistic_sign_direction"
     )
     assert "mean_net_after_cost_scenario_bps" in economic
+    assert 0.0 <= economic["top1_abs_contribution_share"] <= 1.0
+    assert 0.0 <= economic["top5_abs_contribution_share"] <= 1.0
+    assert 0.0 <= economic["top_symbol_abs_contribution_share"] <= 1.0
+    assert economic["mean_gross_without_top5_abs_bps"] is not None
     sensitivity = {
         row["cost_scenario_bps"]
         for row in metrics

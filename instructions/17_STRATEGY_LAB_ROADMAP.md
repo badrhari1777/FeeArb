@@ -15,7 +15,7 @@
 артефакты, затем исправить roadmap в том же логическом коммите.
 
 Последнее обновление: `2026-08-07`.
-Текущий этап: `Funding Forecast v1 реализован; final evaluation ждёт full Event Lake gate`.
+Текущий этап: `Funding Forecast v1 full evaluation завершён; research hold, следующий этап — Executable Spread Timing v1`.
 Текущий режим: `research_only_no_trading`.
 
 ## Цель
@@ -136,7 +136,7 @@ ledger и hash-проверяемые артефакты.
 - [x] Посчитать calls/disk/time для 1 540 событий и получить отдельное решение
   перед долгим запуском.
 
-### Этап 2. Funding Forecast v1 — IMPLEMENTED, FINAL EVALUATION PENDING
+### Этап 2. Funding Forecast v1 — FULL EVALUATED, RESEARCH HOLD
 
 - [x] Причинные targets: следующий знак, величина, ослабление и длительность.
 - [x] Baseline `next_sign = current_sign`.
@@ -145,7 +145,9 @@ ledger и hash-проверяемые артефакты.
   realized/future `4/8/24h` paths и cost sensitivity.
 - [x] Chronological splits и целые unseen symbols.
 - [x] Calibration, Brier/log loss, sign accuracy и экономический replay.
-- [ ] Paper decisions; shadow только после стабильного holdout.
+- [x] Три последовательных временных OOS-блока и concentration audit.
+- [ ] Paper decisions: promotion запрещён до execution-aware проверки и
+  снижения symbol concentration; shadow только после стабильного holdout.
 
 ### Этап 3. Executable Spread Timing v1 — PENDING
 
@@ -418,12 +420,43 @@ Shadow -> live:
   `11 warnings`.
 - Pump Live/ARM/Grid/orders/positions и активный Event Lake collector не менялись.
 
+### 2026-08-07 — Full Event Lake gate и Funding Forecast final evaluation
+
+- Collector PID `5148` завершился штатно. Post-run watcher закончил цепочку со
+  статусом `complete / validated_zero_call_replay`; все stderr-файлы пусты.
+- Строгий Event Lake gate подтвердил `1 540` logical events, `3 080` tasks и
+  ledger records, `2 216/2 216` immutable physical windows и полный coverage.
+  Audited replay сохранил collector commit `5169080`, повторно использовал все
+  `3 080` logical / `2 216` physical records и сделал `0` public API calls.
+- Full Funding Forecast рассмотрел `2 216` окон: `1 024` eligible samples,
+  `1 192` fail-closed veto, `283` symbols, Binance/Bybit. Основные veto:
+  `current_funding_missing=1054`, `market_unavailable=133`.
+- Добавлен третий более ранний chronological OOS-блок и воспроизводимые
+  concentration metrics: top-1/top-5 absolute event contribution, top-symbol
+  absolute contribution и средний gross после исключения пяти экстремумов.
+- Next-sign logistic превзошёл current-sign persistence во всех временных
+  блоках: `77,48% vs 70,20%`, `82,28% vs 77,22%`, `91,49% vs 88,65%`;
+  unseen-symbol holdout: `78,16% vs 69,42%`.
+- Диагностический funding-capture proxy после `8 bps` cost положителен на
+  горизонтах `4/8/24h` во всех четырёх срезах. Это не execution PnL: bid/ask,
+  slippage, capacity, basis и lifecycle в этот proxy не входят.
+- Promotion в paper/shadow запрещён. Причины: ridge для next raw/hourly
+  magnitude проигрывает простому current-rate baseline; в chronological
+  validation один symbol даёт `51,51%` абсолютного результата, top-5 events —
+  `34,45%`; только два из четырёх срезов имеют умеренную symbol concentration.
+- Решение: сохранить sign forecast как кандидатный `CARRY` feature, не считать
+  его готовой стратегией и перейти к Stage 3 execution-aware spread timing.
+- Проверки: Funding Forecast fixture `9 passed`; профильный Strategy Lab/Pump/
+  coin regression `169 passed`, `4 warnings`; полный regression `625 passed`,
+  `11 warnings`. Live/ARM/Pump Live/Grid/orders/positions не изменялись.
+
 ## Точный следующий шаг
 
-1. дождаться завершения активного resumable public-only сбора;
-2. прочитать `postrun_status.json` и потребовать успешные strict validation,
-   pinned zero-call replay и повторную strict validation;
-3. запустить Funding Forecast без `--allow-in-progress`, проверить полный
-   coverage, три временных блока, unseen-symbol holdout и sensitivity к costs;
-4. только после стабильного положительного результата отдельно решить вопрос
-   paper; при слабом holdout оставить гипотезу в research и переработать её.
+1. реализовать Stage 3 как отдельный research-only `Executable Spread Timing
+   v1`, не меняя Funding Forecast и live-контуры;
+2. строить причинные варианты входа `now / +5m / +15m / +30m / expansion stop`
+   и outcomes `15m/1h/4h/8h` по направленным bid/ask;
+3. включить fees, funding cashflows с фактической периодичностью, slippage,
+   capacity, mark/index veto и MAE/MFE/time-to-convergence;
+4. повторить три chronological OOS-блока, unseen-symbol и concentration audit;
+   только затем отдельно решать, разрешать ли unified paper state machine.

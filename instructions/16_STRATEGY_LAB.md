@@ -210,6 +210,27 @@ features.
 - `calibration.csv`, `coefficients.csv`, `predictions.csv` — аудит прогноза;
 - `veto_summary.csv`, `metadata.json`, `index.md` — coverage и provenance.
 
+Full evaluation от 2026-08-07 выполнен после строгого полного gate. Event Lake
+содержит `2 216/2 216` физических окон, `3 080` logical records и прошёл
+повторный replay с `0` API calls. Forecast получил `1 024` eligible samples на
+`283` symbols. Next-sign model превзошла persistence baseline в трёх
+последовательных временных OOS-блоках (`77,48/82,28/91,49%` против
+`70,20/77,22/88,65%`) и на unseen symbols (`78,16%` против `69,42%`).
+
+Этот результат остаётся `research_evaluation_only`. Regression величины
+funding проиграла current-rate baseline, а в одном временном блоке один symbol
+составил `51,51%` абсолютного funding-proxy результата. Поэтому
+`paper_promotion_allowed=false` и `shadow_promotion_allowed=false`. Sign forecast
+можно использовать только как кандидатный признак будущего Stage 3; следующий
+безопасный шаг — execution-aware spread timing с bid/ask, liquidity, fees,
+slippage, capacity и фактическими funding cashflows.
+
+`metrics.csv` дополнительно хранит `top1_abs_contribution_share`,
+`top5_abs_contribution_share`, `top_symbol_abs_contribution_share` и
+`mean_gross_without_top5_abs_bps`. Эти поля обязательны для проверки, что
+результат не определяется несколькими экстремальными событиями или одной
+монетой.
+
 `metadata.final_result_allowed=true` возможно только для строгого полного
 Event Lake. Funding-capture в v1 — диагностический `4/8/24h` proxy с cost sweep,
 а не исполнимый арбитраж: bid/ask, slippage, capacity и lifecycle относятся к

@@ -106,6 +106,22 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- The full Strategy Lab Event Lake and Funding Forecast evaluation completed on
+  2026-08-07. The collector stopped normally; strict validation before and
+  after the pinned replay confirmed 1,540 events, 3,080 logical records and
+  2,216/2,216 physical windows, while replay reused every record with zero
+  public calls. The full forecast retained 1,024 eligible samples across 283
+  symbols. A third chronological OOS block plus reproducible event/symbol
+  concentration metrics were added. Next-sign logistic beat sign persistence
+  in all three time blocks (77.48/82.28/91.49% versus 70.20/77.22/88.65%) and
+  on unseen symbols (78.16% versus 69.42%), but promotion remains disabled:
+  magnitude regression loses to the current-rate baseline and one validation
+  symbol contributes 51.51% of absolute economic-proxy output. Treat sign only
+  as a candidate carry feature and continue with research-only executable
+  spread timing. Funding fixture tests passed (9), focused Strategy Lab/Pump/
+  coin regression passed (169, 4 warnings), and the full suite passed (625,
+  11 warnings). Runtime artifacts remain ignored; live/ARM/Pump Live/Grid/
+  orders/positions were unchanged.
 - Strategy Lab Funding Forecast became funding-interval aware on 2026-08-07
   after a read-only HFT audit showed an actual Bybit cadence change from 8h
   settlements to consecutive hourly `-2%` settlements. Research samples now
