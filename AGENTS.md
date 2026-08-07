@@ -102,6 +102,25 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab phase 1 was added on 2026-08-07 as a research-only bridge
+  between the archived Pump/Dump datasets and ordinary coin-arbitrage evidence.
+  `analysis_features/strategy_lab.py` and `scripts/strategy_lab.py` normalize
+  1,540 existing Pump event rows, causally anchor 203 first-observable
+  arbitrage dislocations from the read-only coin-analysis database, inventory
+  executable auto-exit logs, measure next-funding persistence, and optionally
+  enrich one strongest event per symbol through credential-free public CCXT
+  OHLCV/funding/OI calls. The initial run found 62.42% 4h raw-spread reversion
+  but only 32.73% positive executable capture after the configured 0.18% cost
+  estimate (median -0.209138%), while negative funding retained its sign in
+  87.76% of 5,407 transitions and <=-1% funding in 97.89% of 285. Six of eight
+  API anchors matched within 0.75 percentage points and two more within the
+  explicitly research-only 0-2 point tolerance. No Pump/arbitrage +/-6h links
+  were found because historical overlap is minimal; the next step is
+  multi-exchange enrichment of old Pump windows, not a live rule change.
+  Methodology and operator boundaries are in `docs/strategy_lab.md` and
+  `instructions/16_STRATEGY_LAB.md`. Verified targeted tests (`5 passed`),
+  Python compilation, a fresh eight-event public-API run without errors, and
+  the full suite (`590 passed`, `11 warnings`).
 - Pump Live entry-prefund verification was hardened on 2026-08-07 after the
   HEI canary filled L1 and added `$70`, but Bybit returned an exchange stop
   `0.31934175` versus target `0.319753875`. The fixed model now remains only

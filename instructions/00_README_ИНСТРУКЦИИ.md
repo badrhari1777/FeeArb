@@ -42,6 +42,8 @@
   [`14_UNIFIED_POSITIONS_WEB.md`](14_UNIFIED_POSITIONS_WEB.md)
 - Лёгкая Android-визуализация Main и Pump Live позиций:
   [`15_ANDROID_MAIN_PUMP_POSITIONS.md`](15_ANDROID_MAIN_PUMP_POSITIONS.md)
+- Исследовательский Strategy Lab для Pump/Dump, арбитражных перекосов и публичного API:
+  [`16_STRATEGY_LAB.md`](16_STRATEGY_LAB.md)
 
 ## Важно
 
