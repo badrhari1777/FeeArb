@@ -348,6 +348,16 @@ transfer is a separate future layer; current position/portfolio top-up caps,
 other-position guarantees, shared emergency pool, and `$25` hard floor remain
 in force until that layer is implemented and approved.
 
+### Filled ladder reconciliation
+
+Each open ladder is an exchange-side order and remains executable during a
+brief local monitor interruption. On the next healthy cycle Pump Live reads the
+new exchange quantity, average entry, mark, and liquidation price; marks the
+ladder leg filled; and forces a new Bybit `tpslMode=Full` TP/SL synchronization.
+The stop and take-profit therefore follow the complete enlarged position rather
+than the original L1 quantity. A two-leg tier ends at L2 by design; absence of
+L3 is not a lost order for that tier.
+
 ## Bybit Timestamp Recovery
 
 Pump Live uses a long-lived synchronous CCXT client. A system-clock correction

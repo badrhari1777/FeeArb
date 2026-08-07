@@ -106,6 +106,15 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live ladder-fill reconciliation received a direct regression on
+  2026-08-07 after the HEI review. The test exercises a two-leg live tier from
+  confirmed entry pre-fund through an exchange-filled L2, then verifies that
+  the controller adopts the larger exchange quantity and weighted average,
+  marks L2 filled, and forces new Full-position TP/SL from the refreshed
+  liquidation price. A fresh read-only HEI audit found its only remaining
+  tier leg live on Bybit, confirmed `$75` pre-fund, and healthy armed
+  monitoring; no order or live setting was changed. Focused Pump regression
+  passed (`53`).
 - Strategy Lab source-specific history preflight was completed on 2026-08-07
   without touching ARM or live services. Binance and Bybit historical
   mark/index/premium klines now populate all six COTI/HFT/SIREN 5m windows at

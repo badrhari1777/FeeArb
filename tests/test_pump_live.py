@@ -550,6 +550,81 @@ def test_entry_prefunds_margin_before_ladders_without_changing_strategy(
     assert margin_index < ladder_index
 
 
+def test_filled_second_leg_refreshes_position_and_full_protection(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, prefund_enabled=True)
+    gateway = FakePumpGateway()
+    gateway.initial_liq_price = 13.0
+    gateway.liq_after_add = 16.0
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    decision = ready_decision(armed_at + 1)
+    decision["tier"].update(
+        {
+            "rule_slug": "step50_legs2_tapered_tp25_720",
+            "ladder_legs": 2,
+            "leg_weights": [1.0, 2.0],
+            "max_hold_h": 720,
+        }
+    )
+    controller.submit_decisions([decision])
+
+    opened = controller.run_cycle()
+    item = opened["positions"][0]
+    second = item["legs"][1]
+    assert second["status"] == "open"
+    assert second["trigger_price"] == 15.0
+    assert item["margin_prefund_status"] == "confirmed"
+    assert item["stop_price"] == 15.6
+
+    ladder_order = next(
+        order for order in gateway.orders if order["id"] == second["order_id"]
+    )
+    second_qty = float(ladder_order["notional_usd"]) / float(ladder_order["price"])
+    total_qty = 17.5 + second_qty
+    average = (17.5 * 10.0 + second_qty * 15.0) / total_qty
+    ladder_order.update(
+        {"status": "closed", "filled": second_qty, "average": 15.0}
+    )
+    gateway.positions = [
+        {
+            "symbol": "TESTUSDT",
+            "side": "short",
+            "qty": total_qty,
+            "avg_price": average,
+            "mark_price": 15.0,
+            "liq_price": 19.0,
+            "leverage": 3.0,
+            "margin_mode": "isolated",
+            "position_idx": 0,
+            "unrealized_pnl": 0.0,
+        }
+    ]
+
+    refreshed = controller.run_cycle()
+
+    item = refreshed["positions"][0]
+    second = item["legs"][1]
+    assert second["status"] == "filled"
+    assert second["filled_qty"] == second_qty
+    assert second["avg_fill_price"] == 15.0
+    assert item["qty"] == total_qty
+    assert item["avg_entry_price"] == average
+    assert item["tp_price"] == average * 0.75
+    assert item["stop_price"] == 19.0 * 0.975
+    assert gateway.protections[-1] == (
+        "TESTUSDT",
+        average * 0.75,
+        19.0 * 0.975,
+    )
+
+
 def test_prefund_formula_matches_current_tier_l2_amounts() -> None:
     current_liq = (1.0 + 1.0 / 3.0) / 1.025
     tier_first_notionals = {
