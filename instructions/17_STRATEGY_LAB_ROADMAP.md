@@ -15,7 +15,7 @@
 артефакты, затем исправить roadmap в том же логическом коммите.
 
 Последнее обновление: `2026-08-07`.
-Текущий этап: `Этап 1.2 — local/public merge и source-specific gaps`.
+Текущий этап: `Этап 1.3 — source-specific OI/mark/index/premium gaps`.
 Текущий режим: `research_only_no_trading`.
 
 ## Цель
@@ -130,7 +130,7 @@ ledger и hash-проверяемые артефакты.
 
 - [x] Инвентаризировать поля 3,397 GiB локального multi-exchange архива.
 - [x] Построить SHA-проверяемый byte-offset local reader.
-- [ ] Объединить local-first reader с public cache без потери 5m точности.
+- [x] Объединить local-first reader с public cache без потери 5m точности.
 - [ ] Добавить source-specific mark/index/premium endpoints.
 - [ ] Зафиксировать доступную глубину historical OI и причины retention gaps.
 - [ ] Посчитать calls/disk/time для 1 540 событий и получить отдельное решение
@@ -263,14 +263,23 @@ Shadow -> live:
   `11 warnings`; live/ARM не затронуты.
 - Коммит этого блока: `Index local Pump archive for Strategy Lab` (см. history).
 
+### 2026-08-07 — Deterministic local/public merge
+
+- Объединены `6` общих COTI/HFT/SIREN Binance/Bybit окон без сети.
+- Для OHLCV во всех случаях выбран public 5m (`1 152` строк), а local 1h
+  сохранён в provenance; funding выбирается по лучшему покрытию.
+- Per-dataset строки не смешиваются, identity conflicts дают hard failure.
+- Проверки: Strategy Lab `18 passed`; полный regression `603 passed`,
+  `11 warnings`; live/ARM не затронуты.
+- Коммит: `Merge Strategy Lab local and public windows` (см. history).
+
 ## Точный следующий шаг
 
-Реализовать Этап 1.2 без долгого запуска:
+Реализовать Этап 1.3 bounded-режимом:
 
-1. объединить local archive window и public cache по dataset/resolution;
-2. предпочитать полные public 5m OHLCV локальным 1h, но заполнять local gaps;
-3. сохранять per-dataset provenance/hash и не смешивать несовместимые значения;
-4. добавить deterministic merge tests и bounded 3-event replay;
-5. затем добавить source-specific API только для OI/mark/index/premium gaps;
-6. подготовить оценку полного запуска: tasks, calls, disk, runtime, gaps;
-7. запросить подтверждение перед сбором всех 1 540 событий.
+1. проверить source-specific retention для OI/mark/index/premium;
+2. добавить только подтверждённые исторические endpoints с явным coverage;
+3. не запрашивать поля глубже официально доступного retention;
+4. повторить 3-event pilot и merge regression;
+5. подготовить оценку полного запуска: tasks, calls, disk, runtime, gaps;
+6. запросить подтверждение перед сбором всех 1 540 событий.

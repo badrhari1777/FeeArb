@@ -56,6 +56,15 @@ Preflight не создаёт биржевые клиенты и заранее 
 per-symbol JSONL. Повторный запуск должен показать `index_reused=true` и не
 читать гигабайтные строки последовательно заново.
 
+Zero-network merge локальных и public-cache окон:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\strategy_lab_merge.py
+```
+
+Merge выбирает источник целиком для каждого dataset: более точный OHLCV, затем
+лучшее покрытие. Строки источников не смешиваются; hashes остаются в provenance.
+
 Результат создаётся в `data/research/strategy_lab/`. Каталог игнорируется Git и
 может безопасно пересоздаваться. Исходная SQLite база открывается в режиме
 `mode=ro`, а логи и Pump-выгрузки только читаются.

@@ -106,6 +106,13 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab now merges local archive and public-cache windows
+  deterministically per dataset. It selects finer public 5m OHLCV over local
+  1h, uses the better-covered funding source, never mixes rows from competing
+  sources, retains both hashes/provenance, and hard-fails identity conflicts.
+  The zero-network COTI/HFT/SIREN pilot merged all six common Binance/Bybit
+  windows; OI remains an explicit gap. Verified Strategy Lab tests (`18
+  passed`) and the complete suite (`603 passed`, `11 warnings`).
 - Strategy Lab local-archive indexing was added on 2026-08-07 as the next
   zero-network regression block. The reader verifies summary/JSONL row counts,
   records byte offsets plus SHA-256 identities, validates symbol/exchange on
