@@ -114,7 +114,13 @@ Recent Changes
   ladder once before enabling entries. Unknown/degraded state still fails
   closed; manual state edits remain forbidden. Verified Python compilation,
   focused Pump/API regression (`80 passed`, `6 warnings`), and the complete
-  suite (`585 passed`, `11 warnings`).
+  suite (`585 passed`, `11 warnings`). Deployment on 2026-08-07 restarted the
+  backend disarmed, accepted only the two expected owned-position/order
+  preflight blockers, and recovered HEI through explicit ARM: one `$5`
+  correction raised tracked prefund from `$70` to `$75`, refreshed liquidation
+  to `0.33292`, synchronized TP `0.15594009` and SL `0.324597`, and submitted
+  exactly one L2 sell at `0.31196`. Three following observations kept HEI
+  `open`, prefund `confirmed`, one L2, no monitor error, and Pump Live `armed`.
 - Desktop aggregate balance cards were fixed on 2026-08-04. The backend and
   server-rendered page already contained fresh all-account and Bybit
   main/Pump/combined totals, but `webapp/static/app.js` dropped
