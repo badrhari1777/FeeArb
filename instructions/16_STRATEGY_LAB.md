@@ -231,6 +231,40 @@ slippage, capacity и фактическими funding cashflows.
 результат не определяется несколькими экстремальными событиями или одной
 монетой.
 
+### Executable Spread Timing v1
+
+Следующий research-only replay обычной арбитражной базы:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\strategy_lab_executable_spread.py --source-max-ts-ms 1786221561852
+```
+
+Модуль открывает `state/coin_analysis.db` в `mode=ro`, фиксирует один WAL
+snapshot с явным canonical cutoff и сохраняет его counts/min/max/hash. Он использует первые причинные
+spread triggers, historical top-of-book bid/ask и сравнивает `now`,
+`+5m/+15m/+30m`, а также causal `expansion_stop`. Каждый вход оценивается через
+`15m/1h/4h/8h`; выходной net включает фактические funding settlements и
+раздельные fee/slippage scenarios. Missing funding schedule, quotes, mark или
+exit не превращаются в ноль и дают `VETO`.
+
+Артефакты в `data/research/strategy_lab_executable_spread_v1/`:
+
+- `timing_outcomes.csv` — event/policy/horizon directed bid/ask outcomes;
+- `timing_summary.csv` — chronological summaries, MAE/MFE и concentration;
+- `veto_summary.csv` и `source_quality_rejections.csv` — fail-closed gaps;
+- `metadata.json` и `index.md` — source snapshot, config, boundaries и итог.
+
+Первый полный replay от 2026-08-08 опроверг общий spread-threshold: среди
+`2 374` evaluated outcomes median net отрицателен на всех горизонтах
+(`-0,3762/-0,3324/-0,2873/-0,3447%`), как и во всех entry policies и трёх
+chronological segments. Нельзя подбирать «лучшую задержку» по этому результату;
+следующий блок должен проверять селективные режимные признаки.
+
+USD capacity остаётся unknown, потому что исторический `ca_instruments` пуст и
+raw exchange sizes нельзя умножать на выдуманный contract multiplier. Slippage
+пока фиксированный scenario, а не depth fill. Эти ограничения всегда держат
+`paper_promotion_allowed=false` и `shadow_promotion_allowed=false`.
+
 `metadata.final_result_allowed=true` возможно только для строгого полного
 Event Lake. Funding-capture в v1 — диагностический `4/8/24h` proxy с cost sweep,
 а не исполнимый арбитраж: bid/ask, slippage, capacity и lifecycle относятся к

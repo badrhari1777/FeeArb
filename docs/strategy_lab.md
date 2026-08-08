@@ -202,6 +202,35 @@ slippage, capacity и lifecycle. Кроме того, модель next raw/hour
 исследовательским: paper/shadow promotion запрещён, sign forecast сохраняется
 как кандидатный carry-признак для execution-aware Stage 3.
 
+## Executable Spread Timing v1 2026-08-08
+
+Первый Stage 3 replay использовал обычную арбитражную SQLite-базу, а не Pump
+OHLCV как замену order book. Канонический cutoff
+`source_max_ts_ms=1786221561852`; read-only WAL snapshot содержит `333 416`
+feature rows, после удаления дублирующего направления обработано `166 708`
+rows, `208` первых причинных событий и `22` symbols. Для `now`, задержек
+`5/15/30m` и causal expansion-stop построено `4 160` outcomes на
+`15m/1h/4h/8h`: `2 374` оценены, `1 786` fail-closed veto.
+
+| Горизонт | Evaluated | Net positive | Median net |
+|---|---:|---:|---:|
+| 15m | 667 | 10,94% | -0,3762% |
+| 1h | 639 | 22,38% | -0,3324% |
+| 4h | 554 | 34,12% | -0,2873% |
+| 8h | 514 | 35,99% | -0,3447% |
+
+Все пять entry policies и все три chronological segments имеют отрицательные
+median и mean net. Фактические funding settlements учитываются по каждой бирже
+и стороне позиции; на длинных горизонтах funding в среднем не исправил слабый
+spread capture. Значит общий порог «spread большой — войти» подтверждённо не
+работает, и оптимизация одной задержки была бы переобучением.
+
+Главный новый data gap: исторические bid/ask есть, но `ca_instruments` пуст,
+часть размеров отсутствует, а depth не сохранялся. Поэтому USD capacity не
+вычисляется, а slippage остаётся отдельным `0,06%` сценарием. Pump Event Lake
+можно использовать как multi-exchange price/mark/funding context, но нельзя
+называть его executable replay без исторического order book.
+
 ## Local archive pilot 2026-08-07
 
 Добавлен SHA-проверяемый byte-offset reader локального архива. Он индексирует

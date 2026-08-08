@@ -106,6 +106,26 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab Executable Spread Timing v1 core was added on 2026-08-08 using
+  the ordinary-arbitrage SQLite data requested by the operator. The runner pins
+  one read-only WAL snapshot and compares causal `now`, `5/15/30m`, and
+  expansion-stop entries across `15m/1h/4h/8h` using historical top-of-book
+  bid/ask. Net outcomes include every recorded funding settlement by actual
+  position side, separate 0.12% fee and 0.06% fixed-slippage scenarios, MAE/MFE,
+  time to cost breakeven, chronological segments, and event/symbol
+  concentration. Missing/stale quotes, mark conflicts, >2 pp price mismatch,
+  missing exits or expected funding fail closed. The first full snapshot had
+  pinned cutoff `1786221561852`: 333,416 feature rows, 208 causal events,
+  4,160 outcomes, 2,374 evaluated and
+  1,786 veto across 22 symbols. The generic large-spread rule failed every
+  horizon: median net was -0.3762/-0.3324/-0.2873/-0.3447% for 15m/1h/4h/8h,
+  and every entry policy plus chronological segment had negative median and
+  mean. Do not optimize a generic delay; Stage 3.1 must test selective regimes.
+  USD capacity stays unknown because historical contract multipliers/depth are
+  absent, so paper/shadow remain prohibited. Live/ARM/Pump Live/Grid/orders/
+  positions were unchanged. Executable-spread fixtures passed (`4`), focused
+  Strategy Lab/Pump/coin regression passed (`173`, `4 warnings`), and the full
+  suite passed (`629`, `11 warnings`).
 - The full Strategy Lab Event Lake and Funding Forecast evaluation completed on
   2026-08-07. The collector stopped normally; strict validation before and
   after the pinned replay confirmed 1,540 events, 3,080 logical records and

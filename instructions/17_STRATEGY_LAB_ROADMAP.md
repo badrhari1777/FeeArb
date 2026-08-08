@@ -15,7 +15,7 @@
 артефакты, затем исправить roadmap в том же логическом коммите.
 
 Последнее обновление: `2026-08-07`.
-Текущий этап: `Funding Forecast v1 full evaluation завершён; research hold, следующий этап — Executable Spread Timing v1`.
+Текущий этап: `Executable Spread Timing v1 core реализован; простой spread-threshold опровергнут, Stage 3 selective filters pending`.
 Текущий режим: `research_only_no_trading`.
 
 ## Цель
@@ -149,11 +149,13 @@ ledger и hash-проверяемые артефакты.
 - [ ] Paper decisions: promotion запрещён до execution-aware проверки и
   снижения symbol concentration; shadow только после стабильного holdout.
 
-### Этап 3. Executable Spread Timing v1 — PENDING
+### Этап 3. Executable Spread Timing v1 — CORE IMPLEMENTED, SELECTIVE FILTERS PENDING
 
-- [ ] Вход сейчас и после 5/15/30m подтверждения.
-- [ ] Targets 15m/1h/4h/8h, MAE/MFE и time-to-convergence.
-- [ ] Bid/ask, fee, funding, slippage, liquidity/capacity.
+- [x] Вход сейчас и после 5/15/30m подтверждения плюс causal expansion stop.
+- [x] Targets 15m/1h/4h/8h, MAE/MFE и time-to-cost-breakeven.
+- [x] Исторический top-of-book bid/ask, fees и фактические funding settlements.
+- [ ] Historical depth/slippage и USD capacity: текущий fixed slippage scenario
+  и raw top sizes не дают promotion без contract multiplier/depth.
 - [ ] Mark/index confirmation и mapping veto.
 - [ ] Walk-forward и symbol holdout.
 - [ ] Paper state machine `VETO/WAIT/ENTER/HOLD/EXIT`.
@@ -450,13 +452,54 @@ Shadow -> live:
   coin regression `169 passed`, `4 warnings`; полный regression `625 passed`,
   `11 warnings`. Live/ARM/Pump Live/Grid/orders/positions не изменялись.
 
+### 2026-08-08 — Executable Spread Timing v1 core
+
+- Добавлены research-only module/CLI
+  `strategy_lab_executable_spread.py`. SQLite открывается read-only и один WAL
+  snapshot фиксируется `BEGIN`; counts/min/max и `source_snapshot_id`
+  сохраняются в metadata.
+- Из обычной арбитражной базы используются причинные первые triggers и
+  фактические historical top-of-book bid/ask. Проверяются `now`, задержки
+  `5/15/30m` и causal `expansion_stop` после relief минимум `0,10 п.п.`;
+  outcomes — `15m/1h/4h/8h` после фактического времени входа.
+- Net outcome складывает directed bid/ask capture и каждое реально записанное
+  funding settlement, затем вычитает `0,12%` fee и отдельный `0,06%` fixed
+  slippage scenario. Неизвестный funding schedule не считается нулём.
+- Mark conflict/divergence, stale/missing book, price mismatch >2 п.п.,
+  исчезнувший spread и missing exit/funding дают hard `VETO`. Диапазон
+  `0,75–2 п.п.` остаётся только soft research match.
+- Канонический cutoff `source_max_ts_ms=1786221561852`, snapshot id
+  `af603972...`. Snapshot: `333 416` feature rows total (`166 708` canonical
+  direction rows), `208` causal events, `22` symbols, `4 160` policy/horizon
+  outcomes; `2 374` evaluated и `1 786` veto. Период событий:
+  `2026-06-24..2026-08-08`.
+- Простое правило входа по большому spread опровергнуто во всех горизонтах и
+  трёх chronological segments. Aggregated median net:
+  `-0,3762% / -0,3324% / -0,2873% / -0,3447%` для `15m/1h/4h/8h`; positive
+  rate `10,94% / 22,38% / 34,12% / 35,99%`. Все entry policies также имеют
+  отрицательные median и mean net.
+- USD capacity намеренно неизвестна для всех rows: `ca_instruments` пуст, а
+  raw bid/ask sizes без исторического contract multiplier нельзя безопасно
+  переводить в notional. Slippage пока сценарный, потому что depth snapshots
+  не сохранялись. Это logging/data gap и жёсткий запрет paper/shadow promotion.
+- Concentration metrics по event/symbol встроены в каждую policy/horizon/time
+  summary. Результат сохраняется в ignored
+  `data/research/strategy_lab_executable_spread_v1/`.
+- Решение: не оптимизировать задержку общего threshold. Следующий тест должен
+  отбирать режимы по velocity/expansion, mark/index, funding sign/cadence,
+  OI/volume и symbol-independent validation, одновременно проектируя
+  backward-compatible depth/contract telemetry.
+- Fixture regression: `4 passed`; профильный Strategy Lab/Pump/coin regression
+  `173 passed`, `4 warnings`; полный regression `629 passed`, `11 warnings`.
+  Live/ARM/Pump Live/Grid/orders/positions не изменялись.
+
 ## Точный следующий шаг
 
-1. реализовать Stage 3 как отдельный research-only `Executable Spread Timing
-   v1`, не меняя Funding Forecast и live-контуры;
-2. строить причинные варианты входа `now / +5m / +15m / +30m / expansion stop`
-   и outcomes `15m/1h/4h/8h` по направленным bid/ask;
-3. включить fees, funding cashflows с фактической периодичностью, slippage,
-   capacity, mark/index veto и MAE/MFE/time-to-convergence;
-4. повторить три chronological OOS-блока, unseen-symbol и concentration audit;
-   только затем отдельно решать, разрешать ли unified paper state machine.
+1. добавить Stage 3.1 selective policy research без изменения live: сравнить
+   velocity/expansion-stop, mark/index gap, funding sign/cadence, OI и volume;
+2. train thresholds только на прошлом и проверить три chronological OOS-блока
+   плюс whole-symbol holdout, cost sensitivity и concentration;
+3. отдельно спроектировать backward-compatible сбор contract multiplier и
+   нескольких уровней depth, не переписывая существующие operational logs;
+4. только при положительном execution-aware holdout решить вопрос unified
+   paper state machine; текущий общий spread threshold остаётся отвергнутым.
