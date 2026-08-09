@@ -106,6 +106,15 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Dedicated Pump transfers passed their first supervised live round trip on
+  2026-08-09: `$0.01 USDT` main -> Pump -> main returned both exchange
+  balances, temporary principal, and equity adjustment to their exact starting
+  state while Pump stayed armed with three positions and thirteen orders. The
+  HEI capital review also showed why its `>111%` current-mark buffer is not
+  removable cash: stop clearance above L2 is only `4.0525%`; removing the
+  minimum `$5` step projects `2.2426%`, below the `2.45%` gate. Candidate only:
+  shadow a next-ladder-based `max_releasable_prefund`, never release on current
+  mark buffer alone.
 - Pump temporary transfers gained a dedicated subaccount credential on
   2026-08-09. `BYBIT_PUMP_SUB_TRANSFER_API_KEY/SECRET` now takes precedence
   over the Pump trading key and is restricted to Wallet `AccountTransfer` plus

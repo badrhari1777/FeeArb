@@ -154,3 +154,50 @@ The create -> verify -> cancel -> verify replacement sequence is currently
 KuCoin-specific because conditional-order semantics and duplicate-stop support
 differ by venue. Other exchanges may still replace protection after a real
 price/quantity/side mismatch; they no longer rotate solely on age.
+
+## Live minimum round-trip validation (2026-08-09)
+
+The dedicated master and Pump sub-transfer credentials passed identity,
+parent/sub relationship, UTA, permission, history, and transfer-safe balance
+checks. A supervised `$0.01 USDT` main -> Pump -> main round trip completed
+with a different persisted UUID for each direction and `SUCCESS` confirmation
+from universal-transfer history.
+
+Main and Pump wallet/transfer-safe balances returned exactly to their captured
+pre-test values. Temporary outstanding principal returned to zero,
+`equity_adjustment_usd` returned to zero, cumulative input/return remained
+`$0.01 / $0.01`, and there was no pending reconciliation. Pump stayed armed;
+three tracked positions and thirteen orders were unchanged.
+
+## HEI prefund efficiency decision (2026-08-09)
+
+HEI's current mark-price liquidation buffer above `111%` is not the correct
+measure for releasing its `$75` prefund. The short is far in profit at the
+current mark, but a spike back to the already-resting L2 removes that
+unrealized profit before the order fills. The applicable geometry is:
+
+- current mark about `0.15767`;
+- L2 `0.311955`;
+- exchange liquidation `0.33292`;
+- catastrophic stop `0.324597`;
+- liquidation buffer evaluated at L2: `6.7205%`;
+- stop clearance above L2: `4.0525%`;
+- minimum accepted clearance: `2.45%` (`2.5%` target with the existing
+  bounded tolerance).
+
+Using the current quantity, configured MMR/fee model, and actual exchange
+liquidation, at most about `$4.43` can be removed before the verified clearance
+falls below `2.45%`. The live adjustment step is `$5`; removing one step would
+leave only about `2.2426%`, so the safely releasable amount is `$0` under the
+current policy. Removing `$25` would put the stop about `5.0%` below L2 and
+defeat the purpose of guaranteeing the second ladder before the catastrophic
+stop.
+
+Capital-efficiency candidate, shadow only: calculate and expose both current
+mark buffer and next-ladder stop clearance, plus a rounded
+`max_releasable_prefund_usd`. Observe recommendations without removing the
+immutable floor. Promotion should require exchange-refreshed liquidation,
+two confirmations, cooldown, and a post-removal verification/rollback; price
+fall alone must never justify releasing margin. Main/sub transfers can improve
+slow capital allocation, but cannot replace prefunding needed for a one-tick
+spike.

@@ -475,7 +475,16 @@ false compounding recommendation. Returning the same principal reverses the
 adjustment. Full design and the versioned `$3000` migration decision:
 `docs/pump_live_temporary_transfers_and_3000_migration.md`.
 
-Fresh capability evidence: the Pump key has `SubMemberTransferList` but lacks
-`AccountTransfer`; the current master key has neither required Wallet
-permission. Therefore the live round trip remains blocked and no one-way
-transfer is allowed until both least-privilege gates are configured.
+Earlier pre-configuration evidence found only `SubMemberTransferList` on the
+Pump key and no required Wallet permission on the master key. The round trip
+was correctly blocked at that point; the completed configuration and live
+validation below supersede that snapshot.
+
+Update 2026-08-09: dedicated master and Pump sub-transfer keys are configured
+with the required least-privilege Wallet permissions. The supervised `$0.01`
+main -> Pump -> main validation completed in both directions; balances,
+temporary principal, and `equity_adjustment_usd` returned exactly to their
+pre-test state. Do not infer that a large current mark-price liquidation buffer
+is removable prefund: HEI showed over `111%` at the current mark but only
+`4.0525%` stop clearance above its next ladder. Its `$75` floor remains locked;
+even a `$5` reduction would fail the `2.45%` minimum clearance.
