@@ -120,7 +120,13 @@ Recent Changes
   donor positions near TP and suggests a `25/50/100%` reduction, but automatic
   partial closing remains disabled pending a separately approved canary.
   Canonical design: `docs/pump_capital_rescue_orchestrator.md`; operator rules:
-  `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`.
+  `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`. Commit `fd3ba75` passed the
+  complete Python suite (`664 passed`, `11 warnings`). A supervised restart
+  recovered the same three Pump positions and thirteen orders; explicit ARM
+  passed tracked-position ownership/protection validation, and the following
+  monitor cycles stayed armed with zero protection issues. Runtime showed the
+  new `$500 / 75% / $250` gates, no pending transfer, and HEI as a shadow-only
+  donor. No rescue transfer or position reduction was executed during rollout.
 - The guarded Pump auto-rescue deployment was activated after commits
   `95bbb9f` and `0061324` passed the full Python suite (`659 passed`, `11
   warnings`) and Android unit tests. A supervised restart recovered three

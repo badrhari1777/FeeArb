@@ -510,6 +510,17 @@ canary proves cancellation of remaining ladders, reduce-only execution,
 position refresh, and Full TP/SL resynchronization. See
 `docs/pump_capital_rescue_orchestrator.md`.
 
+Live activation evidence, 2026-08-09: commit `fd3ba75` passed the complete
+Python regression (`664 passed`, `11 warnings`). Before restart, Pump was armed
+with three protected positions and main Grid had no active execution or pending
+transition. The supervised restart recovered the same positions/orders;
+explicit ARM passed tracked-position ownership and protection verification.
+Two following monitor cycles remained armed with no error or protection issue,
+the minimum Pump liquidation buffer remained above `53%`, automatic transfer
+reported the new `$500` available floor, `75%` projected margin ceiling and
+`$250` incident step, and HEI appeared only as the recommended shadow donor.
+No transfer or position reduction was triggered during deployment.
+
 Do not call the transferable-coin endpoint for this member transfer. Bybit
 rejects `UNIFIED -> UNIFIED` there with `131203`; that endpoint compares
 account types rather than different main/sub UIDs. Direction readiness uses
