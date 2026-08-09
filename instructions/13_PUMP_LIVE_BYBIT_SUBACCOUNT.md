@@ -400,3 +400,36 @@ used as realized-PnL substitutes.
 
 This adds no recurring private API polling. Private history is requested only
 when a close needs accounting or a missing historical close is backfilled.
+
+## Four-slot cash guard correction (2026-08-09)
+
+The `$300` reserve is a budget: four `$50` position guarantees, a `$75` shared
+emergency pool, and a `$25` operating floor. Confirmed entry prefunds count
+toward the corresponding `$50` guarantees; they are not an additional reserve.
+
+The new-slot available-balance gate therefore uses:
+
+```text
+slot_margin + (max_total_topup - current_confirmed_topup) + operating_floor
+```
+
+The independent rescue-quota gate remains unchanged. This avoids reserving
+already-spent prefund twice while still preserving the entire unused `$275`
+portfolio top-up capacity and `$25` floor.
+
+Snapshot evidence: three open positions had `$135` confirmed top-up and
+`$380.957704` available. The retired static test required `$475`; the corrected
+complete-cap test requires `$340` and leaves `$40.957704` headroom. The source
+change does not affect a running backend until an explicit restart and ARM.
+
+Reproducible analysis:
+
+```text
+.venv\Scripts\python.exe scripts\pump_live_money_management.py
+```
+
+See `docs/pump_live_money_management_2026-08-09.md`. Automatic main-to-sub
+transfer is still not implemented: the repository has only the researched V5
+endpoint/capability map. Any transfer controller remains a separate staged
+change with a master-side key, idempotent UUID, confirmed `SUCCESS`, protected
+main-account floor, and rescue-capital exclusion accounting.

@@ -106,6 +106,17 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live four-slot cash accounting was corrected on 2026-08-09 after the
+  third open position caused the old `$300 reserve + $175 slot` test to reject
+  HFT despite `$135` of that reserve already being confirmed owned prefund.
+  The entry gate now reserves one full slot, only the unused part of the `$275`
+  portfolio top-up cap, and the `$25` floor; the separate four-by-`$50` rescue
+  guarantee remains fail-closed. At the fresh `$1043.86 / $380.96 available`
+  snapshot the complete requirement is `$340`, not `$475`. A reproducible
+  35-trade four-slot replay compares `$175/$150/$125`; keep `$175` for current
+  persisted positions and evaluate `$150` only after flat. No restart, ARM,
+  transfer, order, or resize was performed. The source contains transfer API
+  research only, not an executable master-to-sub controller.
 - KuCoin protective replacement was made gap-free on 2026-08-09 after the TUT
   incident. Timer-only stop rotation is retired (`stop_force_requote_max_age_sec=0`).
   A changed KuCoin stop/take is now created and confirmed in a fresh private

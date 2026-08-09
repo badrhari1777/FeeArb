@@ -16,6 +16,7 @@ from execution.pump_live import (
     entry_prefund_target_check,
     load_pump_live_config,
     required_entry_prefund_usd,
+    required_available_for_new_slot,
 )
 
 
@@ -1146,6 +1147,57 @@ def test_new_entry_blocks_when_available_would_break_reserve(tmp_path: Path) -> 
     assert status["open_positions"] == 0
     assert status["entry_armed"] is False
     assert status["blocked_reason"] == "available_balance_below_new_slot_guard"
+
+
+def test_new_slot_guard_does_not_reserve_existing_topups_twice(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4, prefund_enabled=False)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions(
+        [
+            ready_decision(
+                armed_at + index + 1,
+                symbol=f"TEST{index}USDT",
+                event_id=f"existing-{index}",
+            )
+            for index in range(3)
+        ]
+    )
+    controller.run_cycle()
+    topups = [25.0, 35.0, 75.0]
+    for item, amount in zip(
+        controller._state["positions"],  # pylint: disable=protected-access
+        topups,
+    ):
+        item["margin_topup_usd"] = amount
+    gateway.balance["available"] = 380.95
+    controller.submit_decisions(
+        [
+            ready_decision(
+                int(time.time() * 1000),
+                symbol="TEST3USDT",
+                event_id="fourth-slot",
+            )
+        ]
+    )
+
+    status = controller.run_cycle()
+
+    config = controller.config()
+    assert required_available_for_new_slot(
+        config,
+        current_total_topup_usd=sum(topups),
+    ) == 340.0
+    assert status["open_positions"] == 4
+    assert status["entry_armed"] is True
 
 
 def test_liquidation_buffer_adds_margin_from_reserved_cash(tmp_path: Path) -> None:

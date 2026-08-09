@@ -81,6 +81,27 @@ class PumpLiveConfig:
         return self.deployable_capital_usd / self.max_active_positions
 
 
+def required_available_for_new_slot(
+    config: PumpLiveConfig,
+    *,
+    current_total_topup_usd: float,
+) -> float:
+    """Cash required before reserving one more full ladder slot.
+
+    Existing top-ups have already reduced exchange available balance, so only
+    the unused part of the portfolio top-up cap must remain reserved. Keep the
+    operating floor separate. A negative tracked total is clamped to zero so
+    it cannot manufacture extra available capacity.
+    """
+    used_topup = max(0.0, float(current_total_topup_usd or 0.0))
+    remaining_topup_capacity = max(0.0, config.max_total_topup_usd - used_topup)
+    return (
+        config.slot_margin_usd
+        + remaining_topup_capacity
+        + config.operating_cash_floor_usd
+    )
+
+
 class PumpGateway(Protocol):
     def credentials_status(self) -> dict[str, Any]: ...
 
@@ -1545,7 +1566,10 @@ class PumpLiveController:
             if rescue_required_after_entry > config.max_total_topup_usd + 1e-9:
                 self.disarm("rescue_budget_below_new_slot_guard")
                 break
-            required_available = config.reserve_usd + config.slot_margin_usd
+            required_available = required_available_for_new_slot(
+                config,
+                current_total_topup_usd=total_topup,
+            )
             if _safe_float(balance.get("available"), 0.0) + 1e-9 < required_available:
                 self.disarm("available_balance_below_new_slot_guard")
                 break
