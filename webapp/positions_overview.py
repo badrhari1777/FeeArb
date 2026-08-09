@@ -102,6 +102,7 @@ def build_positions_overview(
                 )
             },
             "balance": _pump_balance(pump),
+            "capital_regime": dict(pump.get("capital_regime") or {}),
             "notifications": dict(pump.get("notifications") or {}),
             "positions": pump_positions,
             "recent_events": list(pump.get("recent_events") or [])[-20:],
@@ -185,10 +186,14 @@ def _pump_balance(pump: Mapping[str, Any]) -> dict[str, Any]:
     balance = dict(pump.get("last_balance") or {})
     if not balance:
         balance = dict((pump.get("last_preflight") or {}).get("account") or {})
+    capital = dict(pump.get("capital_manager") or {})
     return {
         "total_usd": _number(balance.get("total") or balance.get("total_usdt")),
         "available_usd": _number(balance.get("available") or balance.get("available_usdt")),
         "used_usd": _number(balance.get("used")),
+        "temporary_occupied_usd": _number(
+            capital.get("temporary_transfer_outstanding_usd")
+        ) or 0.0,
     }
 
 

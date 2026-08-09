@@ -12,12 +12,57 @@ from execution.pump_live import (
     PumpLiveConfig,
     PumpLiveController,
     build_capital_manager_status,
+    build_capital_regime_status,
     build_live_legs,
     entry_prefund_target_check,
     load_pump_live_config,
     required_entry_prefund_usd,
     required_available_for_new_slot,
 )
+
+
+def test_capital_regime_reports_locked_and_temporary_cash() -> None:
+    state = {
+        "last_balance": {"wallet": 1050.0, "available": 380.0},
+        "capital_manager": {"temporary_transfer_outstanding_usd": 50.0},
+        "positions": [
+            {
+                "status": "open",
+                "symbol": "HEIUSDT",
+                "liq_buffer_pct": 14.0,
+                "margin_topup_usd": 75.0,
+                "margin_prefund_floor_usd": 75.0,
+            },
+            {
+                "status": "open",
+                "symbol": "BLUAIUSDT",
+                "liq_buffer_pct": 52.0,
+                "margin_topup_usd": 35.0,
+                "margin_prefund_floor_usd": 25.0,
+            },
+        ],
+    }
+
+    result = build_capital_regime_status(state, PumpLiveConfig())
+
+    assert result["mode"] == "stress"
+    assert result["min_liq_buffer_symbol"] == "HEIUSDT"
+    assert result["total_topup_usd"] == 110.0
+    assert result["prefund_floor_usd"] == 100.0
+    assert result["removable_topup_usd"] == 10.0
+    assert result["temporary_occupied_usd"] == 50.0
+    assert result["new_slot_required_available_usd"] == 365.0
+    assert result["new_slot_headroom_usd"] == 15.0
+
+
+def test_capital_regime_is_calm_without_open_positions() -> None:
+    result = build_capital_regime_status(
+        {"last_balance": {"wallet": 1000.0, "available": 1000.0}},
+        PumpLiveConfig(),
+    )
+
+    assert result["mode"] == "calm"
+    assert result["min_liq_buffer_pct"] is None
 
 
 class FakePumpGateway:

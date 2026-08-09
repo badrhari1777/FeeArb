@@ -66,6 +66,9 @@ def _pump_balance_row(pump_status: Mapping[str, Any]) -> dict[str, Any]:
     timestamp = _timestamp_from_ms(
         pump_status.get("last_cycle_at_ms") or pump_status.get("updated_at_ms")
     )
+    capital = pump_status.get("capital_manager")
+    capital = capital if isinstance(capital, Mapping) else {}
+    temporary_occupied = _safe_float(capital.get("temporary_transfer_outstanding_usd"))
     return {
         "exchange": "bybit",
         "account_alias": "bybit_pump",
@@ -75,6 +78,7 @@ def _pump_balance_row(pump_status: Mapping[str, Any]) -> dict[str, Any]:
         "total": total,
         "available": available,
         "used": used,
+        "temporary_occupied_usd": temporary_occupied or 0.0,
         "margin_ratio": margin_ratio,
         "equity": _safe_float(balance.get("total")) or total,
         "buffer_pct": buffer_pct,
@@ -105,6 +109,7 @@ def _aggregate(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
         "total": summed("total"),
         "available": summed("available"),
         "used": summed("used"),
+        "temporary_occupied_usd": summed("temporary_occupied_usd"),
         "reporting_accounts": len(compatible),
         "healthy_accounts": sum(
             1 for row in compatible if str(row.get("status") or "ok").lower() == "ok"

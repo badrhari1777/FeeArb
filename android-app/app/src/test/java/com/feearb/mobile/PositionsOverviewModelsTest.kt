@@ -40,7 +40,13 @@ class PositionsOverviewModelsTest {
                 "balance": {
                   "total_usd": 1000,
                   "available_usd": 825,
-                  "used_usd": 175
+                  "used_usd": 175,
+                  "temporary_occupied_usd": 50
+                },
+                "capital_regime": {
+                  "mode": "normal",
+                  "prefund_floor_usd": 25,
+                  "temporary_occupied_usd": 50
                 },
                 "notifications": {
                   "configured": true,
@@ -87,6 +93,8 @@ class PositionsOverviewModelsTest {
         assertTrue(result.pump.entry_armed)
         assertTrue(result.pump.monitor_thread_alive)
         assertEquals(1000.0, result.pump.balance.total_usd ?: 0.0, 0.0001)
+        assertEquals(50.0, result.pump.balance.temporary_occupied_usd ?: 0.0, 0.0001)
+        assertEquals("normal", result.pump.capital_regime.mode)
         assertEquals("DEXEUSDT", result.pump.positions.single().symbol)
         assertEquals(31.5, result.pump.positions.single().liq_buffer_pct ?: 0.0, 0.0001)
         assertEquals("filled", result.pump.positions.single().legs.single().status)

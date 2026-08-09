@@ -52,6 +52,12 @@ def pump_payload() -> dict:
         "credentials": {"api_secret_present": True},
         "last_balance": {"total": 1000.0, "available": 825.0, "used": 175.0},
         "notifications": {"configured": True, "last_status": "ok"},
+        "capital_manager": {"temporary_transfer_outstanding_usd": 50.0},
+        "capital_regime": {
+            "mode": "stress",
+            "prefund_floor_usd": 25.0,
+            "temporary_occupied_usd": 50.0,
+        },
         "positions": [
             {
                 "live_id": "live-1",
@@ -100,6 +106,8 @@ def test_overview_keeps_main_and_pump_groups_separate() -> None:
     assert payload["pump"]["positions"][0]["margin_prefund_floor_usd"] == 25.0
     assert payload["pump"]["positions"][0]["margin_prefund_status"] == "confirmed"
     assert payload["pump"]["positions"][0]["remaining_hold_h"] > 335.0
+    assert payload["pump"]["balance"]["temporary_occupied_usd"] == 50.0
+    assert payload["pump"]["capital_regime"]["mode"] == "stress"
     assert "credentials" not in payload["pump"]
 
 

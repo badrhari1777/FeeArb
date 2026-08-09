@@ -23,4 +23,15 @@ class BalanceModelsTest {
         assertEquals(125.0, balanceTotal(null, balances) { it.total }, 0.0001)
         assertEquals(130.0, balanceTotal(130.0, balances) { it.total }, 0.0001)
     }
+
+    @Test
+    fun balanceSummaryKeepsTemporaryPumpCapitalSeparate() {
+        val summary = BalanceSummaryDto(
+            bybit_pump = BalanceAggregateDto(temporary_occupied_usd = 50.0),
+            bybit_combined = BalanceAggregateDto(temporary_occupied_usd = 50.0),
+        )
+
+        assertEquals(50.0, summary.bybit_pump.temporary_occupied_usd ?: 0.0, 0.0001)
+        assertEquals(50.0, summary.bybit_combined.temporary_occupied_usd ?: 0.0, 0.0001)
+    }
 }

@@ -659,6 +659,23 @@ private fun PumpStatusCard(
                     Modifier.weight(1f),
                 )
             }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock(
+                    "Capital regime",
+                    pump.capital_regime.mode?.uppercase() ?: "-",
+                    Modifier.weight(1f),
+                )
+                MetricBlock(
+                    "Temporarily occupied",
+                    "\$${formatMoney(balance.temporary_occupied_usd)}",
+                    Modifier.weight(1f),
+                )
+                MetricBlock(
+                    "Locked prefund",
+                    "\$${formatMoney(pump.capital_regime.prefund_floor_usd)}",
+                    Modifier.weight(1f),
+                )
+            }
             if (!hasPositions) {
                 Text(
                     "No open Pump positions. Monitoring for the next eligible signal.",
@@ -795,6 +812,9 @@ private fun BalanceCard(balance: BalanceDto) {
             MetricBlock("Available", formatMoney(balance.available), Modifier.weight(1f))
         }
         MetricBlock("Used", formatMoney(balance.used))
+        if ((balance.temporary_occupied_usd ?: 0.0) > 0.0 || balance.account_type == "pump") {
+            MetricBlock("Temporarily occupied", formatMoney(balance.temporary_occupied_usd))
+        }
         KeyValue("Margin", formatRatio(balance.margin_ratio))
         if (!balance.error.isNullOrBlank()) {
             Text(
@@ -832,6 +852,7 @@ private fun BybitAccountsCard(summary: BalanceSummaryDto) {
                 MetricBlock("Combined", formatMoney(summary.bybit_combined.total), Modifier.weight(1f))
                 MetricBlock("Available", formatMoney(summary.bybit_combined.available), Modifier.weight(1f))
             }
+            KeyValue("Temporarily occupied", formatMoney(summary.bybit_combined.temporary_occupied_usd))
         }
     }
 }

@@ -22,6 +22,7 @@ def _pump_status(**overrides: object) -> dict[str, object]:
             "used": 43.94,
         },
         "last_error": None,
+        "capital_manager": {"temporary_transfer_outstanding_usd": 50.0},
     }
     payload.update(overrides)
     return payload
@@ -65,6 +66,10 @@ def test_mobile_balances_separate_main_and_pump_and_sum_once() -> None:
     assert summary["bybit_main"]["total"] == pytest.approx(7594.22)
     assert summary["bybit_pump"]["total"] == pytest.approx(1043.94)
     assert summary["bybit_combined"]["total"] == pytest.approx(8638.16)
+    assert summary["bybit_pump"]["temporary_occupied_usd"] == pytest.approx(50.0)
+    assert summary["bybit_combined"]["temporary_occupied_usd"] == pytest.approx(50.0)
+    pump_row = next(row for row in payload["balances"] if row["account_type"] == "pump")
+    assert pump_row["temporary_occupied_usd"] == pytest.approx(50.0)
     assert summary["overall"]["total"] == pytest.approx(13843.34)
 
 
@@ -127,3 +132,4 @@ def test_web_account_normalizer_preserves_balance_summary() -> None:
     assert "balance_summary: {}" in app_js
     assert "accounts.balance_summary && typeof accounts.balance_summary === 'object'" in normalizer
     assert "normalized.balance_summary = clone(accounts.balance_summary) || {};" in normalizer
+    assert "balance-summary-bybit-pump-temporary" in app_js

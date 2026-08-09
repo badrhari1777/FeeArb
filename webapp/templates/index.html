@@ -724,11 +724,13 @@
           <span>Bybit Pump subaccount</span>
           <strong id="balance-summary-bybit-pump">{{ balance_bybit_pump.get('total') | round(2) if balance_bybit_pump.get('total') is number else "-" }}</strong>
           <small id="balance-summary-bybit-pump-available">Available {{ balance_bybit_pump.get('available') | round(2) if balance_bybit_pump.get('available') is number else "-" }} USDT</small>
+          <small id="balance-summary-bybit-pump-temporary">Temporarily occupied {{ balance_bybit_pump.get('temporary_occupied_usd') | round(2) if balance_bybit_pump.get('temporary_occupied_usd') is number else "-" }} USDT</small>
         </article>
         <article class="balance-summary-card balance-summary-card--combined">
           <span>Bybit combined</span>
           <strong id="balance-summary-bybit-combined">{{ balance_bybit_combined.get('total') | round(2) if balance_bybit_combined.get('total') is number else "-" }}</strong>
           <small id="balance-summary-bybit-combined-available">Available {{ balance_bybit_combined.get('available') | round(2) if balance_bybit_combined.get('available') is number else "-" }} USDT</small>
+          <small id="balance-summary-bybit-combined-temporary">Temporarily occupied {{ balance_bybit_combined.get('temporary_occupied_usd') | round(2) if balance_bybit_combined.get('temporary_occupied_usd') is number else "-" }} USDT</small>
         </article>
       </div>
       <table class="data-table">
@@ -740,6 +742,7 @@
             <th>Total</th>
             <th>Available</th>
             <th>In Use</th>
+            <th>Temporarily occupied</th>
             <th>Margin Ratio</th>
             <th>Equity</th>
             <th>Buffer %</th>
@@ -757,6 +760,7 @@
                 <td>{{ row.total if row.total is not none else "-" }}</td>
                 <td>{{ row.available if row.available is not none else "-" }}</td>
                 <td>{{ row.used if row.used is not none else "-" }}</td>
+                <td>{{ row.temporary_occupied_usd if row.temporary_occupied_usd is not none else "-" }}</td>
                 <td>
                 {% if row.margin_ratio is number %}
                   {{ row.margin_ratio | round(4) }}
@@ -784,7 +788,7 @@
             </tr>
           {% endfor %}
           {% if account_balance_rows | length == 0 %}
-            <tr><td colspan="12" class="muted">Balances will appear after the first refresh.</td></tr>
+            <tr><td colspan="13" class="muted">Balances will appear after the first refresh.</td></tr>
           {% endif %}
         </tbody>
       </table>

@@ -969,6 +969,7 @@ class PumpLiveController:
         payload["config"] = asdict(config)
         payload["config"]["slot_margin_usd"] = round(config.slot_margin_usd, 6)
         payload["capital_manager"] = build_capital_manager_status(payload, config)
+        payload["capital_regime"] = build_capital_regime_status(payload, config)
         payload["credentials"] = self.gateway.credentials_status()
         payload["monitor_thread_alive"] = bool(self._thread and self._thread.is_alive())
         payload["accounting_thread_alive"] = bool(
@@ -3340,6 +3341,84 @@ def build_capital_manager_status(
     }
 
 
+def build_capital_regime_status(
+    state: Mapping[str, Any],
+    config: PumpLiveConfig,
+) -> dict[str, Any]:
+    """Summarize current Pump cash/risk pressure without changing live state."""
+    open_positions = [
+        item
+        for item in state.get("positions") or []
+        if isinstance(item, Mapping) and item.get("status") != "closed"
+    ]
+    buffers = [
+        value
+        for value in (_optional_float(item.get("liq_buffer_pct")) for item in open_positions)
+        if value is not None
+    ]
+    min_buffer = min(buffers) if buffers else None
+    min_symbol = None
+    if min_buffer is not None:
+        min_symbol = next(
+            (
+                _normalize_symbol(item.get("symbol"))
+                for item in open_positions
+                if _optional_float(item.get("liq_buffer_pct")) == min_buffer
+            ),
+            None,
+        )
+    if min_buffer is None or min_buffer > config.margin_reduce_trigger_buffer_pct:
+        regime = "calm"
+    elif min_buffer > config.warning_liq_buffer_pct:
+        regime = "normal"
+    elif min_buffer > config.panic_liq_buffer_pct:
+        regime = "warning"
+    elif min_buffer > config.emergency_liq_buffer_pct:
+        regime = "stress"
+    else:
+        regime = "emergency"
+
+    total_topup = sum(
+        max(0.0, _safe_float(item.get("margin_topup_usd"), 0.0))
+        for item in open_positions
+    )
+    prefund_floor = sum(
+        max(0.0, _safe_float(item.get("margin_prefund_floor_usd"), 0.0))
+        for item in open_positions
+    )
+    balance = state.get("last_balance")
+    balance = balance if isinstance(balance, Mapping) else {}
+    available = _safe_float(balance.get("available"), 0.0)
+    wallet = _capital_wallet_balance(balance)
+    required_new_slot = required_available_for_new_slot(
+        config,
+        current_total_topup_usd=total_topup,
+    )
+    manager = dict(state.get("capital_manager") or {})
+    temporary_occupied = max(
+        0.0,
+        _safe_float(manager.get("temporary_transfer_outstanding_usd"), 0.0),
+    )
+    return {
+        "mode": regime,
+        "open_positions": len(open_positions),
+        "min_liq_buffer_pct": round(min_buffer, 6) if min_buffer is not None else None,
+        "min_liq_buffer_symbol": min_symbol,
+        "warning_liq_buffer_pct": config.warning_liq_buffer_pct,
+        "panic_liq_buffer_pct": config.panic_liq_buffer_pct,
+        "emergency_liq_buffer_pct": config.emergency_liq_buffer_pct,
+        "calm_liq_buffer_pct": config.margin_reduce_trigger_buffer_pct,
+        "wallet_usd": round(wallet, 6),
+        "available_usd": round(available, 6),
+        "total_topup_usd": round(total_topup, 6),
+        "prefund_floor_usd": round(prefund_floor, 6),
+        "removable_topup_usd": round(max(0.0, total_topup - prefund_floor), 6),
+        "temporary_occupied_usd": round(temporary_occupied, 6),
+        "new_slot_required_available_usd": round(required_new_slot, 6),
+        "new_slot_headroom_usd": round(available - required_new_slot, 6),
+    }
+
+
 def _capital_wallet_balance(balance: Mapping[str, Any]) -> float:
     wallet = _safe_float(balance.get("wallet"), 0.0)
     if wallet > 0:
@@ -3573,6 +3652,7 @@ __all__ = [
     "PumpLiveConfig",
     "PumpLiveController",
     "build_capital_manager_status",
+    "build_capital_regime_status",
     "build_live_legs",
     "entry_prefund_target_check",
     "load_pump_live_config",

@@ -286,8 +286,10 @@
     balanceSummaryBybitMainAvailable: document.getElementById('balance-summary-bybit-main-available'),
     balanceSummaryBybitPump: document.getElementById('balance-summary-bybit-pump'),
     balanceSummaryBybitPumpAvailable: document.getElementById('balance-summary-bybit-pump-available'),
+    balanceSummaryBybitPumpTemporary: document.getElementById('balance-summary-bybit-pump-temporary'),
     balanceSummaryBybitCombined: document.getElementById('balance-summary-bybit-combined'),
     balanceSummaryBybitCombinedAvailable: document.getElementById('balance-summary-bybit-combined-available'),
+    balanceSummaryBybitCombinedTemporary: document.getElementById('balance-summary-bybit-combined-temporary'),
     symbolPositionsTable: document.getElementById('symbol-positions-body'),
     symbolPositionsMeta: document.getElementById('symbol-positions-meta'),
     symbolPositionsDiffs: document.getElementById('symbol-positions-diffs'),
@@ -1108,6 +1110,7 @@
         '<td>' + formatNumber(row.total, 2) + '</td>' +
         '<td>' + formatNumber(row.available, 2) + '</td>' +
         '<td>' + formatNumber(row.used, 2) + '</td>' +
+        '<td>' + formatNumber(row.temporary_occupied_usd, 2) + '</td>' +
         '<td>' + marginRatioText + '</td>' +
         '<td>' + equityText + '</td>' +
         '<td>' + bufferText + '</td>' +
@@ -1117,7 +1120,7 @@
       '</tr>';
     }
     if (!html) {
-      html = '<tr><td colspan="12" class="muted">Balances will appear after the first refresh.</td></tr>';
+      html = '<tr><td colspan="13" class="muted">Balances will appear after the first refresh.</td></tr>';
     }
     elements.accountBalanceTable.innerHTML = html;
   }
@@ -1140,6 +1143,19 @@
       if (availableNode) {
         availableNode.textContent = 'Available ' +
           (typeof row.available === 'number' ? formatNumber(row.available, 2) : '-') +
+          ' USDT';
+      }
+    });
+    var temporaryMappings = [
+      [elements.balanceSummaryBybitPumpTemporary, data.bybit_pump],
+      [elements.balanceSummaryBybitCombinedTemporary, data.bybit_combined]
+    ];
+    temporaryMappings.forEach(function (mapping) {
+      var node = mapping[0];
+      var row = mapping[1] || {};
+      if (node) {
+        node.textContent = 'Temporarily occupied ' +
+          (typeof row.temporary_occupied_usd === 'number' ? formatNumber(row.temporary_occupied_usd, 2) : '-') +
           ' USDT';
       }
     });

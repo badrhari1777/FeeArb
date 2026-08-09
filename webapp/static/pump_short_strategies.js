@@ -178,6 +178,7 @@
     var keyInfo = preflight.key || {};
     var balance = live.last_balance || (preflight.account || {});
     var capital = live.capital_manager || {};
+    var regime = live.capital_regime || {};
     var open = Number(live.open_positions || 0);
     var cap = Number(config.entry_cap || 1);
     setText('pss-live-status', live.status || 'disabled');
@@ -193,6 +194,8 @@
     setText('pss-live-available', money(balance.available || balance.available_usdt || 0));
     setText('pss-live-slots', open + ' / ' + cap + ' (max ' + Number(config.max_active_positions || 4) + ')');
     setText('pss-live-reserve', money(config.reserve_usd || 300));
+    setText('pss-live-temporary', money(capital.temporary_transfer_outstanding_usd || 0));
+    setText('pss-live-regime', String(regime.mode || '-').toUpperCase());
     setText('pss-live-cycle', shortTime(live.last_cycle_at_ms));
     setText(
       'pss-live-capital-mode',

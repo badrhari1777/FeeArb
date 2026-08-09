@@ -22,6 +22,7 @@ data class BalanceDto(
     val total: Double? = null,
     val available: Double? = null,
     val used: Double? = null,
+    val temporary_occupied_usd: Double? = null,
     val margin_ratio: Double? = null,
     val status: String? = null,
     val error: String? = null,
@@ -33,6 +34,7 @@ data class BalanceAggregateDto(
     val total: Double? = null,
     val available: Double? = null,
     val used: Double? = null,
+    val temporary_occupied_usd: Double? = null,
     val reporting_accounts: Int = 0,
     val healthy_accounts: Int = 0,
 )
@@ -178,6 +180,7 @@ data class PumpOverviewDto(
     val monitor_thread_alive: Boolean = false,
     val config: PumpOverviewConfigDto = PumpOverviewConfigDto(),
     val balance: PumpOverviewBalanceDto = PumpOverviewBalanceDto(),
+    val capital_regime: PumpCapitalRegimeDto = PumpCapitalRegimeDto(),
     val notifications: PumpOverviewNotificationsDto = PumpOverviewNotificationsDto(),
     val positions: List<PumpPositionDto> = emptyList(),
     val recent_events: List<JsonObject> = emptyList(),
@@ -204,6 +207,17 @@ data class PumpOverviewBalanceDto(
     val total_usd: Double? = null,
     val available_usd: Double? = null,
     val used_usd: Double? = null,
+    val temporary_occupied_usd: Double? = null,
+)
+
+data class PumpCapitalRegimeDto(
+    val mode: String? = null,
+    val min_liq_buffer_pct: Double? = null,
+    val min_liq_buffer_symbol: String? = null,
+    val prefund_floor_usd: Double? = null,
+    val removable_topup_usd: Double? = null,
+    val temporary_occupied_usd: Double? = null,
+    val new_slot_headroom_usd: Double? = null,
 )
 
 data class PumpOverviewNotificationsDto(
