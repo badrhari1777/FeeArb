@@ -6,6 +6,7 @@ import math
 import os
 import threading
 import time
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
@@ -31,10 +32,12 @@ PUMP_TRANSFER_RETURN_CONFIRMATION = "RETURN TEMPORARY USDT PUMP TO MAIN"
 PUMP_TRANSFER_CONFIRM_DELAYS_SEC = (0.0, 0.2, 0.5, 1.0, 2.0)
 PUMP_TRANSFER_STATE_RETRY_SEC = (0.0, 0.05, 0.1, 0.2, 0.4)
 PUMP_TRANSFER_ENV_PATH = BASE_DIR / "config" / "pump_live.env"
-AUTO_TRANSFER_MAIN_FLOOR_USD = 2_000.0
-AUTO_TRANSFER_MAX_SINGLE_USD = 50.0
-AUTO_TRANSFER_DAILY_CAP_USD = 200.0
-AUTO_TRANSFER_COOLDOWN_SEC = 300
+AUTO_TRANSFER_MAIN_MIN_AVAILABLE_USD = 500.0
+AUTO_TRANSFER_MAIN_MAX_MARGIN_RATIO = 0.75
+AUTO_TRANSFER_MAIN_MIN_LIQ_BUFFER_PCT = 25.0
+AUTO_TRANSFER_MAIN_MAX_DATA_AGE_SEC = 180
+AUTO_TRANSFER_MAX_INCIDENT_USD = 250.0
+AUTO_TRANSFER_DAILY_ALERT_USD = 500.0
 AUTO_TRANSFER_ROUND_USD = 5.0
 
 
@@ -121,34 +124,51 @@ def load_auto_transfer_config(path: Path = PUMP_TRANSFER_ENV_PATH) -> dict[str, 
     }
     return {
         "enabled": enabled,
-        "main_wallet_floor_usd": max(
+        "main_min_available_usd": max(
             0.0,
             _number(
-                values.get("PUMP_LIVE_AUTO_TRANSFER_MAIN_WALLET_FLOOR_USD"),
-                AUTO_TRANSFER_MAIN_FLOOR_USD,
+                values.get("PUMP_LIVE_AUTO_TRANSFER_MAIN_MIN_AVAILABLE_USD"),
+                AUTO_TRANSFER_MAIN_MIN_AVAILABLE_USD,
             ),
         ),
-        "max_single_usd": max(
-            float(PUMP_TRANSFER_MIN_USDT),
+        "main_max_margin_ratio": min(
+            0.95,
+            max(
+                0.05,
+                _number(
+                    values.get("PUMP_LIVE_AUTO_TRANSFER_MAIN_MAX_MARGIN_RATIO"),
+                    AUTO_TRANSFER_MAIN_MAX_MARGIN_RATIO,
+                ),
+            ),
+        ),
+        "main_min_liq_buffer_pct": max(
+            0.0,
             _number(
-                values.get("PUMP_LIVE_AUTO_TRANSFER_MAX_SINGLE_USD"),
-                AUTO_TRANSFER_MAX_SINGLE_USD,
+                values.get("PUMP_LIVE_AUTO_TRANSFER_MAIN_MIN_LIQ_BUFFER_PCT"),
+                AUTO_TRANSFER_MAIN_MIN_LIQ_BUFFER_PCT,
             ),
         ),
-        "daily_cap_usd": max(
-            float(PUMP_TRANSFER_MIN_USDT),
-            _number(
-                values.get("PUMP_LIVE_AUTO_TRANSFER_DAILY_CAP_USD"),
-                AUTO_TRANSFER_DAILY_CAP_USD,
-            ),
-        ),
-        "cooldown_sec": max(
-            60,
+        "main_max_data_age_sec": max(
+            30,
             int(
                 _number(
-                    values.get("PUMP_LIVE_AUTO_TRANSFER_COOLDOWN_SEC"),
-                    AUTO_TRANSFER_COOLDOWN_SEC,
+                    values.get("PUMP_LIVE_AUTO_TRANSFER_MAIN_MAX_DATA_AGE_SEC"),
+                    AUTO_TRANSFER_MAIN_MAX_DATA_AGE_SEC,
                 )
+            ),
+        ),
+        "max_incident_usd": max(
+            float(PUMP_TRANSFER_MIN_USDT),
+            _number(
+                values.get("PUMP_LIVE_AUTO_TRANSFER_MAX_INCIDENT_USD"),
+                AUTO_TRANSFER_MAX_INCIDENT_USD,
+            ),
+        ),
+        "daily_alert_usd": max(
+            float(PUMP_TRANSFER_MIN_USDT),
+            _number(
+                values.get("PUMP_LIVE_AUTO_TRANSFER_DAILY_ALERT_USD"),
+                AUTO_TRANSFER_DAILY_ALERT_USD,
             ),
         ),
         "round_usd": max(
@@ -158,6 +178,150 @@ def load_auto_transfer_config(path: Path = PUMP_TRANSFER_ENV_PATH) -> dict[str, 
                 AUTO_TRANSFER_ROUND_USD,
             ),
         ),
+    }
+
+
+def _timestamp_ms(value: Any) -> int | None:
+    if not value:
+        return None
+    try:
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
+def assess_main_transfer_capacity(
+    main_payload: Mapping[str, Any] | None,
+    *,
+    requested_usd: float,
+    transfer_safe_usd: float,
+    config: Mapping[str, Any],
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Project main-account risk after a proposed main -> Pump transfer.
+
+    The account colour is deliberately not a gate. A transfer is allowed while
+    the active main portfolio remains protected and the projected Bybit margin
+    ratio, available cash, and liquidation buffers stay inside hard limits.
+    """
+    now = int(now_ms if now_ms is not None else time.time() * 1000)
+    payload = dict(main_payload or {})
+    requested = max(0.0, _number(requested_usd))
+    balances = [dict(row) for row in payload.get("balances") or [] if isinstance(row, Mapping)]
+    cards = [dict(row) for row in payload.get("cards") or [] if isinstance(row, Mapping)]
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    updated_ms = _timestamp_ms(payload.get("account_last_updated") or payload.get("last_updated"))
+    age_sec = max(0.0, (now - updated_ms) / 1000.0) if updated_ms else None
+    max_age = _number(config.get("main_max_data_age_sec"), AUTO_TRANSFER_MAIN_MAX_DATA_AGE_SEC)
+    if age_sec is None or age_sec > max_age:
+        errors.append("main_account_snapshot_stale")
+
+    bybit = next(
+        (row for row in balances if str(row.get("exchange") or "").lower() == "bybit"),
+        None,
+    )
+    total = _number((bybit or {}).get("total"), -1.0)
+    available = _number((bybit or {}).get("available"), -1.0)
+    used = _number((bybit or {}).get("used"), -1.0)
+    if used < 0 and total > 0:
+        current_ratio = _number((bybit or {}).get("margin_ratio"), -1.0)
+        used = total * current_ratio if current_ratio >= 0 else -1.0
+    if not bybit or total <= 0 or available < 0 or used < 0:
+        errors.append("main_bybit_margin_metrics_unavailable")
+
+    active_exchanges: set[str] = set()
+    liq_buffers: list[float] = []
+    protection_issues = 0
+    unknown_position_buffers = 0
+    for card in cards:
+        legs = [dict(leg) for leg in card.get("legs") or [] if isinstance(leg, Mapping)]
+        active_exchanges.update(
+            str(leg.get("exchange") or "").lower() for leg in legs if leg.get("exchange")
+        )
+        buffer_pct = _number(card.get("liq_distance_pct"), -1.0)
+        if buffer_pct >= 0:
+            liq_buffers.append(buffer_pct)
+        else:
+            unknown_position_buffers += 1
+        if not legs or any(_number(leg.get("stop_price")) <= 0 for leg in legs):
+            protection_issues += 1
+    min_liq_buffer = min(liq_buffers) if liq_buffers else None
+    if unknown_position_buffers:
+        errors.append("main_position_liq_buffer_unknown")
+    if protection_issues:
+        errors.append("main_position_protection_unverified")
+    min_required_buffer = _number(
+        config.get("main_min_liq_buffer_pct"), AUTO_TRANSFER_MAIN_MIN_LIQ_BUFFER_PCT
+    )
+    if min_liq_buffer is not None and min_liq_buffer < min_required_buffer:
+        errors.append("main_position_liq_buffer_below_floor")
+
+    active_margin_ratios: dict[str, float] = {}
+    for row in balances:
+        exchange = str(row.get("exchange") or "").lower()
+        if exchange not in active_exchanges:
+            continue
+        ratio = _number(row.get("margin_ratio"), -1.0)
+        if ratio < 0:
+            errors.append(f"main_active_margin_ratio_unknown:{exchange}")
+        else:
+            active_margin_ratios[exchange] = ratio
+            if ratio >= 0.8:
+                errors.append(f"main_active_account_in_stress:{exchange}")
+
+    max_ratio = _number(
+        config.get("main_max_margin_ratio"), AUTO_TRANSFER_MAIN_MAX_MARGIN_RATIO
+    )
+    min_available = _number(
+        config.get("main_min_available_usd"), AUTO_TRANSFER_MAIN_MIN_AVAILABLE_USD
+    )
+    max_incident = _number(config.get("max_incident_usd"), AUTO_TRANSFER_MAX_INCIDENT_USD)
+    projected_total = total - requested if total > 0 else -1.0
+    projected_available = available - requested if available >= 0 else -1.0
+    projected_ratio = used / projected_total if projected_total > 0 and used >= 0 else None
+    available_capacity = max(0.0, available - min_available) if available >= 0 else 0.0
+    ratio_capacity = max(0.0, total - used / max_ratio) if total > 0 and used >= 0 else 0.0
+    safe_capacity = max(
+        0.0,
+        min(
+            max(0.0, _number(transfer_safe_usd)),
+            available_capacity,
+            ratio_capacity,
+            max_incident,
+        ),
+    )
+    if requested > safe_capacity + 1e-9:
+        errors.append("main_projected_transfer_capacity_exceeded")
+    if projected_ratio is not None and projected_ratio >= max_ratio - 1e-12:
+        errors.append("main_projected_margin_ratio_too_high")
+    if projected_available >= 0 and projected_available < min_available - 1e-9:
+        errors.append("main_projected_available_below_floor")
+
+    current_ratio = used / total if total > 0 and used >= 0 else None
+    if current_ratio is not None and current_ratio >= 0.6:
+        warnings.append("main_bybit_account_already_watch")
+    return {
+        "ready": not errors,
+        "requested_usd": round(requested, 6),
+        "safe_capacity_usd": round(safe_capacity, 6),
+        "bybit_total_usd": round(total, 6) if total >= 0 else None,
+        "bybit_available_usd": round(available, 6) if available >= 0 else None,
+        "bybit_used_usd": round(used, 6) if used >= 0 else None,
+        "current_margin_ratio": round(current_ratio, 8) if current_ratio is not None else None,
+        "projected_total_usd": round(projected_total, 6) if projected_total >= 0 else None,
+        "projected_available_usd": round(projected_available, 6) if projected_available >= 0 else None,
+        "projected_margin_ratio": round(projected_ratio, 8) if projected_ratio is not None else None,
+        "max_margin_ratio": max_ratio,
+        "min_available_usd": min_available,
+        "min_liq_buffer_pct": round(min_liq_buffer, 6) if min_liq_buffer is not None else None,
+        "required_min_liq_buffer_pct": min_required_buffer,
+        "protection_issues": protection_issues,
+        "active_margin_ratios": active_margin_ratios,
+        "snapshot_age_sec": round(age_sec, 3) if age_sec is not None else None,
+        "errors": errors,
+        "warnings": warnings,
     }
 
 
@@ -538,6 +702,7 @@ class PumpTemporaryTransferController:
         state_dir: Path = PUMP_TRANSFER_STATE_DIR,
         env_path: Path = PUMP_TRANSFER_ENV_PATH,
         sleep: Callable[[float], None] = time.sleep,
+        main_portfolio_provider: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self.accounting = accounting
         self.gateway = gateway or BybitPumpTransferGateway()
@@ -546,6 +711,7 @@ class PumpTemporaryTransferController:
         self.state_path = state_dir / PUMP_TRANSFER_STATE_FILE
         self.events_path = state_dir / PUMP_TRANSFER_EVENTS_FILE
         self._sleep = sleep
+        self._main_portfolio_provider = main_portfolio_provider
         self._lock = threading.RLock()
         self._state = self._load_state()
 
@@ -599,10 +765,7 @@ class PumpTemporaryTransferController:
         return {
             **config,
             "daily_used_usd": round(daily_used, 6),
-            "daily_remaining_usd": round(
-                max(0.0, config["daily_cap_usd"] - daily_used),
-                6,
-            ),
+            "daily_alert_exceeded": daily_used >= config["daily_alert_usd"],
             "last_attempt_at_ms": snapshot.get("last_auto_attempt_at_ms"),
             "last_result": snapshot.get("last_auto_result"),
         }
@@ -625,9 +788,17 @@ class PumpTemporaryTransferController:
         rounded = math.ceil(requested / config["round_usd"] - 1e-12) * config["round_usd"]
         now = int(time.time() * 1000)
         auto_status = self._auto_status()
-        last_attempt = int(_number(auto_status.get("last_attempt_at_ms")))
+        risk_band = (
+            "emergency"
+            if liq_buffer_pct <= 10.0
+            else "stress"
+            if liq_buffer_pct <= 15.0
+            else "warning"
+        )
         context = {
             "symbol": str(symbol),
+            "incident_id": f"{str(symbol).upper()}:{risk_band}",
+            "risk_band": risk_band,
             "liq_buffer_pct": round(_number(liq_buffer_pct), 6),
             "desired_topup_usd": round(_number(desired_topup_usd), 6),
             "available_usd": round(_number(available_usd), 6),
@@ -636,20 +807,7 @@ class PumpTemporaryTransferController:
         reason = None
         if self._state.get("pending"):
             reason = "pending_reconciliation"
-        elif last_attempt and now - last_attempt < config["cooldown_sec"] * 1000:
-            reason = "cooldown"
-        elif rounded > config["max_single_usd"] + 1e-9:
-            reason = "max_single_exceeded"
-        elif rounded > auto_status["daily_remaining_usd"] + 1e-9:
-            reason = "daily_cap_exceeded"
         if reason:
-            if reason == "cooldown":
-                return {
-                    "status": "cooldown",
-                    "reason": reason,
-                    "amount_usd": rounded,
-                    **context,
-                }
             return self._record_auto_result(
                 {"status": "blocked", "reason": reason, "amount_usd": rounded, **context},
                 now=now,
@@ -659,12 +817,23 @@ class PumpTemporaryTransferController:
         balances = dict(preflight.get("balances") or {})
         main = dict(balances.get("main") or {})
         main_wallet = _number(main.get("wallet_usd"))
-        main_above_floor = max(0.0, main_wallet - config["main_wallet_floor_usd"])
-        safe_inbound = min(_number(preflight.get("inbound_limit_usd")), main_above_floor)
+        main_payload: Mapping[str, Any] | None = None
+        if self._main_portfolio_provider is not None:
+            try:
+                main_payload = self._main_portfolio_provider()
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.warning("Pump main portfolio snapshot failed: %s", type(exc).__name__)
+        main_risk = assess_main_transfer_capacity(
+            main_payload,
+            requested_usd=rounded,
+            transfer_safe_usd=_number(preflight.get("inbound_limit_usd")),
+            config=config,
+            now_ms=now,
+        )
         if not preflight.get("round_trip_ready"):
             reason = "round_trip_preflight_not_ready"
-        elif rounded > safe_inbound + 1e-9:
-            reason = "main_wallet_floor_or_transfer_limit"
+        elif not main_risk.get("ready"):
+            reason = str((main_risk.get("errors") or ["main_risk_gate_failed"])[0])
         if reason:
             return self._record_auto_result(
                 {
@@ -672,15 +841,24 @@ class PumpTemporaryTransferController:
                     "reason": reason,
                     "amount_usd": rounded,
                     "main_wallet_usd": main_wallet,
-                    "main_wallet_floor_usd": config["main_wallet_floor_usd"],
-                    "safe_inbound_usd": safe_inbound,
+                    "main_risk": main_risk,
                     **context,
                 },
                 now=now,
             )
 
+        warnings = list(main_risk.get("warnings") or [])
+        projected_daily = auto_status["daily_used_usd"] + rounded
+        if projected_daily > config["daily_alert_usd"] + 1e-9:
+            warnings.append("daily_transfer_alert_threshold_exceeded")
         self._record_auto_result(
-            {"status": "submitting", "amount_usd": rounded, **context},
+            {
+                "status": "submitting",
+                "amount_usd": rounded,
+                "main_risk": main_risk,
+                "warnings": warnings,
+                **context,
+            },
             now=now,
         )
         result = self._execute(
@@ -695,6 +873,8 @@ class PumpTemporaryTransferController:
             "status": "complete",
             "amount_usd": rounded,
             "transfer_id": operation.get("transfer_id"),
+            "main_risk": main_risk,
+            "warnings": warnings,
             **context,
         }
         self._record_auto_result(completed, now=int(time.time() * 1000))

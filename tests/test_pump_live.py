@@ -13,6 +13,7 @@ from execution.pump_live import (
     PumpLiveController,
     build_capital_manager_status,
     build_capital_regime_status,
+    build_capital_rescue_shadow,
     build_live_legs,
     entry_prefund_target_check,
     load_pump_live_config,
@@ -63,6 +64,55 @@ def test_capital_regime_is_calm_without_open_positions() -> None:
 
     assert result["mode"] == "calm"
     assert result["min_liq_buffer_pct"] is None
+
+
+def test_capital_rescue_shadow_prefers_profitable_position_near_take_profit() -> None:
+    state = {
+        "positions": [
+            {
+                "status": "open",
+                "symbol": "THREATUSDT",
+                "unrealized_pnl_usd": -10.0,
+                "liq_buffer_pct": 14.0,
+                "mark_price": 1.0,
+                "tp_price": 0.8,
+                "stop_price": 1.1,
+            },
+            {
+                "status": "open",
+                "symbol": "HEIUSDT",
+                "unrealized_pnl_usd": 40.0,
+                "liq_buffer_pct": 107.0,
+                "mark_price": 0.1605,
+                "tp_price": 0.1559,
+                "stop_price": 0.3,
+                "margin_topup_usd": 75.0,
+                "legs": [{"status": "open"}, {"status": "filled"}],
+            },
+            {
+                "status": "open",
+                "symbol": "RATSUSDT",
+                "unrealized_pnl_usd": 8.0,
+                "liq_buffer_pct": 80.0,
+                "mark_price": 1.0,
+                "tp_price": 0.7,
+                "stop_price": 1.5,
+            },
+        ]
+    }
+
+    result = build_capital_rescue_shadow(
+        state,
+        PumpLiveConfig(),
+        threatened_symbol="THREATUSDT",
+        required_usd=50.0,
+    )
+
+    assert result["mode"] == "shadow"
+    assert result["execution_enabled"] is False
+    assert result["recommended_donor"]["symbol"] == "HEIUSDT"
+    assert result["recommended_donor"]["suggested_reduce_fraction"] == 0.25
+    assert result["recommended_donor"]["remaining_ladder_orders"] == 1
 
 
 class FakePumpGateway:
@@ -1335,7 +1385,7 @@ def test_emergency_buffer_never_waits_for_risk_transfer(tmp_path: Path) -> None:
     assert status["positions"][0]["close_reason"] == "emergency_liq_buffer"
 
 
-def test_critical_buffer_bypasses_topup_cooldown_and_closes(tmp_path: Path) -> None:
+def test_critical_buffer_closes_even_immediately_after_topup(tmp_path: Path) -> None:
     env_path = tmp_path / "pump_live.env"
     write_env(env_path)
     gateway = FakePumpGateway()
@@ -1359,6 +1409,33 @@ def test_critical_buffer_bypasses_topup_cooldown_and_closes(tmp_path: Path) -> N
     assert gateway.positions == []
     assert status["positions"][0]["status"] == "closing"
     assert status["positions"][0]["close_reason"] == "emergency_liq_buffer"
+
+
+def test_warning_position_can_receive_consecutive_verified_topups_without_cooldown(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    gateway.liq_after_add = 15.0
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 15.0
+
+    controller.run_cycle()
+    status = controller.run_cycle()
+
+    assert gateway.margin_adds == [("TESTUSDT", 25.0), ("TESTUSDT", 25.0)]
+    assert status["positions"][0]["margin_topup_usd"] == 50.0
 
 
 def test_topup_is_immediately_verified_and_closes_if_buffer_stays_critical(tmp_path: Path) -> None:

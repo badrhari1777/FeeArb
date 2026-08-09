@@ -198,8 +198,11 @@
     setText('pss-live-temporary', money(capital.temporary_transfer_outstanding_usd || 0));
     setText('pss-live-regime', String(regime.mode || '-').toUpperCase());
     setText('pss-live-auto-transfer', autoTransfer.enabled ? 'ON' : 'OFF');
-    setText('pss-live-auto-main-floor', money(autoTransfer.main_wallet_floor_usd || 0));
-    setText('pss-live-auto-daily-left', money(autoTransfer.daily_remaining_usd || 0));
+    setText('pss-live-auto-main-floor', money(autoTransfer.main_min_available_usd || 0));
+    setText(
+      'pss-live-auto-daily-left',
+      money(autoTransfer.daily_used_usd || 0) + ' / ' + money(autoTransfer.daily_alert_usd || 0)
+    );
     setText('pss-live-cycle', shortTime(live.last_cycle_at_ms));
     setText(
       'pss-live-capital-mode',

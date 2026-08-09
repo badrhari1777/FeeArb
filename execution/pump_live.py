@@ -69,7 +69,7 @@ class PumpLiveConfig:
     entry_margin_prefund_taker_fee_rate: float = 0.00055
     operating_cash_floor_usd: float = 25.0
     flat_confirm_cycles: int = 2
-    topup_cooldown_sec: int = 300
+    topup_cooldown_sec: int = 0  # retained in status for schema compatibility; not a risk gate
     margin_reduce_trigger_buffer_pct: float = 35.0
     margin_reduce_target_buffer_pct: float = 30.0
     margin_reduce_confirm_cycles: int = 2
@@ -978,6 +978,7 @@ class PumpLiveController:
         payload["config"]["slot_margin_usd"] = round(config.slot_margin_usd, 6)
         payload["capital_manager"] = build_capital_manager_status(payload, config)
         payload["capital_regime"] = build_capital_regime_status(payload, config)
+        payload["capital_rescue_shadow"] = build_capital_rescue_shadow(payload, config)
         payload["credentials"] = self.gateway.credentials_status()
         payload["monitor_thread_alive"] = bool(self._thread and self._thread.is_alive())
         payload["accounting_thread_alive"] = bool(
@@ -2029,10 +2030,6 @@ class PumpLiveController:
             item["margin_reduce_confirm_count"] = 0
             self._save_state_locked()
         now = _now_ms()
-        last_topup = _safe_int(item.get("last_topup_at_ms"), 0)
-        topup_in_cooldown = now - last_topup < config.topup_cooldown_sec * 1000
-        if topup_in_cooldown and buffer_pct > config.emergency_liq_buffer_pct:
-            return
         position_topup = _safe_float(item.get("margin_topup_usd"), 0.0)
         with self._lock:
             open_items = self._open_positions(self._state)
@@ -2119,7 +2116,13 @@ class PumpLiveController:
                         "transfer_id": transfer.get("transfer_id"),
                     },
                 )
-            elif transfer_status not in {"disabled", "not_needed", "cooldown"}:
+            elif transfer_status not in {"disabled", "not_needed"}:
+                rescue_shadow = build_capital_rescue_shadow(
+                    self._state,
+                    config,
+                    threatened_symbol=symbol,
+                    required_usd=requested,
+                )
                 self._event(
                     "auto_transfer_blocked",
                     {
@@ -2127,6 +2130,8 @@ class PumpLiveController:
                         "liq_buffer_pct": buffer_pct,
                         "requested_usd": requested,
                         "reason": transfer.get("reason") or transfer_status,
+                        "main_risk": transfer.get("main_risk"),
+                        "capital_rescue_shadow": rescue_shadow,
                     },
                 )
         if allowed >= 1.0:
@@ -3043,11 +3048,29 @@ def _pump_live_notification(
     if event == "auto_transfer_blocked":
         requested = _safe_float(payload.get("requested_usd"), 0.0)
         reason = str(payload.get("reason") or "unknown")
+        main_risk = dict(payload.get("main_risk") or {})
+        projected_ratio = _optional_float(main_risk.get("projected_margin_ratio"))
+        min_main_buffer = _optional_float(main_risk.get("min_liq_buffer_pct"))
+        rescue = dict(payload.get("capital_rescue_shadow") or {})
+        donor = dict(rescue.get("recommended_donor") or {})
+        risk_lines = ""
+        if projected_ratio is not None:
+            risk_lines += f"\nMain projected margin: {projected_ratio * 100.0:.2f}%."
+        if min_main_buffer is not None:
+            risk_lines += f"\nMain minimum liquidation buffer: {min_main_buffer:.2f}%."
+        if donor.get("symbol"):
+            risk_lines += (
+                f"\nShadow donor: {donor.get('symbol')} "
+                f"({float(donor.get('suggested_reduce_fraction') or 0.0) * 100.0:.0f}% reduction)."
+            )
+        else:
+            risk_lines += "\nNo safe profitable Pump donor is currently available."
         return (
             f"Pump Live AUTO TRANSFER BLOCKED {symbol}",
             (
                 f"Pump Live could not transfer the required ${requested:.2f} from main."
                 f"{symbol_line}\nReason: {reason}."
+                f"{risk_lines}"
                 "\nExchange protection remains authoritative; emergency handling was not delayed."
             ),
             f"auto_transfer_blocked:{symbol}:{reason}",
@@ -3507,6 +3530,86 @@ def build_capital_regime_status(
     }
 
 
+def build_capital_rescue_shadow(
+    state: Mapping[str, Any],
+    config: PumpLiveConfig,
+    *,
+    threatened_symbol: str | None = None,
+    required_usd: float = 0.0,
+) -> dict[str, Any]:
+    """Rank profitable Pump positions that could donate cash in a future canary.
+
+    This is intentionally advisory. Pump Live has no automatic partial-close
+    authority: implementing the exchange-confirmed cancel/reduce/protect cycle
+    remains a separately armed live step.
+    """
+    threat = _normalize_symbol(threatened_symbol)
+    required = max(0.0, _safe_float(required_usd, 0.0))
+    donors: list[dict[str, Any]] = []
+    for item in state.get("positions") or []:
+        if not isinstance(item, Mapping) or item.get("status") == "closed":
+            continue
+        symbol = _normalize_symbol(item.get("symbol"))
+        if threat and symbol == threat:
+            continue
+        pnl = _safe_float(item.get("unrealized_pnl_usd"), 0.0)
+        buffer_pct = _optional_float(item.get("liq_buffer_pct"))
+        mark = _safe_float(item.get("mark_price"), 0.0)
+        tp = _optional_float(item.get("tp_price"))
+        protected = bool(_optional_float(item.get("stop_price"))) and bool(tp)
+        if pnl <= 0 or buffer_pct is None or buffer_pct <= config.warning_liq_buffer_pct:
+            continue
+        if not protected or mark <= 0 or tp is None or tp <= 0:
+            continue
+        distance_to_tp_pct = max(0.0, (mark - tp) / mark * 100.0)
+        estimated_releasable = max(
+            0.0,
+            config.slot_margin_usd
+            + _safe_float(item.get("margin_topup_usd"), 0.0),
+        )
+        need = required if required > 0 else min(config.margin_topup_chunk_usd, estimated_releasable)
+        raw_fraction = need / estimated_releasable if estimated_releasable > 0 else 1.0
+        harvest_fraction = next(
+            (fraction for fraction in (0.25, 0.5, 1.0) if raw_fraction <= fraction + 1e-9),
+            1.0,
+        )
+        estimated_release = estimated_releasable * harvest_fraction
+        donors.append(
+            {
+                "symbol": symbol,
+                "unrealized_pnl_usd": round(pnl, 6),
+                "liq_buffer_pct": round(buffer_pct, 6),
+                "distance_to_tp_pct": round(distance_to_tp_pct, 6),
+                "estimated_releasable_usd": round(estimated_releasable, 6),
+                "suggested_reduce_fraction": harvest_fraction,
+                "estimated_release_usd": round(estimated_release, 6),
+                "remaining_ladder_orders": sum(
+                    1
+                    for leg in item.get("legs") or []
+                    if isinstance(leg, Mapping)
+                    and str(leg.get("status") or "") in {"open", "submitted"}
+                ),
+            }
+        )
+    donors.sort(
+        key=lambda row: (
+            row["distance_to_tp_pct"],
+            -row["unrealized_pnl_usd"],
+            -row["liq_buffer_pct"],
+            row["symbol"],
+        )
+    )
+    return {
+        "mode": "shadow",
+        "execution_enabled": False,
+        "threatened_symbol": threat or None,
+        "required_usd": round(required, 6),
+        "recommended_donor": donors[0] if donors else None,
+        "donors": donors,
+        "required_live_gate": "operator_approved_partial_close_canary",
+    }
+
+
 def _capital_wallet_balance(balance: Mapping[str, Any]) -> float:
     wallet = _safe_float(balance.get("wallet"), 0.0)
     if wallet > 0:
@@ -3741,6 +3844,7 @@ __all__ = [
     "PumpLiveController",
     "build_capital_manager_status",
     "build_capital_regime_status",
+    "build_capital_rescue_shadow",
     "build_live_legs",
     "entry_prefund_target_check",
     "load_pump_live_config",

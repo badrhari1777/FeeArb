@@ -106,6 +106,21 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump capital rescue became projection-driven on 2026-08-09. Automatic
+  main -> Pump funding no longer requires a GREEN main-account label or waits
+  for a financial cooldown. It projects the exact transfer against fresh
+  Bybit total/available/used margin, permits GREEN or WATCH only while the
+  resulting ratio stays below `75%`, leaves `$500` available, requires every
+  active main position to retain a verified stop and at least `25%`
+  liquidation buffer, and rejects stale or unknown state. Transfers remain
+  UUID/idempotency guarded, exchange-confirmed, transfer-safe, and capped at
+  `$250` per incident; `$500` daily use is an alert rather than a hard blocker.
+  Repeated verified Pump top-ups are also state/cap driven rather than blocked
+  for five minutes. A new `capital_rescue_shadow` ranks profitable protected
+  donor positions near TP and suggests a `25/50/100%` reduction, but automatic
+  partial closing remains disabled pending a separately approved canary.
+  Canonical design: `docs/pump_capital_rescue_orchestrator.md`; operator rules:
+  `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`.
 - The guarded Pump auto-rescue deployment was activated after commits
   `95bbb9f` and `0061324` passed the full Python suite (`659 passed`, `11
   warnings`) and Android unit tests. A supervised restart recovered three

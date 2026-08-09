@@ -472,19 +472,43 @@ Automatic rescue defaults and hard guards are configured only in ignored
 
 ```text
 PUMP_LIVE_AUTO_TRANSFER_ENABLED=1
-PUMP_LIVE_AUTO_TRANSFER_MAIN_WALLET_FLOOR_USD=2000
-PUMP_LIVE_AUTO_TRANSFER_MAX_SINGLE_USD=50
-PUMP_LIVE_AUTO_TRANSFER_DAILY_CAP_USD=200
-PUMP_LIVE_AUTO_TRANSFER_COOLDOWN_SEC=300
+PUMP_LIVE_AUTO_TRANSFER_MAIN_MIN_AVAILABLE_USD=500
+PUMP_LIVE_AUTO_TRANSFER_MAIN_MAX_MARGIN_RATIO=0.75
+PUMP_LIVE_AUTO_TRANSFER_MAIN_MIN_LIQ_BUFFER_PCT=25
+PUMP_LIVE_AUTO_TRANSFER_MAIN_MAX_DATA_AGE_SEC=180
+PUMP_LIVE_AUTO_TRANSFER_MAX_INCIDENT_USD=250
+PUMP_LIVE_AUTO_TRANSFER_DAILY_ALERT_USD=500
 PUMP_LIVE_AUTO_TRANSFER_ROUND_USD=5
 ```
 
-The requested cash shortfall is rounded upward to `$5`; a partial transfer is
-never sent if the full rounded request would cross the `$50` event cap, `$200`
-UTC-day cap, Bybit transfer-safe balance, or the `$2000` main-wallet floor.
-Every attempt is UUID-backed and history-confirmed. Unknown outcomes remain
-pending and block duplicates. Automatic Pump -> main return is deliberately
-not enabled yet; the existing guarded manual return remains available.
+The requested cash shortfall is rounded upward to `$5`. The main account colour
+is not an independent gate: `GREEN` and `WATCH` may both lend when the exact
+post-transfer projection stays below the configured `75%` Bybit margin ratio,
+leaves at least `$500` available, every active main position has confirmed
+stops and at least a `25%` liquidation buffer, all active exchange accounts are
+below the existing `80%` stress boundary, and the snapshot is no older than
+three minutes. The transfer is also bounded by Bybit's fresh transfer-safe
+amount and a `$250` per-incident canary ceiling. The `$500` daily value is an
+alert threshold, not an emergency blocker.
+
+There is no financial time cooldown. A second confirmed transfer can occur in
+the next protective cycle if the same or another position still has a real
+cash deficit. Each transfer remains UUID-backed and history-confirmed; only an
+unknown/pending result blocks another submission, preventing a duplicate
+outcome. Likewise, a verified margin top-up no longer creates a five-minute
+period in which further necessary margin is forbidden. Position and portfolio
+caps, fresh balance, and a fresh exchange position read after every add remain
+the hard gates. Automatic Pump -> main return is deliberately not enabled yet;
+the existing guarded manual return remains available.
+
+If main cannot safely lend, Pump Live now publishes a read-only
+`capital_rescue_shadow`. It ranks protected, profitable Pump positions by low
+remaining distance to TP, profit and liquidation buffer, and estimates a
+`25% / 50% / 100%` reduction sufficient to release the required cash. This is
+advisory only: automatic partial closing is disabled until a separate live
+canary proves cancellation of remaining ladders, reduce-only execution,
+position refresh, and Full TP/SL resynchronization. See
+`docs/pump_capital_rescue_orchestrator.md`.
 
 Do not call the transferable-coin endpoint for this member transfer. Bybit
 rejects `UNIFIED -> UNIFIED` there with `131203`; that endpoint compares

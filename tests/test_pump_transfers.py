@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -113,6 +114,29 @@ class FakeAccounting:
             },
             "capital_manager": {"active_strategy_capital_usd": 1000.0},
         }
+        self.main_payload = {
+            "status": "ready",
+            "account_last_updated": datetime.now(timezone.utc).isoformat(),
+            "balances": [
+                {
+                    "exchange": "bybit",
+                    "total": 5000.0,
+                    "available": 4000.0,
+                    "used": 1000.0,
+                    "margin_ratio": 0.2,
+                    "status": "ok",
+                }
+            ],
+            "cards": [
+                {
+                    "symbol": "MAINUSDT",
+                    "liq_distance_pct": 40.0,
+                    "legs": [
+                        {"exchange": "bybit", "side": "long", "stop_price": 1.0}
+                    ],
+                }
+            ],
+        }
 
     def status(self) -> dict[str, Any]:
         return self._status
@@ -147,6 +171,7 @@ def _controller(tmp_path: Path) -> tuple[PumpTemporaryTransferController, FakeTr
         state_dir=tmp_path,
         env_path=tmp_path / "pump.env",
         sleep=lambda _seconds: None,
+        main_portfolio_provider=lambda: accounting.main_payload,
     )
     return controller, gateway, accounting
 
@@ -154,10 +179,12 @@ def _controller(tmp_path: Path) -> tuple[PumpTemporaryTransferController, FakeTr
 def _enable_auto_transfer(path: Path, **overrides: float) -> None:
     values = {
         "PUMP_LIVE_AUTO_TRANSFER_ENABLED": "1",
-        "PUMP_LIVE_AUTO_TRANSFER_MAIN_WALLET_FLOOR_USD": "2000",
-        "PUMP_LIVE_AUTO_TRANSFER_MAX_SINGLE_USD": "50",
-        "PUMP_LIVE_AUTO_TRANSFER_DAILY_CAP_USD": "200",
-        "PUMP_LIVE_AUTO_TRANSFER_COOLDOWN_SEC": "300",
+        "PUMP_LIVE_AUTO_TRANSFER_MAIN_MIN_AVAILABLE_USD": "500",
+        "PUMP_LIVE_AUTO_TRANSFER_MAIN_MAX_MARGIN_RATIO": "0.75",
+        "PUMP_LIVE_AUTO_TRANSFER_MAIN_MIN_LIQ_BUFFER_PCT": "25",
+        "PUMP_LIVE_AUTO_TRANSFER_MAIN_MAX_DATA_AGE_SEC": "180",
+        "PUMP_LIVE_AUTO_TRANSFER_MAX_INCIDENT_USD": "250",
+        "PUMP_LIVE_AUTO_TRANSFER_DAILY_ALERT_USD": "500",
         "PUMP_LIVE_AUTO_TRANSFER_ROUND_USD": "5",
     }
     values.update({key: str(value) for key, value in overrides.items()})
@@ -189,13 +216,16 @@ def test_auto_risk_transfer_rounds_up_and_tracks_daily_temporary_cash(tmp_path: 
     assert controller.status()["auto_risk"]["daily_used_usd"] == 15.0
 
 
-def test_auto_risk_transfer_preserves_main_floor_and_does_not_send_partial(
+def test_auto_risk_transfer_preserves_projected_main_available_floor(
     tmp_path: Path,
 ) -> None:
-    controller, gateway, _accounting = _controller(tmp_path)
+    controller, gateway, accounting = _controller(tmp_path)
     _enable_auto_transfer(tmp_path / "pump.env")
     gateway.balances["main"].update(
         {"wallet_usd": 2010.0, "transfer_balance_usd": 2010.0, "transfer_safe_usd": 2010.0}
+    )
+    accounting.main_payload["balances"][0].update(
+        {"total": 2010.0, "available": 510.0, "used": 1500.0, "margin_ratio": 1500 / 2010}
     )
 
     result = controller.auto_transfer_for_risk(
@@ -207,11 +237,11 @@ def test_auto_risk_transfer_preserves_main_floor_and_does_not_send_partial(
     )
 
     assert result["status"] == "blocked"
-    assert result["reason"] == "main_wallet_floor_or_transfer_limit"
+    assert "main_projected" in result["reason"]
     assert gateway.create_calls == []
 
 
-def test_auto_risk_transfer_cooldown_blocks_duplicate_without_sliding(
+def test_auto_risk_transfer_allows_consecutive_confirmed_incidents_without_cooldown(
     tmp_path: Path,
 ) -> None:
     controller, gateway, _accounting = _controller(tmp_path)
@@ -223,8 +253,6 @@ def test_auto_risk_transfer_cooldown_blocks_duplicate_without_sliding(
         desired_topup_usd=25.0,
         available_usd=15.0,
     )
-    first_attempt = controller.status()["auto_risk"]["last_attempt_at_ms"]
-
     second = controller.auto_transfer_for_risk(
         requested_usd=10.0,
         symbol="HEIUSDT",
@@ -234,9 +262,77 @@ def test_auto_risk_transfer_cooldown_blocks_duplicate_without_sliding(
     )
 
     assert first["status"] == "complete"
-    assert second["status"] == "cooldown"
+    assert second["status"] == "complete"
+    assert len(gateway.create_calls) == 2
+    assert first["transfer_id"] != second["transfer_id"]
+    assert controller.status()["auto_risk"]["daily_used_usd"] == 20.0
+
+
+def test_auto_risk_transfer_allows_watch_account_when_projection_stays_safe(
+    tmp_path: Path,
+) -> None:
+    controller, gateway, accounting = _controller(tmp_path)
+    _enable_auto_transfer(tmp_path / "pump.env")
+    gateway.balances["main"].update(
+        {"wallet_usd": 3000.0, "transfer_balance_usd": 1900.0, "transfer_safe_usd": 1900.0}
+    )
+    accounting.main_payload["balances"][0].update(
+        {"total": 3000.0, "available": 1050.0, "used": 1950.0, "margin_ratio": 0.65}
+    )
+    accounting.main_payload["cards"][0]["liq_distance_pct"] = 30.0
+
+    result = controller.auto_transfer_for_risk(
+        requested_usd=150.0,
+        symbol="BLUAIUSDT",
+        liq_buffer_pct=14.0,
+        desired_topup_usd=150.0,
+        available_usd=25.0,
+    )
+
+    assert result["status"] == "complete"
+    assert result["amount_usd"] == 150.0
+    assert result["main_risk"]["current_margin_ratio"] == pytest.approx(0.65)
+    assert result["main_risk"]["projected_margin_ratio"] == pytest.approx(1950 / 2850)
+
+
+def test_auto_risk_transfer_blocks_when_any_main_position_is_undersecured(
+    tmp_path: Path,
+) -> None:
+    controller, gateway, accounting = _controller(tmp_path)
+    _enable_auto_transfer(tmp_path / "pump.env")
+    accounting.main_payload["cards"][0]["liq_distance_pct"] = 24.9
+
+    result = controller.auto_transfer_for_risk(
+        requested_usd=50.0,
+        symbol="BLUAIUSDT",
+        liq_buffer_pct=14.0,
+        desired_topup_usd=50.0,
+        available_usd=25.0,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "main_position_liq_buffer_below_floor"
+    assert gateway.create_calls == []
+
+
+def test_daily_transfer_threshold_warns_but_does_not_block_rescue(tmp_path: Path) -> None:
+    controller, gateway, _accounting = _controller(tmp_path)
+    _enable_auto_transfer(
+        tmp_path / "pump.env",
+        PUMP_LIVE_AUTO_TRANSFER_DAILY_ALERT_USD=10,
+    )
+
+    result = controller.auto_transfer_for_risk(
+        requested_usd=15.0,
+        symbol="BLUAIUSDT",
+        liq_buffer_pct=14.0,
+        desired_topup_usd=15.0,
+        available_usd=25.0,
+    )
+
+    assert result["status"] == "complete"
+    assert "daily_transfer_alert_threshold_exceeded" in result["warnings"]
     assert len(gateway.create_calls) == 1
-    assert controller.status()["auto_risk"]["last_attempt_at_ms"] == first_attempt
 
 
 def test_gateway_prefers_dedicated_sub_transfer_credentials(tmp_path: Path) -> None:

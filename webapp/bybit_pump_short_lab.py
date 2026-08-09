@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from analysis_collectors.bybit_pump_short import (
     DEFAULT_OUTPUT_DIR,
@@ -224,6 +224,7 @@ class BybitPumpShortLab:
         pump_live_controller: PumpLiveController | None = None,
         pump_transfer_controller: PumpTemporaryTransferController | None = None,
         notifier: PumpLiveNotifier | None = None,
+        main_portfolio_provider: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self._lock = threading.Lock()
         self._paper_lock = threading.RLock()
@@ -246,6 +247,7 @@ class BybitPumpShortLab:
                 accounting=self._pump_live,
                 state_dir=self._pump_live.state_dir,
                 env_path=self._pump_live.env_path,
+                main_portfolio_provider=main_portfolio_provider,
             )
         if self._pump_transfers is not None and isinstance(self._pump_live, PumpLiveController):
             self._pump_live.set_risk_transfer_provider(

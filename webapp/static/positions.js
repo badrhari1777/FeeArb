@@ -175,7 +175,7 @@
     setText(
       'pp-pump-auto-transfer',
       autoTransfer.enabled
-        ? ('ON · daily left ' + money(autoTransfer.daily_remaining_usd || 0))
+        ? ('ON · daily used ' + money(autoTransfer.daily_used_usd || 0))
         : 'OFF'
     );
     setText('pp-pump-notifications', notifications.last_status || (notifications.configured ? 'ready' : 'off'));

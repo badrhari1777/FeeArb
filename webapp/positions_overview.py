@@ -103,6 +103,7 @@ def build_positions_overview(
             },
             "balance": _pump_balance(pump),
             "capital_regime": dict(pump.get("capital_regime") or {}),
+            "capital_rescue_shadow": dict(pump.get("capital_rescue_shadow") or {}),
             "auto_transfer": dict(
                 (pump.get("transfers") or {}).get("auto_risk") or {}
             ),
