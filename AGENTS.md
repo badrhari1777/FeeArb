@@ -106,6 +106,21 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live capital visibility and guarded automatic rescue funding were added
+  on 2026-08-09. Desktop, unified positions, Pump controls, and Android now
+  show confirmed outstanding main contribution as `Temporarily occupied`,
+  separate from strategy PnL, plus explicit `CALM / NORMAL / WARNING / STRESS /
+  EMERGENCY` regimes, locked prefund and new-slot headroom. When an open
+  position is above the `10%` emergency boundary but at/below the `20%` warning
+  boundary, risk/top-up caps still permit margin, and Pump cash is the only
+  limiter, the monitor may request a history-confirmed main -> Pump transfer.
+  It rounds the full shortfall upward to `$5`, never sends a partial rescue,
+  preserves a `$2000` main-wallet floor, and enforces `$50` per transfer,
+  `$200` per UTC day, and 300-second cooldown limits. At/below `10%` it never
+  waits for transfer; exchange stop/emergency close remains authoritative.
+  Unknown outcomes persist by UUID and block duplicates. Automatic return is
+  still disabled; manual return remains restricted to confirmed temporary
+  principal and existing Pump safety floors.
 - Dedicated Pump transfers passed their first supervised live round trip on
   2026-08-09: `$0.01 USDT` main -> Pump -> main returned both exchange
   balances, temporary principal, and equity adjustment to their exact starting

@@ -924,6 +924,7 @@ class PumpLiveController:
         self._event_lock = threading.Lock()
         self._notification_lock = threading.Lock()
         self._notification_last_sent: dict[str, int] = {}
+        self._risk_transfer_provider: Callable[..., Mapping[str, Any]] | None = None
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -961,6 +962,13 @@ class PumpLiveController:
 
     def config(self) -> PumpLiveConfig:
         return load_pump_live_config(self.env_path)
+
+    def set_risk_transfer_provider(
+        self,
+        provider: Callable[..., Mapping[str, Any]] | None,
+    ) -> None:
+        """Attach the guarded cash-transfer callback used by the risk monitor."""
+        self._risk_transfer_provider = provider
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -2056,17 +2064,71 @@ class PumpLiveController:
                 config.guaranteed_position_topup_usd,
             )
         )
+        position_capacity = max(0.0, position_cap - position_topup)
+        portfolio_capacity = max(
+            0.0,
+            config.max_total_topup_usd
+            - total_topup
+            - reserved_for_other_positions,
+        )
+        risk_allowed = min(desired, position_capacity, portfolio_capacity)
+        cash_allowed = max(0.0, available - config.operating_cash_floor_usd)
         allowed = min(
             desired,
-            max(0.0, position_cap - position_topup),
-            max(
-                0.0,
-                config.max_total_topup_usd
-                - total_topup
-                - reserved_for_other_positions,
-            ),
-            max(0.0, available - config.operating_cash_floor_usd),
+            position_capacity,
+            portfolio_capacity,
+            cash_allowed,
         )
+        if (
+            risk_allowed >= 1.0
+            and cash_allowed + 1e-9 < risk_allowed
+            and buffer_pct > config.emergency_liq_buffer_pct
+            and self._risk_transfer_provider is not None
+        ):
+            symbol = _normalize_symbol(item.get("symbol"))
+            requested = risk_allowed - cash_allowed
+            try:
+                transfer = dict(
+                    self._risk_transfer_provider(
+                        requested_usd=requested,
+                        symbol=symbol,
+                        liq_buffer_pct=buffer_pct,
+                        desired_topup_usd=risk_allowed,
+                        available_usd=available,
+                    )
+                )
+            except Exception as exc:  # transfer uncertainty must not stop exchange protection
+                transfer = {
+                    "status": "error",
+                    "reason": _clean_error(exc),
+                    "requested_usd": requested,
+                }
+            transfer_status = str(transfer.get("status") or "unknown")
+            if transfer_status == "complete":
+                refreshed_balance = self.gateway.fetch_balance()
+                available = _safe_float(refreshed_balance.get("available"), available)
+                cash_allowed = max(0.0, available - config.operating_cash_floor_usd)
+                allowed = min(risk_allowed, cash_allowed)
+                self._event(
+                    "auto_transfer_complete",
+                    {
+                        "symbol": symbol,
+                        "liq_buffer_pct": buffer_pct,
+                        "amount_usd": _safe_float(transfer.get("amount_usd"), 0.0),
+                        "available_after_usd": available,
+                        "transfer_id": transfer.get("transfer_id"),
+                    },
+                )
+            elif transfer_status not in {"disabled", "not_needed", "cooldown"}:
+                self._event(
+                    "auto_transfer_blocked",
+                    {
+                        "symbol": symbol,
+                        "liq_buffer_pct": buffer_pct,
+                        "requested_usd": requested,
+                        "reason": transfer.get("reason") or transfer_status,
+                    },
+                )
         if allowed >= 1.0:
             symbol = _normalize_symbol(item.get("symbol"))
             self.gateway.add_margin(symbol, allowed)
@@ -2963,6 +3025,32 @@ def _pump_live_notification(
             f"Pump Live ошибка входа {symbol}",
             f"Pump Live: вход не завершён{symbol_line}\nОшибка: {error}\nНовые входы отключены.",
             f"entry_failed:{symbol}:{error}",
+            300,
+        )
+    if event == "auto_transfer_complete":
+        amount = _safe_float(payload.get("amount_usd"), 0.0)
+        buffer_pct = _safe_float(payload.get("liq_buffer_pct"), 0.0)
+        return (
+            f"Pump Live AUTO TRANSFER {symbol}",
+            (
+                f"Pump Live transferred ${amount:.2f} from main to the Pump subaccount."
+                f"{symbol_line}\nLiquidation buffer: {buffer_pct:.2f}%."
+                "\nThe amount is temporary and excluded from strategy profit."
+            ),
+            f"auto_transfer_complete:{payload.get('transfer_id') or symbol}",
+            0,
+        )
+    if event == "auto_transfer_blocked":
+        requested = _safe_float(payload.get("requested_usd"), 0.0)
+        reason = str(payload.get("reason") or "unknown")
+        return (
+            f"Pump Live AUTO TRANSFER BLOCKED {symbol}",
+            (
+                f"Pump Live could not transfer the required ${requested:.2f} from main."
+                f"{symbol_line}\nReason: {reason}."
+                "\nExchange protection remains authoritative; emergency handling was not delayed."
+            ),
+            f"auto_transfer_blocked:{symbol}:{reason}",
             300,
         )
     if event == "margin_added":

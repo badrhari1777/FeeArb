@@ -676,6 +676,14 @@ private fun PumpStatusCard(
                     Modifier.weight(1f),
                 )
             }
+            KeyValue(
+                "Auto rescue",
+                if (pump.auto_transfer.enabled) {
+                    "ON · daily left \$${formatMoney(pump.auto_transfer.daily_remaining_usd)}"
+                } else {
+                    "OFF"
+                },
+            )
             if (!hasPositions) {
                 Text(
                     "No open Pump positions. Monitoring for the next eligible signal.",

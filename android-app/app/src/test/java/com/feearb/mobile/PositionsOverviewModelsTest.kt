@@ -48,6 +48,11 @@ class PositionsOverviewModelsTest {
                   "prefund_floor_usd": 25,
                   "temporary_occupied_usd": 50
                 },
+                "auto_transfer": {
+                  "enabled": true,
+                  "main_wallet_floor_usd": 2000,
+                  "daily_remaining_usd": 185
+                },
                 "notifications": {
                   "configured": true,
                   "last_status": "ok"
@@ -95,6 +100,8 @@ class PositionsOverviewModelsTest {
         assertEquals(1000.0, result.pump.balance.total_usd ?: 0.0, 0.0001)
         assertEquals(50.0, result.pump.balance.temporary_occupied_usd ?: 0.0, 0.0001)
         assertEquals("normal", result.pump.capital_regime.mode)
+        assertTrue(result.pump.auto_transfer.enabled)
+        assertEquals(185.0, result.pump.auto_transfer.daily_remaining_usd ?: 0.0, 0.0001)
         assertEquals("DEXEUSDT", result.pump.positions.single().symbol)
         assertEquals(31.5, result.pump.positions.single().liq_buffer_pct ?: 0.0, 0.0001)
         assertEquals("filled", result.pump.positions.single().legs.single().status)

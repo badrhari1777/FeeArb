@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -29,6 +30,12 @@ PUMP_TRANSFER_IN_CONFIRMATION = "TRANSFER TEMPORARY USDT MAIN TO PUMP"
 PUMP_TRANSFER_RETURN_CONFIRMATION = "RETURN TEMPORARY USDT PUMP TO MAIN"
 PUMP_TRANSFER_CONFIRM_DELAYS_SEC = (0.0, 0.2, 0.5, 1.0, 2.0)
 PUMP_TRANSFER_STATE_RETRY_SEC = (0.0, 0.05, 0.1, 0.2, 0.4)
+PUMP_TRANSFER_ENV_PATH = BASE_DIR / "config" / "pump_live.env"
+AUTO_TRANSFER_MAIN_FLOOR_USD = 2_000.0
+AUTO_TRANSFER_MAX_SINGLE_USD = 50.0
+AUTO_TRANSFER_DAILY_CAP_USD = 200.0
+AUTO_TRANSFER_COOLDOWN_SEC = 300
+AUTO_TRANSFER_ROUND_USD = 5.0
 
 
 class PumpTransferGateway(Protocol):
@@ -102,6 +109,56 @@ def _amount(value: Any) -> Decimal:
 def _amount_text(amount: Decimal) -> str:
     text = format(amount, "f")
     return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def load_auto_transfer_config(path: Path = PUMP_TRANSFER_ENV_PATH) -> dict[str, Any]:
+    values = _read_env(path)
+    enabled = str(values.get("PUMP_LIVE_AUTO_TRANSFER_ENABLED", "0")).lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    return {
+        "enabled": enabled,
+        "main_wallet_floor_usd": max(
+            0.0,
+            _number(
+                values.get("PUMP_LIVE_AUTO_TRANSFER_MAIN_WALLET_FLOOR_USD"),
+                AUTO_TRANSFER_MAIN_FLOOR_USD,
+            ),
+        ),
+        "max_single_usd": max(
+            float(PUMP_TRANSFER_MIN_USDT),
+            _number(
+                values.get("PUMP_LIVE_AUTO_TRANSFER_MAX_SINGLE_USD"),
+                AUTO_TRANSFER_MAX_SINGLE_USD,
+            ),
+        ),
+        "daily_cap_usd": max(
+            float(PUMP_TRANSFER_MIN_USDT),
+            _number(
+                values.get("PUMP_LIVE_AUTO_TRANSFER_DAILY_CAP_USD"),
+                AUTO_TRANSFER_DAILY_CAP_USD,
+            ),
+        ),
+        "cooldown_sec": max(
+            60,
+            int(
+                _number(
+                    values.get("PUMP_LIVE_AUTO_TRANSFER_COOLDOWN_SEC"),
+                    AUTO_TRANSFER_COOLDOWN_SEC,
+                )
+            ),
+        ),
+        "round_usd": max(
+            float(PUMP_TRANSFER_MIN_USDT),
+            _number(
+                values.get("PUMP_LIVE_AUTO_TRANSFER_ROUND_USD"),
+                AUTO_TRANSFER_ROUND_USD,
+            ),
+        ),
+    }
 
 
 class BybitPumpTransferGateway:
@@ -479,11 +536,13 @@ class PumpTemporaryTransferController:
         accounting: PumpTransferAccounting,
         gateway: PumpTransferGateway | None = None,
         state_dir: Path = PUMP_TRANSFER_STATE_DIR,
+        env_path: Path = PUMP_TRANSFER_ENV_PATH,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.accounting = accounting
         self.gateway = gateway or BybitPumpTransferGateway()
         self.state_dir = state_dir
+        self.env_path = env_path
         self.state_path = state_dir / PUMP_TRANSFER_STATE_FILE
         self.events_path = state_dir / PUMP_TRANSFER_EVENTS_FILE
         self._sleep = sleep
@@ -505,6 +564,8 @@ class PumpTemporaryTransferController:
             "pending": payload.get("pending") if isinstance(payload.get("pending"), dict) else None,
             "operations": list(payload.get("operations") or [])[-200:],
             "last_preflight": payload.get("last_preflight"),
+            "last_auto_attempt_at_ms": payload.get("last_auto_attempt_at_ms"),
+            "last_auto_result": payload.get("last_auto_result"),
             "updated_at_ms": payload.get("updated_at_ms"),
         }
 
@@ -515,6 +576,138 @@ class PumpTemporaryTransferController:
         payload["minimum_test_usdt"] = float(PUMP_TRANSFER_MIN_USDT)
         payload["state_file"] = str(self.state_path)
         payload["events_file"] = str(self.events_path)
+        auto = self._auto_status(payload)
+        payload["auto_risk"] = auto
+        return payload
+
+    def _auto_status(self, state: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        config = load_auto_transfer_config(self.env_path)
+        if state is None:
+            with self._lock:
+                snapshot = json.loads(json.dumps(self._state))
+        else:
+            snapshot = dict(state)
+        day_start_ms = int(time.time() * 1000) // 86_400_000 * 86_400_000
+        daily_used = sum(
+            _number(item.get("amount_usd"))
+            for item in snapshot.get("operations") or []
+            if item.get("direction") == "main_to_pump"
+            and item.get("origin") == "auto_risk"
+            and item.get("status") == "complete"
+            and int(_number(item.get("completed_at_ms"))) >= day_start_ms
+        )
+        return {
+            **config,
+            "daily_used_usd": round(daily_used, 6),
+            "daily_remaining_usd": round(
+                max(0.0, config["daily_cap_usd"] - daily_used),
+                6,
+            ),
+            "last_attempt_at_ms": snapshot.get("last_auto_attempt_at_ms"),
+            "last_result": snapshot.get("last_auto_result"),
+        }
+
+    def auto_transfer_for_risk(
+        self,
+        *,
+        requested_usd: float,
+        symbol: str,
+        liq_buffer_pct: float,
+        desired_topup_usd: float,
+        available_usd: float,
+    ) -> dict[str, Any]:
+        config = load_auto_transfer_config(self.env_path)
+        if not config["enabled"]:
+            return {"status": "disabled", "reason": "auto_transfer_disabled"}
+        requested = max(0.0, _number(requested_usd))
+        if requested < float(PUMP_TRANSFER_MIN_USDT):
+            return {"status": "not_needed", "reason": "cash_shortfall_below_minimum"}
+        rounded = math.ceil(requested / config["round_usd"] - 1e-12) * config["round_usd"]
+        now = int(time.time() * 1000)
+        auto_status = self._auto_status()
+        last_attempt = int(_number(auto_status.get("last_attempt_at_ms")))
+        context = {
+            "symbol": str(symbol),
+            "liq_buffer_pct": round(_number(liq_buffer_pct), 6),
+            "desired_topup_usd": round(_number(desired_topup_usd), 6),
+            "available_usd": round(_number(available_usd), 6),
+            "requested_usd": round(requested, 6),
+        }
+        reason = None
+        if self._state.get("pending"):
+            reason = "pending_reconciliation"
+        elif last_attempt and now - last_attempt < config["cooldown_sec"] * 1000:
+            reason = "cooldown"
+        elif rounded > config["max_single_usd"] + 1e-9:
+            reason = "max_single_exceeded"
+        elif rounded > auto_status["daily_remaining_usd"] + 1e-9:
+            reason = "daily_cap_exceeded"
+        if reason:
+            if reason == "cooldown":
+                return {
+                    "status": "cooldown",
+                    "reason": reason,
+                    "amount_usd": rounded,
+                    **context,
+                }
+            return self._record_auto_result(
+                {"status": "blocked", "reason": reason, "amount_usd": rounded, **context},
+                now=now,
+            )
+
+        preflight = self.preflight()
+        balances = dict(preflight.get("balances") or {})
+        main = dict(balances.get("main") or {})
+        main_wallet = _number(main.get("wallet_usd"))
+        main_above_floor = max(0.0, main_wallet - config["main_wallet_floor_usd"])
+        safe_inbound = min(_number(preflight.get("inbound_limit_usd")), main_above_floor)
+        if not preflight.get("round_trip_ready"):
+            reason = "round_trip_preflight_not_ready"
+        elif rounded > safe_inbound + 1e-9:
+            reason = "main_wallet_floor_or_transfer_limit"
+        if reason:
+            return self._record_auto_result(
+                {
+                    "status": "blocked",
+                    "reason": reason,
+                    "amount_usd": rounded,
+                    "main_wallet_usd": main_wallet,
+                    "main_wallet_floor_usd": config["main_wallet_floor_usd"],
+                    "safe_inbound_usd": safe_inbound,
+                    **context,
+                },
+                now=now,
+            )
+
+        self._record_auto_result(
+            {"status": "submitting", "amount_usd": rounded, **context},
+            now=now,
+        )
+        result = self._execute(
+            "main_to_pump",
+            _amount(rounded),
+            preflight,
+            origin="auto_risk",
+            context=context,
+        )
+        operation = dict(result.get("operation") or {})
+        completed = {
+            "status": "complete",
+            "amount_usd": rounded,
+            "transfer_id": operation.get("transfer_id"),
+            **context,
+        }
+        self._record_auto_result(completed, now=int(time.time() * 1000))
+        return completed
+
+    def _record_auto_result(self, result: Mapping[str, Any], *, now: int) -> dict[str, Any]:
+        payload = dict(result)
+        with self._lock:
+            self._state["last_auto_attempt_at_ms"] = now
+            self._state["last_auto_result"] = payload
+            self._state["updated_at_ms"] = now
+            self._save_state_locked()
+        self._event("auto_risk_transfer", payload)
         return payload
 
     def preflight(self) -> dict[str, Any]:
@@ -611,6 +804,9 @@ class PumpTemporaryTransferController:
         direction: str,
         amount: Decimal,
         preflight: Mapping[str, Any],
+        *,
+        origin: str = "operator",
+        context: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         transfer_id = str(uuid4())
         now = int(time.time() * 1000)
@@ -622,6 +818,8 @@ class PumpTemporaryTransferController:
             "status": "submitting",
             "accounting_status": "pending",
             "created_at_ms": now,
+            "origin": origin,
+            "context": dict(context or {}),
             "balances_before": dict(preflight.get("balances") or {}),
         }
         with self._lock:

@@ -2,9 +2,13 @@
 
 ## Current decision
 
-The transfer layer is explicit and fail-closed. It does not automatically move
-money in response to liquidation distance and it does not enable live entries.
-The first live validation is a `$0.01 USDT` round trip:
+The transfer layer is fail-closed and does not enable live entries. Operator
+endpoints remain explicit; a separate bounded callback may now automatically
+move only main -> Pump rescue cash when an already-open position enters the
+`10..20%` liquidation-buffer band and Pump cash alone prevents an otherwise
+permitted top-up. At `<=10%`, the callback is skipped and exchange protection /
+emergency close proceeds without waiting. The first live validation was a
+`$0.01 USDT` round trip:
 
 1. main `UNIFIED` -> Pump subaccount `UNIFIED`;
 2. confirm `SUCCESS` from universal-transfer history;
@@ -98,6 +102,28 @@ the amount back to the adjustment and reduces outstanding principal.
 Accounting is idempotent by transfer UUID. Cumulative input and returned
 amounts remain visible even after outstanding principal returns to zero.
 Exchange-derived trade fees, funding and realized PnL remain separate.
+
+## Automatic rescue funding contract
+
+- Default source configuration is disabled; live activation is an ignored-env
+  operator setting.
+- Trigger: `liq_buffer_pct <= 20` and `> 10`, risk capacity at least `$1`, and
+  Pump available cash above its `$25` floor is smaller than the allowed top-up.
+- The transfer request is the exact cash shortfall rounded upward to `$5`.
+- No partial send: the rounded amount must fit the `$50` single-transfer cap,
+  `$200` UTC-day cap, Bybit transfer-safe amount, and `$2000` main-wallet floor.
+- A successful transfer is fetched back through Pump balance before isolated
+  margin is added. Failure/uncertainty never relaxes top-up caps or protection.
+- Five-minute cooldown and durable pending UUID prevent duplicate transfers.
+- A completed contribution remains `temporary_transfer_outstanding_usd`, is
+  excluded from observed profit, and is shown as `Temporarily occupied`.
+- Automatic return is not enabled. Manual return retains all principal,
+  reserve, operating-floor, and active-capital checks.
+
+The live status also reports `CALM (>35%)`, `NORMAL (20..35%)`, `WARNING
+(15..20%)`, `STRESS (10..15%)`, and `EMERGENCY (<=10%)`, together with minimum
+buffer symbol, total top-up, immutable prefund floor, removable excess, new-slot
+headroom, and temporary external principal.
 
 ## Can the account move to $3000 with three positions open?
 

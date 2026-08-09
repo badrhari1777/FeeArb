@@ -179,6 +179,7 @@
     var balance = live.last_balance || (preflight.account || {});
     var capital = live.capital_manager || {};
     var regime = live.capital_regime || {};
+    var autoTransfer = ((live.transfers || {}).auto_risk) || {};
     var open = Number(live.open_positions || 0);
     var cap = Number(config.entry_cap || 1);
     setText('pss-live-status', live.status || 'disabled');
@@ -196,6 +197,9 @@
     setText('pss-live-reserve', money(config.reserve_usd || 300));
     setText('pss-live-temporary', money(capital.temporary_transfer_outstanding_usd || 0));
     setText('pss-live-regime', String(regime.mode || '-').toUpperCase());
+    setText('pss-live-auto-transfer', autoTransfer.enabled ? 'ON' : 'OFF');
+    setText('pss-live-auto-main-floor', money(autoTransfer.main_wallet_floor_usd || 0));
+    setText('pss-live-auto-daily-left', money(autoTransfer.daily_remaining_usd || 0));
     setText('pss-live-cycle', shortTime(live.last_cycle_at_ms));
     setText(
       'pss-live-capital-mode',

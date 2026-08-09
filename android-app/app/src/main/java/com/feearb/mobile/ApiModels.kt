@@ -181,6 +181,7 @@ data class PumpOverviewDto(
     val config: PumpOverviewConfigDto = PumpOverviewConfigDto(),
     val balance: PumpOverviewBalanceDto = PumpOverviewBalanceDto(),
     val capital_regime: PumpCapitalRegimeDto = PumpCapitalRegimeDto(),
+    val auto_transfer: PumpAutoTransferDto = PumpAutoTransferDto(),
     val notifications: PumpOverviewNotificationsDto = PumpOverviewNotificationsDto(),
     val positions: List<PumpPositionDto> = emptyList(),
     val recent_events: List<JsonObject> = emptyList(),
@@ -218,6 +219,16 @@ data class PumpCapitalRegimeDto(
     val removable_topup_usd: Double? = null,
     val temporary_occupied_usd: Double? = null,
     val new_slot_headroom_usd: Double? = null,
+)
+
+data class PumpAutoTransferDto(
+    val enabled: Boolean = false,
+    val main_wallet_floor_usd: Double? = null,
+    val max_single_usd: Double? = null,
+    val daily_cap_usd: Double? = null,
+    val daily_used_usd: Double? = null,
+    val daily_remaining_usd: Double? = null,
+    val last_attempt_at_ms: Long? = null,
 )
 
 data class PumpOverviewNotificationsDto(

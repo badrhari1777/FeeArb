@@ -1268,6 +1268,73 @@ def test_liquidation_buffer_adds_margin_from_reserved_cash(tmp_path: Path) -> No
     assert status["positions"][0]["margin_topup_usd"] == 25.0
 
 
+def test_warning_buffer_can_request_cash_then_add_full_allowed_margin(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    gateway.liq_after_add = 20.0
+    notifier = FakePumpNotifier()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+        notifier=notifier,
+        background_notifications=False,
+    )
+    requests: list[dict[str, Any]] = []
+
+    def transfer_provider(**payload: Any) -> dict[str, Any]:
+        requests.append(payload)
+        gateway.balance["available"] += 50.0
+        return {"status": "complete", "amount_usd": 50.0, "transfer_id": "auto-1"}
+
+    controller.set_risk_transfer_provider(transfer_provider)
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    gateway.balance["available"] = 25.0
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 14.8
+
+    status = controller.run_cycle()
+
+    assert len(requests) == 1
+    assert requests[0]["symbol"] == "TESTUSDT"
+    assert requests[0]["requested_usd"] == 50.0
+    assert gateway.margin_adds == [("TESTUSDT", 50.0)]
+    assert status["positions"][0]["margin_topup_usd"] == 50.0
+    assert any("AUTO TRANSFER" in title for title, _text in notifier.messages)
+
+
+def test_emergency_buffer_never_waits_for_risk_transfer(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    requests: list[dict[str, Any]] = []
+    controller.set_risk_transfer_provider(lambda **payload: requests.append(payload) or {})
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    gateway.balance["available"] = 25.0
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 14.0
+
+    status = controller.run_cycle()
+
+    assert requests == []
+    assert gateway.positions == []
+    assert status["positions"][0]["close_reason"] == "emergency_liq_buffer"
+
+
 def test_critical_buffer_bypasses_topup_cooldown_and_closes(tmp_path: Path) -> None:
     env_path = tmp_path / "pump_live.env"
     write_env(env_path)

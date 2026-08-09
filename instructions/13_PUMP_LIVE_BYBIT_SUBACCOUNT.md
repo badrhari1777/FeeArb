@@ -22,8 +22,10 @@ account.
 - Live strategy: `main_pullback_tier` short only.
 - Long, slow-pump, super-pump, clean-control, and cycle strategies remain
   paper/shadow only.
-- No automatic transfer from the master account. The `$1000` is transferred
-  manually before arming.
+- Guarded automatic rescue transfer from main is available only for an
+  already-open position whose liquidation buffer is `>10%` and `<=20%`, when
+  risk/top-up caps still allow margin but Pump free cash is insufficient.
+  Normal funding and returns remain operator-controlled.
 
 ## 1. Create the Bybit Account and Key
 
@@ -429,15 +431,16 @@ Reproducible analysis:
 ```
 
 See `docs/pump_live_money_management_2026-08-09.md`. That review preceded the
-explicit transfer implementation below; automatic rescue transfers remain
-disabled even after the operator-only controller was added.
+guarded transfer implementation below.
 
 ## Temporary main/sub transfers (2026-08-09)
 
-The staged transfer controller is explicit only; it never moves money from a
-liquidation monitor or automatically arms entries. It supports a minimum
-project test of `$0.01 USDT` in both directions after a complete read-only
-round-trip preflight.
+The transfer controller keeps explicit operator endpoints and also supplies a
+bounded main -> Pump rescue callback to the liquidation monitor. It never arms
+entries. The live callback is attempted only when the position is in
+`WARNING` (`15..20%`) or `STRESS` (`10..15%`), Pump cash is the limiting factor,
+and position/portfolio top-up caps still allow the full margin step. At or
+below `10%` it is skipped so exchange stop/emergency close is never delayed.
 
 Main -> Pump requires `AccountTransfer` plus `SubMemberTransfer` on a master
 read/write API key. Pump -> main requires `AccountTransfer` plus
@@ -464,6 +467,25 @@ and are never blindly repeated. Return is limited to confirmed temporary
 principal and cannot cross the exchange transfer-safe balance, unused top-up
 capacity, `$25` operating floor, or active strategy-capital floor.
 
+Automatic rescue defaults and hard guards are configured only in ignored
+`config/pump_live.env`:
+
+```text
+PUMP_LIVE_AUTO_TRANSFER_ENABLED=1
+PUMP_LIVE_AUTO_TRANSFER_MAIN_WALLET_FLOOR_USD=2000
+PUMP_LIVE_AUTO_TRANSFER_MAX_SINGLE_USD=50
+PUMP_LIVE_AUTO_TRANSFER_DAILY_CAP_USD=200
+PUMP_LIVE_AUTO_TRANSFER_COOLDOWN_SEC=300
+PUMP_LIVE_AUTO_TRANSFER_ROUND_USD=5
+```
+
+The requested cash shortfall is rounded upward to `$5`; a partial transfer is
+never sent if the full rounded request would cross the `$50` event cap, `$200`
+UTC-day cap, Bybit transfer-safe balance, or the `$2000` main-wallet floor.
+Every attempt is UUID-backed and history-confirmed. Unknown outcomes remain
+pending and block duplicates. Automatic Pump -> main return is deliberately
+not enabled yet; the existing guarded manual return remains available.
+
 Do not call the transferable-coin endpoint for this member transfer. Bybit
 rejects `UNIFIED -> UNIFIED` there with `131203`; that endpoint compares
 account types rather than different main/sub UIDs. Direction readiness uses
@@ -488,3 +510,9 @@ pre-test state. Do not infer that a large current mark-price liquidation buffer
 is removable prefund: HEI showed over `111%` at the current mark but only
 `4.0525%` stop clearance above its next ladder. Its `$75` floor remains locked;
 even a `$5` reduction would fail the `2.45%` minimum clearance.
+
+The same update added read-only capital regimes `CALM / NORMAL / WARNING /
+STRESS / EMERGENCY` and exposes confirmed outstanding main contribution as
+`Temporarily occupied` in desktop, unified positions, Pump controls, and
+Android balance views. This is outstanding external principal, not strategy
+PnL and not necessarily removable position prefund.

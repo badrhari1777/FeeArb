@@ -160,6 +160,7 @@
     var balance = pump.balance || {};
     var notifications = pump.notifications || {};
     var regime = pump.capital_regime || {};
+    var autoTransfer = pump.auto_transfer || {};
     var cards = $('pp-pump-cards');
     var totalTopup = positions.reduce(function (sum, row) {
       return sum + Number(row.margin_topup_usd || 0);
@@ -171,6 +172,12 @@
     setText('pp-pump-topup', money(totalTopup));
     setText('pp-pump-temporary', money(balance.temporary_occupied_usd || 0));
     setText('pp-pump-regime', String(regime.mode || '-').toUpperCase());
+    setText(
+      'pp-pump-auto-transfer',
+      autoTransfer.enabled
+        ? ('ON · daily left ' + money(autoTransfer.daily_remaining_usd || 0))
+        : 'OFF'
+    );
     setText('pp-pump-notifications', notifications.last_status || (notifications.configured ? 'ready' : 'off'));
     setText('pp-pump-freshness', 'Protective cycle: ' + date(pump.last_cycle_at_ms));
     var arm = $('pp-pump-arm');

@@ -245,6 +245,11 @@ class BybitPumpShortLab:
             self._pump_transfers = PumpTemporaryTransferController(
                 accounting=self._pump_live,
                 state_dir=self._pump_live.state_dir,
+                env_path=self._pump_live.env_path,
+            )
+        if self._pump_transfers is not None and isinstance(self._pump_live, PumpLiveController):
+            self._pump_live.set_risk_transfer_provider(
+                self._pump_transfers.auto_transfer_for_risk
             )
         if restore_shadow_schedule:
             self._restore_shadow_schedule_if_enabled()
@@ -430,7 +435,7 @@ class BybitPumpShortLab:
         self._write_strategy_monitor_audit_if_new(output_dir, payload)
         audit = payload.get("audit") if isinstance(payload.get("audit"), dict) else {}
         audit["latest"] = read_latest_jsonl(output_dir / PUMP_STRATEGY_MONITOR_AUDIT_FILE, limit=20)
-        payload["pump_live"] = self._pump_live.status()
+        payload["pump_live"] = self.pump_live_status()
         payload["paper_monitor"] = self.paper_monitor_status()
         return payload
 
@@ -443,7 +448,10 @@ class BybitPumpShortLab:
         return payload
 
     def pump_live_status(self) -> dict[str, Any]:
-        return self._pump_live.status()
+        payload = self._pump_live.status()
+        if self._pump_transfers is not None:
+            payload["transfers"] = self._pump_transfers.status()
+        return payload
 
     def pump_live_preflight(self) -> dict[str, Any]:
         return self._pump_live.preflight()

@@ -145,9 +145,98 @@ def _controller(tmp_path: Path) -> tuple[PumpTemporaryTransferController, FakeTr
         accounting=accounting,
         gateway=gateway,
         state_dir=tmp_path,
+        env_path=tmp_path / "pump.env",
         sleep=lambda _seconds: None,
     )
     return controller, gateway, accounting
+
+
+def _enable_auto_transfer(path: Path, **overrides: float) -> None:
+    values = {
+        "PUMP_LIVE_AUTO_TRANSFER_ENABLED": "1",
+        "PUMP_LIVE_AUTO_TRANSFER_MAIN_WALLET_FLOOR_USD": "2000",
+        "PUMP_LIVE_AUTO_TRANSFER_MAX_SINGLE_USD": "50",
+        "PUMP_LIVE_AUTO_TRANSFER_DAILY_CAP_USD": "200",
+        "PUMP_LIVE_AUTO_TRANSFER_COOLDOWN_SEC": "300",
+        "PUMP_LIVE_AUTO_TRANSFER_ROUND_USD": "5",
+    }
+    values.update({key: str(value) for key, value in overrides.items()})
+    path.write_text(
+        "\n".join(f"{key}={value}" for key, value in values.items()),
+        encoding="utf-8",
+    )
+
+
+def test_auto_risk_transfer_rounds_up_and_tracks_daily_temporary_cash(tmp_path: Path) -> None:
+    controller, gateway, _accounting = _controller(tmp_path)
+    _enable_auto_transfer(tmp_path / "pump.env")
+
+    result = controller.auto_transfer_for_risk(
+        requested_usd=12.01,
+        symbol="HEIUSDT",
+        liq_buffer_pct=18.0,
+        desired_topup_usd=25.0,
+        available_usd=12.99,
+    )
+
+    assert result["status"] == "complete"
+    assert result["amount_usd"] == 15.0
+    assert gateway.create_calls[0]["amount_usdt"] == "15"
+    operation = controller.status()["operations"][-1]
+    assert operation["origin"] == "auto_risk"
+    assert operation["context"]["symbol"] == "HEIUSDT"
+    assert controller.status()["temporary_outstanding_usd"] == 15.0
+    assert controller.status()["auto_risk"]["daily_used_usd"] == 15.0
+
+
+def test_auto_risk_transfer_preserves_main_floor_and_does_not_send_partial(
+    tmp_path: Path,
+) -> None:
+    controller, gateway, _accounting = _controller(tmp_path)
+    _enable_auto_transfer(tmp_path / "pump.env")
+    gateway.balances["main"].update(
+        {"wallet_usd": 2010.0, "transfer_balance_usd": 2010.0, "transfer_safe_usd": 2010.0}
+    )
+
+    result = controller.auto_transfer_for_risk(
+        requested_usd=15.0,
+        symbol="HEIUSDT",
+        liq_buffer_pct=18.0,
+        desired_topup_usd=25.0,
+        available_usd=10.0,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "main_wallet_floor_or_transfer_limit"
+    assert gateway.create_calls == []
+
+
+def test_auto_risk_transfer_cooldown_blocks_duplicate_without_sliding(
+    tmp_path: Path,
+) -> None:
+    controller, gateway, _accounting = _controller(tmp_path)
+    _enable_auto_transfer(tmp_path / "pump.env")
+    first = controller.auto_transfer_for_risk(
+        requested_usd=10.0,
+        symbol="HEIUSDT",
+        liq_buffer_pct=18.0,
+        desired_topup_usd=25.0,
+        available_usd=15.0,
+    )
+    first_attempt = controller.status()["auto_risk"]["last_attempt_at_ms"]
+
+    second = controller.auto_transfer_for_risk(
+        requested_usd=10.0,
+        symbol="HEIUSDT",
+        liq_buffer_pct=17.0,
+        desired_topup_usd=25.0,
+        available_usd=15.0,
+    )
+
+    assert first["status"] == "complete"
+    assert second["status"] == "cooldown"
+    assert len(gateway.create_calls) == 1
+    assert controller.status()["auto_risk"]["last_attempt_at_ms"] == first_attempt
 
 
 def test_gateway_prefers_dedicated_sub_transfer_credentials(tmp_path: Path) -> None:
