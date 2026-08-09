@@ -150,6 +150,33 @@ def _controller(tmp_path: Path) -> tuple[PumpTemporaryTransferController, FakeTr
     return controller, gateway, accounting
 
 
+def test_gateway_prefers_dedicated_sub_transfer_credentials(tmp_path: Path) -> None:
+    main_env = tmp_path / "main.env"
+    pump_env = tmp_path / "pump.env"
+    main_env.write_text("BYBIT_API_KEY=main-key\nBYBIT_API_SECRET=main-secret\n", encoding="utf-8")
+    pump_env.write_text(
+        "\n".join(
+            (
+                "BYBIT_PUMP_API_KEY=trading-key",
+                "BYBIT_PUMP_API_SECRET=trading-secret",
+                "BYBIT_PUMP_SUB_TRANSFER_API_KEY=transfer-key",
+                "BYBIT_PUMP_SUB_TRANSFER_API_SECRET=transfer-secret",
+            )
+        ),
+        encoding="utf-8",
+    )
+    gateway = BybitPumpTransferGateway(
+        main_env_path=main_env,
+        pump_env_path=pump_env,
+    )
+
+    key, secret, _testnet, source = gateway._credentials("pump")  # pylint: disable=protected-access
+
+    assert (key, secret) == ("transfer-key", "transfer-secret")
+    assert source == "dedicated_pump_sub_transfer"
+    assert gateway.credentials_status()["pump_key_source"] == source
+
+
 def _gateway_with_identities(
     tmp_path: Path,
     *,

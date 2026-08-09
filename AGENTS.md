@@ -106,6 +106,12 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump temporary transfers gained a dedicated subaccount credential on
+  2026-08-09. `BYBIT_PUMP_SUB_TRANSFER_API_KEY/SECRET` now takes precedence
+  over the Pump trading key and is restricted to Wallet `AccountTransfer` plus
+  `SubMemberTransferList`; the trading key remains a backward-compatible
+  fallback. This lets transfer access rotate independently without restarting
+  or broadening the armed Pump execution credential.
 - Pump temporary-transfer preflight was corrected on 2026-08-09 after the
   first dedicated master key exposed Bybit `131203`: the transferable-coin
   endpoint rejects `UNIFIED -> UNIFIED` because it compares account types,

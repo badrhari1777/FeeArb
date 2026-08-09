@@ -449,7 +449,14 @@ master key without `Withdraw`, configured only in ignored
 ```text
 BYBIT_PUMP_MASTER_TRANSFER_API_KEY=
 BYBIT_PUMP_MASTER_TRANSFER_API_SECRET=
+BYBIT_PUMP_SUB_TRANSFER_API_KEY=
+BYBIT_PUMP_SUB_TRANSFER_API_SECRET=
 ```
+
+The dedicated sub-transfer key belongs to the configured Pump subaccount and
+needs Wallet `AccountTransfer` plus `SubMemberTransferList`; it should not have
+trading permissions. If omitted, the controller falls back to the Pump trading
+key but applies the same Wallet permission gate.
 
 Every request persists its UUID before submission and must become `SUCCESS` in
 universal-transfer history. Unknown outcomes are reconciled by the same UUID

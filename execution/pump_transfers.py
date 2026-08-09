@@ -135,22 +135,27 @@ class BybitPumpTransferGateway:
                 testnet,
                 "main_trading_fallback",
             )
+        dedicated_key = pump.get("BYBIT_PUMP_SUB_TRANSFER_API_KEY", "").strip()
+        dedicated_secret = pump.get("BYBIT_PUMP_SUB_TRANSFER_API_SECRET", "").strip()
+        if dedicated_key or dedicated_secret:
+            return dedicated_key, dedicated_secret, testnet, "dedicated_pump_sub_transfer"
         return (
             pump.get("BYBIT_PUMP_API_KEY", "").strip(),
             pump.get("BYBIT_PUMP_API_SECRET", "").strip(),
             testnet,
-            "pump_subaccount",
+            "pump_trading_fallback",
         )
 
     def credentials_status(self) -> dict[str, Any]:
         master_key, master_secret, testnet, source = self._credentials("master")
-        pump_key, pump_secret, pump_testnet, _ = self._credentials("pump")
+        pump_key, pump_secret, pump_testnet, pump_source = self._credentials("pump")
         return {
             "master_key_present": bool(master_key),
             "master_secret_present": bool(master_secret),
             "master_key_source": source,
             "pump_key_present": bool(pump_key),
             "pump_secret_present": bool(pump_secret),
+            "pump_key_source": pump_source,
             "testnet": testnet,
             "environment_matches": testnet == pump_testnet,
             "ready": bool(master_key and master_secret and pump_key and pump_secret),

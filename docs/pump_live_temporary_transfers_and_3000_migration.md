@@ -35,6 +35,11 @@ always checks the live `transferBalance` / `transferSafeAmount` first.
   `BYBIT_PUMP_MASTER_TRANSFER_API_KEY` and
   `BYBIT_PUMP_MASTER_TRANSFER_API_SECRET` in ignored
   `config/pump_live.env`.
+- A dedicated Pump subaccount transfer key is preferred through
+  `BYBIT_PUMP_SUB_TRANSFER_API_KEY` and
+  `BYBIT_PUMP_SUB_TRANSFER_API_SECRET`. It needs Wallet
+  `AccountTransfer` plus `SubMemberTransferList` and no trading permission.
+  The existing Pump trading key remains an explicit fallback only.
 - If those values are empty, preflight inspects the root `.env` Bybit key. It
   does not weaken the permission gate.
 - A master transfer key with `Withdraw` is rejected.
