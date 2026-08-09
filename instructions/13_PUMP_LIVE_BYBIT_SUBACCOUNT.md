@@ -516,3 +516,15 @@ STRESS / EMERGENCY` and exposes confirmed outstanding main contribution as
 `Temporarily occupied` in desktop, unified positions, Pump controls, and
 Android balance views. This is outstanding external principal, not strategy
 PnL and not necessarily removable position prefund.
+
+Live activation evidence, 2026-08-09: commits `95bbb9f` and `0061324` passed
+the complete Python regression (`659 passed`, `11 warnings`) and Android unit
+tests. A supervised backend restart recovered the same three Pump positions
+and thirteen orders with zero protection issues; recovery ARM succeeded and
+multiple following 15-second cycles stayed armed/healthy. Auto rescue reported
+enabled with `$0` daily use, no pending transfer, and `$0` temporarily
+occupied because every current position remained above the `20%` trigger.
+Do not describe this as a live risk-trigger transfer test: the real transfer
+rail was validated by the earlier `$0.01` round trip, while warning/emergency
+trigger behavior was covered by regression without deliberately stressing a
+live position.

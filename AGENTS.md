@@ -106,6 +106,16 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- The guarded Pump auto-rescue deployment was activated after commits
+  `95bbb9f` and `0061324` passed the full Python suite (`659 passed`, `11
+  warnings`) and Android unit tests. A supervised restart recovered three
+  tracked positions and thirteen orders with zero protection issues; recovery
+  ARM succeeded and subsequent 15-second cycles stayed healthy. Auto rescue
+  was `enabled` but correctly remained unused (`daily_used=0`, no pending,
+  temporary outstanding `$0`) because all live buffers were above `20%`.
+  This validates deployment/recovery, not an intentionally induced live risk
+  trigger; the transfer rail has the earlier `$0.01` live round trip and the
+  warning/emergency trigger paths have deterministic regression coverage.
 - Pump Live capital visibility and guarded automatic rescue funding were added
   on 2026-08-09. Desktop, unified positions, Pump controls, and Android now
   show confirmed outstanding main contribution as `Temporarily occupied`,
