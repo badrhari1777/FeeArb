@@ -1181,12 +1181,24 @@ class StopManagerCancelSafetyTestCase(unittest.TestCase):
         ):
             nonlocal fetch_count
             fetch_count += 1
-            if force_fetch:
+            if fetch_count == 2:
                 return {
-                    "stop_orders": [],
+                    "stop_orders": [
+                        {"id": "old-stop", "price": 100.0, "qty": 1.0},
+                        {"id": "new-stop", "price": 101.0, "qty": 1.0},
+                    ],
                     "take_orders": [],
                     "unknown_orders": [],
-                    "order_ids": [],
+                    "order_ids": ["old-stop", "new-stop"],
+                    "algo_order_ids": [],
+                    "invalid_side": False,
+                }
+            if fetch_count >= 3:
+                return {
+                    "stop_orders": [{"id": "new-stop", "price": 101.0, "qty": 1.0}],
+                    "take_orders": [],
+                    "unknown_orders": [],
+                    "order_ids": ["new-stop"],
                     "algo_order_ids": [],
                     "invalid_side": False,
                 }
@@ -1221,9 +1233,61 @@ class StopManagerCancelSafetyTestCase(unittest.TestCase):
 
         result = asyncio.run(_run())
         self.assertEqual(result.get("status"), "updated")
+        self.assertEqual(result.get("replacement_mode"), "create_verify_cancel")
         self.assertEqual(place_stop_calls, 1)
-        self.assertEqual(fetch_count, 2)
+        self.assertEqual(fetch_count, 3)
         self.assertEqual(client.cancel_calls, [("old-stop", "BTCUSDTM", {"stop": True})])
+
+    def test_sync_leg_kucoin_keeps_old_stop_when_replacement_is_not_visible(self) -> None:
+        manager = ProtectiveOrderManager(RiskConfig())
+        client = _SyncClient()
+        gateway = _KucoinSyncGateway(client)
+        manager._gateways = {"kucoin": gateway}
+        place_stop_calls = 0
+
+        async def _fake_fetch_existing(
+            _gw,
+            _symbol,
+            _position_id,
+            _side,
+            *,
+            mark_price=None,  # noqa: ARG001
+            entry_price=None,  # noqa: ARG001
+            force_fetch: bool = False,  # noqa: ARG001
+        ):
+            return {
+                "stop_orders": [{"id": "old-stop", "price": 100.0, "qty": 1.0}],
+                "take_orders": [],
+                "unknown_orders": [],
+                "order_ids": ["old-stop"],
+                "algo_order_ids": [],
+                "invalid_side": False,
+            }
+
+        async def _fake_place_stop(_gw, _target, _price):
+            nonlocal place_stop_calls
+            place_stop_calls += 1
+
+        manager._fetch_existing = _fake_fetch_existing  # type: ignore[method-assign]
+        manager._place_stop = _fake_place_stop  # type: ignore[method-assign]
+
+        result = asyncio.run(
+            manager._sync_leg(
+                ProtectiveTarget(
+                    stop=101.0,
+                    takes=[],
+                    quantity=1.0,
+                    side="long",
+                    exchange="kucoin",
+                    symbol="BTCUSDTM",
+                    position_id="p1",
+                )
+            )
+        )
+
+        self.assertEqual(result.get("status"), "replacement_unverified_old_kept")
+        self.assertEqual(place_stop_calls, 1)
+        self.assertEqual(client.cancel_calls, [])
 
     def test_sync_leg_cancels_bitget_uta_tpsl_as_trigger_strategy_order(self) -> None:
         manager = ProtectiveOrderManager(RiskConfig())

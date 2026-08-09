@@ -122,7 +122,7 @@ class AppSettings:
             "auto_rebalance_enabled": False,
             "stop_gap_from_liq_pct": 0.025,
             "stop_requote_threshold_pct": 0.0025,
-            "stop_force_requote_max_age_sec": 60,
+            "stop_force_requote_max_age_sec": 0,
             "fallback_liq_factor_long": 0.33,
             "fallback_liq_factor_short": 1.66,
             "fallback_take_rr_pct": 0.30,
@@ -307,7 +307,7 @@ class AppSettings:
             "auto_rebalance_enabled": False,
             "stop_gap_from_liq_pct": 0.025,
             "stop_requote_threshold_pct": 0.0025,
-            "stop_force_requote_max_age_sec": 60,
+            "stop_force_requote_max_age_sec": 0,
             "fallback_liq_factor_long": 0.33,
             "fallback_liq_factor_short": 1.66,
             "fallback_take_rr_pct": 0.30,
@@ -352,6 +352,10 @@ class AppSettings:
         merged = dict(defaults)
         if isinstance(self.protective, dict):
             merged.update(self.protective)
+        # Retired after a KuCoin incident: an exchange-native conditional stop
+        # does not become unsafe merely because it is old. Rotating it on a
+        # timer created a cancel-before-replace protection gap.
+        merged["stop_force_requote_max_age_sec"] = 0
         self.protective = merged
         manual_defaults = {
             "enter_live_orderbook": False,

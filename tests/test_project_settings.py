@@ -119,6 +119,21 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         service = DataService(settings_manager=self.manager)
         self.assertAlmostEqual(service._risk_config_from_settings().fallback_take_rr_pct, 0.30)
 
+    def test_legacy_timed_stop_rotation_is_disabled(self) -> None:
+        self.settings_path.write_text(
+            json.dumps({"protective": {"stop_force_requote_max_age_sec": 60}}),
+            encoding="utf-8",
+        )
+
+        reloaded = SettingsManager(path=self.settings_path)
+
+        self.assertEqual(
+            reloaded.current.protective.get("stop_force_requote_max_age_sec"),
+            0,
+        )
+        service = DataService(settings_manager=reloaded)
+        self.assertEqual(service._risk_config_from_settings().stop_force_requote_max_age_sec, 0)
+
     def test_fallback_take_rejects_unsafe_range(self) -> None:
         with self.assertRaises(ValueError):
             self.manager.update({"protective": {"fallback_take_rr_pct": 0}})

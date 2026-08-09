@@ -1030,7 +1030,7 @@ class ProtectiveOrderManager:
         gw = self._gateways.get(target.exchange)
         threshold = max(0.0, float(self._risk_config.stop_requote_threshold_pct))
         qty_threshold = max(0.01, threshold)
-        max_stop_age_sec = max(0, int(getattr(self._risk_config, "stop_force_requote_max_age_sec", 120) or 0))
+        max_stop_age_sec = max(0, int(getattr(self._risk_config, "stop_force_requote_max_age_sec", 0) or 0))
         if gw is None:
             return {"exchange": target.exchange, "symbol": target.symbol, "status": "skipped", "reason": "adapter_missing"}
         if target.quantity <= 0:
@@ -1230,6 +1230,48 @@ class ProtectiveOrderManager:
         take_skipped_invalid = False
         place_stop_required = bool(target.stop and (stop_diff or invalid_side))
         place_take_required = bool(target.takes and (take_diff or invalid_side))
+        if target.exchange == "kucoin" and (place_stop_required or place_take_required or to_cancel):
+            try:
+                actions = await self._sync_kucoin_replace_before_cancel(
+                    gw,
+                    target,
+                    actions,
+                    existing,
+                    to_cancel,
+                    place_stop_required=place_stop_required,
+                    place_take_required=place_take_required,
+                    price_threshold=threshold,
+                    qty_threshold=qty_threshold,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                actions["status"] = "error"
+                actions["error"] = str(exc)
+                logger.warning(
+                    "KuCoin protective replace-before-cancel failed for %s %s: %s",
+                    target.symbol,
+                    target.side,
+                    exc,
+                    exc_info=True,
+                )
+            finally:
+                if gw and gw.requires_cycle_close():
+                    try:
+                        await gw.close()
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+            status = actions.get("status")
+            if status not in {"updated", "unchanged", "blocked_ok"}:
+                protective_logger.warning(
+                    "protective issue exchange=%s symbol=%s side=%s status=%s stop=%s take=%s err=%s",
+                    target.exchange,
+                    target.symbol,
+                    target.side,
+                    status,
+                    actions.get("target_stop"),
+                    actions.get("target_take"),
+                    actions.get("error") or actions.get("reason"),
+                )
+            return actions
         try:
             cancel_failures = await self._cancel_protective_order_ids(gw, target, to_cancel, existing) if to_cancel else []
             if cancel_failures:
@@ -1371,6 +1413,185 @@ class ProtectiveOrderManager:
             )
         return actions
 
+    def _has_matching_stop(
+        self,
+        orders: Iterable[Mapping[str, Any]],
+        target: ProtectiveTarget,
+        price_threshold: float,
+        qty_threshold: float,
+    ) -> bool:
+        if target.stop is None:
+            return True
+        for order in orders:
+            differs, _delta = self._needs_stop_update(
+                [order],
+                target.stop,
+                target.quantity,
+                price_threshold,
+                qty_threshold,
+                max_age_sec=0,
+            )
+            if not differs:
+                return True
+        return False
+
+    def _has_matching_takes(
+        self,
+        orders: Iterable[Mapping[str, Any]],
+        target: ProtectiveTarget,
+        price_threshold: float,
+        qty_threshold: float,
+    ) -> bool:
+        if not target.takes:
+            return True
+        remaining = list(orders)
+        for take in target.takes:
+            matched_index = None
+            for index, order in enumerate(remaining):
+                differs, _delta = self._needs_take_update(
+                    [order],
+                    [take],
+                    price_threshold,
+                    qty_threshold,
+                )
+                if not differs:
+                    matched_index = index
+                    break
+            if matched_index is None:
+                return False
+            remaining.pop(matched_index)
+        return True
+
+    async def _sync_kucoin_replace_before_cancel(
+        self,
+        gw: ExchangeGateway,
+        target: ProtectiveTarget,
+        actions: dict[str, Any],
+        existing: Mapping[str, Any],
+        to_cancel: Iterable[str],
+        *,
+        place_stop_required: bool,
+        place_take_required: bool,
+        price_threshold: float,
+        qty_threshold: float,
+    ) -> dict[str, Any]:
+        """Replace KuCoin conditionals without an unprotected cancel gap.
+
+        KuCoin permits multiple stop orders for a contract. Keep every captured
+        protective order active until the replacement is visible through the
+        exchange open-stop endpoint, then remove only the captured old IDs.
+        """
+        placed = False
+        if place_stop_required and target.stop is not None:
+            try:
+                await self._place_stop(gw, target, target.stop)
+                placed = True
+            except InvalidProtectivePrice as exc:
+                actions["status"] = "stop_skipped_invalid_price_old_kept"
+                actions["error"] = str(exc)
+                return actions
+        if place_take_required:
+            for take in target.takes:
+                if take.quantity <= 0:
+                    continue
+                try:
+                    await self._place_take(gw, target, take.price, quantity=take.quantity)
+                    placed = True
+                except InvalidProtectivePrice as exc:
+                    actions["status"] = "take_skipped_invalid_price_old_kept"
+                    actions["error"] = str(exc)
+                    return actions
+
+        after_replace = await self._fetch_existing(
+            gw,
+            target.symbol,
+            target.position_id,
+            target.side,
+            mark_price=target.mark_price,
+            entry_price=target.entry_price,
+            force_fetch=True,
+        )
+        actions["existing_after_replace"] = after_replace
+        stop_ready = self._has_matching_stop(
+            after_replace.get("stop_orders") or [],
+            target,
+            price_threshold,
+            qty_threshold,
+        )
+        take_ready = self._has_matching_takes(
+            after_replace.get("take_orders") or [],
+            target,
+            price_threshold,
+            qty_threshold,
+        )
+        if not stop_ready or not take_ready:
+            missing = []
+            if not stop_ready:
+                missing.append("stop")
+            if not take_ready:
+                missing.append("take")
+            actions["status"] = "replacement_unverified_old_kept"
+            actions["error"] = f"replacement_unverified:{','.join(missing)}"
+            return actions
+
+        captured_ids = []
+        seen_ids = set()
+        for order_id in to_cancel:
+            oid = str(order_id or "")
+            if oid and oid not in seen_ids:
+                captured_ids.append(oid)
+                seen_ids.add(oid)
+        cancel_failures = await self._cancel_protective_order_ids(
+            gw,
+            target,
+            captured_ids,
+            existing,
+        ) if captured_ids else []
+        if cancel_failures:
+            actions["status"] = "replacement_active_cancel_failed"
+            actions["error"] = f"cancel_failed:{','.join(cancel_failures)}"
+            actions["cancel_failures"] = cancel_failures
+            return actions
+
+        after_cancel = await self._fetch_existing(
+            gw,
+            target.symbol,
+            target.position_id,
+            target.side,
+            mark_price=target.mark_price,
+            entry_price=target.entry_price,
+            force_fetch=True,
+        )
+        actions["existing_after_cancel"] = after_cancel
+        active_ids = {
+            str(order_id)
+            for order_id in (after_cancel.get("order_ids") or [])
+            if order_id
+        }
+        lingering = [order_id for order_id in captured_ids if order_id in active_ids]
+        if lingering:
+            actions["status"] = "replacement_active_cancel_pending"
+            actions["error"] = f"cancel_pending:{','.join(lingering)}"
+            actions["cancel_pending_ids"] = lingering
+            return actions
+        if not self._has_matching_stop(
+            after_cancel.get("stop_orders") or [],
+            target,
+            price_threshold,
+            qty_threshold,
+        ) or not self._has_matching_takes(
+            after_cancel.get("take_orders") or [],
+            target,
+            price_threshold,
+            qty_threshold,
+        ):
+            actions["status"] = "replacement_lost_after_cancel"
+            actions["error"] = "replacement_not_visible_after_old_cancel"
+            return actions
+        actions["status"] = "updated" if placed or captured_ids else "unchanged"
+        actions["replacement_mode"] = "create_verify_cancel"
+        return actions
+
     async def _verify_leg(
         self,
         target: ProtectiveTarget,
@@ -1380,7 +1601,7 @@ class ProtectiveOrderManager:
         gw = self._gateways.get(target.exchange)
         threshold = max(0.0, float(self._risk_config.stop_requote_threshold_pct))
         qty_threshold = max(0.01, threshold)
-        max_stop_age_sec = max(0, int(getattr(self._risk_config, "stop_force_requote_max_age_sec", 120) or 0))
+        max_stop_age_sec = max(0, int(getattr(self._risk_config, "stop_force_requote_max_age_sec", 0) or 0))
         if gw is None:
             return {
                 "exchange": target.exchange,

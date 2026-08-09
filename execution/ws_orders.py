@@ -1238,6 +1238,39 @@ class BitgetOrderStream(_BaseOrderStream):
         except Exception:
             return
 
+def _kucoin_zero_fill_stop_event(
+    item: Mapping[str, Any],
+    *,
+    filled_qty: float | None,
+) -> dict[str, Any] | None:
+    """Return a critical event for a triggered KuCoin stop with no execution."""
+    raw_triggered = item.get("stopTriggered")
+    triggered = raw_triggered is True or str(raw_triggered or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if not triggered or float(filled_qty or 0.0) > 0:
+        return None
+    order_id = _safe_order_id(item.get("orderId") or item.get("order_id"))
+    if not order_id:
+        return None
+    return {
+        "order_id": order_id,
+        "symbol": str(item.get("symbol") or ""),
+        "side": str(item.get("side") or ""),
+        "status": str(item.get("status") or item.get("type") or ""),
+        "filled_qty": 0.0,
+        "size": _safe_float(item.get("size")),
+        "remain_size": _safe_float(item.get("remainSize")),
+        "stop_price": _safe_float(item.get("stopPrice")),
+        "stop_direction": str(item.get("stop") or ""),
+        "remark": str(item.get("remark") or item.get("reason") or ""),
+        "ts": _safe_float(item.get("ts") or item.get("orderTime") or item.get("time")),
+        "severity": "critical",
+    }
+
+
 class KucoinOrderStream(_BaseOrderStream):
     def __init__(
         self,
@@ -1311,6 +1344,15 @@ class KucoinOrderStream(_BaseOrderStream):
                     status=status,
                     mode="set",
                 )
+                failure = _kucoin_zero_fill_stop_event(item, filled_qty=filled)
+                if failure:
+                    logger.error(
+                        "kucoin protective stop triggered without fill: symbol=%s order_id=%s remark=%s",
+                        failure.get("symbol"),
+                        failure.get("order_id"),
+                        failure.get("remark"),
+                    )
+                    self._emit_event("protective_stop_zero_fill", failure)
 
     async def _fetch_private_endpoint(self) -> str | None:
         _bootstrap_env(force=True)

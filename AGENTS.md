@@ -106,6 +106,15 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- KuCoin protective replacement was made gap-free on 2026-08-09 after the TUT
+  incident. Timer-only stop rotation is retired (`stop_force_requote_max_age_sec=0`).
+  A changed KuCoin stop/take is now created and confirmed in a fresh private
+  open-order snapshot before captured old IDs are canceled, then confirmed
+  again; an unverified replacement keeps the old protection active. KuCoin
+  private order updates also classify `stopTriggered=true` with zero fill as
+  the critical `protective_stop_zero_fill` event and preserve the exchange
+  remark for diagnosis. The handler deliberately does not submit an unowned
+  blind market retry. Focused protective/settings/WS regression passed (`105`).
 - Strategy Lab Executable Spread Timing v1 core was added on 2026-08-08 using
   the ordinary-arbitrage SQLite data requested by the operator. The runner pins
   one read-only WAL snapshot and compares causal `now`, `5/15/30m`, and

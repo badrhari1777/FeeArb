@@ -14,7 +14,7 @@
 Если реализация и этот документ расходятся, сначала проверить код и свежие
 артефакты, затем исправить roadmap в том же логическом коммите.
 
-Последнее обновление: `2026-08-07`.
+Последнее обновление: `2026-08-09`.
 Текущий этап: `Executable Spread Timing v1 core реализован; простой spread-threshold опровергнут, Stage 3 selective filters pending`.
 Текущий режим: `research_only_no_trading`.
 
@@ -492,6 +492,24 @@ Shadow -> live:
 - Fixture regression: `4 passed`; профильный Strategy Lab/Pump/coin regression
   `173 passed`, `4 warnings`; полный regression `629 passed`, `11 warnings`.
   Live/ARM/Pump Live/Grid/orders/positions не изменялись.
+
+### 2026-08-09 — checkpoint перед защитным разбором TUT
+
+- Разработка Strategy Lab поставлена на контролируемую паузу без изменения
+  исследовательских данных и кода. Последний завершённый коммит:
+  `7489ffa Add Strategy Lab executable spread timing`.
+- Текущая воспроизводимая точка остаётся Stage 3 core: `208` causal events,
+  `22` symbols, `4 160` outcomes, из них `2 374` evaluated и `1 786` veto;
+  простой spread-threshold имеет отрицательную median net на `15m/1h/4h/8h`.
+- Stage 2 Funding Forecast полностью оценён и остаётся `research hold`; его
+  sign forecast разрешён только как будущий `CARRY` feature.
+- Не выполнены: historical depth/contract multiplier и USD capacity,
+  mark/index confirmation, Stage 3.1 selective filters, walk-forward и
+  whole-symbol holdout, paper state machine.
+- Причина паузы: отдельный live-safety incident TUT в Manual/Grid protective
+  контуре. Он не меняет результат Strategy Lab и не даёт live-разрешения.
+- Возобновление начинается ровно с Stage 3.1 по пунктам ниже, после отдельного
+  завершения и коммита защитного блока.
 
 ## Точный следующий шаг
 

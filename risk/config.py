@@ -11,7 +11,9 @@ class RiskConfig:
 
     stop_gap_from_liq_pct: float = 0.025  # 2.5% gap from liquidation
     stop_requote_threshold_pct: float = 0.0025  # 0.25% change required to re-quote
-    stop_force_requote_max_age_sec: int = 60  # force stop refresh when older than this
+    # Conditional stops are durable exchange orders. Age alone must never rotate
+    # them because cancel/recreate can leave the position unprotected.
+    stop_force_requote_max_age_sec: int = 0
     fallback_liq_factor_long: float = 0.33
     fallback_liq_factor_short: float = 1.66
     fallback_take_rr_pct: float = 0.30    # 30% fallback when no peer stop is available
