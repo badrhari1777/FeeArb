@@ -106,6 +106,18 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- A fail-closed temporary Bybit main/Pump transfer layer was added on
+  2026-08-09. It uses a persisted UUID, confirms `SUCCESS` from universal
+  transfer history, blocks on unknown outcomes, and allows return only within
+  confirmed temporary principal while preserving Pump top-up capacity,
+  operating floor, and active strategy capital. Confirmed contributions are
+  offset in capital observation and retained as external cashflows, so they
+  cannot appear as strategy profit. The project minimum round-trip is `$0.01`.
+  Fresh preflight found `SubMemberTransferList` on the Pump sub-key but no
+  `AccountTransfer`, while the current master key has neither required Wallet
+  permission; no one-way live test was submitted.
+  The `$3000` plan keeps three existing `$175` positions immutable and requires
+  versioned mixed-cohort risk policy before new `$525` slots can be enabled.
 - Pump Live four-slot cash accounting was corrected on 2026-08-09 after the
   third open position caused the old `$300 reserve + $175 slot` test to reject
   HFT despite `$135` of that reserve already being confirmed owned prefund.

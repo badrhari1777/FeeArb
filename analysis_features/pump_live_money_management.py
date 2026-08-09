@@ -37,6 +37,59 @@ DEFAULT_POLICIES = (
 )
 
 
+def target_capital_migration_snapshot(
+    state: Mapping[str, Any],
+    *,
+    wallet_total_usd: float,
+    target_capital_usd: float = 3_000.0,
+    legacy_slot_margin_usd: float = 175.0,
+) -> dict[str, Any]:
+    open_positions = [
+        item for item in state.get("positions") or [] if item.get("status") in {"open", "opening"}
+    ]
+    target_deployable = target_capital_usd * 0.70
+    target_reserve = target_capital_usd * 0.30
+    target_slot = target_deployable / 4.0
+    target_guarantee = target_reserve * (200.0 / 300.0) / 4.0
+    target_shared = target_reserve * (75.0 / 300.0)
+    target_floor = target_reserve * (25.0 / 300.0)
+    free_slots = max(0, 4 - len(open_positions))
+    gradual_new_slots = min(1, free_slots)
+    mixed_deployable_commitment = (
+        len(open_positions) * legacy_slot_margin_usd
+        + gradual_new_slots * target_slot
+    )
+    return {
+        "target_capital_usd": round(target_capital_usd, 6),
+        "wallet_total_usd": round(wallet_total_usd, 6),
+        "deposit_to_exact_target_usd": round(max(0.0, target_capital_usd - wallet_total_usd), 6),
+        "open_legacy_positions": len(open_positions),
+        "free_slots": free_slots,
+        "target_deployable_usd": round(target_deployable, 6),
+        "target_reserve_usd": round(target_reserve, 6),
+        "target_slot_margin_usd": round(target_slot, 6),
+        "target_position_notional_at_3x_usd": round(target_slot * 3.0, 6),
+        "target_guaranteed_topup_per_position_usd": round(target_guarantee, 6),
+        "target_shared_emergency_usd": round(target_shared, 6),
+        "target_operating_floor_usd": round(target_floor, 6),
+        "target_max_total_topup_usd": round(target_guarantee * 4.0 + target_shared, 6),
+        "gradual_first_mixed_commitment_usd": round(
+            mixed_deployable_commitment + target_reserve,
+            6,
+        ),
+        "gradual_first_mixed_headroom_usd": round(
+            target_capital_usd - mixed_deployable_commitment - target_reserve,
+            6,
+        ),
+        "current_runtime_supports_mixed_cohorts": False,
+        "recommended_transition": "deposit_excluded_then_legacy_hold_then_versioned_gradual_migration",
+        "warning": (
+            "do not resize existing ladders; target rescue amounts require separate "
+            "execution-aware stress replay and immutable per-position policy versions"
+        ),
+    }
+
+
 def tier_prefund_usd(row: Mapping[str, Any]) -> float:
     rule = str(row.get("rule_slug") or "")
     if "legs5_equal" in rule:
@@ -163,10 +216,12 @@ def write_report(
     live_state_path: Path | None = None,
     wallet_total_usd: float | None = None,
     wallet_available_usd: float | None = None,
+    target_capital_usd: float = 3_000.0,
 ) -> dict[str, Any]:
     trades = load_main_historical_trades(historical_trades_path)
     summaries = [policy_summary(trades, policy) for policy in DEFAULT_POLICIES]
     current: dict[str, Any] | None = None
+    migration: dict[str, Any] | None = None
     if (
         live_state_path is not None
         and live_state_path.exists()
@@ -179,6 +234,11 @@ def write_report(
             wallet_total_usd=wallet_total_usd,
             wallet_available_usd=wallet_available_usd,
         )
+        migration = target_capital_migration_snapshot(
+            state,
+            wallet_total_usd=wallet_total_usd,
+            target_capital_usd=target_capital_usd,
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "policy_summary.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(summaries[0]))
@@ -190,6 +250,7 @@ def write_report(
         "historical_trades": len(trades),
         "policies": summaries,
         "current_wallet_snapshot": current,
+        "target_capital_migration": migration,
         "research_only": True,
     }
     (output_dir / "metadata.json").write_text(

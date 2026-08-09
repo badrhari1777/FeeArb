@@ -1123,6 +1123,77 @@ class PumpLiveController:
         )
         return self.status()
 
+    def record_temporary_transfer(
+        self,
+        *,
+        direction: str,
+        amount_usd: float,
+        transfer_id: str,
+    ) -> dict[str, Any]:
+        """Exclude confirmed temporary cashflows from observed strategy growth.
+
+        The transfer controller calls this only after the exchange history has
+        confirmed SUCCESS. Transfer IDs are durable and idempotent so a retry
+        after an uncertain local write cannot apply the cashflow twice.
+        """
+        amount = _safe_float(amount_usd, 0.0)
+        operation_id = str(transfer_id or "").strip()
+        if amount <= 0:
+            raise ValueError("pump_temporary_transfer_amount_invalid")
+        if not operation_id:
+            raise ValueError("pump_temporary_transfer_id_missing")
+        if direction not in {"main_to_pump", "pump_to_main"}:
+            raise ValueError("pump_temporary_transfer_direction_invalid")
+        with self._lock:
+            manager = dict(self._state.get("capital_manager") or {})
+            recorded_ids = [str(item) for item in manager.get("temporary_transfer_ids") or []]
+            if operation_id in recorded_ids:
+                return build_capital_manager_status(self._state, self.config())
+            outstanding = _safe_float(manager.get("temporary_transfer_outstanding_usd"), 0.0)
+            adjustment = _safe_float(manager.get("equity_adjustment_usd"), 0.0)
+            cumulative_in = _safe_float(manager.get("temporary_transfer_in_usd"), 0.0)
+            cumulative_returned = _safe_float(
+                manager.get("temporary_transfer_returned_usd"),
+                0.0,
+            )
+            if direction == "main_to_pump":
+                outstanding += amount
+                cumulative_in += amount
+                adjustment -= amount
+            else:
+                if amount > outstanding + 1e-9:
+                    raise RuntimeError("pump_temporary_transfer_outstanding_underflow")
+                outstanding = max(0.0, outstanding - amount)
+                cumulative_returned += amount
+                adjustment += amount
+            manager.update(
+                {
+                    "equity_adjustment_usd": round(adjustment, 6),
+                    "temporary_transfer_outstanding_usd": round(outstanding, 6),
+                    "temporary_transfer_in_usd": round(cumulative_in, 6),
+                    "temporary_transfer_returned_usd": round(cumulative_returned, 6),
+                    "temporary_transfer_ids": recorded_ids + [operation_id],
+                    "last_temporary_transfer_id": operation_id,
+                    "last_temporary_transfer_direction": direction,
+                    "last_temporary_transfer_amount_usd": round(amount, 6),
+                    "last_temporary_transfer_at_ms": _now_ms(),
+                }
+            )
+            self._state["capital_manager"] = manager
+            self._state["updated_at_ms"] = _now_ms()
+            self._save_state_locked()
+        self._event(
+            "temporary_transfer_accounted",
+            {
+                "transfer_id": operation_id,
+                "direction": direction,
+                "amount_usd": round(amount, 6),
+                "temporary_outstanding_usd": round(outstanding, 6),
+                "excluded_from_strategy_growth": True,
+            },
+        )
+        return build_capital_manager_status(self._state, self.config())
+
     def preflight(self) -> dict[str, Any]:
         result = self.gateway.preflight(self.config())
         with self._lock:
@@ -3254,6 +3325,18 @@ def build_capital_manager_status(
         "observation_elapsed_days": round(elapsed_days, 3),
         "observation_closed_trades": observed_trades,
         "observation_ready": observation_ready,
+        "temporary_transfer_outstanding_usd": round(
+            _safe_float(manager.get("temporary_transfer_outstanding_usd"), 0.0),
+            6,
+        ),
+        "temporary_transfer_in_usd": round(
+            _safe_float(manager.get("temporary_transfer_in_usd"), 0.0),
+            6,
+        ),
+        "temporary_transfer_returned_usd": round(
+            _safe_float(manager.get("temporary_transfer_returned_usd"), 0.0),
+            6,
+        ),
     }
 
 

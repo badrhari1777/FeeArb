@@ -9,6 +9,7 @@ from analysis_features.pump_live_money_management import (
     current_wallet_snapshot,
     peak_concurrent_prefund_usd,
     policy_summary,
+    target_capital_migration_snapshot,
     write_report,
 )
 
@@ -86,3 +87,26 @@ def test_write_report_creates_reproducible_artifacts(tmp_path: Path) -> None:
     assert result["research_only"] is True
     assert (tmp_path / "out" / "policy_summary.csv").exists()
     assert (tmp_path / "out" / "metadata.json").exists()
+
+
+def test_three_legacy_positions_can_only_use_versioned_gradual_3000_migration() -> None:
+    state = {
+        "positions": [
+            {"status": "open", "margin_topup_usd": amount}
+            for amount in (25.0, 35.0, 75.0)
+        ]
+    }
+
+    result = target_capital_migration_snapshot(
+        state,
+        wallet_total_usd=1043.862297,
+        target_capital_usd=3000.0,
+    )
+
+    assert result["deposit_to_exact_target_usd"] == 1956.137703
+    assert result["target_slot_margin_usd"] == 525.0
+    assert result["target_reserve_usd"] == 900.0
+    assert result["target_max_total_topup_usd"] == 825.0
+    assert result["gradual_first_mixed_commitment_usd"] == 1950.0
+    assert result["gradual_first_mixed_headroom_usd"] == 1050.0
+    assert result["current_runtime_supports_mixed_cohorts"] is False

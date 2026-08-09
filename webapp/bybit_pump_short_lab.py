@@ -32,6 +32,7 @@ from analysis_features.bybit_pump_short_shadow import (
     run_shadow_scan,
 )
 from execution.pump_live import PumpLiveController, PumpLiveNotifier
+from execution.pump_transfers import PumpTemporaryTransferController
 
 PUMP_DASHBOARD_CAPITAL_USD = 1_000.0
 PUMP_DASHBOARD_MAX_ACTIVE_COINS = 3
@@ -221,6 +222,7 @@ class BybitPumpShortLab:
         restore_shadow_schedule: bool = True,
         start_paper_monitor: bool | None = None,
         pump_live_controller: PumpLiveController | None = None,
+        pump_transfer_controller: PumpTemporaryTransferController | None = None,
         notifier: PumpLiveNotifier | None = None,
     ) -> None:
         self._lock = threading.Lock()
@@ -238,6 +240,12 @@ class BybitPumpShortLab:
         self._paper_monitor_state: dict[str, Any] = self._initial_paper_monitor_state()
         self._strategy_monitor_last_audit_key: str | None = None
         self._pump_live = pump_live_controller or PumpLiveController(notifier=notifier)
+        self._pump_transfers = pump_transfer_controller
+        if self._pump_transfers is None and isinstance(self._pump_live, PumpLiveController):
+            self._pump_transfers = PumpTemporaryTransferController(
+                accounting=self._pump_live,
+                state_dir=self._pump_live.state_dir,
+            )
         if restore_shadow_schedule:
             self._restore_shadow_schedule_if_enabled()
         paper_monitor_enabled = (
@@ -463,6 +471,39 @@ class BybitPumpShortLab:
 
     def pump_live_emergency_close(self, confirmation: str) -> dict[str, Any]:
         return self._pump_live.emergency_close_all(confirmation)
+
+    def pump_transfer_status(self) -> dict[str, Any]:
+        if self._pump_transfers is None:
+            return {"ready": False, "errors": ["pump_transfer_controller_unavailable"]}
+        return self._pump_transfers.status()
+
+    def pump_transfer_preflight(self) -> dict[str, Any]:
+        if self._pump_transfers is None:
+            return {"ready": False, "errors": ["pump_transfer_controller_unavailable"]}
+        return self._pump_transfers.preflight()
+
+    def pump_transfer_in(
+        self,
+        amount_usdt: float,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        if self._pump_transfers is None:
+            raise RuntimeError("pump_transfer_controller_unavailable")
+        return self._pump_transfers.transfer_in(amount_usdt, confirmation)
+
+    def pump_transfer_return(
+        self,
+        amount_usdt: float,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        if self._pump_transfers is None:
+            raise RuntimeError("pump_transfer_controller_unavailable")
+        return self._pump_transfers.transfer_return(amount_usdt, confirmation)
+
+    def pump_transfer_reconcile(self) -> dict[str, Any]:
+        if self._pump_transfers is None:
+            raise RuntimeError("pump_transfer_controller_unavailable")
+        return self._pump_transfers.reconcile()
 
     def shutdown(self) -> None:
         self._paper_monitor_stop_requested.set()

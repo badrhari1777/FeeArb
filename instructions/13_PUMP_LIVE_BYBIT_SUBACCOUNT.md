@@ -428,8 +428,42 @@ Reproducible analysis:
 .venv\Scripts\python.exe scripts\pump_live_money_management.py
 ```
 
-See `docs/pump_live_money_management_2026-08-09.md`. Automatic main-to-sub
-transfer is still not implemented: the repository has only the researched V5
-endpoint/capability map. Any transfer controller remains a separate staged
-change with a master-side key, idempotent UUID, confirmed `SUCCESS`, protected
-main-account floor, and rescue-capital exclusion accounting.
+See `docs/pump_live_money_management_2026-08-09.md`. That review preceded the
+explicit transfer implementation below; automatic rescue transfers remain
+disabled even after the operator-only controller was added.
+
+## Temporary main/sub transfers (2026-08-09)
+
+The staged transfer controller is explicit only; it never moves money from a
+liquidation monitor or automatically arms entries. It supports a minimum
+project test of `$0.01 USDT` in both directions after a complete read-only
+round-trip preflight.
+
+Main -> Pump requires `AccountTransfer` plus `SubMemberTransfer` on a master
+read/write API key. Pump -> main requires `AccountTransfer` plus
+`SubMemberTransferList` on the Pump subaccount key; the extra permission is
+needed for the fail-closed transfer-safe balance query. Prefer a dedicated
+master key without `Withdraw`, configured only in ignored
+`config/pump_live.env` as:
+
+```text
+BYBIT_PUMP_MASTER_TRANSFER_API_KEY=
+BYBIT_PUMP_MASTER_TRANSFER_API_SECRET=
+```
+
+Every request persists its UUID before submission and must become `SUCCESS` in
+universal-transfer history. Unknown outcomes are reconciled by the same UUID
+and are never blindly repeated. Return is limited to confirmed temporary
+principal and cannot cross the exchange transfer-safe balance, unused top-up
+capacity, `$25` operating floor, or active strategy-capital floor.
+
+Confirmed contributions update `equity_adjustment_usd` in the opposite
+direction, so temporary cash cannot look like strategy profit or trigger a
+false compounding recommendation. Returning the same principal reverses the
+adjustment. Full design and the versioned `$3000` migration decision:
+`docs/pump_live_temporary_transfers_and_3000_migration.md`.
+
+Fresh capability evidence: the Pump key has `SubMemberTransferList` but lacks
+`AccountTransfer`; the current master key has neither required Wallet
+permission. Therefore the live round trip remains blocked and no one-way
+transfer is allowed until both least-privilege gates are configured.

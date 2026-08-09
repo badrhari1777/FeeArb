@@ -363,6 +363,11 @@ class PumpLiveCapitalPayload(BaseModel):
     note: Optional[str] = Field(default=None, max_length=200)
 
 
+class PumpTemporaryTransferPayload(BaseModel):
+    amount_usdt: float = Field(ge=0.01, le=100_000.0)
+    confirmation: str
+
+
 class NotificationTestPayload(BaseModel):
     title: Optional[str] = "FeeArb test notification"
     message: Optional[str] = "FeeArb notification test from backend."
@@ -754,6 +759,57 @@ async def pump_short_live_emergency_close_api(
         result = bybit_pump_short_lab.pump_live_emergency_close(payload.confirmation)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.get("/api/pump-short/live/transfers")
+async def pump_short_live_transfers_status_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(bybit_pump_short_lab.pump_transfer_status()))
+
+
+@app.post("/api/pump-short/live/transfers/preflight")
+async def pump_short_live_transfers_preflight_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(bybit_pump_short_lab.pump_transfer_preflight()))
+
+
+@app.post("/api/pump-short/live/transfers/in")
+async def pump_short_live_transfers_in_api(
+    payload: PumpTemporaryTransferPayload,
+) -> JSONResponse:
+    try:
+        result = bybit_pump_short_lab.pump_transfer_in(
+            payload.amount_usdt,
+            payload.confirmation,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/pump-short/live/transfers/return")
+async def pump_short_live_transfers_return_api(
+    payload: PumpTemporaryTransferPayload,
+) -> JSONResponse:
+    try:
+        result = bybit_pump_short_lab.pump_transfer_return(
+            payload.amount_usdt,
+            payload.confirmation,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/pump-short/live/transfers/reconcile")
+async def pump_short_live_transfers_reconcile_api() -> JSONResponse:
+    try:
+        result = bybit_pump_short_lab.pump_transfer_reconcile()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return JSONResponse(jsonable_encoder(result))
 
 

@@ -26,6 +26,7 @@ def main() -> None:
     )
     parser.add_argument("--wallet-total-usd", type=float)
     parser.add_argument("--wallet-available-usd", type=float)
+    parser.add_argument("--target-capital-usd", type=float, default=3_000.0)
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -38,6 +39,7 @@ def main() -> None:
         live_state_path=args.live_state,
         wallet_total_usd=args.wallet_total_usd,
         wallet_available_usd=args.wallet_available_usd,
+        target_capital_usd=args.target_capital_usd,
     )
     print(json.dumps(result, ensure_ascii=False))
 
