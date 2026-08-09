@@ -27,6 +27,10 @@ always checks the live `transferBalance` / `transferSafeAmount` first.
   `SubMemberTransferList` for submitting the outbound universal transfer.
 - The UIDs must form the configured parent/subaccount pair and both accounts
   must be UTA.
+- Bybit's transferable-coin endpoint is not used for this member transfer: it
+  rejects `UNIFIED -> UNIFIED` with `131203` because it models account-type
+  changes, not different member UIDs. Fresh USDT `transferBalance` and
+  `transferSafeAmount` remain mandatory for each enabled direction.
 - A dedicated master transfer key is preferred:
   `BYBIT_PUMP_MASTER_TRANSFER_API_KEY` and
   `BYBIT_PUMP_MASTER_TRANSFER_API_SECRET` in ignored

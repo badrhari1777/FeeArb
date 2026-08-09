@@ -457,6 +457,11 @@ and are never blindly repeated. Return is limited to confirmed temporary
 principal and cannot cross the exchange transfer-safe balance, unused top-up
 capacity, `$25` operating floor, or active strategy-capital floor.
 
+Do not call the transferable-coin endpoint for this member transfer. Bybit
+rejects `UNIFIED -> UNIFIED` there with `131203`; that endpoint compares
+account types rather than different main/sub UIDs. Direction readiness uses
+the fresh USDT `transferBalance` and `transferSafeAmount` instead.
+
 Confirmed contributions update `equity_adjustment_usd` in the opposite
 direction, so temporary cash cannot look like strategy profit or trigger a
 false compounding recommendation. Returning the same principal reverses the

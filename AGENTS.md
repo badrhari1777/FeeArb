@@ -106,6 +106,13 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump temporary-transfer preflight was corrected on 2026-08-09 after the
+  first dedicated master key exposed Bybit `131203`: the transferable-coin
+  endpoint rejects `UNIFIED -> UNIFIED` because it compares account types,
+  while universal main/sub transfers distinguish member UIDs. The invalid
+  query was removed; both directions remain fail-closed behind fresh USDT
+  `transferBalance` / `transferSafeAmount`, identity, permissions, ownership,
+  outstanding-principal, reserve, and capital-floor checks.
 - A fail-closed temporary Bybit main/Pump transfer layer was added on
   2026-08-09. It uses a persisted UUID, confirms `SUCCESS` from universal
   transfer history, blocks on unknown outcomes, and allows return only within

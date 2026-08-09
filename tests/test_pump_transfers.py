@@ -184,7 +184,7 @@ def _gateway_with_identities(
         def private_get_v5_asset_transfer_query_transfer_coin_list(
             _params: dict[str, Any],
         ) -> dict[str, Any]:
-            return {"result": {"list": ["USDT"]}}
+            raise AssertionError("same-account-type member transfer must skip this endpoint")
 
     gateway.credentials_status = lambda: {  # type: ignore[method-assign]
         "ready": True,

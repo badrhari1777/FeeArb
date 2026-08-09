@@ -369,24 +369,12 @@ class BybitPumpTransferGateway:
                 if ready_out and not bool((balances.get("pump") or {}).get("available", True)):
                     errors.append("pump_transfer_sub_safe_balance_unavailable")
                     ready_out = False
-                for role, client, direction_ready in (
-                    ("master", self._client("master"), ready_in),
-                    ("pump", self._client("pump"), ready_out),
-                ):
-                    if direction_ready:
-                        payload = self._request(
-                            role,
-                            "transferable_coin",
-                            lambda client=client: client.private_get_v5_asset_transfer_query_transfer_coin_list(
-                                {"fromAccountType": "UNIFIED", "toAccountType": "UNIFIED"}
-                            ),
-                        )
-                        if "USDT" not in list(((payload or {}).get("result") or {}).get("list") or []):
-                            errors.append(f"pump_transfer_usdt_not_transferable:{role}")
-                            if role == "master":
-                                ready_in = False
-                            else:
-                                ready_out = False
+                # Bybit's transferable-coin endpoint is only for transfers
+                # between different account types and rejects
+                # UNIFIED -> UNIFIED with retCode 131203. Universal member
+                # transfers use different UIDs, so the fresh USDT
+                # transferBalance/transferSafeAmount checks above are the
+                # applicable fail-closed capability and amount gate.
                 ready = ready_in and ready_out
                 return {
                     "ready": ready,
