@@ -17,8 +17,9 @@ def build_positions_overview(
     pump = dict(pump_payload or {})
     main_cards = [dict(item) for item in main.get("cards") or [] if isinstance(item, Mapping)]
     pump_config = dict(pump.get("config") or {})
+    pump_active_policy = dict(pump.get("active_risk_policy") or pump_config)
     pump_positions = [
-        _pump_position_card(item, pump_config, now_value)
+        _pump_position_card(item, pump_config, pump_active_policy, now_value)
         for item in pump.get("positions") or []
         if isinstance(item, Mapping) and str(item.get("status") or "") != "closed"
     ]
@@ -117,6 +118,7 @@ def build_positions_overview(
 def _pump_position_card(
     row: Mapping[str, Any],
     config: Mapping[str, Any],
+    active_policy: Mapping[str, Any],
     now_ms: int,
 ) -> dict[str, Any]:
     opened_at_ms = _integer(row.get("opened_at_ms"))
@@ -133,6 +135,11 @@ def _pump_position_card(
     else:
         risk_level = "ok"
     legs = [dict(item) for item in row.get("legs") or [] if isinstance(item, Mapping)]
+    position_policy = dict(row.get("risk_policy") or config)
+    margin_topup_cap = max(
+        _number(position_policy.get("max_position_topup_usd")) or 0.0,
+        _number(active_policy.get("max_position_topup_usd")) or 0.0,
+    )
     return {
         "module": "pump_live",
         "account_alias": row.get("account_alias") or "bybit_pump",
@@ -162,7 +169,11 @@ def _pump_position_card(
         "margin_prefund_next_ladder_price": _number(
             row.get("margin_prefund_next_ladder_price")
         ),
-        "margin_topup_cap_usd": _number(config.get("max_position_topup_usd")),
+        "margin_topup_cap_usd": margin_topup_cap,
+        "margin_continuation_policy_id": row.get("margin_continuation_policy_id"),
+        "ladder_gate_status": row.get("ladder_gate_status"),
+        "ladder_gate_step": _integer(row.get("ladder_gate_step")),
+        "ladder_gate_error": row.get("ladder_gate_error"),
         "margin_reduce_confirm_count": _integer(row.get("margin_reduce_confirm_count")) or 0,
         "opened_at_ms": opened_at_ms,
         "age_h": age_h,

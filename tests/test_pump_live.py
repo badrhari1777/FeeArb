@@ -13,6 +13,7 @@ from execution.pump_live import (
     BybitPumpLiveGateway,
     CAPITAL_SET_CONFIRMATION,
     CAPITAL_PROMOTE_CONFIRMATION,
+    PREFUND_NEXT_LADDER_CONFIRMATION_PREFIX,
     RISK_POLICY_V1,
     RISK_POLICY_V2,
     PumpLiveConfig,
@@ -64,7 +65,7 @@ def test_risk_snapshot_remains_immutable_when_runtime_defaults_change() -> None:
     assert restored.margin_topup_chunk_usd == 25.0
 
 
-def test_capital_promotion_keeps_legacy_positions_and_sizes_only_new_v2_entry(
+def test_capital_promotion_keeps_legacy_sizing_and_uses_available_v2_slots(
     tmp_path: Path,
 ) -> None:
     env_path = tmp_path / "pump_live.env"
@@ -115,8 +116,10 @@ def test_capital_promotion_keeps_legacy_positions_and_sizes_only_new_v2_entry(
     assert sum(float(leg["margin_usd"]) for leg in legacy["legs"]) == 175.0
     assert new["risk_policy_id"] == RISK_POLICY_V2
     assert sum(float(leg["margin_usd"]) for leg in new["legs"]) == 525.0
-    assert all(item["symbol"] != "EXTRAUSDT" for item in status["positions"])
-    assert any(item["symbol"] == "EXTRAUSDT" for item in status["pending_signals"])
+    extra = next(item for item in status["positions"] if item["symbol"] == "EXTRAUSDT")
+    assert extra["risk_policy_id"] == RISK_POLICY_V2
+    assert sum(float(leg["margin_usd"]) for leg in extra["legs"]) == 525.0
+    assert status["pending_signals"] == []
 
     restarted = PumpLiveController(
         gateway=gateway,
@@ -584,6 +587,344 @@ def test_1000_plan_has_four_175_slots_and_orders_clear_bybit_minimum() -> None:
     assert min(item["notional_usd"] for item in legs) > 5.0
 
 
+def test_operator_prefund_uses_live_position_and_confirms_next_ladder(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4, prefund_enabled=True)
+    gateway = FakePumpGateway()
+    gateway.balance.update({"total": 3_000.0, "wallet": 3_000.0, "available": 1_955.0})
+    gateway.positions = [
+        {
+            "symbol": "BLUAIUSDT",
+            "side": "short",
+            "qty": 9_810.0,
+            "avg_price": 0.02138577,
+            "mark_price": 0.028026,
+            "liq_price": 0.032313,
+            "leverage": 3.0,
+            "margin_mode": "isolated",
+            "position_idx": 0,
+            "unrealized_pnl": -65.0,
+        }
+    ]
+    gateway.liq_after_add = 0.0378
+    gateway.orders = [
+        {"id": "l3", "symbol": "BLUAIUSDT", "status": "open"},
+        {"id": "l4", "symbol": "BLUAIUSDT", "status": "open"},
+    ]
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["positions"] = [  # pylint: disable=protected-access
+        {
+            "live_id": "bluai",
+            "symbol": "BLUAIUSDT",
+            "status": "open",
+            "qty": 9_810.0,
+            "mark_price": 0.028026,
+            "liq_price": 0.032313,
+            "margin_topup_usd": 50.0,
+            "margin_prefund_floor_usd": 35.0,
+            "legs": [
+                {"step": 1, "status": "filled", "trigger_price": 0.017841},
+                {"step": 2, "status": "filled", "trigger_price": 0.0267615},
+                {"step": 3, "status": "open", "trigger_price": 0.035682, "order_id": "l3"},
+                {"step": 4, "status": "open", "trigger_price": 0.0446025, "order_id": "l4"},
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="pump_live_prefund_confirmation_invalid"):
+        controller.prefund_next_ladder("BLUAIUSDT", "wrong")
+    result = controller.prefund_next_ladder(
+        "BLUAIUSDT",
+        f"{PREFUND_NEXT_LADDER_CONFIRMATION_PREFIX} BLUAIUSDT",
+    )
+
+    assert result["status"] == "confirmed"
+    assert result["step"] == 3
+    assert result["amount_usd"] == 55.0
+    assert result["position_topup_usd"] == 105.0
+    assert result["margin_prefund_floor_usd"] == 105.0
+    assert result["verification"]["ready"] is True
+    assert gateway.margin_adds == [("BLUAIUSDT", 55.0)]
+    assert gateway.protections[-1][2] == pytest.approx(0.0378 * 0.975)
+
+
+def test_existing_multi_order_ladder_is_migrated_to_only_next_live(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4, prefund_enabled=True)
+    gateway = FakePumpGateway()
+    gateway.balance.update({"total": 3_000.0, "wallet": 3_000.0, "available": 1_900.0})
+    gateway.positions = [
+        {
+            "symbol": "BLUAIUSDT",
+            "side": "short",
+            "qty": 9_810.0,
+            "avg_price": 0.02138577,
+            "mark_price": 0.0281,
+            "liq_price": 0.037698,
+            "unrealized_pnl": -65.0,
+        }
+    ]
+    gateway.orders = [
+        {"id": "l3", "symbol": "BLUAIUSDT", "status": "open", "order_link_id": "FAPbluaiL3"},
+        {"id": "l4", "symbol": "BLUAIUSDT", "status": "open", "order_link_id": "FAPbluaiL4"},
+        {"id": "l5", "symbol": "BLUAIUSDT", "status": "open", "order_link_id": "FAPbluaiL5"},
+    ]
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "active_strategy_capital_usd": 3_000.0,
+        "application_enabled": True,
+    }
+    controller._state["positions"] = [  # pylint: disable=protected-access
+        {
+            "live_id": "bluai",
+            "symbol": "BLUAIUSDT",
+            "status": "open",
+            "qty": 9_810.0,
+            "mark_price": 0.0281,
+            "liq_price": 0.037698,
+            "margin_topup_usd": 105.0,
+            "margin_prefund_floor_usd": 105.0,
+            "risk_policy_id": RISK_POLICY_V1,
+            "risk_policy": risk_policy_snapshot(RISK_POLICY_V1, PumpLiveConfig()),
+            "legs": [
+                {"step": 1, "status": "filled", "trigger_price": 0.017841},
+                {"step": 2, "status": "filled", "trigger_price": 0.0267615},
+                {"step": 3, "status": "open", "trigger_price": 0.035682, "order_id": "l3"},
+                {"step": 4, "status": "open", "trigger_price": 0.0446025, "order_id": "l4"},
+                {"step": 5, "status": "open", "trigger_price": 0.053523, "order_id": "l5"},
+            ],
+        }
+    ]
+
+    status = controller.run_cycle()
+    item = status["positions"][0]
+
+    assert gateway.canceled == ["l4", "l5"]
+    assert [leg["status"] for leg in item["legs"]] == [
+        "filled",
+        "filled",
+        "open",
+        "planned",
+        "planned",
+    ]
+    assert item["ladder_gate_status"] == "ready"
+    assert item["ladder_gate_step"] == 3
+
+
+def test_legacy_position_uses_active_v2_margin_envelope_for_next_step(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4, prefund_enabled=True)
+    gateway = FakePumpGateway()
+    gateway.balance.update({"total": 3_000.0, "wallet": 3_000.0, "available": 1_900.0})
+    gateway.positions = [
+        {
+            "symbol": "BLUAIUSDT",
+            "side": "short",
+            "qty": 12_750.0,
+            "avg_price": 0.0247,
+            "mark_price": 0.03,
+            "liq_price": 0.0386,
+            "unrealized_pnl": -130.0,
+        }
+    ]
+    gateway.liq_after_add = 0.0475
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "active_strategy_capital_usd": 3_000.0,
+        "application_enabled": True,
+    }
+    controller._state["positions"] = [  # pylint: disable=protected-access
+        {
+            "live_id": "bluai",
+            "symbol": "BLUAIUSDT",
+            "status": "open",
+            "qty": 12_750.0,
+            "mark_price": 0.03,
+            "liq_price": 0.0386,
+            "margin_topup_usd": 105.0,
+            "margin_prefund_floor_usd": 105.0,
+            "risk_policy_id": RISK_POLICY_V1,
+            "risk_policy": risk_policy_snapshot(RISK_POLICY_V1, PumpLiveConfig()),
+            "legs": [
+                {"step": 1, "status": "filled", "trigger_price": 0.017841},
+                {"step": 2, "status": "filled", "trigger_price": 0.0267615},
+                {"step": 3, "status": "filled", "trigger_price": 0.035682},
+                {"step": 4, "status": "planned", "trigger_price": 0.0446025, "notional_usd": 105.0},
+                {"step": 5, "status": "planned", "trigger_price": 0.053523, "notional_usd": 105.0},
+            ],
+        }
+    ]
+
+    status = controller.run_cycle()
+    item = status["positions"][0]
+
+    assert gateway.margin_adds == [("BLUAIUSDT", 110.0)]
+    assert item["margin_topup_usd"] == 215.0
+    assert item["margin_topup_usd"] > 175.0
+    assert item["margin_prefund_floor_usd"] == 215.0
+    assert item["margin_continuation_policy_id"] == RISK_POLICY_V2
+    assert item["legs"][3]["status"] == "open"
+    assert item["legs"][4]["status"] == "planned"
+
+
+def test_next_ladder_is_deferred_when_margin_envelope_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, prefund_enabled=True)
+    gateway = FakePumpGateway()
+    gateway.positions = [
+        {
+            "symbol": "TESTUSDT",
+            "side": "short",
+            "qty": 20.0,
+            "avg_price": 12.0,
+            "mark_price": 10.0,
+            "liq_price": 16.0,
+            "unrealized_pnl": 40.0,
+        }
+    ]
+    gateway.orders = [
+        {"id": "l3", "symbol": "TESTUSDT", "status": "open", "order_link_id": "FAPtestL3"}
+    ]
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["positions"] = [  # pylint: disable=protected-access
+        {
+            "live_id": "test",
+            "symbol": "TESTUSDT",
+            "status": "open",
+            "qty": 20.0,
+            "mark_price": 10.0,
+            "liq_price": 16.0,
+            "margin_topup_usd": 175.0,
+            "margin_prefund_floor_usd": 175.0,
+            "risk_policy_id": RISK_POLICY_V1,
+            "risk_policy": risk_policy_snapshot(RISK_POLICY_V1, PumpLiveConfig()),
+            "legs": [
+                {"step": 1, "status": "filled", "trigger_price": 10.0},
+                {"step": 2, "status": "filled", "trigger_price": 15.0},
+                {"step": 3, "status": "open", "trigger_price": 20.0, "order_id": "l3"},
+            ],
+        }
+    ]
+
+    status = controller.run_cycle()
+    item = status["positions"][0]
+
+    assert gateway.margin_adds == []
+    assert gateway.canceled == ["l3"]
+    assert item["legs"][2]["status"] == "planned"
+    assert item["ladder_gate_status"] == "blocked"
+    assert status["blocked_reason"] == "next_ladder_margin_not_confirmed"
+    assert status["last_error"] is None
+
+
+def test_next_ladder_prefund_uses_guarded_main_transfer_only_for_cash_gap(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4, prefund_enabled=True)
+    gateway = FakePumpGateway()
+    gateway.balance.update({"total": 3_000.0, "wallet": 3_000.0, "available": 100.0})
+    gateway.positions = [
+        {
+            "symbol": "BLUAIUSDT",
+            "side": "short",
+            "qty": 12_750.0,
+            "avg_price": 0.0247,
+            "mark_price": 0.03,
+            "liq_price": 0.0386,
+            "unrealized_pnl": -130.0,
+        }
+    ]
+    gateway.liq_after_add = 0.0475
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "active_strategy_capital_usd": 3_000.0,
+        "application_enabled": True,
+    }
+    controller._state["positions"] = [  # pylint: disable=protected-access
+        {
+            "live_id": "bluai",
+            "symbol": "BLUAIUSDT",
+            "status": "open",
+            "qty": 12_750.0,
+            "mark_price": 0.03,
+            "liq_price": 0.0386,
+            "margin_topup_usd": 105.0,
+            "margin_prefund_floor_usd": 105.0,
+            "risk_policy_id": RISK_POLICY_V1,
+            "risk_policy": risk_policy_snapshot(RISK_POLICY_V1, PumpLiveConfig()),
+            "legs": [
+                {"step": 1, "status": "filled", "trigger_price": 0.017841},
+                {"step": 2, "status": "filled", "trigger_price": 0.0267615},
+                {"step": 3, "status": "filled", "trigger_price": 0.035682},
+                {"step": 4, "status": "planned", "trigger_price": 0.0446025, "notional_usd": 105.0},
+            ],
+        }
+    ]
+    calls: list[dict[str, Any]] = []
+
+    def transfer(**kwargs: Any) -> dict[str, Any]:
+        calls.append(dict(kwargs))
+        amount = float(kwargs["requested_usd"])
+        gateway.balance["available"] += amount
+        return {"status": "complete", "amount_usd": amount, "transfer_id": "risk-transfer"}
+
+    controller.set_risk_transfer_provider(transfer)
+
+    status = controller.run_cycle()
+    item = status["positions"][0]
+
+    assert calls[0]["symbol"] == "BLUAIUSDT"
+    assert calls[0]["requested_usd"] == 85.0
+    assert gateway.margin_adds == [("BLUAIUSDT", 110.0)]
+    assert item["legs"][3]["status"] == "open"
+    assert any(
+        event["event"] == "next_ladder_transfer_complete"
+        for event in status["recent_events"]
+    )
+
+
 def test_capital_observation_reports_growth_without_changing_active_slot(
     tmp_path: Path,
 ) -> None:
@@ -762,7 +1103,7 @@ def test_arm_ignores_old_signal_and_opens_new_main_signal(tmp_path: Path) -> Non
     assert len(open_items) == 1
     assert open_items[0]["symbol"] == "TESTUSDT"
     assert len(open_items[0]["legs"]) == 3
-    assert len(gateway.orders) == 2
+    assert len(gateway.orders) == 1
     assert gateway.leverage_calls == [("TESTUSDT", 3.0)]
     assert gateway.take_profits[-1] == ("TESTUSDT", 7.5)
     assert gateway.protections[-1] == ("TESTUSDT", 7.5, 14.625)
@@ -885,7 +1226,7 @@ def test_entry_prefunds_margin_before_ladders_without_changing_strategy(
         58.333333,
         87.5,
     ]
-    assert len(gateway.orders) == 2
+    assert len(gateway.orders) == 1
     margin_index = next(
         index
         for index, operation in enumerate(gateway.operations)
@@ -1052,7 +1393,7 @@ def test_prefund_adds_bounded_five_dollar_correction_after_confirmed_move(
     assert item["margin_prefund_floor_usd"] == 30.0
     assert item["margin_prefund_verification"]["ready"] is True
     assert gateway.margin_adds == [("TESTUSDT", 25.0), ("TESTUSDT", 5.0)]
-    assert len(gateway.orders) == 2
+    assert len(gateway.orders) == 1
 
 
 def test_prefund_accepts_only_clearance_relative_tolerance_without_correction(
@@ -1146,11 +1487,14 @@ def test_arm_recovers_exact_prefund_failure_without_duplicate_ladders(
     assert recovered["positions"][0]["status"] == "open"
     assert recovered["positions"][0]["margin_topup_usd"] == 35.0
     assert recovered["positions"][0]["last_error"] is None
-    assert len(gateway.orders) == 2
-    assert all(leg["status"] == "open" for leg in recovered["positions"][0]["legs"][1:])
+    assert len(gateway.orders) == 1
+    assert [leg["status"] for leg in recovered["positions"][0]["legs"][1:]] == [
+        "open",
+        "planned",
+    ]
 
     controller.arm(ARM_CONFIRMATION)
-    assert len(gateway.orders) == 2
+    assert len(gateway.orders) == 1
 
 
 def test_arm_does_not_recover_unrecognized_opening_uncertain_state(
@@ -1187,7 +1531,7 @@ def test_arm_does_not_recover_unrecognized_opening_uncertain_state(
     assert gateway.orders == []
 
 
-def test_prefund_keeps_all_five_strategy_ladders(tmp_path: Path) -> None:
+def test_prefund_keeps_five_leg_plan_but_only_next_ladder_live(tmp_path: Path) -> None:
     env_path = tmp_path / "pump_live.env"
     write_env(env_path, prefund_enabled=True)
     gateway = FakePumpGateway()
@@ -1218,7 +1562,14 @@ def test_prefund_keeps_all_five_strategy_ladders(tmp_path: Path) -> None:
     item = status["positions"][0]
     assert item["margin_prefund_floor_usd"] == 30.0
     assert len(item["legs"]) == 5
-    assert len(gateway.orders) == 4
+    assert len(gateway.orders) == 1
+    assert [leg["status"] for leg in item["legs"]] == [
+        "filled",
+        "open",
+        "planned",
+        "planned",
+        "planned",
+    ]
     assert [leg["trigger_price"] for leg in item["legs"]] == [
         10.0,
         15.0,
@@ -1338,7 +1689,7 @@ def test_prefund_floor_survives_restart_recovery_state(tmp_path: Path) -> None:
     assert status["positions"][0]["margin_prefund_status"] == "confirmed"
 
 
-def test_four_prefunded_positions_keep_every_original_ladder(tmp_path: Path) -> None:
+def test_four_prefunded_positions_keep_one_margin_gated_ladder_each(tmp_path: Path) -> None:
     env_path = tmp_path / "pump_live.env"
     write_env(env_path, entry_cap=4, prefund_enabled=True)
     gateway = FakePumpGateway()
@@ -1366,7 +1717,7 @@ def test_four_prefunded_positions_keep_every_original_ladder(tmp_path: Path) -> 
     status = controller.run_cycle()
 
     assert status["open_positions"] == 4
-    assert len(gateway.orders) == 8
+    assert len(gateway.orders) == 4
     assert sum(item["margin_prefund_floor_usd"] for item in status["positions"]) == 100.0
     assert all(len(item["legs"]) == 3 for item in status["positions"])
     assert status["entry_armed"] is True
@@ -1391,12 +1742,12 @@ def test_flat_position_needs_two_cycles_then_cancels_ladder(tmp_path: Path) -> N
 
     first = controller.run_cycle()
     assert first["open_positions"] == 1
-    assert len(gateway.canceled) == 2
+    assert len(gateway.canceled) == 1
     assert first["entry_armed"] is False
     assert first["blocked_reason"] == "position_absent_unconfirmed"
     second = controller.run_cycle()
     assert second["open_positions"] == 0
-    assert len(gateway.canceled) == 2
+    assert len(gateway.canceled) == 1
     assert second["entry_armed"] is False
     assert second["close_recovery_healthy_cycles"] == 1
     recovered = controller.run_cycle()
@@ -1989,12 +2340,16 @@ def test_warning_freeze_requires_two_calm_cycles_and_a_fresh_signal(
     gateway.positions[0]["mark_price"] = 13.0
     gateway.positions[0]["liq_price"] = 15.0
     controller.run_cycle()
-    gateway.positions[0]["mark_price"] = 10.0
+    gateway.positions[0]["mark_price"] = 15.0 / 1.24
     gateway.positions[0]["liq_price"] = 15.0
 
+    still_frozen = controller.run_cycle()
+    gateway.positions[0]["mark_price"] = 15.0 / 1.26
     first_calm = controller.run_cycle()
     recovered = controller.run_cycle()
 
+    assert still_frozen["entry_armed"] is False
+    assert still_frozen["portfolio_risk_recovery_cycles"] == 0
     assert first_calm["entry_armed"] is False
     assert first_calm["portfolio_risk_recovery_cycles"] == 1
     assert recovered["entry_armed"] is True

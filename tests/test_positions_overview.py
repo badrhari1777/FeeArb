@@ -49,6 +49,10 @@ def pump_payload() -> dict:
             "exchange_stop_gap_from_liq_pct": 2.5,
             "max_position_topup_usd": 175.0,
         },
+        "active_risk_policy": {
+            "policy_id": "v2_3000",
+            "max_position_topup_usd": 525.0,
+        },
         "credentials": {"api_secret_present": True},
         "last_balance": {"total": 1000.0, "available": 825.0, "used": 175.0},
         "notifications": {"configured": True, "last_status": "ok"},
@@ -85,6 +89,10 @@ def pump_payload() -> dict:
                 "margin_prefund_status": "confirmed",
                 "margin_prefund_target_stop_price": 15.375,
                 "margin_prefund_next_ladder_price": 15.0,
+                "risk_policy": {"max_position_topup_usd": 175.0},
+                "margin_continuation_policy_id": "v2_3000",
+                "ladder_gate_status": "ready",
+                "ladder_gate_step": 2,
                 "opened_at_ms": 500_000,
                 "max_hold_h": 336,
                 "legs": [
@@ -112,6 +120,9 @@ def test_overview_keeps_main_and_pump_groups_separate() -> None:
     assert payload["pump"]["positions"][0]["legs_filled"] == 1
     assert payload["pump"]["positions"][0]["margin_prefund_floor_usd"] == 25.0
     assert payload["pump"]["positions"][0]["margin_prefund_status"] == "confirmed"
+    assert payload["pump"]["positions"][0]["margin_topup_cap_usd"] == 525.0
+    assert payload["pump"]["positions"][0]["ladder_gate_status"] == "ready"
+    assert payload["pump"]["positions"][0]["ladder_gate_step"] == 2
     assert payload["pump"]["positions"][0]["remaining_hold_h"] > 335.0
     assert payload["pump"]["balance"]["temporary_occupied_usd"] == 50.0
     assert payload["pump"]["capital_regime"]["mode"] == "stress"

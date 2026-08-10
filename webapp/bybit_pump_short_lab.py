@@ -542,6 +542,13 @@ class BybitPumpShortLab:
     def pump_live_emergency_close(self, confirmation: str) -> dict[str, Any]:
         return self._pump_live.emergency_close_all(confirmation)
 
+    def pump_live_prefund_next_ladder(
+        self,
+        symbol: str,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        return self._pump_live.prefund_next_ladder(symbol, confirmation)
+
     def pump_transfer_status(self) -> dict[str, Any]:
         if self._pump_transfers is None:
             return {"ready": False, "errors": ["pump_transfer_controller_unavailable"]}

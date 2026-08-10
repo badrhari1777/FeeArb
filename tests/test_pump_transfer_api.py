@@ -32,6 +32,39 @@ def test_transfer_status_and_preflight_are_read_only_delegates() -> None:
     assert preflight.json()["ready"] is False
 
 
+def test_pump_prefund_next_ladder_api_maps_confirmation_and_result() -> None:
+    client = TestClient(webapp_app.app)
+    with patch.object(
+        webapp_app.bybit_pump_short_lab,
+        "pump_live_prefund_next_ladder",
+        return_value={"status": "confirmed", "symbol": "BLUAIUSDT", "amount_usd": 55.0},
+    ) as prefund:
+        response = client.post(
+            "/api/pump-short/live/prefund-next-ladder",
+            json={
+                "symbol": "BLUAIUSDT",
+                "confirmation": "PREFUND PUMP NEXT LADDER BLUAIUSDT",
+            },
+        )
+    with patch.object(
+        webapp_app.bybit_pump_short_lab,
+        "pump_live_prefund_next_ladder",
+        side_effect=ValueError("pump_live_prefund_confirmation_invalid"),
+    ):
+        invalid = client.post(
+            "/api/pump-short/live/prefund-next-ladder",
+            json={"symbol": "BLUAIUSDT", "confirmation": "wrong"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["amount_usd"] == 55.0
+    prefund.assert_called_once_with(
+        "BLUAIUSDT",
+        "PREFUND PUMP NEXT LADDER BLUAIUSDT",
+    )
+    assert invalid.status_code == 400
+
+
 def test_transfer_in_maps_confirmation_and_preflight_failures() -> None:
     client = TestClient(webapp_app.app)
     with patch.object(

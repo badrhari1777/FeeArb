@@ -610,8 +610,10 @@ confirmation `PROMOTE PUMP CAPITAL 3000`. The promotion consumes only the
 principal needed to make effective strategy capital exactly `$3000`; profits
 reduce that amount and excess transferred cash remains temporary/returnable.
 Future entries then use `v2_3000` (`$525` slot, `$150` guarantee, `$825`
-portfolio top-up cap, `$75` floor), initially limited to one concurrent v2
-position. Promotion neither places orders nor arms entries; it disarms the
+portfolio top-up cap, `$75` floor). The former one-concurrent-v2 canary was
+replaced on 2026-08-10 by the same four-position cap plus fresh available-cash,
+portfolio top-up and operating-floor admission gates described below.
+Promotion neither places orders nor arms entries; it disarms the
 entry gate and requires a fresh v2 preflight/ARM after the accounting boundary. Restart recovery
 under v2 requires `ARM PUMP LIVE 3000`; the old `$1000` confirmation is rejected.
 Realized PnL, external contribution, and the 70/30 profit allocation target are
@@ -682,7 +684,7 @@ cannot leave entry sizing with stale available cash.
 
 An automatically-created risk freeze may restore its prior armed state only
 after two consecutive complete cycles where every remaining position is
-strictly above the `35%` CALM threshold, is exchange-present and `open`, and has
+strictly above the dedicated `25%` entry-restore threshold, is exchange-present and `open`, and has
 positive confirmed TP and catastrophic SL. The second recovery cycle only
 re-arms; a fresh signal can execute no earlier than the next cycle. Explicit
 operator disarm, backend restart, emergency close, unknown exchange state,
@@ -696,6 +698,62 @@ blocked -> close the threatened position reduce-only at the emergency boundary.
 Automatic donor reduction remains disabled and requires its separate approved
 micro-canary. Targeted Pump/transfer/API regression passed (`95` tests), and
 the complete Python suite passed (`681 passed`, `11 warnings`).
+
+## Sequential ladder margin gate (2026-08-10)
+
+Pump now keeps only the nearest unfilled ladder order live on Bybit. The full
+2/3/5-leg strategy plan, trigger prices, weights and notional remain unchanged
+in the durable position, but later legs stay `planned`. After a fill is
+exchange-confirmed, the monitor recalculates the actual isolated-margin need
+from fresh quantity and liquidation price. It requires the prospective Full
+catastrophic stop to be at least `2.5%` above the next trigger (with the existing
+relative `0..2%` verification tolerance), rounds the required add upward to
+`$5`, adds margin, rereads the exchange position, synchronizes TP/SL, and only
+then submits that one next ladder.
+
+On first deployment, an old position with several live ladder orders is
+migrated in place: the nearest order is retained and every later order is
+cancelled and exchange-confirmed before being returned to `planned`. A cancel
+that races with a fill cancels all remaining later orders, refreshes the
+position and disarms entries for a clean next cycle. If the calculated margin
+cannot fit the position/portfolio envelope or cannot be confirmed, the next
+ladder is cancelled/deferred, Full TP/SL remains active, monitoring continues,
+and entries stay fail-closed with `next_ladder_margin_not_confirmed`.
+
+Entry notional remains cohort-immutable: legacy `v1_1000` positions keep their
+original `$175` ladder plan. Margin defence is different from entry sizing: an
+open legacy position may use the currently active `v2_3000` per-position
+defence ceiling (`$525`) while the shared `$825` top-up cap, guarantees for the
+other positions and `$75` operating floor still apply. This lets free Pump cash
+protect a valid next step instead of stopping at the obsolete legacy `$175`
+ceiling. If only cash is missing but those risk limits allow the add, the
+existing projection-gated main -> Pump rescue provider is tried before the
+ladder is deferred.
+
+The old hard `v2_concurrent_entry_cap=1` is now reported as legacy state and no
+longer blocks a fourth coin by itself. Admission remains bounded by four total
+positions, the `$525` new slot, all unused shared top-up capacity and the `$75`
+floor. A warning position still freezes fresh signals at `<=20%`; recovery is
+now decoupled from the margin-removal `35%` CALM boundary and needs two healthy
+cycles strictly above `25%`. Backend restart and operator disarm still never
+auto-arm.
+
+An explicit emergency operator endpoint is available for a tracked open
+position:
+
+```text
+POST /api/pump-short/live/prefund-next-ladder
+symbol: BLUAIUSDT
+confirmation: PREFUND PUMP NEXT LADDER BLUAIUSDT
+```
+
+It uses the same serialized operation path, risk envelopes, durable accounting,
+exchange verification and Full TP/SL synchronization as the automatic gate; it
+is not an arbitrary untracked Bybit margin call. Pre-deployment verification
+passed the focused Pump/API/positions set (`87` tests at the first checkpoint),
+the expanded Pump suite (`77` tests), Python compilation, JS contract review,
+and the complete project regression (`696 passed`, `8` subtests, `13`
+pre-existing warnings).
 
 Deployment evidence: commit `7e60848` was deployed only after confirming Pump
 `CALM`, zero pending signals/transfers, zero Grid executions/transitions and

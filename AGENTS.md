@@ -109,6 +109,27 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live sequential ladder margin gating was added on 2026-08-10 after BLUAI
+  filled L2 while its legacy stop still sat below L3 and the promoted `$3000`
+  wallet had substantial unused cash. Only the nearest unfilled ladder may now
+  remain live; every later leg stays durably `planned`. After each confirmed
+  fill, fresh quantity/liquidation data determine the exact `$5`-rounded margin
+  required to put the Full catastrophic stop at least `2.5%` beyond the next
+  trigger, and that next order is submitted only after exchange verification
+  and TP/SL resync. Existing multi-order ladders are cancelled back to one-live
+  form with fill-race handling. Legacy `$175` entry plans remain immutable but
+  may use the active v2 `$525` defence ceiling inside the shared `$825` cap and
+  `$75` floor; a cash-only shortage can invoke the guarded main transfer. The
+  obsolete one-v2-position gate is replaced by actual four-slot cash/top-up
+  admission, and warning recovery now uses two cycles above `25%` rather than
+  the unrelated `35%` margin-removal threshold. The whitelisted positions API
+  and web control center expose the effective cap and ladder-gate state. A
+  serialized confirmation endpoint can prefund a named next ladder without an
+  untracked exchange mutation. Canonical behavior is documented in
+  `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`. Verified the expanded Pump
+  suite (`77 passed`), related Pump/API/positions tests (`87 passed` at the
+  first checkpoint), Python compilation, and the complete suite (`696 passed`,
+  `8` subtests, `13` warnings).
 - External candidate sources for Strategy Lab Candidate Observatory were audited
   read-only on 2026-08-10. The existing Coinglass browser parser does not apply
   the operator's exchange checkboxes and only parses the first 20 global rows; a
