@@ -1369,6 +1369,14 @@ a {
   margin-bottom: 0.8rem;
 }
 
+.manual-field-note {
+  max-width: 15rem;
+  margin-top: 0.3rem;
+  color: #6f7e8f;
+  font-size: 0.72rem;
+  line-height: 1.25;
+}
+
 .manual-settings-group {
   width: 100%;
   margin-top: 0.65rem;

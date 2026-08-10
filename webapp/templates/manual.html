@@ -52,8 +52,14 @@
           <input type="text" id="manual-symbol" placeholder="BTC or BTCUSDT" autocomplete="off" />
         </label>
         <label>
-          Quantity (base)
-          <input type="number" id="manual-qty" step="0.0001" min="0" />
+          Quantity cap (base)
+          <input type="number" id="manual-qty" step="any" min="0" placeholder="e.g. 7500" />
+          <span class="manual-field-note">Maximum coin quantity per leg.</span>
+        </label>
+        <label>
+          Amount cap (USDT per leg)
+          <input type="number" id="manual-notional" step="0.01" min="0" placeholder="e.g. 500" />
+          <span class="manual-field-note">If both caps are set, the smaller size is used.</span>
         </label>
         <label class="manual-scope-enter-exit">
           Long exchange

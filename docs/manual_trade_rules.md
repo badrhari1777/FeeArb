@@ -4,6 +4,18 @@ Scope
 - Applies to manual enter/exit/roll execution in `execution/manual.py`.
 - WS order/trade updates are the primary source of truth for fills and hedge synchronization.
 
+Sizing Caps
+- The Manual web form accepts either a base-quantity cap, a per-leg USDT cap,
+  or both.
+- When both are present, the final base quantity is the smaller of the explicit
+  quantity and the USDT-implied quantity. Neither cap is silently preferred or
+  ignored.
+- The USDT conversion uses the highest valid current ticker reference across
+  both selected venues. If either venue reference is unavailable, planning
+  fails closed before orderbook checks or order submission.
+- Dry-run returns the requested caps, selected cap, selected base quantity, and
+  per-venue/reference prices under `sizing`.
+
 Order Fill Tracking (WS)
 - Track fills from private order/trade streams in `execution/ws_orders.py`.
 - Use filled_qty per order_id; clamp to expected qty when needed.

@@ -3351,6 +3351,18 @@ class ManualTradeManager:
         include_orderbooks = bool(payload.get("include_orderbooks", False))
         notional = _safe_float(payload.get("notional"))
         qty = _safe_float(payload.get("qty"))
+        requested_qty = qty
+        requested_notional = notional
+        sizing: dict[str, Any] = {
+            "policy": "minimum_of_qty_and_notional_caps",
+            "requested_qty": requested_qty,
+            "requested_notional": requested_notional,
+            "notional_implied_qty": None,
+            "notional_reference_price": None,
+            "notional_reference_prices": {},
+            "selected_qty": None,
+            "selected_by": None,
+        }
         chunk_qty = _safe_float(payload.get("chunk_qty"))
         chunk_notional = _safe_float(payload.get("chunk_notional"))
         allow_liquidity_chunking = bool(payload.get("allow_liquidity_chunking"))
@@ -3498,7 +3510,68 @@ class ManualTradeManager:
                 legs = []
 
         if errors:
-            return self._plan_response(payload, legs, errors, warnings, action=action)
+            return self._plan_response(
+                payload,
+                legs,
+                errors,
+                warnings,
+                action=action,
+                sizing=sizing,
+            )
+
+        notional_qty = None
+        if notional is not None:
+            (
+                notional_qty,
+                notional_reference_price,
+                notional_reference_prices,
+                missing_price_exchanges,
+            ) = await self._resolve_qty_from_notional(
+                symbol, notional, long_exchange, short_exchange
+            )
+            sizing["notional_implied_qty"] = notional_qty
+            sizing["notional_reference_price"] = notional_reference_price
+            sizing["notional_reference_prices"] = notional_reference_prices
+            if notional_qty is None or notional_qty <= 0:
+                missing_suffix = (
+                    f" Missing: {', '.join(missing_price_exchanges)}."
+                    if missing_price_exchanges
+                    else ""
+                )
+                errors.append(
+                    "Unable to apply notional cap because a current market price "
+                    f"is unavailable for one or both exchanges.{missing_suffix}"
+                )
+
+        if errors:
+            return self._plan_response(
+                payload,
+                legs,
+                errors,
+                warnings,
+                action=action,
+                sizing=sizing,
+            )
+
+        if qty is not None and notional_qty is not None:
+            if qty <= notional_qty:
+                sizing["selected_by"] = "qty"
+                warnings.append(
+                    "Both sizing caps are set; quantity is the smaller cap "
+                    f"({qty:g} base <= {notional_qty:g} base from USDT)."
+                )
+            else:
+                qty = notional_qty
+                sizing["selected_by"] = "notional"
+                warnings.append(
+                    "Both sizing caps are set; USDT amount is the smaller cap "
+                    f"({notional_qty:g} base < {requested_qty:g} base)."
+                )
+        elif notional_qty is not None:
+            qty = notional_qty
+            sizing["selected_by"] = "notional"
+        elif qty is not None:
+            sizing["selected_by"] = "qty"
 
         if qty is None and position_rows:
             inferred = self._infer_qty_from_positions(
@@ -3511,16 +3584,21 @@ class ManualTradeManager:
             )
             if inferred:
                 qty = inferred
+                sizing["selected_by"] = "positions"
                 warnings.append(f"qty inferred from positions: {qty:g}")
 
-        if qty is None:
-            qty = await self._resolve_qty_from_notional(
-                symbol, notional, long_exchange, short_exchange
-            )
-            if qty is None or qty <= 0:
-                errors.append("Unable to resolve qty from notional (missing market price).")
+        sizing["selected_qty"] = qty
+        if qty is None or qty <= 0:
+            errors.append("Unable to resolve a positive order quantity.")
         if errors:
-            return self._plan_response(payload, legs, errors, warnings, action=action)
+            return self._plan_response(
+                payload,
+                legs,
+                errors,
+                warnings,
+                action=action,
+                sizing=sizing,
+            )
 
         orderbooks: dict[str, dict[str, Any]] = {}
         stats_by_exchange: dict[str, OrderBookStats] = {}
@@ -3733,6 +3811,7 @@ class ManualTradeManager:
             "symbol": symbol,
             "qty": qty,
             "notional": notional,
+            "sizing": sizing,
             "mode": payload.get("mode"),
             "legs": legs,
             "orderbooks": orderbooks if include_orderbooks else {},
@@ -11579,25 +11658,43 @@ class ManualTradeManager:
         notional: float | None,
         long_exchange: str,
         short_exchange: str,
-    ) -> float | None:
+    ) -> tuple[float | None, float | None, dict[str, float], list[str]]:
         if notional is None or notional <= 0:
-            return None
-        price = None
+            return None, None, {}, []
+        exchanges: list[str] = []
         for exchange in (long_exchange, short_exchange):
+            normalized = normalize_exchange_name(exchange)
+            if normalized and normalized not in exchanges:
+                exchanges.append(normalized)
+        prices: dict[str, float] = {}
+        missing: list[str] = []
+        for exchange in exchanges:
             client = await self._ensure_client(exchange, [])
             if not client:
+                missing.append(exchange)
                 continue
-            ccxt_symbol = await self._resolve_market_symbol(client, symbol)
             try:
+                ccxt_symbol = await self._resolve_market_symbol(client, symbol)
+                if not ccxt_symbol:
+                    missing.append(exchange)
+                    continue
                 ticker = await client.fetch_ticker(ccxt_symbol)
             except Exception:  # pylint: disable=broad-except
+                missing.append(exchange)
                 continue
-            price = _safe_float(ticker.get("last")) or _safe_float(ticker.get("mark")) or _safe_float(ticker.get("close"))
-            if price:
-                break
-        if not price:
-            return None
-        return notional / price
+            candidates = [
+                _safe_float(ticker.get(field))
+                for field in ("ask", "last", "mark", "close", "bid")
+            ]
+            valid_prices = [price for price in candidates if price is not None and price > 0]
+            if not valid_prices:
+                missing.append(exchange)
+                continue
+            prices[exchange] = max(valid_prices)
+        if missing or len(prices) != len(exchanges) or not prices:
+            return None, None, prices, missing
+        reference_price = max(prices.values())
+        return notional / reference_price, reference_price, prices, []
 
     def _infer_qty_from_positions(
         self,
@@ -11844,12 +11941,15 @@ class ManualTradeManager:
         warnings: list[str],
         *,
         action: str,
+        sizing: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         return {
             "dry_run": bool(payload.get("dry_run", False)),
             "action": action,
             "symbol": payload.get("symbol"),
             "qty": payload.get("qty"),
+            "notional": payload.get("notional"),
+            "sizing": dict(sizing or {}),
             "mode": payload.get("mode"),
             "legs": legs,
             "errors": errors,

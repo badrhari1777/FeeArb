@@ -370,6 +370,23 @@
     if (plan.spread_pct !== undefined && plan.spread_pct !== null) {
       lines.push('Spread (%): ' + formatNumber(plan.spread_pct, 4));
     }
+    if (plan.sizing && plan.sizing.selected_qty !== null && plan.sizing.selected_qty !== undefined) {
+      var sizing = plan.sizing;
+      var selectedLabel = sizing.selected_by === 'notional' ? 'USDT amount cap' :
+        (sizing.selected_by === 'qty' ? 'quantity cap' : sizing.selected_by);
+      lines.push('Selected size: ' + formatNumber(sizing.selected_qty, 8) +
+        ' base (limited by ' + (selectedLabel || '-') + ')');
+      if (sizing.requested_qty !== null && sizing.requested_qty !== undefined) {
+        lines.push('Requested quantity cap: ' + formatNumber(sizing.requested_qty, 8) + ' base');
+      }
+      if (sizing.requested_notional !== null && sizing.requested_notional !== undefined) {
+        lines.push('Requested amount cap: ' + formatNumber(sizing.requested_notional, 2) + ' USDT per leg');
+      }
+      if (sizing.notional_reference_price !== null && sizing.notional_reference_price !== undefined) {
+        lines.push('USDT cap reference price: ' + formatNumber(sizing.notional_reference_price, 8) +
+          ' (higher current price across selected exchanges)');
+      }
+    }
     if (plan.spread_range && (plan.spread_range.min !== null || plan.spread_range.max !== null)) {
       lines.push('Spread range: ' +
         (plan.spread_range.min !== null && plan.spread_range.min !== undefined ? plan.spread_range.min : '-') +
@@ -593,6 +610,7 @@
       'manual-action': true,
       'manual-symbol': true,
       'manual-qty': true,
+      'manual-notional': true,
       'manual-long-exchange': true,
       'manual-short-exchange': true,
       'manual-side': true,
@@ -807,6 +825,7 @@
     return {
       symbol: (getValue('symbol') || '').trim().toUpperCase(),
       qty: parseOptionalNumber(getValue('qty')),
+      notional: parseOptionalNumber(getValue('notional')),
       mode: getValue('mode'),
       max_slippage_bps: parseOptionalNumber(getValue('slippage')) || 0,
       spread_min_pct: triggerSpread !== null && triggerOperator === 'gte' ? triggerSpread : null,

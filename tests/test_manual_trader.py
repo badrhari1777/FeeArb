@@ -32,6 +32,28 @@ from execution.manual import (
 
 
 class ManualTradeHelpersTestCase(unittest.TestCase):
+    @staticmethod
+    def _configured_plan_manager() -> ManualTradeManager:
+        manager = ManualTradeManager()
+        manager._ensure_client = AsyncMock(return_value=object())
+        manager._resolve_market_symbol = AsyncMock(return_value="TEST/USDT:USDT")
+        manager._fetch_orderbook = AsyncMock(
+            return_value={
+                "bids": [[99.0, 100.0]],
+                "asks": [[101.0, 100.0]],
+                "source": "test",
+            }
+        )
+        manager._extract_market_constraints = lambda *_args, **_kwargs: {
+            "min_qty": 0.001,
+            "min_notional": None,
+            "amount_step": 0.001,
+            "price_step": 0.01,
+            "contract_size": 1.0,
+        }
+        manager._fetch_funding_meta = AsyncMock(return_value={})
+        return manager
+
     def test_estimate_fill_buy(self) -> None:
         levels = [(100.0, 1.0), (101.0, 1.0)]
         result = estimate_fill(levels, 1.5)
@@ -363,6 +385,113 @@ class ManualTradeHelpersTestCase(unittest.TestCase):
             "spread_min_pct must be less than or equal to spread_max_pct.",
             result.get("errors") or [],
         )
+
+    def test_notional_qty_uses_highest_current_price_across_both_exchanges(self) -> None:
+        class FakeClient:
+            def __init__(self, ticker):
+                self.ticker = ticker
+
+            async def fetch_ticker(self, _symbol):
+                return self.ticker
+
+        manager = ManualTradeManager()
+        clients = {
+            "binance": FakeClient({"bid": 99.0, "ask": 101.0, "last": 100.0}),
+            "kucoin": FakeClient({"bid": 101.5, "ask": 102.0, "last": 102.5}),
+        }
+        manager._ensure_client = AsyncMock(
+            side_effect=lambda exchange, *_args: clients[exchange]
+        )
+        manager._resolve_market_symbol = AsyncMock(return_value="TEST/USDT:USDT")
+
+        qty, reference, prices, missing = asyncio.run(
+            manager._resolve_qty_from_notional(
+                "TESTUSDT",
+                1000.0,
+                "binance",
+                "kucoin",
+            )
+        )
+
+        self.assertAlmostEqual(qty or 0.0, 1000.0 / 102.5)
+        self.assertEqual(reference, 102.5)
+        self.assertEqual(prices, {"binance": 101.0, "kucoin": 102.5})
+        self.assertEqual(missing, [])
+
+    def test_build_plan_uses_notional_when_it_is_the_smaller_cap(self) -> None:
+        manager = self._configured_plan_manager()
+        manager._resolve_qty_from_notional = AsyncMock(
+            return_value=(8.0, 125.0, {"binance": 120.0, "kucoin": 125.0}, [])
+        )
+
+        result = asyncio.run(
+            manager._build_plan(
+                {
+                    "symbol": "TESTUSDT",
+                    "qty": 10.0,
+                    "notional": 1000.0,
+                    "long_exchange": "binance",
+                    "short_exchange": "kucoin",
+                    "dry_run": True,
+                },
+                action="enter",
+            )
+        )
+
+        self.assertEqual(result.get("errors"), [])
+        self.assertEqual(result["qty"], 8.0)
+        self.assertEqual(result["sizing"]["selected_by"], "notional")
+        self.assertEqual(result["sizing"]["requested_qty"], 10.0)
+        self.assertTrue(any("USDT amount is the smaller cap" in item for item in result["warnings"]))
+
+    def test_build_plan_uses_quantity_when_it_is_the_smaller_cap(self) -> None:
+        manager = self._configured_plan_manager()
+        manager._resolve_qty_from_notional = AsyncMock(
+            return_value=(12.0, 100.0, {"binance": 99.0, "kucoin": 100.0}, [])
+        )
+
+        result = asyncio.run(
+            manager._build_plan(
+                {
+                    "symbol": "TESTUSDT",
+                    "qty": 10.0,
+                    "notional": 1200.0,
+                    "long_exchange": "binance",
+                    "short_exchange": "kucoin",
+                    "dry_run": True,
+                },
+                action="enter",
+            )
+        )
+
+        self.assertEqual(result.get("errors"), [])
+        self.assertEqual(result["qty"], 10.0)
+        self.assertEqual(result["sizing"]["selected_by"], "qty")
+        self.assertTrue(any("quantity is the smaller cap" in item for item in result["warnings"]))
+
+    def test_build_plan_fails_closed_when_one_notional_price_is_missing(self) -> None:
+        manager = self._configured_plan_manager()
+        manager._resolve_qty_from_notional = AsyncMock(
+            return_value=(None, None, {"binance": 100.0}, ["kucoin"])
+        )
+
+        result = asyncio.run(
+            manager._build_plan(
+                {
+                    "symbol": "TESTUSDT",
+                    "qty": 10.0,
+                    "notional": 1000.0,
+                    "long_exchange": "binance",
+                    "short_exchange": "kucoin",
+                    "dry_run": True,
+                },
+                action="enter",
+            )
+        )
+
+        self.assertTrue(result.get("errors"))
+        self.assertIn("Missing: kucoin", result["errors"][0])
+        manager._fetch_orderbook.assert_not_awaited()
 
     def test_build_exit_plan_uses_position_margin_mode_when_payload_unset(self) -> None:
         manager = ManualTradeManager()

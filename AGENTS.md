@@ -52,7 +52,10 @@ Dry Run Logic (ManualTradeManager in `execution/manual.py`)
   - Otherwise executes the plan via `_execute_plan(...)` (or smart/fast enter/exit).
 - `_build_plan(...)` does the heavy lifting:
   - Validates action, symbol, exchanges, qty/notional; can infer qty from positions for exit/roll.
-  - Resolves qty from notional via ticker if needed.
+  - Treats qty and per-leg USDT notional as independent caps. If both are set,
+    it resolves notional with the highest current ticker reference across both
+    selected venues and uses the smaller base quantity. Missing either venue
+    price fails closed instead of ignoring the notional cap.
   - For each leg:
     - Ensures exchange client (requires credentials unless ccxt supports public-only for that exchange).
     - Resolves ccxt symbol.
@@ -106,6 +109,16 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Manual Trade dual sizing was added on 2026-08-10. The desktop web form now
+  exposes both base-quantity and per-leg USDT caps. The backend applies the
+  same authoritative rule to Enter, Exit, and Roll: when both are supplied,
+  use the smaller base quantity after converting USDT with the highest valid
+  current price across both selected exchanges. If either current venue price
+  is unavailable, notional-based planning fails before orderbook access or any
+  submit. Dry Run reports the requested caps, selected cap, reference prices,
+  and selected quantity. This changes sizing only; order modes, chunking,
+  exchange constraints, margin, leverage, and protective behavior are
+  unchanged.
 - Commit `b4151b0` was deployed by supervised FeeArb backend restart on
   2026-08-10. Preflight had zero active Manual/Grid executions. Pump Live
   recovered owned `1000RATSUSDT` and `BLUAIUSDT` positions in monitoring mode
