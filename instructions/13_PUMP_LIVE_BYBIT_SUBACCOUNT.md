@@ -759,6 +759,26 @@ the expanded Pump suite (`77` tests), Python compilation, JS contract review,
 and the complete project regression (`696 passed`, `8` subtests, `13`
 pre-existing warnings).
 
+Live deployment evidence, 2026-08-10: BLUAI first received an explicit
+ledger-aware `$55` prefund before the wider change. Tracked top-up/floor became
+`$105/$105`; Bybit liquidation moved from `0.032313` to `0.037698`, and the
+confirmed Full stop moved to `0.03675555`, `3.009%` above L3 `0.035682`.
+Commits `ba9ae06` and `5a011a0` were then deployed after the full `696`-test
+regression. The pre-restart TUT Grid state had no active execution or fill
+(`completed_no_fill`, `filled_qty=0`) and survived as
+`partial_enter_waiting_trigger`; Manual had zero running executions.
+
+The live migration retained only 1000RATS L2, BLUAI L3 and ACE L2. Their later
+legs are durable `planned`; all three report `ladder_gate_status=ready` and
+`margin_continuation_policy_id=v2_3000`. Exchange state is exactly three ladder
+orders plus six reduce-only Full TP/SL orders. No additional margin was added
+during migration: total tracked top-up/floor stayed `$220/$220`. Cancelling the
+six distant orders released their order reservation, increasing fresh Pump
+available balance to `$2375.444987`; the capital regime reports `$1205` required
+for a fourth slot and `$1170.444987` headroom. BLUAI remained protected around
+`35.6..35.8%` buffer. Restart stayed deliberately fail-closed with
+`entry_armed=false`; no automatic or implicit ARM was performed.
+
 Deployment evidence: commit `7e60848` was deployed only after confirming Pump
 `CALM`, zero pending signals/transfers, zero Grid executions/transitions and
 zero running Manual executions. The restart recovered two immutable v1

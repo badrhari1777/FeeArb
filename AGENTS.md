@@ -131,7 +131,15 @@ Recent Changes
   `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`. Verified the expanded Pump
   suite (`77 passed`), related Pump/API/positions tests (`87 passed` at the
   first checkpoint), Python compilation, and the complete suite (`696 passed`,
-  `8` subtests, `13` warnings).
+  `8` subtests, `13` warnings). Live deployment commits are `ba9ae06` and
+  `5a011a0`: BLUAI received a confirmed `$55` operator prefund first
+  (`$105` total/floor, liquidation `0.037698`, stop `0.03675555`, L3
+  `0.035682`). Migration left exactly one ready ladder per open position and
+  six Full TP/SL orders; total top-up stayed `$220`, while cancelling distant
+  reservations increased available Pump cash to `$2375.444987` and fourth-slot
+  headroom to `$1170.444987`. TUT Grid's zero-fill waiting transition and zero
+  running Manual executions survived restart. Pump remains deliberately
+  disarmed after deployment; no implicit ARM was performed.
 - External candidate sources for Strategy Lab Candidate Observatory were audited
   read-only on 2026-08-10. The existing Coinglass browser parser does not apply
   the operator's exchange checkboxes and only parses the first 20 global rows; a
