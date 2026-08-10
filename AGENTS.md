@@ -109,7 +109,7 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
-- Manual Trade dual sizing was added on 2026-08-10. The desktop web form now
+- Manual Trade dual sizing was added and deployed on 2026-08-10. The desktop web form now
   exposes both base-quantity and per-leg USDT caps. The backend applies the
   same authoritative rule to Enter, Exit, and Roll: when both are supplied,
   use the smaller base quantity after converting USDT with the highest valid
@@ -119,6 +119,11 @@ Recent Changes
   and selected quantity. This changes sizing only; order modes, chunking,
   exchange constraints, margin, leverage, and protective behavior are
   unchanged.
+  Commit `29237af` passed the complete suite (`689 passed`, `8 subtests`) and
+  was deployed by supervised restart after zero Manual/Grid executions or
+  transitions were confirmed. Pump recovered two owned v1 positions and ten
+  orders fail-closed; explicit `ARM PUMP LIVE 3000` passed resume ownership and
+  protection checks, followed by three healthy armed monitor cycles.
 - Commit `b4151b0` was deployed by supervised FeeArb backend restart on
   2026-08-10. Preflight had zero active Manual/Grid executions. Pump Live
   recovered owned `1000RATSUSDT` and `BLUAIUSDT` positions in monitoring mode

@@ -21,6 +21,13 @@
   измениться вместе с рынком в пределах остальных ограничителей исполнения и
   проскальзывания.
 
+Deployment evidence, 2026-08-10: commit `29237af` прошел полную регрессию
+(`689 passed`, `8 subtests passed`) и был загружен штатным supervised restart.
+После запуска `/manual` отдавал новый `manual-notional` и static version
+`v2026-08-10-manual-dual-sizing-01`. До restart не было активных Manual/Grid
+executions или Grid transitions. Pump Live затем отдельно прошел resume ownership
+и protection preflight и был явно вооружен фразой `ARM PUMP LIVE 3000`.
+
 ## Основной источник состояния
 
 - Приватные WebSocket-потоки являются основным источником данных об исполнении ордеров.

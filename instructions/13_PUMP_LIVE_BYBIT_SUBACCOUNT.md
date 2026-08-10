@@ -682,3 +682,14 @@ positions and ten orders with entries disarmed. `ARM PUMP LIVE 3000` passed
 armed with no blocked reason/error, no active freeze, zero pending signals and
 minimum liquidation buffer `72.22..72.26%`. No v2 position opened during the
 deployment observation.
+
+Manual dual-sizing deployment evidence, 2026-08-10: commit `29237af` was
+deployed by the supervised stop/start scripts only after confirming a clean
+worktree, zero running Manual executions, and zero active or pending Grid
+transitions. Restart recovery was fail-closed and restored the two immutable
+v1 positions (`1000RATSUSDT`, `BLUAIUSDT`) plus ten owned orders with zero
+protection issues. The raw read-only gate reported only the expected existing
+position/order errors; explicit `ARM PUMP LIVE 3000` then passed the ownership
+and protection-aware resume preflight. Three following complete monitor cycles
+remained armed with no blocked reason, last error, risk freeze, or pending
+signal. Minimum Pump liquidation buffer was about `79.5%` at final verification.
