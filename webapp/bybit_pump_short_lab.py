@@ -476,6 +476,18 @@ class BybitPumpShortLab:
             note,
         )
 
+    def pump_live_promote_strategy_capital(
+        self,
+        target_capital_usd: float,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        if self._pump_transfers is None:
+            raise RuntimeError("pump_transfer_controller_unavailable")
+        return self._pump_transfers.promote_capital(
+            target_capital_usd,
+            confirmation,
+        )
+
     def pump_live_disarm(self) -> dict[str, Any]:
         return self._pump_live.disarm()
 

@@ -81,3 +81,36 @@ def test_transfer_return_success_contract() -> None:
         0.01,
         "RETURN TEMPORARY USDT PUMP TO MAIN",
     )
+
+
+def test_capital_promotion_api_is_explicit_and_maps_conflicts() -> None:
+    client = TestClient(webapp_app.app)
+    with patch.object(
+        webapp_app.bybit_pump_short_lab,
+        "pump_live_promote_strategy_capital",
+        return_value={"operation": {"status": "complete", "amount_usd": 1912.2}},
+    ) as promote:
+        response = client.post(
+            "/api/pump-short/live/capital/promote",
+            json={
+                "target_capital_usd": 3000.0,
+                "confirmation": "PROMOTE PUMP CAPITAL 3000",
+            },
+        )
+    with patch.object(
+        webapp_app.bybit_pump_short_lab,
+        "pump_live_promote_strategy_capital",
+        side_effect=RuntimeError("pump_live_capital_promotion_principal_insufficient"),
+    ):
+        blocked = client.post(
+            "/api/pump-short/live/capital/promote",
+            json={
+                "target_capital_usd": 3000.0,
+                "confirmation": "PROMOTE PUMP CAPITAL 3000",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["operation"]["status"] == "complete"
+    promote.assert_called_once_with(3000.0, "PROMOTE PUMP CAPITAL 3000")
+    assert blocked.status_code == 409

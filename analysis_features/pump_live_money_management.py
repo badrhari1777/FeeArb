@@ -81,11 +81,14 @@ def target_capital_migration_snapshot(
             target_capital_usd - mixed_deployable_commitment - target_reserve,
             6,
         ),
-        "current_runtime_supports_mixed_cohorts": False,
-        "recommended_transition": "deposit_excluded_then_legacy_hold_then_versioned_gradual_migration",
+        "current_runtime_supports_mixed_cohorts": True,
+        "runtime_policy_ids": ["v1_1000", "v2_3000"],
+        "initial_v2_concurrent_entry_cap": 1,
+        "promotion_confirmation": "PROMOTE PUMP CAPITAL 3000",
+        "recommended_transition": "deposit_excluded_then_explicit_promotion_then_one_v2_canary",
         "warning": (
-            "do not resize existing ladders; target rescue amounts require separate "
-            "execution-aware stress replay and immutable per-position policy versions"
+            "do not resize existing ladders; promotion remains explicit and the first "
+            "v2 policy is limited to one concurrent new position"
         ),
     }
 

@@ -5,21 +5,171 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from execution.pump_live import (
     ARM_CONFIRMATION,
+    ARM_CONFIRMATION_V2,
     BybitPumpLiveGateway,
     CAPITAL_SET_CONFIRMATION,
+    CAPITAL_PROMOTE_CONFIRMATION,
+    RISK_POLICY_V1,
+    RISK_POLICY_V2,
     PumpLiveConfig,
     PumpLiveController,
     build_capital_manager_status,
     build_capital_regime_status,
     build_capital_rescue_shadow,
     build_live_legs,
+    config_from_risk_snapshot,
     entry_prefund_target_check,
     load_pump_live_config,
     required_entry_prefund_usd,
     required_available_for_new_slot,
+    risk_policy_config,
+    risk_policy_snapshot,
 )
+
+
+def test_versioned_risk_policies_have_fixed_1000_and_3000_envelopes() -> None:
+    runtime = PumpLiveConfig(entry_cap=3, poll_interval_sec=7)
+
+    legacy = risk_policy_config(RISK_POLICY_V1, runtime)
+    promoted = risk_policy_config(RISK_POLICY_V2, runtime)
+
+    assert legacy.slot_margin_usd == 175.0
+    assert legacy.max_total_topup_usd == 275.0
+    assert promoted.total_capital_usd == 3_000.0
+    assert promoted.slot_margin_usd == 525.0
+    assert promoted.reserve_usd == 900.0
+    assert promoted.guaranteed_position_topup_usd == 150.0
+    assert promoted.max_total_topup_usd == 825.0
+    assert promoted.operating_cash_floor_usd == 75.0
+    assert promoted.entry_cap == 3
+    assert promoted.poll_interval_sec == 7
+
+
+def test_risk_snapshot_remains_immutable_when_runtime_defaults_change() -> None:
+    snapshot = risk_policy_snapshot(RISK_POLICY_V1, PumpLiveConfig())
+    changed_runtime = PumpLiveConfig(
+        deployable_capital_usd=2_100.0,
+        reserve_usd=900.0,
+        margin_topup_chunk_usd=75.0,
+    )
+
+    restored = config_from_risk_snapshot(snapshot, changed_runtime)
+
+    assert restored.slot_margin_usd == 175.0
+    assert restored.reserve_usd == 300.0
+    assert restored.margin_topup_chunk_usd == 25.0
+
+
+def test_capital_promotion_keeps_legacy_positions_and_sizes_only_new_v2_entry(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1, symbol="OLDUSDT")])
+    controller.run_cycle()
+    legacy = next(item for item in controller.status()["positions"] if item["symbol"] == "OLDUSDT")
+    assert sum(float(leg["margin_usd"]) for leg in legacy["legs"]) == 175.0
+
+    gateway.balance.update(
+        {"total": 3_000.0, "wallet": 3_000.0, "available": 2_800.0}
+    )
+    controller.record_temporary_transfer(
+        direction="main_to_pump",
+        amount_usd=2_000.0,
+        transfer_id="capital-transfer",
+    )
+    promoted = controller.promote_strategy_capital(
+        target_capital_usd=3_000.0,
+        confirmation=CAPITAL_PROMOTE_CONFIRMATION,
+        promotion_id="pump-capital-v2-3000",
+    )
+    assert controller.status()["entry_armed"] is False
+    v2_armed_at = int(controller.arm(ARM_CONFIRMATION_V2)["armed_at_ms"])
+    controller.submit_decisions(
+        [
+            ready_decision(v2_armed_at + 1, symbol="NEWUSDT", event_id="v2-entry"),
+            ready_decision(v2_armed_at + 2, symbol="EXTRAUSDT", event_id="v2-extra"),
+        ]
+    )
+    status = controller.run_cycle()
+
+    assert promoted["active_risk_policy_id"] == RISK_POLICY_V2
+    assert promoted["last_capital_promotion_amount_usd"] == 2_000.0
+    assert status["active_risk_policy"]["slot_margin_usd"] == 525.0
+    legacy = next(item for item in status["positions"] if item["symbol"] == "OLDUSDT")
+    new = next(item for item in status["positions"] if item["symbol"] == "NEWUSDT")
+    assert legacy["risk_policy_id"] == RISK_POLICY_V1
+    assert sum(float(leg["margin_usd"]) for leg in legacy["legs"]) == 175.0
+    assert new["risk_policy_id"] == RISK_POLICY_V2
+    assert sum(float(leg["margin_usd"]) for leg in new["legs"]) == 525.0
+    assert all(item["symbol"] != "EXTRAUSDT" for item in status["positions"])
+    assert any(item["symbol"] == "EXTRAUSDT" for item in status["pending_signals"])
+
+    restarted = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    with pytest.raises(ValueError, match="arm_confirmation_invalid"):
+        restarted.arm(ARM_CONFIRMATION)
+    resumed = restarted.arm(ARM_CONFIRMATION_V2)
+    assert resumed["entry_armed"] is True
+    assert resumed["active_risk_policy"]["policy_id"] == RISK_POLICY_V2
+
+
+def test_capital_promotion_counts_existing_profit_before_external_principal(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    gateway.balance.update(
+        {"total": 1_087.0, "wallet": 1_087.0, "available": 1_087.0}
+    )
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller.set_strategy_capital(1_087.0, CAPITAL_SET_CONFIRMATION)
+    controller.arm(ARM_CONFIRMATION)
+    gateway.balance.update(
+        {"total": 3_087.0, "wallet": 3_087.0, "available": 3_087.0}
+    )
+    controller.record_temporary_transfer(
+        direction="main_to_pump",
+        amount_usd=2_000.0,
+        transfer_id="round-capital-transfer",
+    )
+
+    result = controller.promote_strategy_capital(
+        target_capital_usd=3_000.0,
+        confirmation=CAPITAL_PROMOTE_CONFIRMATION,
+        promotion_id="pump-capital-v2-3000",
+    )
+
+    assert result["last_capital_promotion_amount_usd"] == 1_913.0
+    assert result["external_strategy_contribution_usd"] == 1_913.0
+    assert result["temporary_transfer_outstanding_usd"] == 87.0
+    assert result["effective_strategy_capital_usd"] == 3_000.0
+    assert controller.status()["entry_armed"] is False
 
 
 def test_capital_regime_reports_locked_and_temporary_cash() -> None:
@@ -64,6 +214,23 @@ def test_capital_regime_is_calm_without_open_positions() -> None:
 
     assert result["mode"] == "calm"
     assert result["min_liq_buffer_pct"] is None
+
+
+def test_capital_regime_uses_active_v2_portfolio_reserve_across_mixed_positions() -> None:
+    state = {
+        "last_balance": {"wallet": 3_000.0, "available": 1_600.0},
+        "capital_manager": {"active_risk_policy_id": RISK_POLICY_V2},
+        "positions": [
+            {"status": "open", "symbol": "OLDUSDT", "margin_topup_usd": 25.0},
+            {"status": "open", "symbol": "NEWUSDT", "margin_topup_usd": 75.0},
+        ],
+    }
+
+    result = build_capital_regime_status(state, PumpLiveConfig())
+
+    assert result["active_risk_policy_id"] == RISK_POLICY_V2
+    assert result["new_slot_required_available_usd"] == 1_325.0
+    assert result["new_slot_headroom_usd"] == 275.0
 
 
 def test_capital_rescue_shadow_prefers_profitable_position_near_take_profit() -> None:
@@ -590,6 +757,8 @@ def test_arm_ignores_old_signal_and_opens_new_main_signal(tmp_path: Path) -> Non
 
     status = controller.run_cycle()
     open_items = [item for item in status["positions"] if item["status"] != "closed"]
+    assert open_items[0]["risk_policy_id"] == RISK_POLICY_V1
+    assert open_items[0]["risk_policy"]["slot_margin_usd"] == 175.0
     assert len(open_items) == 1
     assert open_items[0]["symbol"] == "TESTUSDT"
     assert len(open_items[0]["legs"]) == 3
@@ -1260,6 +1429,8 @@ def test_restart_disarms_entries_but_keeps_recovery_monitor_state(tmp_path: Path
     assert status["entry_armed"] is False
     assert status["monitor_enabled"] is True
     assert status["status"] == "recovery_monitoring"
+    assert status["positions"][0]["risk_policy_id"] == RISK_POLICY_V1
+    assert status["positions"][0]["risk_policy"]["max_position_topup_usd"] == 175.0
 
 
 def test_new_entry_blocks_when_available_would_break_reserve(tmp_path: Path) -> None:

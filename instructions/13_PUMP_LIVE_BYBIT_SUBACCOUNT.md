@@ -121,6 +121,9 @@ To permit new real entries, use `Arm live` and enter:
 ARM PUMP LIVE 1000
 ```
 
+After the explicit `$3000` promotion, use `ARM PUMP LIVE 3000` instead. The UI
+selects the confirmation from the active persisted risk policy.
+
 Arming never adopts an old paper position. Only a new
 `main_pullback_tier/entry_ready` decision produced after arming can be queued.
 Every backend restart initially disables new entries; existing Pump positions
@@ -154,10 +157,11 @@ the UI on the expected existing-position warning.
 - If a position is absent in one complete scan, remaining add orders are
   cancelled immediately and entries are disarmed. It is marked closed only
   after two consecutive flat scans.
-- Liquidation distance is monitored. Margin is added from the subaccount
-  reserve in capped `$25/$50` steps; per-position and portfolio top-up caps are
-  enforced. Warning/panic/emergency buffers are `20% / 15% / 10%`.
-- Normal top-ups stop at the position's guaranteed `$50`. At or below the
+- Liquidation distance is monitored. A v1 position uses `$25/$50` steps and a
+  v2 position uses proportional `$75/$150` steps; immutable per-position and
+  active portfolio top-up caps are enforced. Warning/panic/emergency buffers
+  remain `20% / 15% / 10%`.
+- Normal v1 top-ups stop at the position's guaranteed `$50`; v2 uses `$150`. At or below the
   `15%` panic buffer, positions are processed from the smallest liquidation
   buffer upward and may use the shared `$75` emergency pool while preserving
   `$50` quotas for every other open position.
@@ -334,7 +338,7 @@ excess. If prefund or verification fails, L1 remains exchange-protected,
 entries are disarmed, and remaining ladders are not submitted under uncertain
 execution.
 
-An explicit `ARM PUMP LIVE 1000` may recover only the exact durable failure
+The policy-appropriate explicit ARM confirmation may recover only the exact durable failure
 shape `opening_uncertain + target_unconfirmed +
 pump_live_margin_prefund_target_unconfirmed`: L1 must be confirmed filled,
 every later ladder must still be unsubmitted `planned`, exchange positions and
@@ -574,3 +578,22 @@ healthy scans. Operator disarm, emergency close, incomplete accounting, an
 unknown exchange object, or degraded protection is never overridden. A
 restart also clears the pending automatic recovery and still requires the
 normal explicit ARM/resume verification.
+
+Update 2026-08-10, `$3000` capital path: every legacy position is migrated to
+an immutable `v1_1000` snapshot and is never resized. A confirmed main -> Pump
+transfer remains temporary and excluded until the separate endpoint
+`POST /api/pump-short/live/capital/promote` receives target `3000` and exact
+confirmation `PROMOTE PUMP CAPITAL 3000`. The promotion consumes only the
+principal needed to make effective strategy capital exactly `$3000`; profits
+reduce that amount and excess transferred cash remains temporary/returnable.
+Future entries then use `v2_3000` (`$525` slot, `$150` guarantee, `$825`
+portfolio top-up cap, `$75` floor), initially limited to one concurrent v2
+position. Promotion neither places orders nor arms entries; it disarms the
+entry gate and requires a fresh v2 preflight/ARM after the accounting boundary. Restart recovery
+under v2 requires `ARM PUMP LIVE 3000`; the old `$1000` confirmation is rejected.
+Realized PnL, external contribution, and the 70/30 profit allocation target are
+reported separately; profit does not silently compound live size.
+Manual capital funding above the `$0.01` rail test is now also fail-closed on
+the fresh projected main-account state: the exact post-debit available balance,
+margin ratio, position protection, liquidation buffers and data age must pass
+before the universal transfer is submitted.

@@ -2,6 +2,11 @@
 
 ## Current decision
 
+Implementation status, 2026-08-10: the versioned mixed-cohort runtime and
+capitalization gate described below are complete. This supersedes older text
+in this document saying the runtime cannot yet mix cohorts. It still does not
+authorize a transfer or activate v2 automatically.
+
 The transfer layer is fail-closed and does not enable live entries. Operator
 endpoints remain explicit; a separate bounded callback may now automatically
 move only main -> Pump rescue cash when an already-open position enters the
@@ -63,12 +68,14 @@ Endpoints:
 - `POST /api/pump-short/live/transfers/in`;
 - `POST /api/pump-short/live/transfers/return`;
 - `POST /api/pump-short/live/transfers/reconcile`.
+- `POST /api/pump-short/live/capital/promote`.
 
 Exact confirmations:
 
 ```text
 TRANSFER TEMPORARY USDT MAIN TO PUMP
 RETURN TEMPORARY USDT PUMP TO MAIN
+PROMOTE PUMP CAPITAL 3000
 ```
 
 The controller persists a UUID and pending state before the Bybit POST. A
@@ -76,6 +83,12 @@ timeout or unknown response is never blindly resubmitted: later reconciliation
 queries that exact UUID. Another transfer is blocked until the pending outcome
 is resolved. A successful response is still checked in universal-transfer
 history before local accounting changes.
+
+A manual transfer larger than the `$0.01` rail test also requires the same
+fresh projected main-account risk gate as automatic rescue: after the exact
+debit main must retain the configured available floor, acceptable margin
+ratio, fresh account data, protected positions and minimum liquidation buffer.
+Missing main portfolio evidence blocks submission before Bybit is called.
 
 Return is bounded by all of:
 
@@ -127,8 +140,8 @@ headroom, and temporary external principal.
 
 ## Can the account move to $3000 with three positions open?
 
-Financially yes; the current runtime policy cannot yet do it safely by simply
-changing one global number.
+Yes, through the explicit mixed-cohort path. Changing one global number or
+editing the ordinary observe-only capital setting remains forbidden.
 
 At the captured wallet `$1043.862297`, the deposit needed to reach exactly
 `$3000` is approximately `$1956.137703`. The wallet is live and this amount must
@@ -153,22 +166,36 @@ Recommended staged migration:
 
 1. Add the future capital as an excluded contribution while keeping active
    policy `v1_1000` and `$175` entries.
-2. Complete an execution-aware `$3000` margin/spike replay. The approximate
-   prefunds and rescue caps scale with quantity and cannot be inferred only
-   from the old ROI replay.
-3. Add immutable per-position `risk_policy_id` and portfolio accounting that
-   understands simultaneous legacy and new cohorts.
-4. Only after regression, enable `v2_3000` for new signals. Existing positions
+2. Preserve every existing position under its persisted `v1_1000` risk-policy
+   snapshot. Restart and runtime-config changes cannot resize it.
+3. Promote only the principal required to make effective strategy capital
+   exactly `$3000`; realized profit reduces this amount. Any excess from a
+   round `$2000` transfer remains temporary/outstanding and returnable.
+4. Enable `v2_3000` only through the exact promotion confirmation. Existing positions
    remain v1 until flat; each freed slot migrates to `$525` independently.
-5. Promote the deposited contribution from temporary/excluded capacity to
-   declared strategy capital only with an explicit operator action. It remains
-   an external cashflow for performance reporting.
+5. The initial v2 gate permits only one concurrent v2 position. The ordinary
+   four-position portfolio cap and the ignored-env entry cap still apply.
 
 With three legacy positions and one future `$525` v2 slot, the conservative
 capital commitment is `$525 legacy + $525 new + $900 reserve = $1950`, leaving
-`$1050` headroom inside `$3000`. Capacity is sufficient, but current code does
-not yet carry immutable mixed-cohort risk policies, so this configuration is
-research/design only and must not be armed as `$3000` yet.
+`$1050` headroom inside `$3000`. Capacity is sufficient and the runtime now
+carries immutable mixed-cohort policies. The v2 policy uses a `$525` slot,
+`$150` per-position guarantee, `$525` per-position top-up cap, `$825` portfolio
+top-up cap and `$75` operating floor. Legacy positions continue to use their
+persisted `$175/$50/$175` limits while all top-ups count against the active v2
+portfolio envelope.
+
+Promotion changes accounting and future sizing only. It does not place an
+order, alter an existing ladder, or change TP/SL; it explicitly disarms new
+entries so a scan cannot race the policy boundary. The operator must then run
+the v2 preflight and ARM separately. After a backend
+restart, policy v2 requires the distinct confirmation `ARM PUMP LIVE 3000`;
+the legacy `ARM PUMP LIVE 1000` cannot arm a promoted account.
+
+Closed exchange-accounted PnL is reported separately from external principal.
+The status exposes a 70% deployable / 30% reserve profit target, but profits do
+not silently resize live positions. Any later increase or decrease remains a
+separate versioned policy and operator decision.
 
 ## Protective-order scope clarification
 

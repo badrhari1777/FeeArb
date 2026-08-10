@@ -29,6 +29,7 @@ PUMP_TRANSFER_MIN_USDT = Decimal("0.01")
 PUMP_TRANSFER_MAX_USDT = Decimal("100000")
 PUMP_TRANSFER_IN_CONFIRMATION = "TRANSFER TEMPORARY USDT MAIN TO PUMP"
 PUMP_TRANSFER_RETURN_CONFIRMATION = "RETURN TEMPORARY USDT PUMP TO MAIN"
+PUMP_CAPITAL_PROMOTE_CONFIRMATION = "PROMOTE PUMP CAPITAL 3000"
 PUMP_TRANSFER_CONFIRM_DELAYS_SEC = (0.0, 0.2, 0.5, 1.0, 2.0)
 PUMP_TRANSFER_STATE_RETRY_SEC = (0.0, 0.05, 0.1, 0.2, 0.4)
 PUMP_TRANSFER_ENV_PATH = BASE_DIR / "config" / "pump_live.env"
@@ -68,6 +69,14 @@ class PumpTransferAccounting(Protocol):
         direction: str,
         amount_usd: float,
         transfer_id: str,
+    ) -> dict[str, Any]: ...
+
+    def promote_strategy_capital(
+        self,
+        *,
+        target_capital_usd: float,
+        confirmation: str,
+        promotion_id: str,
     ) -> dict[str, Any]: ...
 
 
@@ -727,6 +736,7 @@ class PumpTemporaryTransferController:
             "temporary_outstanding_usd": round(_number(payload.get("temporary_outstanding_usd")), 6),
             "cumulative_in_usd": round(_number(payload.get("cumulative_in_usd")), 6),
             "cumulative_returned_usd": round(_number(payload.get("cumulative_returned_usd")), 6),
+            "cumulative_promoted_usd": round(_number(payload.get("cumulative_promoted_usd")), 6),
             "pending": payload.get("pending") if isinstance(payload.get("pending"), dict) else None,
             "operations": list(payload.get("operations") or [])[-200:],
             "last_preflight": payload.get("last_preflight"),
@@ -903,7 +913,7 @@ class PumpTemporaryTransferController:
             item for item in pump.get("positions") or [] if item.get("status") not in {"closed"}
         ]
         total_topup = sum(_number(item.get("margin_topup_usd")) for item in open_positions)
-        config = dict(pump.get("config") or {})
+        config = dict(pump.get("active_risk_policy") or pump.get("config") or {})
         remaining_topup = max(0.0, _number(config.get("max_total_topup_usd"), 275.0) - total_topup)
         operating_floor = _number(config.get("operating_cash_floor_usd"), 25.0)
         active_capital = _number(
@@ -966,6 +976,33 @@ class PumpTemporaryTransferController:
             raise RuntimeError("pump_temporary_transfer_round_trip_preflight_not_ready")
         if float(amount) > _number(preflight.get("inbound_limit_usd")) + 1e-9:
             raise RuntimeError("pump_temporary_transfer_in_exceeds_safe_balance")
+        if self._main_portfolio_provider is None:
+            if amount > PUMP_TRANSFER_MIN_USDT:
+                raise RuntimeError("pump_temporary_transfer_main_risk_snapshot_unavailable")
+        else:
+            try:
+                main_payload = self._main_portfolio_provider()
+            except Exception as exc:  # pylint: disable=broad-except
+                raise RuntimeError(
+                    "pump_temporary_transfer_main_risk_snapshot_unavailable"
+                ) from exc
+            manual_risk_config = {
+                **load_auto_transfer_config(self.env_path),
+                "max_incident_usd": float(amount),
+            }
+            main_risk = assess_main_transfer_capacity(
+                main_payload,
+                requested_usd=float(amount),
+                transfer_safe_usd=_number(preflight.get("inbound_limit_usd")),
+                config=manual_risk_config,
+            )
+            if not main_risk.get("ready"):
+                reason = str(
+                    (main_risk.get("errors") or ["main_risk_gate_failed"])[0]
+                )
+                raise RuntimeError(
+                    f"pump_temporary_transfer_main_risk_gate_failed:{reason}"
+                )
         return self._execute("main_to_pump", amount, preflight)
 
     def transfer_return(self, amount_usdt: Any, confirmation: str) -> dict[str, Any]:
@@ -978,6 +1015,86 @@ class PumpTemporaryTransferController:
         if float(amount) > _number(preflight.get("return_limit_usd")) + 1e-9:
             raise RuntimeError("pump_temporary_transfer_return_exceeds_safe_limit")
         return self._execute("pump_to_main", amount, preflight)
+
+    def promote_capital(
+        self,
+        target_capital_usd: Any,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        """Convert only the required confirmed temporary principal into capital."""
+        if confirmation != PUMP_CAPITAL_PROMOTE_CONFIRMATION:
+            raise ValueError("pump_capital_promotion_confirmation_invalid")
+        target = _number(target_capital_usd)
+        if abs(target - 3_000.0) > 1e-9:
+            raise ValueError("pump_capital_promotion_target_unsupported")
+        promotion_id = "pump-capital-v2-3000"
+        with self._lock:
+            if self._state.get("pending"):
+                raise RuntimeError("pump_temporary_transfer_pending_reconciliation")
+            completed = next(
+                (
+                    dict(item)
+                    for item in self._state.get("operations") or []
+                    if item.get("promotion_id") == promotion_id
+                    and item.get("status") == "complete"
+                ),
+                None,
+            )
+            if completed is not None:
+                return {
+                    "operation": completed,
+                    "accounting": self.accounting.status().get("capital_manager") or {},
+                    "status": self.status(),
+                    "idempotent": True,
+                }
+            outstanding_before = _number(self._state.get("temporary_outstanding_usd"))
+        if outstanding_before < float(PUMP_TRANSFER_MIN_USDT):
+            raise RuntimeError("pump_capital_promotion_no_temporary_principal")
+        accounting_result = self.accounting.promote_strategy_capital(
+            target_capital_usd=target,
+            confirmation=confirmation,
+            promotion_id=promotion_id,
+        )
+        promoted = _number(accounting_result.get("last_capital_promotion_amount_usd"))
+        if promoted <= 0 or promoted > outstanding_before + 0.01:
+            raise RuntimeError("pump_capital_promotion_accounting_mismatch")
+        now = int(time.time() * 1000)
+        operation = {
+            "promotion_id": promotion_id,
+            "direction": "temporary_to_strategy_capital",
+            "amount_usd": round(promoted, 6),
+            "target_capital_usd": target,
+            "status": "complete",
+            "completed_at_ms": now,
+            "origin": "operator",
+        }
+        with self._lock:
+            current = _number(self._state.get("temporary_outstanding_usd"))
+            if promoted > current + 0.01:
+                raise RuntimeError("pump_capital_promotion_outstanding_underflow")
+            self._state["temporary_outstanding_usd"] = round(
+                max(0.0, current - promoted),
+                6,
+            )
+            self._state["cumulative_promoted_usd"] = round(
+                _number(self._state.get("cumulative_promoted_usd")) + promoted,
+                6,
+            )
+            self._state["operations"] = (self._state.get("operations") or [])[-199:] + [operation]
+            self._state["updated_at_ms"] = now
+            self._save_state_locked()
+        self._event(
+            "temporary_principal_promoted",
+            {
+                **operation,
+                "temporary_outstanding_usd": self._state["temporary_outstanding_usd"],
+            },
+        )
+        return {
+            "operation": operation,
+            "accounting": accounting_result,
+            "status": self.status(),
+        }
 
     def _execute(
         self,

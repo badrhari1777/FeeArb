@@ -173,6 +173,7 @@
   function renderPumpLive() {
     var live = state.pump_live || {};
     var config = live.config || {};
+    var activePolicy = live.active_risk_policy || config;
     var credentials = live.credentials || {};
     var preflight = live.last_preflight || {};
     var keyInfo = preflight.key || {};
@@ -194,7 +195,7 @@
     setText('pss-live-balance', money(balance.total || balance.total_usdt || 0));
     setText('pss-live-available', money(balance.available || balance.available_usdt || 0));
     setText('pss-live-slots', open + ' / ' + cap + ' (max ' + Number(config.max_active_positions || 4) + ')');
-    setText('pss-live-reserve', money(config.reserve_usd || 300));
+    setText('pss-live-reserve', money(activePolicy.reserve_usd || 300));
     setText('pss-live-temporary', money(capital.temporary_transfer_outstanding_usd || 0));
     setText('pss-live-regime', String(regime.mode || '-').toUpperCase());
     setText('pss-live-auto-transfer', autoTransfer.enabled ? 'ON' : 'OFF');
@@ -213,6 +214,9 @@
     setText('pss-live-capital-active-slot', money(capital.active_slot_margin_usd || config.slot_margin_usd || 0));
     setText('pss-live-capital-recommended-slot', money(capital.recommended_slot_margin_usd || 0));
     setText('pss-live-capital-next-slot', money(capital.next_capped_slot_margin_usd || 0));
+    setText('pss-live-capital-policy', capital.active_risk_policy_id || 'v1_1000');
+    setText('pss-live-capital-external', money(capital.external_strategy_contribution_usd || 0));
+    setText('pss-live-capital-profit-reserve', money(capital.profit_reserve_target_usd || 0));
     setText(
       'pss-live-capital-progress',
       fmt(capital.observation_elapsed_days || 0, 1) + 'd / ' +
@@ -241,6 +245,14 @@
         ' newly closed live trades, followed by a separate operator decision.'
     );
     setDisabled('pss-live-capital-save', Number(capital.account_wallet_usd || balance.wallet || balance.total || 0) <= 0);
+    setDisabled(
+      'pss-live-capital-promote',
+      capital.active_risk_policy_id === 'v2_3000' ||
+        !live.entry_armed ||
+        Number(capital.temporary_transfer_outstanding_usd || 0) < 0.01 ||
+        Number(capital.temporary_transfer_outstanding_usd || 0) + 0.01 <
+          Number(capital.target_3000_external_required_usd || 0)
+    );
 
     var warnings = [];
     if (live.blocked_reason) warnings.push('Blocked: ' + live.blocked_reason);
@@ -307,8 +319,11 @@
   }
 
   function liveArm() {
-    var confirmation = window.prompt('REAL TRADING: new main-tier signals can place orders. Type: ARM PUMP LIVE 1000');
-    if (confirmation !== 'ARM PUMP LIVE 1000') {
+    var live = state.pump_live || {};
+    var policy = ((live.capital_manager || {}).active_risk_policy_id || 'v1_1000');
+    var expected = policy === 'v2_3000' ? 'ARM PUMP LIVE 3000' : 'ARM PUMP LIVE 1000';
+    var confirmation = window.prompt('REAL TRADING: new main-tier signals can place orders. Type: ' + expected);
+    if (confirmation !== expected) {
       setStatus('Pump live arm canceled', true);
       return;
     }
@@ -346,6 +361,27 @@
         return;
       }
       setStatus('Observed strategy capital saved; live slot remains unchanged', false);
+      refresh();
+    });
+  }
+
+  function livePromoteCapital() {
+    var confirmation = window.prompt(
+      'CAPITAL POLICY CHANGE: existing positions remain v1; only one concurrent new v2 $525 canary is enabled. Type: PROMOTE PUMP CAPITAL 3000'
+    );
+    if (confirmation !== 'PROMOTE PUMP CAPITAL 3000') {
+      setStatus('Capital promotion canceled', true);
+      return;
+    }
+    requestJson('POST', '/api/pump-short/live/capital/promote', {
+      target_capital_usd: 3000,
+      confirmation: confirmation
+    }, function (err) {
+      if (err) {
+        setStatus(err.message, true);
+        return;
+      }
+      setStatus('v2_3000 mixed-cohort canary enabled for future entries', false);
       refresh();
     });
   }
@@ -971,6 +1007,7 @@
     if ($('pss-live-prepare')) $('pss-live-prepare').addEventListener('click', livePrepare);
     if ($('pss-live-arm')) $('pss-live-arm').addEventListener('click', liveArm);
     if ($('pss-live-capital-save')) $('pss-live-capital-save').addEventListener('click', liveSetCapital);
+    if ($('pss-live-capital-promote')) $('pss-live-capital-promote').addEventListener('click', livePromoteCapital);
     if ($('pss-live-disarm')) $('pss-live-disarm').addEventListener('click', liveDisarm);
     if ($('pss-live-emergency')) $('pss-live-emergency').addEventListener('click', liveEmergencyClose);
   }

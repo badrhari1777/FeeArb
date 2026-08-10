@@ -106,6 +106,17 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live mixed-capital migration was implemented on 2026-08-10. Existing
+  positions receive immutable `v1_1000` snapshots; explicit capitalization of
+  confirmed temporary principal can activate `v2_3000` only for future entries,
+  initially one concurrent `$525` canary. The controller consumes only the
+  amount needed to reach exactly `$3000`, leaves transfer excess temporary,
+  separates external contribution from exchange-accounted PnL, uses the v2
+  `$900` reserve envelope across mixed cohorts, and never resizes or arms an
+  order during promotion. Promotion disarms entries, and the following
+  preflight/restart recovery requires `ARM PUMP LIVE 3000`. Manual capital
+  transfer above the `$0.01` rail test also requires a fresh safe post-debit
+  projection of the main account before Bybit submission.
 - Pump Live normal-close recovery was hardened on 2026-08-10 after a confirmed
   HEI take-profit left entries blocked by `position_absent_unconfirmed`. A
   close may now auto-rearm only when entries were armed before the first

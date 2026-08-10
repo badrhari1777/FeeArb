@@ -10,6 +10,7 @@ from execution.pump_live import PumpLiveController
 from execution.pump_transfers import (
     BybitPumpTransferGateway,
     PUMP_TRANSFER_IN_CONFIRMATION,
+    PUMP_CAPITAL_PROMOTE_CONFIRMATION,
     PUMP_TRANSFER_RETURN_CONFIRMATION,
     PumpTemporaryTransferController,
 )
@@ -97,6 +98,7 @@ class FakeTransferGateway:
 class FakeAccounting:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.temporary_outstanding_usd = 0.0
         self._status = {
             "positions": [
                 {"status": "open", "margin_topup_usd": amount}
@@ -156,10 +158,36 @@ class FakeAccounting:
             }
         )
         delta = amount_usd if direction == "main_to_pump" else -amount_usd
+        self.temporary_outstanding_usd += delta
         self._status["last_balance"]["wallet"] += delta
         self._status["last_balance"]["total"] += delta
         self._status["last_balance"]["available"] += delta
         return {"excluded_from_strategy_growth": True}
+
+    def promote_strategy_capital(
+        self,
+        *,
+        target_capital_usd: float,
+        confirmation: str,
+        promotion_id: str,
+    ) -> dict[str, Any]:
+        assert confirmation == PUMP_CAPITAL_PROMOTE_CONFIRMATION
+        effective = (
+            self._status["last_balance"]["wallet"]
+            - self.temporary_outstanding_usd
+        )
+        promoted = max(0.0, target_capital_usd - effective)
+        assert promoted <= self.temporary_outstanding_usd + 1e-9
+        self.temporary_outstanding_usd -= promoted
+        self._status["capital_manager"].update(
+            {
+                "active_strategy_capital_usd": target_capital_usd,
+                "active_risk_policy_id": "v2_3000",
+                "last_capital_promotion_amount_usd": promoted,
+                "last_capital_promotion_id": promotion_id,
+            }
+        )
+        return dict(self._status["capital_manager"])
 
 
 def _controller(tmp_path: Path) -> tuple[PumpTemporaryTransferController, FakeTransferGateway, FakeAccounting]:
@@ -496,6 +524,36 @@ def test_unknown_submission_is_persisted_and_blocks_duplicate(tmp_path: Path) ->
 
     assert controller.status()["pending"]["status"] == "outcome_unknown"
     assert len(gateway.create_calls) == 1
+
+
+def test_manual_large_transfer_requires_safe_projected_main_account(tmp_path: Path) -> None:
+    controller, gateway, accounting = _controller(tmp_path)
+    accounting.main_payload["balances"][0]["available"] = 2_100.0
+
+    with pytest.raises(RuntimeError, match="main_risk_gate_failed"):
+        controller.transfer_in(2_000.0, PUMP_TRANSFER_IN_CONFIRMATION)
+
+    assert gateway.create_calls == []
+
+
+def test_capital_promotion_uses_only_required_principal_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    controller, _gateway, accounting = _controller(tmp_path)
+    controller.transfer_in(2_000.0, PUMP_TRANSFER_IN_CONFIRMATION)
+
+    result = controller.promote_capital(3_000.0, PUMP_CAPITAL_PROMOTE_CONFIRMATION)
+    duplicate = controller.promote_capital(
+        3_000.0,
+        PUMP_CAPITAL_PROMOTE_CONFIRMATION,
+    )
+
+    assert result["operation"]["amount_usd"] == 1956.14
+    assert result["status"]["temporary_outstanding_usd"] == 43.86
+    assert result["status"]["cumulative_promoted_usd"] == 1956.14
+    assert accounting._status["capital_manager"]["active_risk_policy_id"] == "v2_3000"
+    assert duplicate["idempotent"] is True
+    assert duplicate["status"]["temporary_outstanding_usd"] == 43.86
 
 
 def test_success_record_must_match_expected_coin_and_amount(tmp_path: Path) -> None:

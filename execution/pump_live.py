@@ -8,7 +8,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
@@ -28,9 +28,11 @@ PUMP_LIVE_STATE_FILE = "live_state.json"
 PUMP_LIVE_EVENTS_FILE = "live_events.jsonl"
 PUMP_ORDER_LINK_PREFIX = "FAP"
 ARM_CONFIRMATION = "ARM PUMP LIVE 1000"
+ARM_CONFIRMATION_V2 = "ARM PUMP LIVE 3000"
 PREPARE_CONFIRMATION = "PREPARE PUMP SUBACCOUNT"
 EMERGENCY_CONFIRMATION = "CLOSE ALL PUMP POSITIONS"
 CAPITAL_SET_CONFIRMATION = "SET PUMP STRATEGY CAPITAL"
+CAPITAL_PROMOTE_CONFIRMATION = "PROMOTE PUMP CAPITAL 3000"
 TRANSIENT_RECOVERY_CYCLES = 2
 STATE_REPLACE_RETRY_DELAYS_SEC = (0.0, 0.05, 0.1, 0.2, 0.4, 0.8)
 CAPITAL_OBSERVATION_DAYS = 14
@@ -39,6 +41,8 @@ CAPITAL_GROWTH_TRIGGER_PCT = 10.0
 CAPITAL_REDUCTION_TRIGGER_PCT = 5.0
 CAPITAL_MAX_INCREASE_STEP_PCT = 25.0
 CAPITAL_SLOT_ROUND_USD = 5.0
+RISK_POLICY_V1 = "v1_1000"
+RISK_POLICY_V2 = "v2_3000"
 PREFUND_VERIFY_READ_DELAYS_SEC = (0.0, 0.05, 0.1)
 PREFUND_MAX_CORRECTION_STEPS = 3
 
@@ -79,6 +83,53 @@ class PumpLiveConfig:
     @property
     def slot_margin_usd(self) -> float:
         return self.deployable_capital_usd / self.max_active_positions
+
+
+def risk_policy_config(
+    policy_id: str,
+    runtime_config: PumpLiveConfig,
+) -> PumpLiveConfig:
+    """Return a versioned policy while retaining operational runtime knobs."""
+    if policy_id == RISK_POLICY_V1:
+        return runtime_config
+    if policy_id == RISK_POLICY_V2:
+        return replace(
+            runtime_config,
+            total_capital_usd=3_000.0,
+            deployable_capital_usd=2_100.0,
+            reserve_usd=900.0,
+            margin_topup_chunk_usd=75.0,
+            max_position_topup_usd=525.0,
+            max_total_topup_usd=825.0,
+            guaranteed_position_topup_usd=150.0,
+            operating_cash_floor_usd=75.0,
+        )
+    raise ValueError(f"pump_live_risk_policy_unknown:{policy_id}")
+
+
+def risk_policy_snapshot(
+    policy_id: str,
+    runtime_config: PumpLiveConfig,
+) -> dict[str, Any]:
+    policy = risk_policy_config(policy_id, runtime_config)
+    return {
+        "policy_id": policy_id,
+        **asdict(policy),
+        "slot_margin_usd": round(policy.slot_margin_usd, 6),
+    }
+
+
+def config_from_risk_snapshot(
+    snapshot: Mapping[str, Any] | None,
+    fallback: PumpLiveConfig,
+) -> PumpLiveConfig:
+    if not snapshot:
+        return fallback
+    values = asdict(fallback)
+    for field in fields(PumpLiveConfig):
+        if field.name in snapshot:
+            values[field.name] = snapshot[field.name]
+    return PumpLiveConfig(**values)
 
 
 def required_available_for_new_slot(
@@ -374,7 +425,7 @@ class BybitPumpLiveGateway:
                 total = _safe_float(balance.get("total"), 0.0)
                 available = _safe_float(balance.get("available"), 0.0)
                 if total < config.total_capital_usd * 0.95:
-                    errors.append("pump_live_equity_below_950_usdt")
+                    errors.append("pump_live_equity_below_policy_minimum")
                 if available < config.reserve_usd:
                     errors.append("pump_live_available_below_reserve")
                 unknown_positions = [
@@ -408,6 +459,10 @@ class BybitPumpLiveGateway:
                         "margin_mode": margin_mode,
                         "total_usdt": round(total, 6),
                         "available_usdt": round(available, 6),
+                        "policy_minimum_total_usdt": round(
+                            config.total_capital_usd * 0.95,
+                            6,
+                        ),
                         "positions": len(positions),
                         "open_orders": len(open_orders),
                     },
@@ -963,6 +1018,25 @@ class PumpLiveController:
     def config(self) -> PumpLiveConfig:
         return load_pump_live_config(self.env_path)
 
+    def _position_config(
+        self,
+        item: Mapping[str, Any],
+        runtime_config: PumpLiveConfig,
+    ) -> PumpLiveConfig:
+        return config_from_risk_snapshot(
+            item.get("risk_policy") if isinstance(item, Mapping) else None,
+            runtime_config,
+        )
+
+    def _active_policy_id(self) -> str:
+        with self._lock:
+            manager = dict(self._state.get("capital_manager") or {})
+        policy_id = str(manager.get("active_risk_policy_id") or RISK_POLICY_V1)
+        return policy_id if policy_id in {RISK_POLICY_V1, RISK_POLICY_V2} else RISK_POLICY_V1
+
+    def _active_policy_config(self, runtime_config: PumpLiveConfig) -> PumpLiveConfig:
+        return risk_policy_config(self._active_policy_id(), runtime_config)
+
     def set_risk_transfer_provider(
         self,
         provider: Callable[..., Mapping[str, Any]] | None,
@@ -976,6 +1050,16 @@ class PumpLiveController:
         config = self.config()
         payload["config"] = asdict(config)
         payload["config"]["slot_margin_usd"] = round(config.slot_margin_usd, 6)
+        active_policy_id = str(
+            (payload.get("capital_manager") or {}).get("active_risk_policy_id")
+            or RISK_POLICY_V1
+        )
+        if active_policy_id not in {RISK_POLICY_V1, RISK_POLICY_V2}:
+            active_policy_id = RISK_POLICY_V1
+        payload["active_risk_policy"] = risk_policy_snapshot(
+            active_policy_id,
+            config,
+        )
         payload["capital_manager"] = build_capital_manager_status(payload, config)
         payload["capital_regime"] = build_capital_regime_status(payload, config)
         payload["capital_rescue_shadow"] = build_capital_rescue_shadow(payload, config)
@@ -1105,6 +1189,8 @@ class PumpLiveController:
         now = _now_ms()
         with self._lock:
             manager = dict(self._state.get("capital_manager") or {})
+            if manager.get("active_risk_policy_id") == RISK_POLICY_V2:
+                raise RuntimeError("pump_live_capital_observe_locked_after_promotion")
             manager.update(
                 {
                     "mode": "observe",
@@ -1204,8 +1290,118 @@ class PumpLiveController:
         )
         return build_capital_manager_status(self._state, self.config())
 
+    def promote_strategy_capital(
+        self,
+        *,
+        target_capital_usd: float,
+        confirmation: str,
+        promotion_id: str,
+    ) -> dict[str, Any]:
+        """Capitalize confirmed temporary principal and enable one v2 canary."""
+        if confirmation != CAPITAL_PROMOTE_CONFIRMATION:
+            raise ValueError("pump_live_capital_promotion_confirmation_invalid")
+        target = _safe_float(target_capital_usd, 0.0)
+        if abs(target - 3_000.0) > 1e-9:
+            raise ValueError("pump_live_capital_promotion_target_unsupported")
+        operation_id = str(promotion_id or "").strip()
+        if not operation_id:
+            raise ValueError("pump_live_capital_promotion_id_missing")
+        balance = self.gateway.fetch_balance()
+        wallet = _capital_wallet_balance(balance)
+        if wallet <= 0:
+            raise RuntimeError("pump_live_capital_wallet_balance_missing")
+        now = _now_ms()
+        with self._lock:
+            manager = dict(self._state.get("capital_manager") or {})
+            promotion_ids = [str(item) for item in manager.get("capital_promotion_ids") or []]
+            if operation_id in promotion_ids:
+                return build_capital_manager_status(self._state, self.config())
+            if manager.get("active_risk_policy_id") == RISK_POLICY_V2:
+                raise RuntimeError("pump_live_capital_policy_already_promoted")
+            if self._state.get("emergency_close_requested"):
+                raise RuntimeError("pump_live_capital_promotion_emergency_active")
+            if self._state.get("last_error"):
+                raise RuntimeError("pump_live_capital_promotion_monitor_error")
+            if not self._state.get("entry_armed") or self._state.get("blocked_reason"):
+                raise RuntimeError("pump_live_capital_promotion_health_gate_not_ready")
+            if self._state.get("pending_signals"):
+                raise RuntimeError("pump_live_capital_promotion_pending_signals")
+            open_items = self._open_positions(self._state)
+            if any(
+                item.get("status") != "open"
+                or item.get("risk_policy_id") != RISK_POLICY_V1
+                or not isinstance(item.get("risk_policy"), Mapping)
+                for item in open_items
+            ):
+                raise RuntimeError("pump_live_capital_promotion_position_state_invalid")
+            adjustment = _safe_float(manager.get("equity_adjustment_usd"), 0.0)
+            effective_before = wallet + adjustment
+            required = max(0.0, target - effective_before)
+            outstanding = _safe_float(
+                manager.get("temporary_transfer_outstanding_usd"),
+                0.0,
+            )
+            if required > outstanding + 0.01:
+                raise RuntimeError("pump_live_capital_promotion_principal_insufficient")
+            promoted = min(outstanding, required)
+            manager.update(
+                {
+                    "mode": "mixed_canary",
+                    "application_enabled": True,
+                    "active_strategy_capital_usd": target,
+                    "declared_strategy_capital_usd": target,
+                    "declared_account_wallet_usd": round(wallet, 6),
+                    "equity_adjustment_usd": round(adjustment + promoted, 6),
+                    "temporary_transfer_outstanding_usd": round(
+                        max(0.0, outstanding - promoted),
+                        6,
+                    ),
+                    "external_strategy_contribution_usd": round(
+                        _safe_float(manager.get("external_strategy_contribution_usd"), 0.0)
+                        + promoted,
+                        6,
+                    ),
+                    "active_risk_policy_id": RISK_POLICY_V2,
+                    "policy_application_mode": "mixed_canary",
+                    "v2_concurrent_entry_cap": 1,
+                    "capital_promotion_ids": promotion_ids + [operation_id],
+                    "last_capital_promotion_id": operation_id,
+                    "last_capital_promotion_amount_usd": round(promoted, 6),
+                    "last_capital_promotion_at_ms": now,
+                    "declared_at_ms": now,
+                    "declared_note": "operator-approved v2_3000 mixed-cohort canary",
+                    "declared_source": "capital_promotion",
+                }
+            )
+            self._state["capital_manager"] = manager
+            self._state["last_balance"] = balance
+            self._state["entry_armed"] = False
+            self._state["monitor_enabled"] = bool(open_items)
+            self._state["status"] = "monitoring" if open_items else "disarmed"
+            self._state["blocked_reason"] = "capital_policy_promotion"
+            self._state["transient_recovery_pending"] = False
+            self._state["healthy_recovery_cycles"] = 0
+            self._state["updated_at_ms"] = now
+            self._save_state_locked()
+        self._event(
+            "capital_policy_promoted",
+            {
+                "promotion_id": operation_id,
+                "target_capital_usd": target,
+                "promoted_principal_usd": round(promoted, 6),
+                "remaining_temporary_principal_usd": round(
+                    max(0.0, outstanding - promoted),
+                    6,
+                ),
+                "risk_policy_id": RISK_POLICY_V2,
+                "v2_concurrent_entry_cap": 1,
+            },
+        )
+        return build_capital_manager_status(self._state, self.config())
+
     def preflight(self) -> dict[str, Any]:
-        result = self.gateway.preflight(self.config())
+        runtime_config = self.config()
+        result = self.gateway.preflight(self._active_policy_config(runtime_config))
         with self._lock:
             self._state["last_preflight"] = result
             self._state["updated_at_ms"] = _now_ms()
@@ -1216,7 +1412,8 @@ class PumpLiveController:
     def prepare_account(self, confirmation: str) -> dict[str, Any]:
         if confirmation != PREPARE_CONFIRMATION:
             raise ValueError("pump_live_prepare_confirmation_invalid")
-        preflight = self.gateway.preflight(self.config())
+        runtime_config = self.config()
+        preflight = self.gateway.preflight(self._active_policy_config(runtime_config))
         non_mode_errors = [
             item
             for item in preflight.get("errors") or []
@@ -1230,7 +1427,12 @@ class PumpLiveController:
         return {"prepare": result, "preflight": verified}
 
     def arm(self, confirmation: str) -> dict[str, Any]:
-        if confirmation != ARM_CONFIRMATION:
+        expected_confirmation = (
+            ARM_CONFIRMATION_V2
+            if self._active_policy_id() == RISK_POLICY_V2
+            else ARM_CONFIRMATION
+        )
+        if confirmation != expected_confirmation:
             raise ValueError("pump_live_arm_confirmation_invalid")
         preflight = self.preflight()
         with self._lock:
@@ -1271,6 +1473,21 @@ class PumpLiveController:
             "pump_live_subaccount_has_existing_positions",
             "pump_live_subaccount_has_unknown_open_orders",
         }
+        active_config = self._active_policy_config(self.config())
+        tracked_topup = sum(
+            max(0.0, _safe_float(item.get("margin_topup_usd"), 0.0))
+            for item in open_items
+        )
+        remaining_reserve = (
+            max(0.0, active_config.max_total_topup_usd - tracked_topup)
+            + active_config.operating_cash_floor_usd
+        )
+        preflight_available = _safe_float(
+            (preflight.get("account") or {}).get("available_usdt"),
+            0.0,
+        )
+        if preflight_available + 1e-9 >= remaining_reserve:
+            tolerated.add("pump_live_available_below_reserve")
         remaining_errors = [
             str(item)
             for item in preflight.get("errors") or []
@@ -1315,14 +1532,15 @@ class PumpLiveController:
         }
         config = self.config()
         for item in open_items:
+            position_config = self._position_config(item, config)
             self._apply_exchange_position(
                 item,
                 exchange_by_symbol[_normalize_symbol(item.get("symbol"))],
             )
             if self._is_recoverable_prefund_position(item):
-                self._recover_prefund_position(item, config)
+                self._recover_prefund_position(item, position_config)
             else:
-                self._sync_full_protection(item, config, force=True)
+                self._sync_full_protection(item, position_config, force=True)
         resume_preflight = dict(preflight)
         resume_preflight.update(
             {
@@ -1614,6 +1832,8 @@ class PumpLiveController:
         open_orders: list[dict[str, Any]],
         config: PumpLiveConfig,
     ) -> None:
+        candidate_policy_id = self._active_policy_id()
+        candidate_config = risk_policy_config(candidate_policy_id, config)
         with self._lock:
             if not self._state.get("entry_armed"):
                 return
@@ -1630,8 +1850,25 @@ class PumpLiveController:
                 if not self._state.get("entry_armed"):
                     break
                 open_items = self._open_positions(self._state)
-                if len(open_items) >= min(config.entry_cap, config.max_active_positions):
+                if len(open_items) >= min(config.entry_cap, candidate_config.max_active_positions):
                     break
+                if candidate_policy_id == RISK_POLICY_V2:
+                    v2_cap = max(
+                        1,
+                        _safe_int(
+                            (self._state.get("capital_manager") or {}).get(
+                                "v2_concurrent_entry_cap"
+                            ),
+                            1,
+                        ),
+                    )
+                    v2_open = sum(
+                        1
+                        for item in open_items
+                        if item.get("risk_policy_id") == RISK_POLICY_V2
+                    )
+                    if v2_open >= v2_cap:
+                        break
                 if any(
                     _normalize_symbol(item.get("symbol")) == _normalize_symbol(decision.get("symbol"))
                     for item in open_items
@@ -1645,7 +1882,10 @@ class PumpLiveController:
                 guaranteed_deficit = sum(
                     max(
                         0.0,
-                        config.guaranteed_position_topup_usd
+                        self._position_config(
+                            item,
+                            config,
+                        ).guaranteed_position_topup_usd
                         - _safe_float(item.get("margin_topup_usd"), 0.0),
                     )
                     for item in open_items
@@ -1653,22 +1893,32 @@ class PumpLiveController:
                 rescue_required_after_entry = (
                     total_topup
                     + guaranteed_deficit
-                    + config.guaranteed_position_topup_usd
+                    + candidate_config.guaranteed_position_topup_usd
                 )
-            if rescue_required_after_entry > config.max_total_topup_usd + 1e-9:
+            if rescue_required_after_entry > candidate_config.max_total_topup_usd + 1e-9:
                 self.disarm("rescue_budget_below_new_slot_guard")
                 break
             required_available = required_available_for_new_slot(
-                config,
+                candidate_config,
                 current_total_topup_usd=total_topup,
             )
             if _safe_float(balance.get("available"), 0.0) + 1e-9 < required_available:
                 self.disarm("available_balance_below_new_slot_guard")
                 break
-            self._open_new_position(decision, config)
+            self._open_new_position(
+                decision,
+                candidate_config,
+                risk_policy_id=candidate_policy_id,
+            )
             balance = self.gateway.fetch_balance()
 
-    def _open_new_position(self, decision: dict[str, Any], config: PumpLiveConfig) -> None:
+    def _open_new_position(
+        self,
+        decision: dict[str, Any],
+        config: PumpLiveConfig,
+        *,
+        risk_policy_id: str,
+    ) -> None:
         symbol = _normalize_symbol(decision.get("symbol"))
         tier = dict(decision.get("tier") or {})
         key = _decision_key(decision)
@@ -1692,6 +1942,8 @@ class PumpLiveController:
             position = {
                 "live_id": live_id,
                 "strategy_id": "main_pullback_tier",
+                "risk_policy_id": risk_policy_id,
+                "risk_policy": risk_policy_snapshot(risk_policy_id, config),
                 "account_alias": "bybit_pump",
                 "symbol": symbol,
                 "event_key": key,
@@ -1777,6 +2029,7 @@ class PumpLiveController:
                     "symbol": symbol,
                     "live_id": live_id,
                     "slot_margin_usd": config.slot_margin_usd,
+                    "risk_policy_id": risk_policy_id,
                     "ladder_legs": len(legs),
                     "ladder_errors": ladder_errors,
                     "margin_prefund_floor_usd": _safe_float(
@@ -1865,7 +2118,10 @@ class PumpLiveController:
 
         items.sort(key=risk_key)
         for item in items:
-            self._maintain_single_position(item, config)
+            self._maintain_single_position(
+                item,
+                self._position_config(item, config),
+            )
 
     def _maintain_single_position(self, item: dict[str, Any], config: PumpLiveConfig) -> None:
         symbol = _normalize_symbol(item.get("symbol"))
@@ -2023,6 +2279,8 @@ class PumpLiveController:
                 self._save_state_locked()
 
     def _maybe_topup_or_emergency(self, item: dict[str, Any], config: PumpLiveConfig) -> None:
+        runtime_config = self.config()
+        portfolio_config = self._active_policy_config(runtime_config)
         mark = _safe_float(item.get("mark_price"), 0.0)
         liq = _optional_float(item.get("liq_price"))
         if not liq or mark <= 0:
@@ -2051,7 +2309,10 @@ class PumpLiveController:
             reserved_for_other_positions = sum(
                 max(
                     0.0,
-                    config.guaranteed_position_topup_usd
+                    self._position_config(
+                        row,
+                        runtime_config,
+                    ).guaranteed_position_topup_usd
                     - _safe_float(row.get("margin_topup_usd"), 0.0),
                 )
                 for row in open_items
@@ -2075,12 +2336,12 @@ class PumpLiveController:
         position_capacity = max(0.0, position_cap - position_topup)
         portfolio_capacity = max(
             0.0,
-            config.max_total_topup_usd
+            portfolio_config.max_total_topup_usd
             - total_topup
             - reserved_for_other_positions,
         )
         risk_allowed = min(desired, position_capacity, portfolio_capacity)
-        cash_allowed = max(0.0, available - config.operating_cash_floor_usd)
+        cash_allowed = max(0.0, available - portfolio_config.operating_cash_floor_usd)
         allowed = min(
             desired,
             position_capacity,
@@ -2115,7 +2376,10 @@ class PumpLiveController:
             if transfer_status == "complete":
                 refreshed_balance = self.gateway.fetch_balance()
                 available = _safe_float(refreshed_balance.get("available"), available)
-                cash_allowed = max(0.0, available - config.operating_cash_floor_usd)
+                cash_allowed = max(
+                    0.0,
+                    available - portfolio_config.operating_cash_floor_usd,
+                )
                 allowed = min(risk_allowed, cash_allowed)
                 self._event(
                     "auto_transfer_complete",
@@ -2211,6 +2475,8 @@ class PumpLiveController:
         item: dict[str, Any],
         config: PumpLiveConfig,
     ) -> tuple[float, float, float]:
+        runtime_config = self.config()
+        portfolio_config = self._active_policy_config(runtime_config)
         position_topup = _safe_float(item.get("margin_topup_usd"), 0.0)
         with self._lock:
             open_items = self._open_positions(self._state)
@@ -2221,7 +2487,10 @@ class PumpLiveController:
             reserved_for_other_positions = sum(
                 max(
                     0.0,
-                    config.guaranteed_position_topup_usd
+                    self._position_config(
+                        row,
+                        runtime_config,
+                    ).guaranteed_position_topup_usd
                     - _safe_float(row.get("margin_topup_usd"), 0.0),
                 )
                 for row in open_items
@@ -2233,11 +2502,11 @@ class PumpLiveController:
             max(0.0, config.max_position_topup_usd - position_topup),
             max(
                 0.0,
-                config.max_total_topup_usd
+                portfolio_config.max_total_topup_usd
                 - total_topup
                 - reserved_for_other_positions,
             ),
-            max(0.0, available - config.operating_cash_floor_usd),
+            max(0.0, available - portfolio_config.operating_cash_floor_usd),
         )
         return allowed, available, total_topup
 
@@ -2694,6 +2963,7 @@ class PumpLiveController:
         with self._lock:
             ledger_items = self._open_positions(self._state)
         for item in ledger_items:
+            position_config = self._position_config(item, config)
             symbol = _normalize_symbol(item.get("symbol"))
             actual = exchange_by_symbol.get(symbol)
             if actual:
@@ -2728,7 +2998,7 @@ class PumpLiveController:
                 item["flat_confirm_count"] = count
                 item["updated_at_ms"] = _now_ms()
                 self._save_state_locked()
-            if count >= config.flat_confirm_cycles:
+            if count >= position_config.flat_confirm_cycles:
                 closed_at_ms = _now_ms()
                 accounting: dict[str, Any] = {}
                 accounting_error: str | None = None
@@ -2915,6 +3185,25 @@ class PumpLiveController:
         if not isinstance(payload, dict):
             payload = {}
         last_balance = payload.get("last_balance")
+        runtime_config = self.config()
+        positions: list[dict[str, Any]] = []
+        for raw_item in payload.get("positions") or []:
+            if not isinstance(raw_item, Mapping):
+                continue
+            item = dict(raw_item)
+            if not isinstance(item.get("risk_policy"), Mapping):
+                item["risk_policy_id"] = RISK_POLICY_V1
+                item["risk_policy"] = risk_policy_snapshot(
+                    RISK_POLICY_V1,
+                    runtime_config,
+                )
+            else:
+                item["risk_policy_id"] = str(
+                    item.get("risk_policy_id")
+                    or item["risk_policy"].get("policy_id")
+                    or RISK_POLICY_V1
+                )
+            positions.append(item)
         manager = dict(payload.get("capital_manager") or {})
         if not manager:
             observed_wallet = _capital_wallet_balance(
@@ -2939,6 +3228,8 @@ class PumpLiveController:
                 "declared_note": "automatic migration to observe mode",
                 "declared_source": "migration",
             }
+        manager.setdefault("active_risk_policy_id", RISK_POLICY_V1)
+        manager.setdefault("policy_application_mode", "legacy")
         return {
             "schema": "pump_live_state_v1",
             "status": payload.get("status") or "disabled",
@@ -2946,7 +3237,7 @@ class PumpLiveController:
             "entry_armed": False,
             "armed_at_ms": payload.get("armed_at_ms"),
             "updated_at_ms": payload.get("updated_at_ms"),
-            "positions": list(payload.get("positions") or []),
+            "positions": positions,
             "seen_events": list(payload.get("seen_events") or []),
             "pending_signals": [],
             "last_preflight": payload.get("last_preflight"),
@@ -3445,6 +3736,10 @@ def build_capital_manager_status(
 ) -> dict[str, Any]:
     """Build the read-only capital-sizing recommendation shown during observation."""
     manager = dict(state.get("capital_manager") or {})
+    active_policy_id = str(manager.get("active_risk_policy_id") or RISK_POLICY_V1)
+    if active_policy_id not in {RISK_POLICY_V1, RISK_POLICY_V2}:
+        active_policy_id = RISK_POLICY_V1
+    active_policy = risk_policy_config(active_policy_id, config)
     balance = state.get("last_balance")
     wallet = _capital_wallet_balance(balance if isinstance(balance, Mapping) else {})
     adjustment = _safe_float(manager.get("equity_adjustment_usd"), 0.0)
@@ -3458,14 +3753,15 @@ def build_capital_manager_status(
         manager.get("active_strategy_capital_usd"),
         config.total_capital_usd,
     )
-    active_slot = config.slot_margin_usd
+    active_slot = active_policy.slot_margin_usd
     deployable_ratio = (
-        config.deployable_capital_usd / max(config.total_capital_usd, 1e-9)
+        active_policy.deployable_capital_usd
+        / max(active_policy.total_capital_usd, 1e-9)
     )
     raw_slot = (
         observed_capital
         * deployable_ratio
-        / max(config.max_active_positions, 1)
+        / max(active_policy.max_active_positions, 1)
     )
     recommended_slot = _round_down_increment(raw_slot, CAPITAL_SLOT_ROUND_USD)
     growth_threshold = active_capital * (1.0 + CAPITAL_GROWTH_TRIGGER_PCT / 100.0)
@@ -3501,10 +3797,19 @@ def build_capital_manager_status(
         elapsed_days >= CAPITAL_OBSERVATION_DAYS
         and observed_trades >= CAPITAL_OBSERVATION_TRADES
     )
+    closed_net_pnl = sum(
+        _safe_float(item.get("realized_pnl_usd"), 0.0)
+        for item in state.get("positions") or []
+        if item.get("status") == "closed"
+        and item.get("close_accounting_status") == "complete"
+    )
+    application_enabled = bool(manager.get("application_enabled"))
+    manager_mode = str(manager.get("mode") or "observe")
     return {
         **manager,
-        "mode": "observe",
-        "application_enabled": False,
+        "mode": manager_mode,
+        "application_enabled": application_enabled,
+        "active_risk_policy_id": active_policy_id,
         "account_wallet_usd": round(wallet, 6),
         "effective_strategy_capital_usd": round(observed_capital, 6),
         "active_strategy_capital_usd": round(active_capital, 6),
@@ -3523,6 +3828,17 @@ def build_capital_manager_status(
         "observation_elapsed_days": round(elapsed_days, 3),
         "observation_closed_trades": observed_trades,
         "observation_ready": observation_ready,
+        "closed_trade_net_pnl_usd": round(closed_net_pnl, 6),
+        "profit_deployable_target_usd": round(max(0.0, closed_net_pnl) * 0.70, 6),
+        "profit_reserve_target_usd": round(max(0.0, closed_net_pnl) * 0.30, 6),
+        "external_strategy_contribution_usd": round(
+            _safe_float(manager.get("external_strategy_contribution_usd"), 0.0),
+            6,
+        ),
+        "target_3000_external_required_usd": round(
+            max(0.0, 3_000.0 - observed_capital),
+            6,
+        ),
         "temporary_transfer_outstanding_usd": round(
             _safe_float(manager.get("temporary_transfer_outstanding_usd"), 0.0),
             6,
@@ -3543,6 +3859,11 @@ def build_capital_regime_status(
     config: PumpLiveConfig,
 ) -> dict[str, Any]:
     """Summarize current Pump cash/risk pressure without changing live state."""
+    manager = dict(state.get("capital_manager") or {})
+    policy_id = str(manager.get("active_risk_policy_id") or RISK_POLICY_V1)
+    if policy_id not in {RISK_POLICY_V1, RISK_POLICY_V2}:
+        policy_id = RISK_POLICY_V1
+    config = risk_policy_config(policy_id, config)
     open_positions = [
         item
         for item in state.get("positions") or []
@@ -3591,13 +3912,13 @@ def build_capital_regime_status(
         config,
         current_total_topup_usd=total_topup,
     )
-    manager = dict(state.get("capital_manager") or {})
     temporary_occupied = max(
         0.0,
         _safe_float(manager.get("temporary_transfer_outstanding_usd"), 0.0),
     )
     return {
         "mode": regime,
+        "active_risk_policy_id": policy_id,
         "open_positions": len(open_positions),
         "min_liq_buffer_pct": round(min_buffer, 6) if min_buffer is not None else None,
         "min_liq_buffer_symbol": min_symbol,

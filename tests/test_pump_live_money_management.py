@@ -109,4 +109,6 @@ def test_three_legacy_positions_can_only_use_versioned_gradual_3000_migration() 
     assert result["target_max_total_topup_usd"] == 825.0
     assert result["gradual_first_mixed_commitment_usd"] == 1950.0
     assert result["gradual_first_mixed_headroom_usd"] == 1050.0
-    assert result["current_runtime_supports_mixed_cohorts"] is False
+    assert result["current_runtime_supports_mixed_cohorts"] is True
+    assert result["runtime_policy_ids"] == ["v1_1000", "v2_3000"]
+    assert result["initial_v2_concurrent_entry_cap"] == 1
