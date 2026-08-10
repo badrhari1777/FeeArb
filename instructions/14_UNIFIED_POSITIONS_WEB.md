@@ -69,3 +69,19 @@ accidentally to another.
   the unified endpoint.
 - The detailed page refreshes every 15 seconds and has an explicit refresh
   button.
+
+## Deployment checkpoint: 2026-08-10
+
+Commit `b4151b0` was loaded by a supervised backend restart using the canonical
+Windows stop script and the `FeeArb Public UI (Tailscale Funnel)` scheduled
+task. Before restart there were no active Manual/Grid executions. Pump Live
+recovered two owned positions (`1000RATSUSDT`, `BLUAIUSDT`) in monitoring mode
+with entries disarmed, both TP/SL pairs visible, no monitor error, and three
+clean 15-second cycles. Do not infer ARM from this deployment checkpoint; the
+active `v2_3000` policy still requires explicit `ARM PUMP LIVE 3000`.
+
+Fresh TUT validation after deployment showed current exposures near
+`$1222.30 / $1230.73` while KuCoin's diagnostic entry-like native notional
+remained near `$1722.09`. The signed next-funding estimates were approximately
+`-$0.332 / +$1.264`, or `+$0.931` net for the next venue payments at that
+snapshot.

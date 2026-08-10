@@ -106,6 +106,14 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Commit `b4151b0` was deployed by supervised FeeArb backend restart on
+  2026-08-10. Preflight had zero active Manual/Grid executions. Pump Live
+  recovered owned `1000RATSUSDT` and `BLUAIUSDT` positions in monitoring mode
+  with entries disarmed, visible TP/SL, no last error, no portfolio risk freeze,
+  and three clean 15-second cycles; `v2_3000` remains intentionally unarmed
+  until explicit `ARM PUMP LIVE 3000`. Fresh TUT API output used current
+  exposures near `$1222 / $1231`, kept KuCoin native `$1722` diagnostic-only,
+  and estimated the next signed funding near `-$0.332 / +$1.264`.
 - Main-position valuation was normalized across every supported exchange on
   2026-08-10 after the TUT Binance/KuCoin view mixed Binance current Mark
   notional with KuCoin entry `posCost`. Public Main rows now calculate
