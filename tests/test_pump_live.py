@@ -727,6 +727,21 @@ def test_existing_multi_order_ladder_is_migrated_to_only_next_live(
     assert item["ladder_gate_status"] == "ready"
     assert item["ladder_gate_step"] == 3
 
+    # A concurrent legacy monitor may observe the confirmed cancellations
+    # before the new controller persists `planned`. Durable gate events are the
+    # only authority allowed to restore those exact legs.
+    for leg, old_order_id in zip(item["legs"][3:], ("l4", "l5"), strict=True):
+        leg.update(
+            {
+                "status": "canceled",
+                "order_id": old_order_id,
+                "error": "ladder_order_no_longer_open",
+            }
+        )
+    recovered = controller.run_cycle()["positions"][0]
+    assert [leg["status"] for leg in recovered["legs"][3:]] == ["planned", "planned"]
+    assert [leg["order_id"] for leg in recovered["legs"][3:]] == [None, None]
+
 
 def test_legacy_position_uses_active_v2_margin_envelope_for_next_step(
     tmp_path: Path,

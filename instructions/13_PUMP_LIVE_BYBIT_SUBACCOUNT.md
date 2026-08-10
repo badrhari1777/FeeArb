@@ -719,6 +719,10 @@ position and disarms entries for a clean next cycle. If the calculated margin
 cannot fit the position/portfolio envelope or cannot be confirmed, the next
 ladder is cancelled/deferred, Full TP/SL remains active, monitoring continues,
 and entries stay fail-closed with `next_ladder_margin_not_confirmed`.
+If a concurrently finishing legacy monitor overwrites an already-confirmed
+gate cancellation as generic `ladder_order_lost`, only the exact durable
+`symbol + step + old_order_id` gate event may restore that leg to `planned`;
+unexplained operator/exchange cancellations are never recreated automatically.
 
 Entry notional remains cohort-immutable: legacy `v1_1000` positions keep their
 original `$175` ladder plan. Margin defence is different from entry sizing: an

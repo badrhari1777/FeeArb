@@ -117,7 +117,9 @@ Recent Changes
   required to put the Full catastrophic stop at least `2.5%` beyond the next
   trigger, and that next order is submitted only after exchange verification
   and TP/SL resync. Existing multi-order ladders are cancelled back to one-live
-  form with fill-race handling. Legacy `$175` entry plans remain immutable but
+  form with fill-race handling. An exact durable gate event can recover a
+  cancellation concurrently overwritten as legacy `ladder_order_lost`, while
+  unexplained cancellations remain fail-closed. Legacy `$175` entry plans remain immutable but
   may use the active v2 `$525` defence ceiling inside the shared `$825` cap and
   `$75` floor; a cash-only shortage can invoke the guarded main transfer. The
   obsolete one-v2-position gate is replaced by actual four-slot cash/top-up

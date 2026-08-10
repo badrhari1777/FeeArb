@@ -3022,6 +3022,7 @@ class PumpLiveController:
         legs = list(item.get("legs") or [])
         if len(legs) < 2:
             return
+        self._restore_gate_deferred_legs(item, legs)
         active = [
             leg
             for leg in legs[1:]
@@ -3126,6 +3127,44 @@ class PumpLiveController:
             item["margin_continuation_policy_id"] = self._active_policy_id()
             item["updated_at_ms"] = _now_ms()
             self._save_state_locked()
+
+    def _restore_gate_deferred_legs(
+        self,
+        item: dict[str, Any],
+        legs: list[dict[str, Any]],
+    ) -> None:
+        candidates = [
+            leg
+            for leg in legs[1:]
+            if leg.get("status") in {"canceled", "cancelled", "rejected"}
+            and leg.get("error") == "ladder_order_no_longer_open"
+            and leg.get("order_id")
+        ]
+        if not candidates:
+            return
+        symbol = _normalize_symbol(item.get("symbol"))
+        deferred = {
+            (
+                _normalize_symbol(event.get("symbol")),
+                _safe_int(event.get("step"), 0),
+                str(event.get("old_order_id") or ""),
+            )
+            for event in _read_latest_jsonl(self.events_path, limit=500)
+            if event.get("event") == "ladder_deferred_until_margin_ready"
+        }
+        for leg in candidates:
+            key = (
+                symbol,
+                _safe_int(leg.get("step"), 0),
+                str(leg.get("order_id") or ""),
+            )
+            if key not in deferred:
+                continue
+            self._reset_ladder_to_planned(
+                item,
+                leg,
+                reason="deferred_event_state_recovery",
+            )
 
     def _verify_entry_prefund_target(
         self,
