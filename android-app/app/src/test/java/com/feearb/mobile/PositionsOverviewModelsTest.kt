@@ -25,7 +25,27 @@ class PositionsOverviewModelsTest {
               },
               "main": {
                 "status": "ready",
-                "positions": [{"symbol": "BTCUSDT", "pair_label": "BYBIT / BINANCE"}]
+                "positions": [{
+                  "symbol": "BTCUSDT",
+                  "pair_label": "BYBIT / BINANCE",
+                  "expected_funding": 0.42,
+                  "position_summary": {
+                    "current_exposure_usdt": 1282.14,
+                    "gross_current_exposure_usdt": 2551.76,
+                    "entry_exposure_usdt": 1638.44,
+                    "gross_entry_exposure_usdt": 3360.53
+                  },
+                  "legs": [{
+                    "exchange": "kucoin",
+                    "current_notional": 1282.14,
+                    "entry_notional": 1722.09,
+                    "exchange_notional": 1722.09,
+                    "current_mark_price": 0.16982,
+                    "mark_price_source": "position",
+                    "valuation_status": "current",
+                    "expected_funding": 0.21
+                  }]
+                }]
               },
               "pump": {
                 "status": "armed",
@@ -102,6 +122,10 @@ class PositionsOverviewModelsTest {
         assertEquals("normal", result.pump.capital_regime.mode)
         assertTrue(result.pump.auto_transfer.enabled)
         assertEquals(185.0, result.pump.auto_transfer.daily_remaining_usd ?: 0.0, 0.0001)
+        assertEquals(1282.14, result.main.positions.single().position_summary.current_exposure_usdt ?: 0.0, 0.0001)
+        assertEquals(2551.76, result.main.positions.single().position_summary.gross_current_exposure_usdt ?: 0.0, 0.0001)
+        assertEquals(1282.14, result.main.positions.single().legs.single().current_notional ?: 0.0, 0.0001)
+        assertEquals("current", result.main.positions.single().legs.single().valuation_status)
         assertEquals("DEXEUSDT", result.pump.positions.single().symbol)
         assertEquals(31.5, result.pump.positions.single().liq_buffer_pct ?: 0.0, 0.0001)
         assertEquals("filled", result.pump.positions.single().legs.single().status)

@@ -843,15 +843,15 @@
             <th>Symbol</th>
             <th>Exchange</th>
             <th>Quantity</th>
-            <th title="Amount (USDT)"><span class="th-wrap">Amount<br>(USDT)</span></th>
+            <th title="Current position exposure: absolute coin quantity multiplied by the current Mark Price"><span class="th-wrap">Position now<br>(USDT)</span></th>
             <th>Entry</th>
             <th>Mark</th>
             <th>PnL</th>
             <th><span class="th-wrap">Liq<br>Price</span></th>
             <th><span class="th-wrap">Liq<br>Dist %</span></th>
             <th>Lev.</th>
-            <th>Funding</th>
-            <th><span class="th-wrap">Exp.<br>Funding</span></th>
+            <th title="Funding rate for the venue funding interval">Funding / period</th>
+            <th title="Estimated next funding payment from the current Mark Price position value"><span class="th-wrap">Next funding<br>(USDT)</span></th>
             <th><span class="th-wrap">Stop<br>Price</span></th>
             <th><span class="th-wrap">Take<br>Price</span></th>
             <th><span class="th-wrap">Next<br>Funding</span></th>
@@ -881,9 +881,9 @@
               <td>{{ row.symbol }}</td>
               <td>{{ row.exchange or "-" }}</td>
               <td>{{ row.quantity }}</td>
-              <td>{{ row.amount or "-" }}</td>
+              <td>{{ row.amount | round(2) if row.amount is not none else "-" }}</td>
               <td>{{ row.entry_price or "-" }}</td>
-              <td>{{ row.mark_price or "-" }}</td>
+              <td>{{ row.current_mark_price if row.type != 'summary' and row.current_mark_price is defined and row.current_mark_price is not none else (row.mark_price or "-") if row.type == 'summary' else "-" }}</td>
               <td>{{ row.unrealized_pnl or "-" }}</td>
               <td>{{ row.liquidation_price if row.liquidation_price is not none else "-" }}</td>
               <td>
@@ -896,14 +896,14 @@
               <td>{{ row.leverage if row.leverage is not none else "-" }}</td>
               <td>
                 {% if row.funding_rate is not none %}
-                  {{ ((row.funding_rate or 0) * 100) | round(4) }}%
+                  {{ ((row.funding_rate or 0) * 100) | round(4) }}%{% if row.funding_interval_hours is defined and row.funding_interval_hours %} / {{ row.funding_interval_hours | round(2) }}h{% endif %}
                 {% else %}
                   -
                 {% endif %}
               </td>
               <td>
                 {% if row.expected_funding is defined and row.expected_funding is not none %}
-                  {{ row.expected_funding | round(6) }}
+                  {{ row.expected_funding | round(3) }}
                 {% else %}
                   -
                 {% endif %}

@@ -547,7 +547,131 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(card["auto_exit"]["exit_percent"], 100.0)
         self.assertAlmostEqual(card["position_summary"]["hedged_quantity"], 1.0)
         self.assertAlmostEqual(card["position_summary"]["imbalance_quantity"], 0.0)
+        self.assertAlmostEqual(card["position_summary"]["current_exposure_usdt"], 98.0)
+        self.assertAlmostEqual(card["position_summary"]["gross_current_exposure_usdt"], 199.0)
+        self.assertAlmostEqual(card["position_summary"]["entry_exposure_usdt"], 99.0)
+        self.assertAlmostEqual(card["position_summary"]["gross_entry_exposure_usdt"], 199.0)
+        self.assertAlmostEqual(card["expected_funding"], 0.0095)
         self.assertEqual(len(card["legs"]), 2)
+
+    def test_position_valuation_is_exchange_neutral_for_all_supported_venues(self) -> None:
+        service = DataService(settings_manager=self.manager)
+        next_funding = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
+        venues = (
+            ("binance", 100.0, 1.0),
+            ("bybit", 100.0, 1.0),
+            ("kucoin", 10.0, 10.0),
+            ("okx", 20.0, 5.0),
+            ("gate", 1000.0, 0.1),
+            ("bitget", 100.0, 1.0),
+            ("mexc", 200.0, 0.5),
+            ("bingx", 100.0, 1.0),
+        )
+
+        for exchange, contracts, contract_size in venues:
+            with self.subTest(exchange=exchange):
+                rows, grouped = service._positions_by_symbol(  # type: ignore[attr-defined]
+                    [
+                        {
+                            "exchange": exchange,
+                            "symbol": "LABUSDT",
+                            "symbol_normalized": "LABUSDT",
+                            "side": "long",
+                            "contracts": contracts,
+                            "contract_size": contract_size,
+                            "notional": 9999.0,
+                            "entry_price": 2.0,
+                            "mark_price": 1.25,
+                            "funding_rate": 0.01,
+                            "funding_interval_hours": 4.0,
+                            "next_funding": next_funding,
+                        }
+                    ],
+                    return_grouped=True,
+                )
+                leg = grouped["LABUSDT"][0]
+                self.assertAlmostEqual(leg["amount"], 125.0)
+                self.assertAlmostEqual(leg["current_notional"], 125.0)
+                self.assertAlmostEqual(leg["entry_notional"], 200.0)
+                self.assertAlmostEqual(leg["exchange_notional"], 9999.0)
+                self.assertAlmostEqual(leg["expected_funding"], -1.25)
+                self.assertEqual(leg["valuation_status"], "current")
+                self.assertEqual(leg["mark_price_source"], "position")
+                self.assertAlmostEqual(leg["funding_interval_hours"], 4.0)
+                self.assertEqual(rows[0]["exchange"], exchange)
+
+    def test_position_valuation_is_unavailable_without_real_mark_price(self) -> None:
+        service = DataService(settings_manager=self.manager)
+        next_funding = (datetime.now(timezone.utc) + timedelta(hours=8)).isoformat()
+
+        _rows, grouped = service._positions_by_symbol(  # type: ignore[attr-defined]
+            [
+                {
+                    "exchange": "kucoin",
+                    "symbol": "LABUSDT",
+                    "symbol_normalized": "LABUSDT",
+                    "side": "short",
+                    "contracts": 10.0,
+                    "contract_size": 10.0,
+                    "notional": 200.0,
+                    "entry_price": 2.0,
+                    "mark_price": None,
+                    "funding_rate": -0.01,
+                    "next_funding": next_funding,
+                }
+            ],
+            return_grouped=True,
+        )
+
+        leg = grouped["LABUSDT"][0]
+        self.assertIsNone(leg["current_notional"])
+        self.assertIsNone(leg["current_mark_price"])
+        self.assertIsNone(leg["expected_funding"])
+        self.assertEqual(leg["entry_notional"], 200.0)
+        self.assertEqual(leg["exchange_notional"], 200.0)
+        self.assertEqual(leg["valuation_status"], "unavailable")
+
+    def test_tut_native_cost_mismatch_normalizes_to_current_mark_exposure(self) -> None:
+        service = DataService(settings_manager=self.manager)
+        next_funding = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        rows, grouped = service._positions_by_symbol(  # type: ignore[attr-defined]
+            [
+                {
+                    "exchange": "binance",
+                    "symbol": "TUTUSDT",
+                    "side": "long",
+                    "contracts": 7520.0,
+                    "contract_size": 1.0,
+                    "notional": 1269.61664,
+                    "entry_price": 0.217877,
+                    "mark_price": 0.168832,
+                    "funding_rate": 0.001,
+                    "next_funding": next_funding,
+                },
+                {
+                    "exchange": "kucoin",
+                    "symbol": "TUTUSDT",
+                    "side": "short",
+                    "contracts": 755.0,
+                    "contract_size": 10.0,
+                    "notional": 1722.0795,
+                    "entry_price": 0.22809,
+                    "mark_price": 0.16982,
+                    "funding_rate": 0.001,
+                    "next_funding": next_funding,
+                },
+            ],
+            return_grouped=True,
+        )
+
+        legs = {leg["exchange"]: leg for leg in grouped["TUTUSDT"]}
+        self.assertAlmostEqual(legs["binance"]["current_notional"], 1269.61664)
+        self.assertAlmostEqual(legs["kucoin"]["current_notional"], 1282.141)
+        self.assertAlmostEqual(legs["kucoin"]["entry_notional"], 1722.0795)
+        self.assertAlmostEqual(legs["kucoin"]["exchange_notional"], 1722.0795)
+        summary = next(row for row in rows if row["type"] == "summary")
+        self.assertAlmostEqual(summary["expected_funding"], 0.01252436)
+        self.assertAlmostEqual(summary["imbalance_pct"], 30.0 / 7520.0 * 100.0)
 
     def test_position_pair_quantities_uses_smaller_coin_leg(self) -> None:
         quantities = _position_pair_quantities(

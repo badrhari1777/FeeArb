@@ -106,6 +106,18 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Main-position valuation was normalized across every supported exchange on
+  2026-08-10 after the TUT Binance/KuCoin view mixed Binance current Mark
+  notional with KuCoin entry `posCost`. Public Main rows now calculate
+  `current_notional = abs(base coin quantity) * current Mark Price`, retain
+  separate entry/native exchange notionals for explanation, and calculate the
+  signed next-funding USDT estimate from the current value. Missing real Mark
+  Price remains unavailable instead of presenting entry value as current.
+  Hedge balance and position actions remain quantity-based. The web tables now
+  label current exposure and funding period/payment explicitly; Android
+  `0.4.1` / code `5` consumes the same backend values and exposes current vs
+  entry exposure. Universal regression covers Binance, Bybit, KuCoin, OKX,
+  Gate, Bitget, MEXC, and BingX.
 - Pump Live monitoring became risk-first on 2026-08-10. Fresh exchange state
   now freezes and clears stale entries before maintenance when any position is
   not fully open, lacks a liquidation buffer, or is at/below `20%`; positions

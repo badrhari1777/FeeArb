@@ -1613,10 +1613,18 @@
         : formatNumber(row.entry_price, 6);
       var markText = isSummary
         ? (row.mark_price !== null && row.mark_price !== undefined ? formatNumber(row.mark_price, 2) + '%' : '-')
-        : formatNumber(row.mark_price, 6);
+        : formatNumber(
+            row.current_mark_price !== null && row.current_mark_price !== undefined
+              ? row.current_mark_price
+              : null,
+            6
+          );
       var fundingText = row.funding_rate !== null && row.funding_rate !== undefined
         ? formatPercent(row.funding_rate, 4)
         : '-';
+      if (!isSummary && fundingText !== '-' && row.funding_interval_hours !== null && row.funding_interval_hours !== undefined) {
+        fundingText += ' / ' + formatTrimmedNumber(row.funding_interval_hours, 2) + 'h';
+      }
       var liqPriceText = isSummary ? '-' : formatNumber(row.liquidation_price, 4);
       var liqDistText = row.dist_to_liq_pct !== null && row.dist_to_liq_pct !== undefined
         ? formatNumber(row.dist_to_liq_pct, 3) + '%'

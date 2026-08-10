@@ -47,6 +47,22 @@ accidentally to another.
 ## Data and Safety Rules
 
 - Exchange-side position data remains authoritative.
+- Main-position dollar valuation is exchange-neutral on every supported venue
+  (Binance, Bybit, KuCoin, OKX, Gate, Bitget, MEXC, and BingX):
+  `current_notional = abs(base_coin_quantity) * current_mark_price`.
+- Native exchange fields such as `notional`, `posCost`, and `value` are not
+  interchangeable. They remain available as `exchange_notional` for
+  diagnostics but are never presented as the current position value.
+- `entry_notional` is calculated separately from the entry price. The public
+  `amount` field remains as a compatibility alias for `current_notional`.
+- Estimated next funding in USDT uses the same current notional. A positive
+  value means expected receipt and a negative value means expected payment for
+  that leg. When the venue interval is known, the rate is displayed together
+  with its period (for example, `0.01% / 8h`).
+- If no real Mark Price is available, current notional and estimated funding
+  stay unavailable. Entry price is not silently presented as current value.
+- Hedge balance continues to use base-coin quantities, not dollar notionals;
+  differing venue prices must not create a false quantity rebalance.
 - Main and Pump freshness ages are shown independently.
 - Missing TP/SL visibility is a protection issue, not silently treated as OK.
 - Pump API credentials and key identity/preflight details are not included in

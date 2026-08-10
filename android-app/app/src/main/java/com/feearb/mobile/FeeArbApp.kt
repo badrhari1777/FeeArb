@@ -904,7 +904,7 @@ private fun PositionCard(
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
                 MetricBlock("Hedged qty", formatNumber(card.position_summary.hedged_quantity), Modifier.weight(1f))
                 MetricBlock("Net PnL", formatSigned(card.net_pnl), Modifier.weight(1f))
-                MetricBlock("Exp. funding", formatSigned(card.expected_funding), Modifier.weight(1f))
+                MetricBlock("Next funding USDT", formatSigned(card.expected_funding), Modifier.weight(1f))
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
                 MetricBlock("Enter spread", formatPercent(card.position_summary.pair_entry_spread_pct), Modifier.weight(1f))
@@ -915,6 +915,11 @@ private fun PositionCard(
                 MetricBlock("Live spread", formatPercent(card.live_spread_pct), Modifier.weight(1f))
                 MetricBlock("Long qty", formatNumber(card.position_summary.long_quantity), Modifier.weight(1f))
                 MetricBlock("Short qty", formatNumber(card.position_summary.short_quantity), Modifier.weight(1f))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
+                MetricBlock("Current exposure", formatNumber(card.position_summary.current_exposure_usdt), Modifier.weight(1f))
+                MetricBlock("Gross current", formatNumber(card.position_summary.gross_current_exposure_usdt), Modifier.weight(1f))
+                MetricBlock("Imbalance", formatPercent(card.position_summary.imbalance_pct), Modifier.weight(1f))
             }
             HorizontalDivider()
             Text("Position size", style = MaterialTheme.typography.labelLarge)
@@ -1011,8 +1016,10 @@ private fun PositionCard(
                         KeyValue("Long quantity", formatNumber(card.position_summary.long_quantity))
                         KeyValue("Short quantity", formatNumber(card.position_summary.short_quantity))
                         KeyValue("Imbalance quantity", formatNumber(card.position_summary.imbalance_quantity))
-                        KeyValue("Amount USDT", formatNumber(card.position_summary.amount_usdt))
-                        KeyValue("Gross amount", formatNumber(card.position_summary.gross_amount_usdt))
+                        KeyValue("Current exposure USDT", formatNumber(card.position_summary.current_exposure_usdt))
+                        KeyValue("Gross current exposure", formatNumber(card.position_summary.gross_current_exposure_usdt))
+                        KeyValue("Entry exposure USDT", formatNumber(card.position_summary.entry_exposure_usdt))
+                        KeyValue("Gross entry exposure", formatNumber(card.position_summary.gross_entry_exposure_usdt))
                         KeyValue("Entry spread", formatPercent(card.position_summary.pair_entry_spread_pct))
                         KeyValue("Mark spread", formatPercent(card.position_summary.pair_mark_spread_pct))
                     }
@@ -1025,7 +1032,7 @@ private fun PositionCard(
                     }
                     SectionCard("Funding") {
                         KeyValue("Net funding", formatPercent(card.funding.net_funding_rate?.times(100.0)))
-                        KeyValue("Expected funding", formatSigned(card.funding.expected_funding))
+                        KeyValue("Next funding USDT", formatSigned(card.funding.expected_funding))
                         KeyValue("Next funding", formatMinutes(card.funding.minutes_to_next_funding))
                     }
                     SectionCard("More") {
@@ -1039,9 +1046,12 @@ private fun PositionCard(
                             KeyValue("Exchange", (leg.exchange ?: "-").uppercase())
                             KeyValue("Side", leg.side ?: "-")
                             KeyValue("Qty", formatNumber(leg.quantity?.absoluteValue))
+                            KeyValue("Current exposure USDT", formatNumber(leg.current_notional))
+                            KeyValue("Entry exposure USDT", formatNumber(leg.entry_notional))
                             KeyValue("Entry", formatNumber(leg.entry_price))
-                            KeyValue("Mark", formatNumber(leg.mark_price))
+                            KeyValue("Current mark", formatNumber(leg.current_mark_price))
                             KeyValue("PnL", formatSigned(leg.unrealized_pnl))
+                            KeyValue("Next funding USDT", formatSigned(leg.expected_funding))
                             KeyValue("Leverage", formatNumber(leg.leverage))
                         }
                     }

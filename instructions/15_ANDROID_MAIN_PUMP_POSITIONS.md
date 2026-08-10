@@ -76,7 +76,22 @@
 - API overview не передаёт Android-приложению ключи, секреты, UID или
   preflight identity.
 
-## Balance view (Android 0.4.0)
+## Main position valuation (Android 0.4.1)
+
+Android consumes the same backend position contract as the web dashboard; it
+does not recalculate venue notionals locally. Main cards and details show:
+
+- hedged and gross current exposure at current Mark Prices;
+- separate hedged and gross entry exposure;
+- per-leg current/entry exposure and current Mark Price;
+- signed estimated next funding in USDT.
+
+The universal calculation and unavailable-Mark behavior are defined in
+`instructions/14_UNIFIED_POSITIONS_WEB.md`. Position actions still use
+base-coin quantities, so this presentation correction does not resize or
+rebalance an open hedge.
+
+## Balance view (Android 0.4.0+)
 
 The `Balances` tab uses `GET /api/mobile/positions` as its single read-only
 source and includes the Pump Live subaccount without mixing trading ownership:

@@ -12358,9 +12358,13 @@ class DataService:
                 return None
             return total_value / total_weight
 
-        def _pair_amount_usdt(longs: list[Mapping[str, Any]], shorts: list[Mapping[str, Any]]) -> float | None:
-            long_total = sum(abs(_safe_float(item.get("amount")) or 0.0) for item in longs)
-            short_total = sum(abs(_safe_float(item.get("amount")) or 0.0) for item in shorts)
+        def _pair_amount_usdt(
+            longs: list[Mapping[str, Any]],
+            shorts: list[Mapping[str, Any]],
+            key: str = "current_notional",
+        ) -> float | None:
+            long_total = sum(abs(_safe_float(item.get(key)) or 0.0) for item in longs)
+            short_total = sum(abs(_safe_float(item.get(key)) or 0.0) for item in shorts)
             if long_total > 0 and short_total > 0:
                 return min(long_total, short_total)
             gross = long_total + short_total
@@ -12479,6 +12483,7 @@ class DataService:
                 default=0.0,
             )
             pair_amount = _pair_amount_usdt(longs, shorts)
+            pair_entry_amount = _pair_amount_usdt(longs, shorts, key="entry_notional")
             selected_long_exchange = normalize_exchange_name(
                 str((selected_pair or {}).get("long_exchange") or row.get("long_exchange") or "")
             )
@@ -12530,7 +12535,17 @@ class DataService:
                         "imbalance_quantity": imbalance_quantity,
                         "imbalance_pct": imbalance_pct,
                         "amount_usdt": pair_amount,
-                        "gross_amount_usdt": sum(abs(_safe_float(leg.get("amount")) or 0.0) for leg in legs) or None,
+                        "gross_amount_usdt": sum(
+                            abs(_safe_float(leg.get("current_notional")) or 0.0) for leg in legs
+                        ) or None,
+                        "current_exposure_usdt": pair_amount,
+                        "gross_current_exposure_usdt": sum(
+                            abs(_safe_float(leg.get("current_notional")) or 0.0) for leg in legs
+                        ) or None,
+                        "entry_exposure_usdt": pair_entry_amount,
+                        "gross_entry_exposure_usdt": sum(
+                            abs(_safe_float(leg.get("entry_notional")) or 0.0) for leg in legs
+                        ) or None,
                         "pair_entry_spread_pct": _safe_float(row.get("entry_price")),
                         "pair_mark_spread_pct": _safe_float(row.get("mark_price")),
                         "long_entry_avg": _safe_float(row.get("long_entry_avg")),
@@ -13716,7 +13731,7 @@ class DataService:
             funding_rate = None
             next_funding_iso = None
             signed_coin = -coin_qty if side == "short" else coin_qty
-            notional = float(entry.get("notional") or 0.0)
+            exchange_notional = abs(float(entry.get("notional") or 0.0)) or None
             funding_rate = _safe_float(entry.get("funding_rate") or entry.get("fundingRate"))
             next_funding_iso = (
                 entry.get("next_funding")
@@ -13736,7 +13751,7 @@ class DataService:
             exchange_name = str(entry.get("exchange") or "").lower()
             snapshot = None
             snapshot_ts = None
-            funding_interval_hours = None
+            funding_interval_hours = _safe_float(entry.get("funding_interval_hours"))
             for sym in lookup_symbols:
                 key = (exchange_name, sym)
                 snapshot = market_lookup.get(key)
@@ -13745,6 +13760,7 @@ class DataService:
                     break
             entry_price = entry.get("entry_price")
             mark_price = entry.get("mark_price")
+            mark_price_source = "position" if _safe_float(mark_price) not in (None, 0) else None
             unrealized = entry.get("unrealized_pnl")
             snapshot_funding_stale = False
             if snapshot:
@@ -13776,6 +13792,7 @@ class DataService:
                     mark_val = _safe_float(mark_price)
                     if mark_val is None or mark_val == 0:
                         mark_price = snap_mark
+                        mark_price_source = "positions_market"
                     elif exchange_name == "bingx":
                         try:
                             delta_pct = abs(snap_mark - mark_val) / abs(mark_val) * 100.0
@@ -13783,6 +13800,7 @@ class DataService:
                             delta_pct = None
                         if delta_pct is None or delta_pct >= 0.1:
                             mark_price = snap_mark
+                            mark_price_source = "positions_market"
             needs_live = funding_rate is None or next_funding_iso is None or snapshot_funding_stale
             if needs_live:
                 rate_live, next_live, mark_live = self._funding_live(
@@ -13797,6 +13815,7 @@ class DataService:
                     next_funding_iso = next_live
                 if mark_price is None and mark_live is not None:
                     mark_price = mark_live
+                    mark_price_source = "funding_live"
             if (
                 unrealized is None
                 and entry_price is not None
@@ -13825,6 +13844,14 @@ class DataService:
                     funding_rate = float(funding_rate)
             except Exception:  # pylint: disable=broad-except
                 funding_rate = None
+            current_mark_price = _safe_float(mark_price)
+            current_notional = None
+            if current_mark_price is not None and current_mark_price > 0 and abs(coin_qty) > 0:
+                current_notional = abs(coin_qty) * current_mark_price
+            entry_notional = None
+            entry_price_value = _safe_float(entry_price)
+            if entry_price_value is not None and entry_price_value > 0 and abs(coin_qty) > 0:
+                entry_notional = abs(coin_qty) * entry_price_value
             if mark_price is None and entry_price is not None:
                 # Fallback to entry so we at least display and compute PnL as 0.
                 mark_price = entry_price
@@ -13841,9 +13868,19 @@ class DataService:
                     "exchange": entry.get("exchange"),
                     "side": side or None,
                     "quantity": signed_coin,
-                    "amount": abs(notional) if notional else None,
+                    # Public position valuation is deliberately exchange-neutral:
+                    # base-asset quantity multiplied by the current Mark Price.
+                    # Native venue fields such as KuCoin posCost and Binance
+                    # notional do not share the same meaning and remain diagnostic.
+                    "amount": current_notional,
+                    "current_notional": current_notional,
+                    "entry_notional": entry_notional,
+                    "exchange_notional": exchange_notional,
+                    "valuation_status": "current" if current_notional is not None else "unavailable",
+                    "mark_price_source": mark_price_source,
                     "entry_price": entry_price,
                     "mark_price": mark_price,
+                    "current_mark_price": current_mark_price,
                     "unrealized_pnl": unrealized,
                     "funding_rate": funding_rate,
                     "funding_interval_hours": funding_interval_hours,
@@ -13859,10 +13896,10 @@ class DataService:
                     "expected_funding": (
                         (
                             (funding_rate or 0.0)
-                            * (abs(notional) if notional else 0.0)
+                            * current_notional
                             * (-1.0 if side == "long" else 1.0)
                         )
-                        if funding_rate is not None and notional
+                        if funding_rate is not None and current_notional is not None
                         else None
                     ),
                 }

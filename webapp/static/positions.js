@@ -116,7 +116,7 @@
       return;
     }
     if (!positions.length) {
-      body.innerHTML = '<tr><td colspan="9" class="muted">No open positions in the main module.</td></tr>';
+      body.innerHTML = '<tr><td colspan="10" class="muted">No open positions in the main module.</td></tr>';
       return;
     }
     body.innerHTML = positions.map(function (card) {
@@ -130,6 +130,7 @@
         '<td>' + esc(exchanges) + '</td>' +
         '<td class="' + pnlClass + '">' + money(pnl) + '</td>' +
         '<td>' + money(summary.amount_usdt) + '</td>' +
+        '<td>' + money(card.expected_funding) + '</td>' +
         '<td>' + (card.live_spread_pct === null || card.live_spread_pct === undefined ? '-' : number(card.live_spread_pct, 3) + '%') + '</td>' +
         '<td>' + (card.liq_distance_pct === null || card.liq_distance_pct === undefined ? '-' : number(card.liq_distance_pct, 2) + '%') + '</td>' +
         '<td>' + esc(protectionText(card)) + '</td>' +

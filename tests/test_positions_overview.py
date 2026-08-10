@@ -190,3 +190,5 @@ class PositionsOverviewApiTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn('data-positions-tab="main"', body)
         self.assertIn('data-positions-tab="pump"', body)
         self.assertIn('href="/positions"', body)
+        self.assertIn("Position now", body)
+        self.assertIn("Next funding", body)
