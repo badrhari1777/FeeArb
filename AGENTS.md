@@ -118,6 +118,11 @@ Recent Changes
   and a fresh scanner event is required. Profitable-donor execution remains
   shadow-only pending a separate micro-canary. Targeted Pump/transfer/API tests
   passed (`95`); the complete suite passed (`681`, `11 warnings`).
+  Commit `7e60848` was deployed after a clean Pump/Grid/Manual preflight.
+  Restart disarmed entries; v2 ARM passed tracked-position verification, and
+  three cycles stayed armed/error-free with two v1 positions, ten orders, no
+  freeze/pending signal and `72.22..72.26%` minimum buffer. No v2 position
+  opened during observation.
 - Pump Live completed the operator-authorized `$3000` migration on 2026-08-10.
   A fresh no-position/no-transition main-account gate permitted a real `$2000`
   main -> Pump transfer. The controller capitalized exactly `$1912.195164`,

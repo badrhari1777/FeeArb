@@ -18,6 +18,11 @@ then only fresh scanner signals are eligible. Operator/restart/emergency/hard
 error disarms stay manual. Profit-harvest donor execution remains shadow-only.
 Verified with the targeted Pump/transfer/API set (`95 passed`) and the complete
 Python regression (`681 passed`, `11 warnings`).
+Commit `7e60848` was deployed from a clean `CALM` preflight with no Pump
+signal/transfer, Grid transition, or Manual execution pending. Restart was
+fail-closed; explicit v2 ARM verified the two legacy positions and ten orders.
+Three following cycles stayed armed/error-free with no risk freeze and minimum
+buffer `72.22..72.26%`; no v2 entry opened.
 
 ## Objective
 

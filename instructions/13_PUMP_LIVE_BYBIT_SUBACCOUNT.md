@@ -673,3 +673,12 @@ blocked -> close the threatened position reduce-only at the emergency boundary.
 Automatic donor reduction remains disabled and requires its separate approved
 micro-canary. Targeted Pump/transfer/API regression passed (`95` tests), and
 the complete Python suite passed (`681 passed`, `11 warnings`).
+
+Deployment evidence: commit `7e60848` was deployed only after confirming Pump
+`CALM`, zero pending signals/transfers, zero Grid executions/transitions and
+zero running Manual executions. The restart recovered two immutable v1
+positions and ten orders with entries disarmed. `ARM PUMP LIVE 3000` passed
+`tracked_positions_verified`; three complete risk-first cycles then remained
+armed with no blocked reason/error, no active freeze, zero pending signals and
+minimum liquidation buffer `72.22..72.26%`. No v2 position opened during the
+deployment observation.
