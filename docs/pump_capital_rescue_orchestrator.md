@@ -2,6 +2,23 @@
 
 Status: staged implementation, 2026-08-09.
 
+Runtime-order update, 2026-08-10: the live controller is now risk-first. Fresh
+exchange positions are reconciled and a portfolio entry freeze is established
+before any pending entry can execute. A position at/below `20%`, an unavailable
+liquidation buffer, or a tracked position not fully `open` clears stale pending
+signals and keeps entries disabled while normal protection/top-up/transfer
+handling continues. Positions are maintained lowest-buffer first. Entry
+admission, when still permitted, runs afterward with freshly fetched balance,
+positions and orders.
+
+Only a freeze that interrupted an armed healthy state can recover
+automatically. Recovery requires two consecutive cycles with every position
+strictly above `35%`, exchange-present, `open`, and carrying confirmed TP/SL;
+then only fresh scanner signals are eligible. Operator/restart/emergency/hard
+error disarms stay manual. Profit-harvest donor execution remains shadow-only.
+Verified with the targeted Pump/transfer/API set (`95 passed`) and the complete
+Python regression (`681 passed`, `11 warnings`).
+
 ## Objective
 
 Protect Pump positions without treating an arbitrary timer or a fixed main

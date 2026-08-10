@@ -989,6 +989,8 @@ class PumpLiveController:
         self._state["entry_armed"] = False
         self._state["transient_recovery_pending"] = False
         self._state["healthy_recovery_cycles"] = 0
+        self._state["portfolio_risk_restore_armed"] = False
+        self._state["portfolio_risk_recovery_cycles"] = 0
         if self._open_positions(self._state):
             self._state["monitor_enabled"] = True
             self._state["status"] = "recovery_monitoring"
@@ -1456,6 +1458,13 @@ class PumpLiveController:
             open_items = list(self._open_positions(self._state))
         if open_items:
             self._resume_tracked_positions(preflight, open_items)
+            risk = self._portfolio_entry_risk_snapshot(self.config())
+            if risk["freeze_required"]:
+                self._activate_portfolio_risk_freeze(self.config())
+                raise RuntimeError(
+                    "pump_live_arm_portfolio_risk_not_ready:"
+                    f"{risk.get('reason')}:{risk.get('symbol')}:{risk.get('buffer_pct')}"
+                )
             event = "armed_resumed"
         else:
             if not preflight.get("ready"):
@@ -1474,6 +1483,12 @@ class PumpLiveController:
                     "pending_signals": [],
                     "transient_recovery_pending": False,
                     "healthy_recovery_cycles": 0,
+                    "portfolio_risk_freeze_active": False,
+                    "portfolio_risk_freeze_reason": None,
+                    "portfolio_risk_freeze_symbol": None,
+                    "portfolio_risk_freeze_buffer_pct": None,
+                    "portfolio_risk_restore_armed": False,
+                    "portfolio_risk_recovery_cycles": 0,
                 }
             )
             self._save_state_locked()
@@ -1645,6 +1660,12 @@ class PumpLiveController:
             self._state["blocked_reason"] = reason
             self._state["transient_recovery_pending"] = False
             self._state["healthy_recovery_cycles"] = 0
+            self._state["portfolio_risk_freeze_active"] = False
+            self._state["portfolio_risk_freeze_reason"] = None
+            self._state["portfolio_risk_freeze_symbol"] = None
+            self._state["portfolio_risk_freeze_buffer_pct"] = None
+            self._state["portfolio_risk_restore_armed"] = False
+            self._state["portfolio_risk_recovery_cycles"] = 0
             self._state["updated_at_ms"] = _now_ms()
             self._state["pending_signals"] = []
             self._save_state_locked()
@@ -1716,6 +1737,12 @@ class PumpLiveController:
             self._state["status"] = "emergency_closing"
             self._state["transient_recovery_pending"] = False
             self._state["healthy_recovery_cycles"] = 0
+            self._state["portfolio_risk_freeze_active"] = False
+            self._state["portfolio_risk_freeze_reason"] = None
+            self._state["portfolio_risk_freeze_symbol"] = None
+            self._state["portfolio_risk_freeze_buffer_pct"] = None
+            self._state["portfolio_risk_restore_armed"] = False
+            self._state["portfolio_risk_recovery_cycles"] = 0
             self._state["updated_at_ms"] = _now_ms()
             self._save_state_locked()
         self._event("emergency_close_requested", {})
@@ -1753,13 +1780,44 @@ class PumpLiveController:
             if self._emergency_requested():
                 self._execute_emergency_close(exchange_positions, open_orders, config)
             else:
-                self._process_pending_signals(balance, exchange_positions, open_orders, config)
+                self._activate_portfolio_risk_freeze(config)
                 self._maintain_positions(config)
+                risk_recovered = self._advance_portfolio_risk_recovery(
+                    exchange_positions,
+                    open_orders,
+                    config,
+                )
+                with self._lock:
+                    process_pending = bool(
+                        not risk_recovered
+                        and self._state.get("entry_armed")
+                        and not self._state.get("portfolio_risk_freeze_active")
+                        and self._state.get("pending_signals")
+                        and all(
+                            item.get("status") == "open"
+                            for item in self._open_positions(self._state)
+                        )
+                    )
+                if process_pending:
+                    balance = self.gateway.fetch_balance()
+                    exchange_positions = self.gateway.fetch_positions()
+                    open_orders = self.gateway.fetch_open_orders()
+                    with self._lock:
+                        self._state["last_balance"] = balance
+                        self._state["last_exchange_positions"] = exchange_positions
+                        self._state["last_open_orders"] = open_orders
+                    self._process_pending_signals(
+                        balance,
+                        exchange_positions,
+                        open_orders,
+                        config,
+                    )
             recovered = False
             with self._lock:
                 recovery_pending = bool(
                     self._state.get("transient_recovery_pending")
                     and self._state.get("blocked_reason") == "monitor_cycle_transient_error"
+                    and not self._state.get("portfolio_risk_freeze_active")
                 )
                 if recovery_pending:
                     healthy = _safe_int(self._state.get("healthy_recovery_cycles"), 0) + 1
@@ -1841,6 +1899,219 @@ class PumpLiveController:
             self.run_cycle()
             self._wake.wait(self.config().poll_interval_sec)
             self._wake.clear()
+
+    def _portfolio_entry_risk_snapshot(
+        self,
+        runtime_config: PumpLiveConfig,
+    ) -> dict[str, Any]:
+        """Evaluate whether existing positions must freeze every new entry."""
+        with self._lock:
+            items = list(self._open_positions(self._state))
+        if not items:
+            return {
+                "freeze_required": False,
+                "all_calm": True,
+                "reason": None,
+                "symbol": None,
+                "buffer_pct": None,
+            }
+        minimum: tuple[float, str] | None = None
+        invalid_reason: str | None = None
+        invalid_symbol: str | None = None
+        warning: tuple[float, str] | None = None
+        all_calm = True
+        for item in items:
+            symbol = _normalize_symbol(item.get("symbol"))
+            position_config = self._position_config(item, runtime_config)
+            if item.get("status") != "open":
+                if invalid_reason is None:
+                    invalid_reason = "position_state_not_open"
+                    invalid_symbol = symbol
+                all_calm = False
+                continue
+            buffer_pct = _short_liq_buffer_pct(
+                _safe_float(item.get("mark_price"), 0.0),
+                _optional_float(item.get("liq_price")),
+            )
+            if buffer_pct is None:
+                if invalid_reason is None:
+                    invalid_reason = "liq_buffer_unavailable"
+                    invalid_symbol = symbol
+                all_calm = False
+                continue
+            if minimum is None or buffer_pct < minimum[0]:
+                minimum = (buffer_pct, symbol)
+            if buffer_pct <= position_config.margin_reduce_trigger_buffer_pct:
+                all_calm = False
+            if buffer_pct <= position_config.warning_liq_buffer_pct:
+                if warning is None or buffer_pct < warning[0]:
+                    warning = (buffer_pct, symbol)
+        freeze_reason = invalid_reason or ("liq_buffer_warning" if warning else None)
+        freeze_symbol = invalid_symbol or (warning[1] if warning else None)
+        freeze_buffer = warning[0] if warning and not invalid_reason else None
+        return {
+            "freeze_required": freeze_reason is not None,
+            "all_calm": all_calm,
+            "reason": freeze_reason,
+            "symbol": freeze_symbol or (minimum[1] if minimum else None),
+            "buffer_pct": freeze_buffer if freeze_reason else (minimum[0] if minimum else None),
+        }
+
+    def _activate_portfolio_risk_freeze(self, config: PumpLiveConfig) -> bool:
+        snapshot = self._portfolio_entry_risk_snapshot(config)
+        if not snapshot["freeze_required"]:
+            return False
+        with self._lock:
+            was_active = bool(self._state.get("portfolio_risk_freeze_active"))
+            prior_reason = self._state.get("portfolio_risk_freeze_reason")
+            prior_symbol = self._state.get("portfolio_risk_freeze_symbol")
+            restore_armed = bool(self._state.get("portfolio_risk_restore_armed"))
+            may_claim_entry_gate = bool(
+                (
+                    self._state.get("entry_armed")
+                    and not self._state.get("blocked_reason")
+                )
+                or (
+                    was_active
+                    and self._state.get("blocked_reason") == "portfolio_risk_freeze"
+                )
+            )
+            if self._state.get("entry_armed") and not self._state.get("blocked_reason"):
+                restore_armed = True
+            dropped_pending = len(self._state.get("pending_signals") or [])
+            self._state["entry_armed"] = False
+            self._state["portfolio_risk_freeze_active"] = True
+            self._state["portfolio_risk_freeze_reason"] = snapshot["reason"]
+            self._state["portfolio_risk_freeze_symbol"] = snapshot["symbol"]
+            self._state["portfolio_risk_freeze_buffer_pct"] = snapshot["buffer_pct"]
+            self._state["portfolio_risk_restore_armed"] = restore_armed
+            self._state["portfolio_risk_recovery_cycles"] = 0
+            self._state["pending_signals"] = []
+            if may_claim_entry_gate:
+                self._state["blocked_reason"] = "portfolio_risk_freeze"
+                self._state["status"] = "monitoring"
+            self._state["updated_at_ms"] = _now_ms()
+            self._save_state_locked()
+        changed = bool(
+            not was_active
+            or prior_reason != snapshot["reason"]
+            or prior_symbol != snapshot["symbol"]
+        )
+        if changed:
+            self._event(
+                "portfolio_risk_freeze",
+                {
+                    **snapshot,
+                    "dropped_pending_signals": dropped_pending,
+                    "auto_recovery_eligible": restore_armed,
+                },
+            )
+        return True
+
+    def _advance_portfolio_risk_recovery(
+        self,
+        exchange_positions: list[dict[str, Any]],
+        open_orders: list[dict[str, Any]],
+        config: PumpLiveConfig,
+    ) -> bool:
+        snapshot = self._portfolio_entry_risk_snapshot(config)
+        with self._lock:
+            if not self._state.get("portfolio_risk_freeze_active"):
+                return False
+            self._state["portfolio_risk_freeze_buffer_pct"] = snapshot.get("buffer_pct")
+            if snapshot["freeze_required"] or not snapshot["all_calm"]:
+                self._state["portfolio_risk_recovery_cycles"] = 0
+                self._save_state_locked()
+                return False
+            restore_armed = bool(self._state.get("portfolio_risk_restore_armed"))
+            if (
+                not restore_armed
+                or self._state.get("blocked_reason") != "portfolio_risk_freeze"
+            ):
+                self._state["portfolio_risk_freeze_active"] = False
+                self._state["portfolio_risk_freeze_reason"] = None
+                self._state["portfolio_risk_freeze_symbol"] = None
+                self._state["portfolio_risk_freeze_buffer_pct"] = None
+                self._state["portfolio_risk_restore_armed"] = False
+                self._state["portfolio_risk_recovery_cycles"] = 0
+                self._save_state_locked()
+                return False
+            if self._unknown_exchange_positions(exchange_positions):
+                self._state["portfolio_risk_recovery_cycles"] = 0
+                self._save_state_locked()
+                return False
+            if self._unknown_open_orders(open_orders):
+                self._state["portfolio_risk_recovery_cycles"] = 0
+                self._save_state_locked()
+                return False
+            open_items = self._open_positions(self._state)
+            if open_items:
+                exchange_symbols = {
+                    _normalize_symbol(item.get("symbol"))
+                    for item in exchange_positions
+                    if item.get("side") == "short"
+                    and _safe_float(item.get("qty"), 0.0) > 0
+                }
+                healthy_positions = all(
+                    item.get("status") == "open"
+                    and _normalize_symbol(item.get("symbol")) in exchange_symbols
+                    and _safe_float(item.get("qty"), 0.0) > 0
+                    and _safe_float(item.get("tp_price"), 0.0) > 0
+                    and _safe_float(item.get("stop_price"), 0.0) > 0
+                    for item in open_items
+                )
+                if not healthy_positions:
+                    self._state["portfolio_risk_recovery_cycles"] = 0
+                    self._save_state_locked()
+                    return False
+            else:
+                frozen_symbol = _normalize_symbol(
+                    self._state.get("portfolio_risk_freeze_symbol")
+                )
+                frozen_item = next(
+                    (
+                        item
+                        for item in self._state.get("positions") or []
+                        if _normalize_symbol(item.get("symbol")) == frozen_symbol
+                    ),
+                    None,
+                )
+                if (
+                    not frozen_item
+                    or frozen_item.get("close_accounting_status") != "complete"
+                    or str(frozen_item.get("close_reason") or "").startswith("emergency_")
+                ):
+                    self._state["portfolio_risk_recovery_cycles"] = 0
+                    self._save_state_locked()
+                    return False
+            healthy = _safe_int(
+                self._state.get("portfolio_risk_recovery_cycles"),
+                0,
+            ) + 1
+            self._state["portfolio_risk_recovery_cycles"] = healthy
+            self._state["monitor_enabled"] = True
+            if healthy < TRANSIENT_RECOVERY_CYCLES:
+                self._save_state_locked()
+                return False
+            self._state["entry_armed"] = True
+            self._state["armed_at_ms"] = _now_ms()
+            self._state["blocked_reason"] = None
+            self._state["portfolio_risk_freeze_active"] = False
+            self._state["portfolio_risk_freeze_reason"] = None
+            self._state["portfolio_risk_freeze_symbol"] = None
+            self._state["portfolio_risk_freeze_buffer_pct"] = None
+            self._state["portfolio_risk_restore_armed"] = False
+            self._state["portfolio_risk_recovery_cycles"] = 0
+            self._state["updated_at_ms"] = _now_ms()
+            self._save_state_locked()
+        self._event(
+            "portfolio_risk_recovered",
+            {
+                "healthy_cycles": TRANSIENT_RECOVERY_CYCLES,
+                "calm_threshold_pct": config.margin_reduce_trigger_buffer_pct,
+            },
+        )
+        return True
 
     def _process_pending_signals(
         self,
@@ -2915,6 +3186,16 @@ class PumpLiveController:
             item["close_reason"] = reason
             item["close_order_id"] = order.get("id")
             item["updated_at_ms"] = _now_ms()
+            if reason.startswith("emergency_"):
+                self._state["entry_armed"] = False
+                self._state["monitor_enabled"] = True
+                self._state["blocked_reason"] = reason
+                self._state["portfolio_risk_freeze_active"] = False
+                self._state["portfolio_risk_freeze_reason"] = None
+                self._state["portfolio_risk_freeze_symbol"] = None
+                self._state["portfolio_risk_freeze_buffer_pct"] = None
+                self._state["portfolio_risk_restore_armed"] = False
+                self._state["portfolio_risk_recovery_cycles"] = 0
             self._save_state_locked()
         self._event("position_close_submitted", {"symbol": symbol, "reason": reason, "qty": qty})
 
@@ -2950,6 +3231,12 @@ class PumpLiveController:
             self._state["blocked_reason"] = "emergency_close"
             self._state["transient_recovery_pending"] = False
             self._state["healthy_recovery_cycles"] = 0
+            self._state["portfolio_risk_freeze_active"] = False
+            self._state["portfolio_risk_freeze_reason"] = None
+            self._state["portfolio_risk_freeze_symbol"] = None
+            self._state["portfolio_risk_freeze_buffer_pct"] = None
+            self._state["portfolio_risk_restore_armed"] = False
+            self._state["portfolio_risk_recovery_cycles"] = 0
             self._save_state_locked()
         self._event("emergency_close_submitted", {"positions": len(exchange_positions)})
 
@@ -3285,6 +3572,20 @@ class PumpLiveController:
             "close_recovery_pending": False,
             "close_recovery_symbol": None,
             "close_recovery_healthy_cycles": 0,
+            "portfolio_risk_freeze_active": bool(
+                payload.get("portfolio_risk_freeze_active")
+            ),
+            "portfolio_risk_freeze_reason": payload.get(
+                "portfolio_risk_freeze_reason"
+            ),
+            "portfolio_risk_freeze_symbol": payload.get(
+                "portfolio_risk_freeze_symbol"
+            ),
+            "portfolio_risk_freeze_buffer_pct": payload.get(
+                "portfolio_risk_freeze_buffer_pct"
+            ),
+            "portfolio_risk_restore_armed": False,
+            "portfolio_risk_recovery_cycles": 0,
             "emergency_close_requested": bool(payload.get("emergency_close_requested")),
             "last_notification_event": payload.get("last_notification_event"),
             "last_notification_status": payload.get("last_notification_status"),
@@ -3413,6 +3714,36 @@ def _pump_live_notification(
             f"Pump Live: новые входы отключены\nПричина: {reason}",
             f"disarmed:{reason}",
             60,
+        )
+    if event == "portfolio_risk_freeze":
+        reason = str(payload.get("reason") or "unknown")
+        buffer_pct = _optional_float(payload.get("buffer_pct"))
+        buffer_line = (
+            f"\nLiquidation buffer: {buffer_pct:.2f}%."
+            if buffer_pct is not None
+            else "\nLiquidation buffer is unavailable."
+        )
+        return (
+            f"Pump Live ENTRY FREEZE {symbol}",
+            (
+                "Pump Live froze every new entry before position maintenance."
+                f"{symbol_line}\nReason: {reason}.{buffer_line}"
+                "\nExisting exchange protection and risk top-ups remain active."
+            ),
+            f"portfolio_risk_freeze:{symbol}:{reason}",
+            300,
+        )
+    if event == "portfolio_risk_recovered":
+        threshold = _safe_float(payload.get("calm_threshold_pct"), 35.0)
+        return (
+            "Pump Live ENTRY FREEZE recovered",
+            (
+                "Pump Live re-enabled new entries after two healthy risk-first cycles."
+                f"\nEvery remaining position is above the CALM threshold ({threshold:.2f}%)"
+                " and has confirmed TP/SL. Fresh signals are required."
+            ),
+            "portfolio_risk_recovered",
+            0,
         )
     if event == "live_position_opened":
         slot_margin = _safe_float(payload.get("slot_margin_usd"), 0.0)

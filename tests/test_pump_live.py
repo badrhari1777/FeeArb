@@ -1840,8 +1840,187 @@ def test_four_positions_each_keep_fifty_dollar_rescue_quota(tmp_path: Path) -> N
         "TEST2USDT": 50.0,
         "TEST3USDT": 50.0,
     }
-    assert status["entry_armed"] is True
+    assert status["entry_armed"] is False
+    assert status["blocked_reason"] == "portfolio_risk_freeze"
     assert sum(item["margin_topup_usd"] for item in status["positions"]) == 200.0
+
+
+def test_warning_freezes_entries_before_topup_and_drops_stale_pending_signal(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1, event_id="first")])
+    controller.run_cycle()
+    controller.submit_decisions(
+        [ready_decision(armed_at + 2, symbol="SECONDUSDT", event_id="stale")]
+    )
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 15.0
+    gateway.operations.clear()
+
+    status = controller.run_cycle()
+
+    assert status["entry_armed"] is False
+    assert status["blocked_reason"] == "portfolio_risk_freeze"
+    assert status["portfolio_risk_freeze_active"] is True
+    assert status["portfolio_risk_freeze_symbol"] == "TESTUSDT"
+    assert status["portfolio_risk_recovery_cycles"] == 0
+    assert status["pending_signals"] == []
+    assert status["open_positions"] == 1
+    assert gateway.margin_adds == [("TESTUSDT", 25.0)]
+    assert gateway.operations[0] == "add_margin:TESTUSDT:25.0"
+    assert not any(operation == "market_sell:SECONDUSDT" for operation in gateway.operations)
+    assert any(
+        row["event"] == "portfolio_risk_freeze"
+        for row in status["recent_events"]
+    )
+
+
+def test_warning_freeze_requires_two_calm_cycles_and_a_fresh_signal(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, entry_cap=4)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 15.0
+    controller.run_cycle()
+    gateway.positions[0]["mark_price"] = 10.0
+    gateway.positions[0]["liq_price"] = 15.0
+
+    first_calm = controller.run_cycle()
+    recovered = controller.run_cycle()
+
+    assert first_calm["entry_armed"] is False
+    assert first_calm["portfolio_risk_recovery_cycles"] == 1
+    assert recovered["entry_armed"] is True
+    assert recovered["blocked_reason"] is None
+    assert recovered["portfolio_risk_freeze_active"] is False
+    assert recovered["pending_signals"] == []
+    assert any(
+        row["event"] == "portfolio_risk_recovered"
+        for row in recovered["recent_events"]
+    )
+
+    new_armed_at = int(recovered["armed_at_ms"])
+    queued = controller.submit_decisions(
+        [
+            ready_decision(
+                new_armed_at + 1,
+                symbol="SECONDUSDT",
+                event_id="fresh-after-risk",
+            )
+        ]
+    )
+    opened = controller.run_cycle()
+    assert queued["accepted"] == 1
+    assert opened["open_positions"] == 2
+
+
+def test_missing_exchange_position_never_counts_as_calm_recovery(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 15.0
+    controller.run_cycle()
+    with controller._lock:  # pylint: disable=protected-access
+        item = controller._state["positions"][0]  # pylint: disable=protected-access
+        item["mark_price"] = 10.0
+        item["liq_price"] = 15.0
+    gateway.positions = []
+
+    status = controller.run_cycle()
+
+    assert status["entry_armed"] is False
+    assert status["portfolio_risk_recovery_cycles"] == 0
+
+
+def test_operator_disarm_is_never_overridden_by_risk_recovery(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 15.0
+    controller.run_cycle()
+    controller.disarm("operator_disarm")
+    gateway.positions[0]["mark_price"] = 10.0
+    gateway.positions[0]["liq_price"] = 15.0
+
+    controller.run_cycle()
+    status = controller.run_cycle()
+
+    assert status["entry_armed"] is False
+    assert status["blocked_reason"] == "operator_disarm"
+    assert status["portfolio_risk_freeze_active"] is False
+
+
+def test_arm_rejects_tracked_position_inside_warning_band(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    gateway.preflight_existing_state_errors = True
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    controller.disarm("operator_disarm")
+    gateway.positions[0]["mark_price"] = 13.0
+    gateway.positions[0]["liq_price"] = 15.0
+
+    with pytest.raises(RuntimeError, match="arm_portfolio_risk_not_ready"):
+        controller.arm(ARM_CONFIRMATION)
+
+    status = controller.status()
+    assert status["entry_armed"] is False
+    assert status["portfolio_risk_freeze_active"] is True
+    assert status["portfolio_risk_restore_armed"] is False
 
 
 def test_shared_emergency_pool_prioritizes_smallest_liquidation_buffer(

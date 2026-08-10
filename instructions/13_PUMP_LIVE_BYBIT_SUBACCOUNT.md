@@ -639,3 +639,37 @@ protection recovery. Three complete monitor cycles stayed armed with no blocked
 reason/error, two v1 positions, zero v2 positions, ten orders and a live
 monitor. Final regime was `CALM`, minimum liquidation buffer `71.62%`, and new
 slot headroom `$1223.16`.
+
+## Risk-first entry freeze (2026-08-10)
+
+The monitor now evaluates and maintains every existing position before it can
+process a pending entry. Immediately after the fresh exchange reconciliation,
+all new entries are frozen when any tracked position is not fully `open`, has
+an unavailable liquidation buffer, or is at/below its `20%` warning boundary.
+The freeze happens before margin top-up or main -> Pump rescue funding and
+does not disable monitoring, Full TP/SL, ladder reconciliation, margin adds or
+emergency handling.
+
+Any pending entry captured before the freeze is discarded rather than replayed
+after a potentially long risk incident. Signals received while frozen are also
+not queued; the scanner must provide a fresh `entry_ready` event after recovery.
+If no freeze is active, pending-entry admission occurs only after position
+maintenance and uses newly fetched balance, positions and orders, so a top-up
+cannot leave entry sizing with stale available cash.
+
+An automatically-created risk freeze may restore its prior armed state only
+after two consecutive complete cycles where every remaining position is
+strictly above the `35%` CALM threshold, is exchange-present and `open`, and has
+positive confirmed TP and catastrophic SL. The second recovery cycle only
+re-arms; a fresh signal can execute no earlier than the next cycle. Explicit
+operator disarm, backend restart, emergency close, unknown exchange state,
+reserve failure and other hard errors are never auto-overridden. Explicit ARM
+also rejects a tracked position still inside the warning band.
+
+Risk order is therefore: freeze/clear stale entries -> maintain the lowest
+buffer first -> use Pump reserve -> attempt projection-gated main funding above
+the `10%` emergency boundary -> emit the profitable-donor shadow if funding is
+blocked -> close the threatened position reduce-only at the emergency boundary.
+Automatic donor reduction remains disabled and requires its separate approved
+micro-canary. Targeted Pump/transfer/API regression passed (`95` tests), and
+the complete Python suite passed (`681 passed`, `11 warnings`).

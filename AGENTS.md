@@ -106,6 +106,18 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live monitoring became risk-first on 2026-08-10. Fresh exchange state
+  now freezes and clears stale entries before maintenance when any position is
+  not fully open, lacks a liquidation buffer, or is at/below `20%`; positions
+  are then maintained from the lowest buffer through Pump reserve and guarded
+  main funding. Only afterward may an entry use freshly re-read balance,
+  positions and orders. Automatic recovery requires two complete cycles with
+  every remaining position strictly above `35%` and confirmed TP/SL, and the
+  recovered cycle itself cannot execute an entry. Operator/restart/emergency
+  and hard-error disarms remain sticky, ARM rejects warning-band positions,
+  and a fresh scanner event is required. Profitable-donor execution remains
+  shadow-only pending a separate micro-canary. Targeted Pump/transfer/API tests
+  passed (`95`); the complete suite passed (`681`, `11 warnings`).
 - Pump Live completed the operator-authorized `$3000` migration on 2026-08-10.
   A fresh no-position/no-transition main-account gate permitted a real `$2000`
   main -> Pump transfer. The controller capitalized exactly `$1912.195164`,
