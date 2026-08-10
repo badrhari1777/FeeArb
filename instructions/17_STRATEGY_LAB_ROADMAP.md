@@ -555,3 +555,32 @@ Shadow -> live:
 - Следующий safe change block: Phase O0 schema/tests, five-venue Instrument
   Registry и bounded multiplexed feed prototype. Никакого long run, shadow
   position, paper/live promotion, ARM или заявки это решение не разрешает.
+
+### 2026-08-10 — аудит Coinglass и ArbitrageScanner для Candidate Observatory
+
+- Текущий Coinglass web parser не применяет выбранные оператором exchange
+  checkboxes: отдельная headless-сессия разбирает первые `20` строк общей таблицы.
+  Свежий fetch занял около `71.8s`; только `5/20` exact pairs целиком относились к
+  `Binance/Bybit/OKX/KuCoin/Gate`. Поэтому parser оставлен только как будущий slow
+  fallback и не включался/не изменялся в runtime.
+- Официальный Coinglass funding-arbitrage API поддерживает точный
+  `exchange_list=Binance,Bybit,OKX,Gate.io,KuCoin` и отдаёт pair funding intervals,
+  next settlement, OI, spread и fee с update frequency `20s`. Для endpoint нужен
+  Startup+ plan и API key; на момент аудита ключа в проекте нет.
+- Публичный ArbitrageScanner endpoint доступен и вернул `779` rows / `23` exchange
+  identifiers; exact-five offline universe содержал около `500` symbols. Но старый
+  adapter нельзя включать: `okx` не совпадает с `okex_futures`, а long/short funding
+  legs назначаются в обратном направлении. Кроме того, источник не отдаёт price
+  basis, OI, interval, fees или BBO.
+- Принят mix: own five-venue discovery остаётся ground truth; Coinglass exact pair
+  и ArbitrageScanner используются как candidate seeds/independent cross-checks с
+  обязательной verification собственными feeds. Source disagreement сохраняется
+  как feature. Ни один внешний источник не является торговым сигналом.
+- Coinglass coin futures page остаётся ручным drill-down; её core funding/OI/price/
+  volume поля собираются напрямую с бирж. Actual liquidations — optional enrichment.
+  Liquidation heatmap является моделью, а не raw events; numeric API существует,
+  но требует Professional+, поэтому v1 не зависит от heatmap.
+- Phase O0 расширен versioned `source_observation` contract, replay fixtures,
+  exact aliases/sign tests и research-only adapters. Источники остаются disabled
+  до отдельного bounded preflight; long run, shadow positions, paper/live, ARM и
+  торговые настройки этим checkpoint не разрешены.

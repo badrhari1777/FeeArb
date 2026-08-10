@@ -94,6 +94,153 @@ sampling, selection bias, неполное межбиржевое покрыти
 Это не оценка предельной мощности бирж. Это доказательство, что Observatory нельзя
 строить поверх текущего синхронного REST fan-out и per-symbol WebSocket loops.
 
+## Аудит внешних источников кандидатов 2026-08-10
+
+Аудит выполнен read-only: источники не включались в runtime, настройки торговли,
+ARM, заявки и долгий сбор не изменялись. Цель проверки — определить роль каждого
+источника до реализации Phase O0.
+
+### Coinglass `FrArbitrage`
+
+Что делает текущий код:
+
+- `parsers/coinglass.py` открывает веб-страницу через headless Chromium, ждёт
+  render, прокручивает её и разбирает первые `20` DOM-строк;
+- фильтр `Exchanges` не нажимается и список бирж в запрос не передаётся;
+- cookies/local storage обычного браузера оператора не разделяются с headless
+  сессией, поэтому выбранные человеком галочки на parser не влияют;
+- после парсинга pipeline сохраняет только base-symbol в общем universe и теряет
+  exact-pair provenance при внутреннем пересчёте opportunity;
+- свежий cache считается пригодным `20m`, хотя раннее событие funding/spread за
+  это время может существенно измениться.
+
+Свежий технический probe показал:
+
+- успешный headless fetch занял около `71.8s` и вернул `20` строк;
+- только `5/20` exact pairs целиком состояли из выбранной пятёрки бирж;
+- первый запуск без принудительного UTF-8 завершился на Windows
+  `UnicodeEncodeError` из-за встретившегося Unicode-symbol, повтор с UTF-8 прошёл;
+- веб-приложение использует внутренний encrypted endpoint
+  `interestArbitrageV2?ex=...`; привязываться к его частным headers и шифрованию
+  в production нельзя.
+
+Следовательно, текущий parser годится только как временный низкочастотный fallback
+и независимый sanity-check. Он не годится как основной prospective intake.
+
+Предпочтительный путь — официальный Coinglass API v4:
+
+```text
+GET /api/futures/funding-rate/arbitrage
+usd=<research notional>
+exchange_list=Binance,Bybit,OKX,Gate.io,KuCoin
+```
+
+Он поддерживает точный список пяти бирж и возвращает exact buy/sell pair, funding
+обеих ног, interval, next settlement, OI обеих ног, spread, fee и APR с заявленной
+частотой обновления `20s`. Ограничение: endpoint недоступен на Hobbyist, нужен
+Startup или выше и `CG-API-KEY`; на дату аудита ключ/переменная в проекте отсутствуют.
+
+Fallback без платного API допустим в Phase O0 только так:
+
+1. периодически рендерить таблицу вне hot path;
+2. получать полный доступный набор, затем применять exact alias map пяти бирж до
+   лимита кандидатов, а не фильтровать уже обрезанные первые `20`;
+3. сохранять raw row, source timestamp, requested exchange set и parser version;
+4. не доверять направлению/ставкам до подтверждения собственными exchange feeds;
+5. при DOM/schema/Unicode ошибке fail-open для остальных candidate baskets, но
+   помечать Coinglass source stale/unavailable.
+
+Автоматически кликать пять UI-checkbox технически возможно, но это хуже официального
+API и хуже post-filter полного набора: selectors, локализация, internal endpoint и
+anti-bot поведение не являются стабильным контрактом.
+
+### ArbitrageScanner funding table
+
+Публичный endpoint, который уже использует проект, на момент probe доступен без
+ключа: `779` rows и `23` exchange identifiers. В row присутствуют:
+
+```text
+symbol / ticker / maxSpread
+rates[].exchange
+rates[].rate
+rates[].nextFundingTime
+```
+
+То есть он полезен как широкий бесплатный funding-discovery source, но не содержит
+достаточного контракта для решения о сделке: нет price basis, OI, funding interval,
+fees, BBO freshness и executable entry/exit spread.
+
+Старую интеграцию нельзя включать без исправления:
+
+- текущий substring include с именем `okx` не совпадает с фактическим
+  `okex_futures`, поэтому из выбранной пятёрки реально проходили только четыре;
+- `build_top` назначает max funding ногой `long`, а min funding ногой `short`.
+  Для обычной perpetual funding convention экономическое направление обратное:
+  long должен быть на минимальной ставке, short — на максимальной;
+- aliases должны быть exact, versioned и fail-closed, а не substring matching;
+- funding следует хранить как raw rate плюс `nextFundingTime`; interval нельзя
+  выдумывать из одного снимка.
+
+После точного offline-фильтра
+`binance_futures/bybit_futures/okex_futures/kucoin_futures/gate_futures` в свежем
+ответе было около `500` symbols с минимум двумя ногами. Это подтверждает хорошее
+coverage, но не качество готовых сделок.
+
+Роль источника: `candidate seed + independent cross-check`, не ground truth и не
+готовый long/short сигнал. Его собственная таблица позволяет человеку выбирать
+биржи; в нашем коде точный выбор пяти бирж можно сделать надёжнее локальным alias
+filter без автоматизации UI.
+
+### Coinglass страницы конкретной монеты
+
+`/currencies/<coin>/futures` полезна как ручной drill-down: на одной странице видны
+price/index, funding, OI, volume, long/short, 24h liquidations и список бирж. Для
+машинного prospective-контура основные поля целесообразнее брать напрямую с пяти
+бирж с единым timestamp и quality flags. Официальные Coinglass `pairs-markets`,
+funding exchange list и OI exchange list можно позднее использовать для
+independent validation/backfill, но веб-страницу не нужно парсить в Baseline.
+
+`/liquidations/<coin>` содержит aggregated long/short liquidations, recent orders
+и исторические окна. Это потенциально полезный optional event feature для
+washout/cascade гипотез. Реальные liquidation streams отдельных бирж и официальный
+Coinglass liquidation API следует сравнить на coverage; отсутствие данных не
+блокирует funding/spread candidate.
+
+`LiquidationHeatMap` — не эквивалент потоку фактических ликвидаций. Это модельная
+оценка зон потенциальной ликвидации. Прямые публичные exchange API не дают полной
+раскладки чужих entry/leverage, поэтому идентичную карту самостоятельно получить
+нельзя. Скриншот/canvas scraping не даёт воспроизводимого numeric contract.
+Официальный API возвращает numeric axes, candle series и liquidation intensity,
+но heatmap model2 доступен только на Professional/Enterprise. Поэтому heatmap:
+
+- не участвует в Candidate Observatory v1 и не является gate;
+- остаётся ручным контекстом для редких Hot событий;
+- может стать отдельным versioned enrichment experiment в O2, если появится
+  подходящий API plan и будет доказан incremental lift на locked holdout.
+
+### Решение по source mix
+
+Ни Coinglass, ни ArbitrageScanner не должны единолично определять universe. Первый
+дороже/медленнее без API, второй шире и бесплатнее, но беднее по полям. Целевой mix:
+
+1. `P0`: held positions и manual pins;
+2. `P1`: собственный пятибиржевой discovery по funding/basis/OI/volume/premium;
+3. `P1 seed`: exact Coinglass pair, если есть официальный API; иначе slow web
+   fallback с обязательной own-feed verification;
+4. `P2 seed`: ArbitrageScanner exact-five funding anomalies после исправления
+   aliases/sign convention;
+5. `P2`: собственные OI-volume-price/premium triggers;
+6. `P3`: matched controls.
+
+Совпадение двух независимых источников повышает monitoring priority, но не является
+доказательством alpha. Расхождение external source и own feed сохраняется как
+`source_disagreement` и может само стать исследовательским признаком.
+
+Phase O0 начинается не с подписки на платный источник, а с versioned source
+contract и replay fixtures. Это позволяет одинаково подключить официальный
+Coinglass API, web fallback или полностью собственный discovery без изменения
+downstream candidate/event schema.
+
 ## Целевая транспортная архитектура
 
 ### Instrument Registry
@@ -468,6 +615,17 @@ funding interval, premium/oracle spread, OI, volume, fees и фактическ�
 
 - Coinglass funding arbitrage API:
   https://docs.coinglass.com/reference/fr-arbitrage
+- Coinglass futures pair markets:
+  https://docs.coinglass.com/reference/pairs-markets
+- Coinglass funding/OI exchange lists and liquidation endpoints:
+  https://docs.coinglass.com/reference/fr-exchange-list
+  https://docs.coinglass.com/reference/oi-exchange-list
+  https://docs.coinglass.com/reference/endpoint-overview
+- Coinglass liquidation heatmap model2 availability/schema:
+  https://docs.coinglass.com/v4.0-zhtw/reference/liquidation-heatmap-model2
+- ArbitrageScanner funding table and API overview:
+  https://arbitragescanner.io/ru/funding-rates
+  https://arbitragescanner.io/crypto-api
 - Hummingbot cross-exchange market making:
   https://hummingbot.org/strategies/v1-strategies/cross-exchange-market-making/
 - Binance futures all BBO stream:
@@ -495,13 +653,20 @@ funding interval, premium/oracle spread, OI, volume, fees и фактическ�
 
 ### Phase O0 — data contract and bounded preflight
 
-1. Зафиксировать schema/version, sign convention, candidate/event identity.
-2. Реализовать общий Instrument Registry для пяти бирж.
-3. Сделать multiplexed public feed prototype без постоянного long run.
-4. Проверить coverage common symbols, freshness, reconnect и field availability.
-5. Провести bounded `1h`, затем `24h` preflight и измерить calls/messages,
+1. Зафиксировать schema/version, sign convention, candidate/event identity и
+   общий `source_observation` contract для own/Coinglass/ArbitrageScanner.
+2. Добавить replay fixtures и контрактные тесты для exact exchange aliases,
+   long=min funding / short=max funding и потери/stale внешнего источника.
+3. Реализовать общий Instrument Registry для пяти бирж.
+4. Реализовать source adapters в выключенном по умолчанию research-контуре:
+   ArbitrageScanner exact-five; Coinglass official API при наличии ключа; web
+   parser только как slow fallback.
+5. Сделать multiplexed public feed prototype без постоянного long run.
+6. Проверить coverage common symbols, freshness, reconnect, field availability,
+   source overlap/disagreement и candidate recall.
+7. Провести bounded `1h`, затем `24h` preflight и измерить calls/messages,
    missingness, compressed bytes/row, CPU/RAM и gaps.
-6. Обновить реальные caps только по результату preflight.
+8. Обновить реальные caps только по результату preflight.
 
 ### Phase O1 — prospective collector
 
@@ -534,7 +699,9 @@ funding interval, premium/oracle spread, OI, volume, fees и фактическ�
 
 Следующий change block — только `Phase O0`:
 
-- schema и tests;
+- versioned source/candidate schema, replay fixtures и tests;
+- исправление ArbitrageScanner aliases/sign в новом research adapter без
+  автоматического включения старого runtime source;
 - пятибиржевой Instrument Registry;
 - bounded multiplexed feed prototype;
 - без долгого запуска, shadow positions, orders, ARM и изменений live-модулей.

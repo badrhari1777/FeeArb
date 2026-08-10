@@ -109,6 +109,23 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- External candidate sources for Strategy Lab Candidate Observatory were audited
+  read-only on 2026-08-10. The existing Coinglass browser parser does not apply
+  the operator's exchange checkboxes and only parses the first 20 global rows; a
+  fresh UTF-8 probe took about 71.8 seconds and only 5/20 exact pairs were fully
+  inside Binance/Bybit/OKX/KuCoin/Gate. The official funding-arbitrage API can
+  filter exactly those five venues and includes per-leg interval/OI plus spread
+  and fee, but requires Startup+ and no API key is configured. The public
+  ArbitrageScanner feed returned 779 rows across 23 identifiers and about 500
+  symbols with at least two exact-five legs, but the legacy parser omits OKX
+  (`okex_futures`) and reverses the economic long/min-rate and short/max-rate
+  direction. It remains disabled. The accepted design uses own five-venue data
+  as ground truth, both external sources only as verified seeds/cross-checks,
+  actual liquidations as optional enrichment, and the Professional-only modeled
+  Coinglass heatmap outside v1. Phase O0 now starts with a versioned source
+  contract, replay fixtures and alias/sign tests before Instrument Registry and
+  bounded feeds. No runtime source, collector, ARM, order, or live setting changed.
+  Canonical details: `instructions/18_STRATEGY_LAB_CANDIDATE_OBSERVATORY.md`.
 - Strategy Lab Candidate Observatory was designed on 2026-08-10 as the new
   canonical prospective research path before further Stage 3.1 threshold
   mining. The first venue universe is limited to Binance, Bybit, OKX, KuCoin,
