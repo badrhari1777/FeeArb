@@ -45,6 +45,12 @@ CAPITAL_SLOT_ROUND_USD = 5.0
 TEMPORARY_TRANSFER_DUST_THRESHOLD_USD = 0.01
 RISK_POLICY_V1 = "v1_1000"
 RISK_POLICY_V2 = "v2_3000"
+MARGIN_MANAGER_V2_CURRENT = "v2_current_next"
+MARGIN_MANAGER_V3_SHARED = "v3_shared_projected"
+MARGIN_MANAGER_POLICIES = {
+    MARGIN_MANAGER_V2_CURRENT,
+    MARGIN_MANAGER_V3_SHARED,
+}
 PREFUND_VERIFY_READ_DELAYS_SEC = (0.0, 0.05, 0.1)
 PREFUND_MAX_CORRECTION_STEPS = 3
 LADDER_CANCEL_VERIFY_READ_DELAYS_SEC = (0.0, 0.05, 0.1)
@@ -75,6 +81,10 @@ class PumpLiveConfig:
     entry_margin_prefund_round_usd: float = 5.0
     entry_margin_prefund_mmr: float = 0.025
     entry_margin_prefund_taker_fee_rate: float = 0.00055
+    margin_manager_policy_id: str = MARGIN_MANAGER_V2_CURRENT
+    projected_final_fill_buffer_pct: float = 20.0
+    shared_rescue_facility_cap_usd: float = 2_000.0
+    shared_max_position_topup_usd: float = 2_000.0
     operating_cash_floor_usd: float = 25.0
     flat_confirm_cycles: int = 2
     topup_cooldown_sec: int = 0  # retained in status for schema compatibility; not a risk gate
@@ -130,8 +140,14 @@ def config_from_risk_snapshot(
     if not snapshot:
         return fallback
     values = asdict(fallback)
+    dynamic_margin_fields = {
+        "margin_manager_policy_id",
+        "projected_final_fill_buffer_pct",
+        "shared_rescue_facility_cap_usd",
+        "shared_max_position_topup_usd",
+    }
     for field in fields(PumpLiveConfig):
-        if field.name in snapshot:
+        if field.name in snapshot and field.name not in dynamic_margin_fields:
             values[field.name] = snapshot[field.name]
     return PumpLiveConfig(**values)
 
@@ -155,6 +171,84 @@ def required_available_for_new_slot(
         + remaining_topup_capacity
         + config.operating_cash_floor_usd
     )
+
+
+def projected_short_liquidation_after_fill(
+    *,
+    qty: float,
+    current_liq_price: float,
+    added_notional_usd: float,
+    added_price: float,
+    leverage: float,
+    maintenance_margin_rate: float,
+) -> tuple[float, float]:
+    """Project qty/liquidation using the exchange's current liq as calibration.
+
+    The current liquidation price already includes actual isolated margin,
+    maintenance deduction and exchange rounding. Adding the next leg changes
+    only position quantity and entry notional, so carrying that calibrated
+    numerator forward is safer than rebuilding the whole position from a
+    theoretical average price.
+    """
+    if (
+        qty <= 0
+        or current_liq_price <= 0
+        or added_notional_usd <= 0
+        or added_price <= 0
+        or leverage <= 0
+    ):
+        raise ValueError("pump_live_projected_fill_inputs_invalid")
+    mmr = max(0.0, maintenance_margin_rate)
+    added_qty = added_notional_usd / added_price
+    projected_qty = qty + added_qty
+    current_numerator = current_liq_price * qty * (1.0 + mmr)
+    projected_numerator = current_numerator + added_notional_usd * (
+        1.0 + 1.0 / leverage
+    )
+    projected_liq = projected_numerator / (projected_qty * (1.0 + mmr))
+    return projected_qty, projected_liq
+
+
+def shared_margin_target(
+    *,
+    legs: Iterable[Mapping[str, Any]],
+    target_leg: Mapping[str, Any],
+    safety_pct: float,
+    final_fill_buffer_pct: float,
+) -> dict[str, Any]:
+    ordered = sorted(
+        (dict(leg) for leg in legs),
+        key=lambda leg: _safe_int(leg.get("step"), 0),
+    )
+    target_step = _safe_int(target_leg.get("step"), 0)
+    following = next(
+        (leg for leg in ordered if _safe_int(leg.get("step"), 0) > target_step),
+        None,
+    )
+    target_price = _safe_float(target_leg.get("trigger_price"), 0.0)
+    if target_price <= 0:
+        raise ValueError("pump_live_shared_margin_target_invalid")
+    if following is not None:
+        reference_price = _safe_float(following.get("trigger_price"), 0.0)
+        clearance_pct = max(0.0, safety_pct)
+        target_kind = "following_ladder"
+    else:
+        reference_price = target_price
+        clearance_pct = max(0.0, final_fill_buffer_pct)
+        target_kind = "final_fill_buffer"
+    if reference_price <= 0:
+        raise ValueError("pump_live_shared_margin_reference_invalid")
+    return {
+        "target_kind": target_kind,
+        "target_leg_step": target_step,
+        "target_leg_price": target_price,
+        "following_leg_step": (
+            _safe_int(following.get("step"), 0) if following is not None else None
+        ),
+        "reference_price": reference_price,
+        "clearance_pct": clearance_pct,
+        "target_stop_price": reference_price * (1.0 + clearance_pct / 100.0),
+    }
 
 
 class PumpGateway(Protocol):
@@ -258,6 +352,23 @@ def load_pump_live_config(path: Path = PUMP_LIVE_ENV_PATH) -> PumpLiveConfig:
         values.get("PUMP_LIVE_MARGIN_PREFUND_TOLERANCE_PCT"),
         2.0,
     )
+    margin_manager_policy = str(
+        values.get("PUMP_LIVE_MARGIN_MANAGER_POLICY", MARGIN_MANAGER_V2_CURRENT)
+    ).strip()
+    if margin_manager_policy not in MARGIN_MANAGER_POLICIES:
+        margin_manager_policy = MARGIN_MANAGER_V2_CURRENT
+    final_fill_buffer = _safe_float(
+        values.get("PUMP_LIVE_PROJECTED_FINAL_FILL_BUFFER_PCT"),
+        20.0,
+    )
+    shared_rescue_cap = _safe_float(
+        values.get("PUMP_LIVE_SHARED_RESCUE_FACILITY_CAP_USD"),
+        2_000.0,
+    )
+    shared_position_cap = _safe_float(
+        values.get("PUMP_LIVE_SHARED_MAX_POSITION_TOPUP_USD"),
+        2_000.0,
+    )
     return PumpLiveConfig(
         entry_cap=max(1, min(4, entry_cap)),
         poll_interval_sec=max(5, min(60, poll_interval)),
@@ -270,6 +381,13 @@ def load_pump_live_config(path: Path = PUMP_LIVE_ENV_PATH) -> PumpLiveConfig:
         entry_margin_prefund_tolerance_pct=max(
             0.0,
             min(2.0, prefund_tolerance),
+        ),
+        margin_manager_policy_id=margin_manager_policy,
+        projected_final_fill_buffer_pct=max(5.0, min(50.0, final_fill_buffer)),
+        shared_rescue_facility_cap_usd=max(0.0, min(2_000.0, shared_rescue_cap)),
+        shared_max_position_topup_usd=max(
+            0.0,
+            min(2_000.0, shared_position_cap),
         ),
     )
 
@@ -1044,6 +1162,51 @@ class PumpLiveController:
     def _active_policy_config(self, runtime_config: PumpLiveConfig) -> PumpLiveConfig:
         return risk_policy_config(self._active_policy_id(), runtime_config)
 
+    def _active_margin_envelope_config(
+        self,
+        runtime_config: PumpLiveConfig,
+    ) -> PumpLiveConfig:
+        active = self._active_policy_config(runtime_config)
+        if runtime_config.margin_manager_policy_id != MARGIN_MANAGER_V3_SHARED:
+            return active
+        with self._lock:
+            open_items = self._open_positions(self._state)
+        committed_base = sum(
+            self._position_full_slot_margin_usd(item, runtime_config)
+            for item in open_items
+        )
+        own_topup_capacity = max(
+            0.0,
+            active.total_capital_usd
+            - committed_base
+            - active.operating_cash_floor_usd,
+        )
+        return replace(
+            active,
+            max_position_topup_usd=max(
+                active.max_position_topup_usd,
+                runtime_config.shared_max_position_topup_usd,
+            ),
+            max_total_topup_usd=(
+                own_topup_capacity
+                + runtime_config.shared_rescue_facility_cap_usd
+            ),
+        )
+
+    def _position_full_slot_margin_usd(
+        self,
+        item: Mapping[str, Any],
+        runtime_config: PumpLiveConfig,
+    ) -> float:
+        legs = list(item.get("legs") or [])
+        planned = sum(
+            max(0.0, _safe_float(leg.get("margin_usd"), 0.0))
+            for leg in legs
+        )
+        if planned > 0:
+            return planned
+        return self._position_config(item, runtime_config).slot_margin_usd
+
     def _position_margin_defense_config(
         self,
         item: Mapping[str, Any],
@@ -1051,7 +1214,7 @@ class PumpLiveController:
     ) -> PumpLiveConfig:
         """Keep entry sizing immutable while allowing the active capital envelope to defend it."""
         position_config = self._position_config(item, runtime_config)
-        active_config = self._active_policy_config(runtime_config)
+        active_config = self._active_margin_envelope_config(runtime_config)
         return replace(
             position_config,
             max_position_topup_usd=max(
@@ -1085,8 +1248,58 @@ class PumpLiveController:
             active_policy_id,
             config,
         )
+        margin_envelope = self._active_margin_envelope_config(config)
+        payload["margin_manager"] = {
+            "policy_id": config.margin_manager_policy_id,
+            "rollback_policy_id": MARGIN_MANAGER_V2_CURRENT,
+            "slot_margin_usd": round(
+                self._active_policy_config(config).slot_margin_usd,
+                6,
+            ),
+            "shared_max_position_topup_usd": round(
+                margin_envelope.max_position_topup_usd,
+                6,
+            ),
+            "shared_max_total_topup_usd": round(
+                margin_envelope.max_total_topup_usd,
+                6,
+            ),
+            "rescue_facility_cap_usd": round(
+                config.shared_rescue_facility_cap_usd,
+                6,
+            ),
+            "projected_final_fill_buffer_pct": round(
+                config.projected_final_fill_buffer_pct,
+                6,
+            ),
+            "main_funds_count_for_entry": False,
+            "exchange_margin_mode": "isolated",
+        }
+        if config.margin_manager_policy_id == MARGIN_MANAGER_V3_SHARED:
+            payload["shared_pool"] = self._shared_entry_admission(
+                balance=(payload.get("last_balance") or {}),
+                open_items=self._open_positions(payload),
+                candidate_config=self._active_policy_config(config),
+                tier={
+                    "ladder_legs": 5,
+                    "ladder_step_pct": 50.0,
+                    "leg_weights": [1.0, 1.0, 1.0, 1.0, 1.0],
+                },
+            )
         payload["capital_manager"] = build_capital_manager_status(payload, config)
-        payload["capital_regime"] = build_capital_regime_status(payload, config)
+        capital_regime = build_capital_regime_status(payload, config)
+        shared_pool = payload.get("shared_pool")
+        if isinstance(shared_pool, Mapping):
+            capital_regime["new_slot_required_available_usd"] = shared_pool.get(
+                "required_available_usd"
+            )
+            capital_regime["new_slot_headroom_usd"] = shared_pool.get(
+                "entry_headroom_usd"
+            )
+            capital_regime["new_slot_ready"] = bool(shared_pool.get("ready"))
+            capital_regime["new_slot_blocked_reason"] = shared_pool.get("reason")
+            capital_regime["margin_manager_policy_id"] = MARGIN_MANAGER_V3_SHARED
+        payload["capital_regime"] = capital_regime
         payload["capital_rescue_shadow"] = build_capital_rescue_shadow(payload, config)
         payload["credentials"] = self.gateway.credentials_status()
         payload["monitor_thread_alive"] = bool(self._thread and self._thread.is_alive())
@@ -2204,22 +2417,245 @@ class PumpLiveController:
                     + guaranteed_deficit
                     + candidate_config.guaranteed_position_topup_usd
                 )
-            if rescue_required_after_entry > candidate_config.max_total_topup_usd + 1e-9:
-                self.disarm("rescue_budget_below_new_slot_guard")
-                break
-            required_available = required_available_for_new_slot(
-                candidate_config,
-                current_total_topup_usd=total_topup,
-            )
-            if _safe_float(balance.get("available"), 0.0) + 1e-9 < required_available:
-                self.disarm("available_balance_below_new_slot_guard")
-                break
+            if config.margin_manager_policy_id == MARGIN_MANAGER_V3_SHARED:
+                admission = self._shared_entry_admission(
+                    balance=balance,
+                    open_items=open_items,
+                    candidate_config=candidate_config,
+                    tier=dict(decision.get("tier") or {}),
+                )
+                with self._lock:
+                    self._state["shared_entry_admission"] = admission
+                    self._save_state_locked()
+                if not admission["ready"]:
+                    self.disarm(str(admission["reason"]))
+                    break
+            else:
+                if rescue_required_after_entry > candidate_config.max_total_topup_usd + 1e-9:
+                    self.disarm("rescue_budget_below_new_slot_guard")
+                    break
+                required_available = required_available_for_new_slot(
+                    candidate_config,
+                    current_total_topup_usd=total_topup,
+                )
+                if _safe_float(balance.get("available"), 0.0) + 1e-9 < required_available:
+                    self.disarm("available_balance_below_new_slot_guard")
+                    break
             self._open_new_position(
                 decision,
                 candidate_config,
                 risk_policy_id=candidate_policy_id,
             )
             balance = self.gateway.fetch_balance()
+
+    def _initial_projected_prefund_reserve(
+        self,
+        *,
+        tier: Mapping[str, Any],
+        config: PumpLiveConfig,
+    ) -> float:
+        legs = build_live_legs(
+            tier=tier,
+            slot_margin_usd=config.slot_margin_usd,
+            leverage=config.leverage,
+            reference_price=1.0,
+        )
+        if len(legs) < 2:
+            return 0.0
+        first = legs[0]
+        first_qty = _safe_float(first.get("notional_usd"), 0.0)
+        theoretical_liq = (
+            (1.0 + 1.0 / config.leverage)
+            / (1.0 + config.entry_margin_prefund_mmr)
+        )
+        reserve = projected_ladder_margin_reserve(
+            qty=first_qty,
+            current_liq_price=theoretical_liq,
+            legs=legs,
+            target_legs=legs[1:],
+            leverage=config.leverage,
+            stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
+            safety_above_next_ladder_pct=config.entry_margin_prefund_safety_pct,
+            final_fill_buffer_pct=config.projected_final_fill_buffer_pct,
+            maintenance_margin_rate=config.entry_margin_prefund_mmr,
+            taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
+            round_up_increment_usd=config.entry_margin_prefund_round_usd,
+            correction_steps=PREFUND_MAX_CORRECTION_STEPS,
+        )
+        return _safe_float(reserve.get("total_reserve_usd"), 0.0)
+
+    def _shared_entry_admission(
+        self,
+        *,
+        balance: Mapping[str, Any],
+        open_items: Iterable[Mapping[str, Any]],
+        candidate_config: PumpLiveConfig,
+        tier: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        runtime_config = self.config()
+        envelope = self._active_margin_envelope_config(runtime_config)
+        items = list(open_items)
+        existing_full_base = sum(
+            self._position_full_slot_margin_usd(item, runtime_config)
+            for item in items
+        )
+        planned_base = 0.0
+        safety_shortfall = 0.0
+        desired_total_topup = 0.0
+        position_cap_ready = True
+        position_rows: list[dict[str, Any]] = []
+        for item in items:
+            legs = list(item.get("legs") or [])
+            planned = sum(
+                max(0.0, _safe_float(leg.get("margin_usd"), 0.0))
+                for leg in legs
+                if leg.get("status") == "planned"
+            )
+            planned_base += planned
+            current_topup = max(0.0, _safe_float(item.get("margin_topup_usd"), 0.0))
+            remaining_legs = [
+                leg
+                for leg in sorted(
+                    legs,
+                    key=lambda row: _safe_int(row.get("step"), 0),
+                )
+                if _safe_int(leg.get("step"), 0) > 1
+                and leg.get("status") in {"planned", "open", "submitted"}
+            ]
+            required = 0.0
+            error: str | None = None
+            immediate_ready = True
+            if remaining_legs:
+                try:
+                    position_config = self._position_config(item, runtime_config)
+                    reserve = projected_ladder_margin_reserve(
+                        qty=_safe_float(item.get("qty"), 0.0),
+                        current_liq_price=_safe_float(item.get("liq_price"), 0.0),
+                        legs=legs,
+                        target_legs=remaining_legs,
+                        leverage=position_config.leverage,
+                        stop_gap_from_liq_pct=position_config.exchange_stop_gap_from_liq_pct,
+                        safety_above_next_ladder_pct=position_config.entry_margin_prefund_safety_pct,
+                        final_fill_buffer_pct=position_config.projected_final_fill_buffer_pct,
+                        maintenance_margin_rate=position_config.entry_margin_prefund_mmr,
+                        taker_fee_rate=position_config.entry_margin_prefund_taker_fee_rate,
+                        round_up_increment_usd=position_config.entry_margin_prefund_round_usd,
+                        correction_steps=PREFUND_MAX_CORRECTION_STEPS,
+                    )
+                    required = _safe_float(reserve.get("total_reserve_usd"), 0.0)
+                    _, immediate_check = self._build_prefund_plan_and_check(
+                        item,
+                        position_config,
+                        target_leg=remaining_legs[0],
+                    )
+                    immediate_ready = bool(immediate_check.get("ready"))
+                except Exception as exc:
+                    immediate_ready = False
+                    error = _clean_error(exc)
+                    required = math.inf
+            safety_shortfall += required
+            desired_total_topup += current_topup + required
+            row_cap_ready = bool(
+                math.isfinite(required)
+                and current_topup + required
+                <= envelope.max_position_topup_usd + 1e-9
+            )
+            position_cap_ready = position_cap_ready and row_cap_ready
+            position_rows.append(
+                {
+                    "symbol": _normalize_symbol(item.get("symbol")),
+                    "planned_base_margin_usd": round(planned, 6),
+                    "current_topup_usd": round(current_topup, 6),
+                    "safety_shortfall_usd": (
+                        round(required, 6) if math.isfinite(required) else None
+                    ),
+                    "immediate_ready": immediate_ready,
+                    "full_path_cap_ready": row_cap_ready,
+                    "error": error,
+                }
+            )
+        new_safety = self._initial_projected_prefund_reserve(
+            tier=tier,
+            config=candidate_config,
+        )
+        desired_total_topup += new_safety
+        new_position_cap_ready = bool(
+            new_safety <= envelope.max_position_topup_usd + 1e-9
+        )
+        position_cap_ready = position_cap_ready and new_position_cap_ready
+        available = max(0.0, _safe_float(balance.get("available"), 0.0))
+        with self._lock:
+            manager = dict(self._state.get("capital_manager") or {})
+        rescue_only_temporary = max(
+            0.0,
+            _safe_float(manager.get("temporary_transfer_outstanding_usd"), 0.0),
+        )
+        required_available = (
+            planned_base
+            + safety_shortfall
+            + candidate_config.slot_margin_usd
+            + new_safety
+            + envelope.operating_cash_floor_usd
+            + rescue_only_temporary
+        )
+        admission_topup_cap = (
+            max(
+                0.0,
+                candidate_config.total_capital_usd
+                - existing_full_base
+                - candidate_config.slot_margin_usd
+                - envelope.operating_cash_floor_usd,
+            )
+            + runtime_config.shared_rescue_facility_cap_usd
+        )
+        cap_ready = desired_total_topup <= admission_topup_cap + 1e-9
+        cash_ready = available + 1e-9 >= required_available
+        if not position_cap_ready:
+            reason = "shared_projected_position_cap_below_new_slot"
+        elif not cap_ready:
+            reason = "shared_projected_topup_cap_below_new_slot"
+        elif not cash_ready:
+            reason = "shared_projected_cash_below_new_slot"
+        else:
+            reason = None
+        return {
+            "ready": bool(position_cap_ready and cap_ready and cash_ready),
+            "reason": reason,
+            "policy_id": MARGIN_MANAGER_V3_SHARED,
+            "main_funds_count_for_entry": False,
+            "available_usd": round(available, 6),
+            "planned_base_margin_usd": round(planned_base, 6),
+            "existing_full_slot_margin_usd": round(existing_full_base, 6),
+            "existing_safety_shortfall_usd": (
+                round(safety_shortfall, 6)
+                if math.isfinite(safety_shortfall)
+                else None
+            ),
+            "new_slot_margin_usd": round(candidate_config.slot_margin_usd, 6),
+            "new_initial_safety_usd": round(new_safety, 6),
+            "candidate_ladder_legs": _safe_int(tier.get("ladder_legs"), 0),
+            "candidate_leg_weights": list(tier.get("leg_weights") or []),
+            "new_position_cap_ready": new_position_cap_ready,
+            "operating_floor_usd": round(envelope.operating_cash_floor_usd, 6),
+            "rescue_only_temporary_lock_usd": round(rescue_only_temporary, 6),
+            "required_available_usd": (
+                round(required_available, 6)
+                if math.isfinite(required_available)
+                else None
+            ),
+            "entry_headroom_usd": (
+                round(available - required_available, 6)
+                if math.isfinite(required_available)
+                else None
+            ),
+            "desired_total_topup_usd": (
+                round(desired_total_topup, 6)
+                if math.isfinite(desired_total_topup)
+                else None
+            ),
+            "max_total_topup_usd": round(admission_topup_cap, 6),
+            "positions": position_rows,
+        }
 
     def _open_new_position(
         self,
@@ -2617,7 +3053,7 @@ class PumpLiveController:
 
     def _maybe_topup_or_emergency(self, item: dict[str, Any], config: PumpLiveConfig) -> None:
         runtime_config = self.config()
-        portfolio_config = self._active_policy_config(runtime_config)
+        portfolio_config = self._active_margin_envelope_config(runtime_config)
         mark = _safe_float(item.get("mark_price"), 0.0)
         liq = _optional_float(item.get("liq_price"))
         if not liq or mark <= 0:
@@ -2814,7 +3250,7 @@ class PumpLiveController:
         config: PumpLiveConfig,
     ) -> tuple[float, float, float]:
         runtime_config = self.config()
-        portfolio_config = self._active_policy_config(runtime_config)
+        portfolio_config = self._active_margin_envelope_config(runtime_config)
         position_topup = _safe_float(item.get("margin_topup_usd"), 0.0)
         with self._lock:
             open_items = self._open_positions(self._state)
@@ -2855,7 +3291,7 @@ class PumpLiveController:
         config: PumpLiveConfig,
     ) -> float:
         runtime_config = self.config()
-        portfolio_config = self._active_policy_config(runtime_config)
+        portfolio_config = self._active_margin_envelope_config(runtime_config)
         defense_config = self._position_margin_defense_config(item, runtime_config)
         position_topup = _safe_float(item.get("margin_topup_usd"), 0.0)
         with self._lock:
@@ -2895,7 +3331,7 @@ class PumpLiveController:
         if self._risk_transfer_provider is None:
             return allowed_usd, available_usd, 0.0
         runtime_config = self.config()
-        portfolio_config = self._active_policy_config(runtime_config)
+        portfolio_config = self._active_margin_envelope_config(runtime_config)
         risk_capacity = self._entry_prefund_risk_capacity(item, config)
         cash_capacity = max(0.0, available_usd - portfolio_config.operating_cash_floor_usd)
         if required_usd > risk_capacity + 1e-9 or cash_capacity + 1e-9 >= required_usd:
@@ -3061,16 +3497,40 @@ class PumpLiveController:
         liq = _optional_float(item.get("liq_price"))
         if liq is None or next_price <= 0:
             raise RuntimeError("pump_live_ladder_gate_inputs_missing")
-        target_stop = next_price * (
-            1.0 + config.entry_margin_prefund_safety_pct / 100.0
+        plan, check = self._build_prefund_plan_and_check(
+            item,
+            config,
+            target_leg=next_leg,
         )
-        check = entry_prefund_target_check(
-            verified_stop_price=self._desired_emergency_stop(liq, config),
-            target_stop_price=target_stop,
-            next_ladder_price=next_price,
-            tolerance_pct=config.entry_margin_prefund_tolerance_pct,
-        )
+        with self._lock:
+            item["margin_prefund_plan"] = plan
+            item["margin_prefund_verification"] = check
+            self._save_state_locked()
         if not check["ready"]:
+            if (
+                config.margin_manager_policy_id == MARGIN_MANAGER_V3_SHARED
+                and next_leg.get("status") in {"open", "submitted"}
+            ):
+                cancel_fill_race = self._cancel_ladder_for_gate(
+                    item,
+                    next_leg,
+                    reason="projected_margin_rebuild",
+                )
+                if cancel_fill_race:
+                    exchange = self._fetch_exchange_short(
+                        _normalize_symbol(item.get("symbol"))
+                    )
+                    if exchange is not None:
+                        self._apply_exchange_position(item, exchange)
+                    self.disarm("ladder_gate_fill_race")
+                    self._event(
+                        "ladder_gate_fill_race",
+                        {
+                            "symbol": _normalize_symbol(item.get("symbol")),
+                            "step": _safe_int(next_leg.get("step"), 0),
+                        },
+                    )
+                    return
             try:
                 self._ensure_entry_margin_prefund(
                     item,
@@ -3124,7 +3584,11 @@ class PumpLiveController:
             item["ladder_gate_status"] = "ready"
             item["ladder_gate_step"] = _safe_int(next_leg.get("step"), 0)
             item["ladder_gate_error"] = None
-            item["margin_continuation_policy_id"] = self._active_policy_id()
+            item["margin_continuation_policy_id"] = (
+                MARGIN_MANAGER_V3_SHARED
+                if config.margin_manager_policy_id == MARGIN_MANAGER_V3_SHARED
+                else self._active_policy_id()
+            )
             item["updated_at_ms"] = _now_ms()
             self._save_state_locked()
 
@@ -3166,21 +3630,88 @@ class PumpLiveController:
                 reason="deferred_event_state_recovery",
             )
 
+    def _build_prefund_plan_and_check(
+        self,
+        item: Mapping[str, Any],
+        config: PumpLiveConfig,
+        *,
+        target_leg: Mapping[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        qty = _safe_float(item.get("qty"), 0.0)
+        liq = _optional_float(item.get("liq_price"))
+        if qty <= 0 or liq is None:
+            raise RuntimeError("pump_live_margin_prefund_inputs_missing")
+        policy_id = config.margin_manager_policy_id
+        plan = ladder_prefund_plan(
+            policy_id=policy_id,
+            qty=qty,
+            current_liq_price=liq,
+            legs=item.get("legs") or [],
+            target_leg=target_leg,
+            leverage=config.leverage,
+            stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
+            safety_above_next_ladder_pct=config.entry_margin_prefund_safety_pct,
+            final_fill_buffer_pct=config.projected_final_fill_buffer_pct,
+            maintenance_margin_rate=config.entry_margin_prefund_mmr,
+            taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
+            round_up_increment_usd=config.entry_margin_prefund_round_usd,
+        )
+        tolerance = (
+            0.0
+            if policy_id == MARGIN_MANAGER_V3_SHARED
+            else config.entry_margin_prefund_tolerance_pct
+        )
+        current_check = entry_prefund_target_check(
+            verified_stop_price=self._desired_emergency_stop(liq, config),
+            target_stop_price=_safe_float(plan.get("target_stop_price"), 0.0),
+            next_ladder_price=_safe_float(plan.get("reference_price"), 0.0),
+            tolerance_pct=tolerance,
+        )
+        projected_check: dict[str, Any] | None = None
+        if policy_id == MARGIN_MANAGER_V3_SHARED:
+            projected_check = entry_prefund_target_check(
+                verified_stop_price=_optional_float(plan.get("projected_stop_price")),
+                target_stop_price=_safe_float(plan.get("target_stop_price"), 0.0),
+                next_ladder_price=_safe_float(plan.get("reference_price"), 0.0),
+                tolerance_pct=0.0,
+            )
+        ready = bool(
+            current_check["ready"]
+            and (projected_check is None or projected_check["ready"])
+        )
+        if policy_id != MARGIN_MANAGER_V3_SHARED:
+            return plan, {
+                **current_check,
+                "policy_id": policy_id,
+                "current": current_check,
+                "projected": None,
+                "reference_price": plan.get("reference_price"),
+                "hard_target_enforced": False,
+            }
+        return plan, {
+            "ready": ready,
+            "policy_id": policy_id,
+            "current": current_check,
+            "projected": projected_check,
+            "verified_stop_price": current_check.get("verified_stop_price"),
+            "target_stop_price": plan.get("target_stop_price"),
+            "reference_price": plan.get("reference_price"),
+            "hard_target_enforced": policy_id == MARGIN_MANAGER_V3_SHARED,
+        }
+
     def _verify_entry_prefund_target(
         self,
         item: dict[str, Any],
         config: PumpLiveConfig,
         *,
         symbol: str,
-        target_stop: float,
-        next_ladder: float,
-    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        target_leg: Mapping[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any], dict[str, Any]]:
         verified: dict[str, Any] | None = None
-        check = entry_prefund_target_check(
-            verified_stop_price=None,
-            target_stop_price=target_stop,
-            next_ladder_price=next_ladder,
-            tolerance_pct=config.entry_margin_prefund_tolerance_pct,
+        plan, check = self._build_prefund_plan_and_check(
+            item,
+            config,
+            target_leg=target_leg,
         )
         for delay in PREFUND_VERIFY_READ_DELAYS_SEC:
             if delay > 0:
@@ -3189,21 +3720,18 @@ class PumpLiveController:
             if verified is None:
                 continue
             self._apply_exchange_position(item, verified)
-            check = entry_prefund_target_check(
-                verified_stop_price=self._desired_emergency_stop(
-                    _optional_float(item.get("liq_price")),
-                    config,
-                ),
-                target_stop_price=target_stop,
-                next_ladder_price=next_ladder,
-                tolerance_pct=config.entry_margin_prefund_tolerance_pct,
+            plan, check = self._build_prefund_plan_and_check(
+                item,
+                config,
+                target_leg=target_leg,
             )
             with self._lock:
+                item["margin_prefund_plan"] = plan
                 item["margin_prefund_verification"] = check
                 self._save_state_locked()
             if check["ready"]:
                 break
-        return verified, check
+        return verified, plan, check
 
     def _record_entry_prefund_add(
         self,
@@ -3252,23 +3780,23 @@ class PumpLiveController:
         next_ladder = _safe_float(selected_leg.get("trigger_price"), 0.0)
         if qty <= 0 or liq is None or next_ladder <= 0:
             raise RuntimeError("pump_live_margin_prefund_inputs_missing")
-        target_stop = next_ladder * (
-            1.0 + config.entry_margin_prefund_safety_pct / 100.0
-        )
         buffer_before = _short_liq_buffer_pct(
             _safe_float(item.get("mark_price"), 0.0),
             liq,
         )
-        current_check = entry_prefund_target_check(
-            verified_stop_price=self._desired_emergency_stop(liq, config),
-            target_stop_price=target_stop,
-            next_ladder_price=next_ladder,
-            tolerance_pct=config.entry_margin_prefund_tolerance_pct,
+        plan, current_check = self._build_prefund_plan_and_check(
+            item,
+            config,
+            target_leg=selected_leg,
         )
+        target_stop = _safe_float(plan.get("target_stop_price"), 0.0)
+        reference_price = _safe_float(plan.get("reference_price"), next_ladder)
         position_topup = _safe_float(item.get("margin_topup_usd"), 0.0)
         with self._lock:
             item["margin_prefund_target_stop_price"] = target_stop
             item["margin_prefund_next_ladder_price"] = next_ladder
+            item["margin_prefund_reference_price"] = reference_price
+            item["margin_prefund_plan"] = plan
             item["margin_prefund_verification"] = current_check
             self._save_state_locked()
         if current_check["ready"]:
@@ -3280,16 +3808,7 @@ class PumpLiveController:
                 self._save_state_locked()
             return
 
-        required = required_entry_prefund_usd(
-            qty=qty,
-            current_liq_price=liq,
-            next_ladder_price=next_ladder,
-            stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
-            safety_above_next_ladder_pct=config.entry_margin_prefund_safety_pct,
-            maintenance_margin_rate=config.entry_margin_prefund_mmr,
-            taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
-            round_up_usd=config.entry_margin_prefund_round_usd,
-        )
+        required = _safe_float(plan.get("required_add_usd"), 0.0)
         if required < 1e-9:
             required = config.entry_margin_prefund_round_usd
         allowed, available, total_topup_before = self._entry_prefund_capacity(item, config)
@@ -3327,12 +3846,11 @@ class PumpLiveController:
             amount_usd=required,
             status="verifying",
         )
-        verified, check = self._verify_entry_prefund_target(
+        verified, verified_plan, check = self._verify_entry_prefund_target(
             item,
             config,
             symbol=symbol,
-            target_stop=target_stop,
-            next_ladder=next_ladder,
+            target_leg=selected_leg,
         )
         while not check["ready"] and correction_steps < PREFUND_MAX_CORRECTION_STEPS:
             verified_liq = _optional_float(item.get("liq_price"))
@@ -3374,12 +3892,11 @@ class PumpLiveController:
                     "position_topup_usd": position_topup_after,
                 },
             )
-            verified, check = self._verify_entry_prefund_target(
+            verified, verified_plan, check = self._verify_entry_prefund_target(
                 item,
                 config,
                 symbol=symbol,
-                target_stop=target_stop,
-                next_ladder=next_ladder,
+                target_leg=selected_leg,
             )
 
         verified_stop = check.get("verified_stop_price")
@@ -3405,6 +3922,7 @@ class PumpLiveController:
                     "verified_stop_price": verified_stop,
                     "correction_steps": correction_steps,
                     "verification": check,
+                    "projected_plan": verified_plan,
                 },
             )
             raise RuntimeError("pump_live_margin_prefund_target_unconfirmed")
@@ -3432,6 +3950,7 @@ class PumpLiveController:
                 "target_stop_price": target_stop,
                 "verified_stop_price": verified_stop,
                 "verification": check,
+                "projected_plan": verified_plan,
                 "liq_buffer_pct_before": buffer_before,
                 "liq_buffer_pct_after": verified_buffer,
                 "total_topup_usd": total_topup_before + total_added,
@@ -4508,6 +5027,186 @@ def required_entry_prefund_usd(
     return math.ceil(required / increment - 1e-12) * increment
 
 
+def ladder_prefund_plan(
+    *,
+    policy_id: str,
+    qty: float,
+    current_liq_price: float,
+    legs: Iterable[Mapping[str, Any]],
+    target_leg: Mapping[str, Any],
+    leverage: float,
+    stop_gap_from_liq_pct: float,
+    safety_above_next_ladder_pct: float,
+    final_fill_buffer_pct: float,
+    maintenance_margin_rate: float,
+    taker_fee_rate: float,
+    round_up_increment_usd: float,
+) -> dict[str, Any]:
+    target_leg_price = _safe_float(target_leg.get("trigger_price"), 0.0)
+    target_leg_notional = _safe_float(target_leg.get("notional_usd"), 0.0)
+    if policy_id == MARGIN_MANAGER_V3_SHARED:
+        target = shared_margin_target(
+            legs=legs,
+            target_leg=target_leg,
+            safety_pct=safety_above_next_ladder_pct,
+            final_fill_buffer_pct=final_fill_buffer_pct,
+        )
+    else:
+        target = {
+            "target_kind": "current_next_ladder",
+            "target_leg_step": _safe_int(target_leg.get("step"), 0),
+            "target_leg_price": target_leg_price,
+            "following_leg_step": None,
+            "reference_price": target_leg_price,
+            "clearance_pct": max(0.0, safety_above_next_ladder_pct),
+            "target_stop_price": target_leg_price
+            * (1.0 + max(0.0, safety_above_next_ladder_pct) / 100.0),
+        }
+    reference_price = _safe_float(target.get("reference_price"), 0.0)
+    target_stop = _safe_float(target.get("target_stop_price"), 0.0)
+    current_required = required_entry_prefund_usd(
+        qty=qty,
+        current_liq_price=current_liq_price,
+        next_ladder_price=reference_price,
+        stop_gap_from_liq_pct=stop_gap_from_liq_pct,
+        safety_above_next_ladder_pct=_safe_float(target.get("clearance_pct"), 0.0),
+        maintenance_margin_rate=maintenance_margin_rate,
+        taker_fee_rate=taker_fee_rate,
+        round_up_usd=round_up_increment_usd,
+    )
+    projected_qty: float | None = None
+    projected_liq: float | None = None
+    projected_stop: float | None = None
+    projected_required = 0.0
+    if policy_id == MARGIN_MANAGER_V3_SHARED:
+        projected_qty, projected_liq = projected_short_liquidation_after_fill(
+            qty=qty,
+            current_liq_price=current_liq_price,
+            added_notional_usd=target_leg_notional,
+            added_price=target_leg_price,
+            leverage=leverage,
+            maintenance_margin_rate=maintenance_margin_rate,
+        )
+        projected_stop = projected_liq * (
+            1.0 - max(0.1, min(20.0, stop_gap_from_liq_pct)) / 100.0
+        )
+        projected_required = required_entry_prefund_usd(
+            qty=projected_qty,
+            current_liq_price=projected_liq,
+            next_ladder_price=reference_price,
+            stop_gap_from_liq_pct=stop_gap_from_liq_pct,
+            safety_above_next_ladder_pct=_safe_float(target.get("clearance_pct"), 0.0),
+            maintenance_margin_rate=maintenance_margin_rate,
+            taker_fee_rate=taker_fee_rate,
+            round_up_usd=round_up_increment_usd,
+        )
+    required = max(current_required, projected_required)
+    return {
+        "policy_id": policy_id,
+        **target,
+        "target_stop_price": target_stop,
+        "current_required_add_usd": round(current_required, 6),
+        "projected_required_add_usd": round(projected_required, 6),
+        "required_add_usd": round(required, 6),
+        "projected_qty": round(projected_qty, 12) if projected_qty is not None else None,
+        "projected_liq_price": (
+            round(projected_liq, 12) if projected_liq is not None else None
+        ),
+        "projected_stop_price": (
+            round(projected_stop, 12) if projected_stop is not None else None
+        ),
+        "hard_target_enforced": policy_id == MARGIN_MANAGER_V3_SHARED,
+    }
+
+
+def projected_ladder_margin_reserve(
+    *,
+    qty: float,
+    current_liq_price: float,
+    legs: Iterable[Mapping[str, Any]],
+    target_legs: Iterable[Mapping[str, Any]],
+    leverage: float,
+    stop_gap_from_liq_pct: float,
+    safety_above_next_ladder_pct: float,
+    final_fill_buffer_pct: float,
+    maintenance_margin_rate: float,
+    taker_fee_rate: float,
+    round_up_increment_usd: float,
+    correction_steps: int,
+) -> dict[str, Any]:
+    """Reserve the complete remaining ladder path from past/current state only."""
+    projected_qty = qty
+    projected_liq = current_liq_price
+    ordered_legs = sorted(
+        (dict(leg) for leg in legs),
+        key=lambda leg: _safe_int(leg.get("step"), 0),
+    )
+    ordered_targets = sorted(
+        (dict(leg) for leg in target_legs),
+        key=lambda leg: _safe_int(leg.get("step"), 0),
+    )
+    if projected_qty <= 0 or projected_liq <= 0:
+        raise ValueError("pump_live_projected_reserve_inputs_invalid")
+    required_total = 0.0
+    correction_total = 0.0
+    steps: list[dict[str, Any]] = []
+    for target_leg in ordered_targets:
+        plan = ladder_prefund_plan(
+            policy_id=MARGIN_MANAGER_V3_SHARED,
+            qty=projected_qty,
+            current_liq_price=projected_liq,
+            legs=ordered_legs,
+            target_leg=target_leg,
+            leverage=leverage,
+            stop_gap_from_liq_pct=stop_gap_from_liq_pct,
+            safety_above_next_ladder_pct=safety_above_next_ladder_pct,
+            final_fill_buffer_pct=final_fill_buffer_pct,
+            maintenance_margin_rate=maintenance_margin_rate,
+            taker_fee_rate=taker_fee_rate,
+            round_up_increment_usd=round_up_increment_usd,
+        )
+        required = _safe_float(plan.get("required_add_usd"), 0.0)
+        correction = (
+            max(0, int(correction_steps)) * max(0.0, round_up_increment_usd)
+            if required > 0
+            else 0.0
+        )
+        required_total += required
+        correction_total += correction
+        if required > 0:
+            projected_liq += required / (
+                projected_qty * (1.0 + max(0.0, maintenance_margin_rate))
+            )
+        target_price = _safe_float(target_leg.get("trigger_price"), 0.0)
+        target_notional = _safe_float(target_leg.get("notional_usd"), 0.0)
+        projected_qty, projected_liq = projected_short_liquidation_after_fill(
+            qty=projected_qty,
+            current_liq_price=projected_liq,
+            added_notional_usd=target_notional,
+            added_price=target_price,
+            leverage=leverage,
+            maintenance_margin_rate=maintenance_margin_rate,
+        )
+        steps.append(
+            {
+                "step": _safe_int(target_leg.get("step"), 0),
+                "required_add_usd": round(required, 6),
+                "correction_reserve_usd": round(correction, 6),
+                "projected_qty_after_fill": round(projected_qty, 12),
+                "projected_liq_after_fill": round(projected_liq, 12),
+                "target_kind": plan.get("target_kind"),
+                "reference_price": plan.get("reference_price"),
+            }
+        )
+    return {
+        "policy_id": MARGIN_MANAGER_V3_SHARED,
+        "required_add_usd": round(required_total, 6),
+        "correction_reserve_usd": round(correction_total, 6),
+        "total_reserve_usd": round(required_total + correction_total, 6),
+        "steps": steps,
+    }
+
+
 def build_live_legs(
     *,
     tier: Mapping[str, Any],
@@ -5111,6 +5810,8 @@ __all__ = [
     "PREFUND_NEXT_LADDER_CONFIRMATION_PREFIX",
     "PREPARE_CONFIRMATION",
     "PUMP_LIVE_ENV_PATH",
+    "MARGIN_MANAGER_V2_CURRENT",
+    "MARGIN_MANAGER_V3_SHARED",
     "PumpLiveConfig",
     "PumpLiveController",
     "build_capital_manager_status",
@@ -5118,6 +5819,10 @@ __all__ = [
     "build_capital_rescue_shadow",
     "build_live_legs",
     "entry_prefund_target_check",
+    "ladder_prefund_plan",
     "load_pump_live_config",
     "required_entry_prefund_usd",
+    "projected_short_liquidation_after_fill",
+    "projected_ladder_margin_reserve",
+    "shared_margin_target",
 ]

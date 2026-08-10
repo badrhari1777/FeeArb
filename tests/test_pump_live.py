@@ -14,6 +14,8 @@ from execution.pump_live import (
     CAPITAL_SET_CONFIRMATION,
     CAPITAL_PROMOTE_CONFIRMATION,
     PREFUND_NEXT_LADDER_CONFIRMATION_PREFIX,
+    MARGIN_MANAGER_V2_CURRENT,
+    MARGIN_MANAGER_V3_SHARED,
     RISK_POLICY_V1,
     RISK_POLICY_V2,
     PumpLiveConfig,
@@ -24,6 +26,7 @@ from execution.pump_live import (
     build_live_legs,
     config_from_risk_snapshot,
     entry_prefund_target_check,
+    ladder_prefund_plan,
     load_pump_live_config,
     required_entry_prefund_usd,
     required_available_for_new_slot,
@@ -519,6 +522,7 @@ def write_env(
     *,
     entry_cap: int = 1,
     prefund_enabled: bool = False,
+    margin_manager_policy: str = MARGIN_MANAGER_V2_CURRENT,
 ) -> None:
     path.write_text(
         "\n".join(
@@ -536,6 +540,10 @@ def write_env(
                 ),
                 "PUMP_LIVE_MARGIN_PREFUND_SAFETY_PCT=2.5",
                 "PUMP_LIVE_MARGIN_PREFUND_TOLERANCE_PCT=2.0",
+                f"PUMP_LIVE_MARGIN_MANAGER_POLICY={margin_manager_policy}",
+                "PUMP_LIVE_PROJECTED_FINAL_FILL_BUFFER_PCT=20",
+                "PUMP_LIVE_SHARED_RESCUE_FACILITY_CAP_USD=2000",
+                "PUMP_LIVE_SHARED_MAX_POSITION_TOPUP_USD=2000",
             ]
         ),
         encoding="utf-8",
@@ -1637,6 +1645,428 @@ def test_prefund_defaults_on_but_can_be_disabled_in_local_config(
     write_env(env_path, prefund_enabled=False)
     disabled = load_pump_live_config(env_path)
     assert disabled.entry_margin_prefund_enabled is False
+
+
+def test_margin_manager_versions_are_separate_and_current_is_default(
+    tmp_path: Path,
+) -> None:
+    missing = load_pump_live_config(tmp_path / "missing.env")
+    assert missing.margin_manager_policy_id == MARGIN_MANAGER_V2_CURRENT
+
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        prefund_enabled=True,
+        margin_manager_policy=MARGIN_MANAGER_V3_SHARED,
+    )
+    shared = load_pump_live_config(env_path)
+
+    assert shared.margin_manager_policy_id == MARGIN_MANAGER_V3_SHARED
+    assert shared.projected_final_fill_buffer_pct == 20.0
+    assert shared.shared_rescue_facility_cap_usd == 2_000.0
+    assert shared.shared_max_position_topup_usd == 2_000.0
+
+
+def test_projected_prefund_uses_bluai_full_fill_and_following_ladder() -> None:
+    legs = [
+        {"step": 1, "trigger_price": 0.017841, "notional_usd": 105.0},
+        {"step": 2, "trigger_price": 0.0267615, "notional_usd": 105.0},
+        {"step": 3, "trigger_price": 0.035682, "notional_usd": 105.0},
+        {"step": 4, "trigger_price": 0.0446025, "notional_usd": 105.0},
+        {"step": 5, "trigger_price": 0.053523, "notional_usd": 105.0},
+    ]
+
+    plan = ladder_prefund_plan(
+        policy_id=MARGIN_MANAGER_V3_SHARED,
+        qty=9_810.0,
+        current_liq_price=0.037698,
+        legs=legs,
+        target_leg=legs[2],
+        leverage=3.0,
+        stop_gap_from_liq_pct=2.5,
+        safety_above_next_ladder_pct=2.5,
+        final_fill_buffer_pct=20.0,
+        maintenance_margin_rate=0.025,
+        taker_fee_rate=0.00055,
+        round_up_increment_usd=5.0,
+    )
+
+    assert plan["target_kind"] == "following_ladder"
+    assert plan["target_leg_step"] == 3
+    assert plan["following_leg_step"] == 4
+    assert plan["reference_price"] == 0.0446025
+    assert plan["required_add_usd"] == 95.0
+    assert plan["projected_qty"] > 12_750
+    assert plan["hard_target_enforced"] is True
+
+
+@pytest.mark.parametrize(
+    ("legs_count", "weights", "expected_reserve"),
+    [
+        (5, [1, 1, 1, 1, 1], 1_445.0),
+        (3, [1, 2, 3], 530.0),
+        (2, [1, 2], 310.0),
+    ],
+)
+def test_shared_entry_reserves_projected_initial_safety_for_every_tier(
+    tmp_path: Path,
+    legs_count: int,
+    weights: list[int],
+    expected_reserve: float,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        entry_cap=4,
+        prefund_enabled=True,
+        margin_manager_policy=MARGIN_MANAGER_V3_SHARED,
+    )
+    gateway = FakePumpGateway()
+    gateway.balance.update({"total": 3_000.0, "wallet": 3_000.0, "available": 3_000.0})
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "active_strategy_capital_usd": 3_000.0,
+        "application_enabled": True,
+    }
+    config = risk_policy_config(RISK_POLICY_V2, controller.config())
+
+    result = controller._shared_entry_admission(  # pylint: disable=protected-access
+        balance=gateway.balance,
+        open_items=[],
+        candidate_config=config,
+        tier={
+            "ladder_legs": legs_count,
+            "ladder_step_pct": 50.0,
+            "leg_weights": weights,
+        },
+    )
+
+    assert result["ready"] is True
+    assert result["new_slot_margin_usd"] == 525.0
+    assert result["new_initial_safety_usd"] == expected_reserve
+    assert result["main_funds_count_for_entry"] is False
+
+
+def test_shared_entry_blocks_when_temporary_rescue_cash_creates_false_headroom(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        entry_cap=4,
+        prefund_enabled=True,
+        margin_manager_policy=MARGIN_MANAGER_V3_SHARED,
+    )
+    gateway = FakePumpGateway()
+    gateway.balance.update({"total": 3_000.0, "wallet": 3_000.0, "available": 1_200.0})
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "temporary_transfer_outstanding_usd": 500.0,
+    }
+    config = risk_policy_config(RISK_POLICY_V2, controller.config())
+
+    result = controller._shared_entry_admission(  # pylint: disable=protected-access
+        balance=gateway.balance,
+        open_items=[],
+        candidate_config=config,
+        tier={
+            "ladder_legs": 5,
+            "ladder_step_pct": 50.0,
+            "leg_weights": [1, 1, 1, 1, 1],
+        },
+    )
+
+    assert result["ready"] is False
+    assert result["reason"] == "shared_projected_cash_below_new_slot"
+    assert result["rescue_only_temporary_lock_usd"] == 500.0
+    assert result["entry_headroom_usd"] < 0
+
+
+def test_shared_entry_blocks_third_slot_when_two_positions_own_future_margin(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        entry_cap=4,
+        prefund_enabled=True,
+        margin_manager_policy=MARGIN_MANAGER_V3_SHARED,
+    )
+    gateway = FakePumpGateway()
+    gateway.balance.update({"total": 3_000.0, "wallet": 3_000.0, "available": 1_500.0})
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "active_strategy_capital_usd": 3_000.0,
+        "application_enabled": True,
+    }
+    config = risk_policy_config(RISK_POLICY_V2, controller.config())
+    open_items = []
+    for symbol in ("ONEUSDT", "TWOUSDT"):
+        open_items.append(
+            {
+                "symbol": symbol,
+                "qty": 100.0,
+                "liq_price": 5.0,
+                "margin_topup_usd": 0.0,
+                "legs": [
+                    {"step": 1, "status": "filled", "trigger_price": 1.0, "margin_usd": 105.0},
+                    {"step": 2, "status": "open", "trigger_price": 1.5, "notional_usd": 105.0, "margin_usd": 105.0},
+                    {"step": 3, "status": "planned", "trigger_price": 2.0, "notional_usd": 105.0, "margin_usd": 105.0},
+                    {"step": 4, "status": "planned", "trigger_price": 2.5, "notional_usd": 105.0, "margin_usd": 105.0},
+                    {"step": 5, "status": "planned", "trigger_price": 3.0, "notional_usd": 105.0, "margin_usd": 105.0},
+                ],
+            }
+        )
+
+    result = controller._shared_entry_admission(  # pylint: disable=protected-access
+        balance=gateway.balance,
+        open_items=open_items,
+        candidate_config=config,
+        tier={
+            "ladder_legs": 5,
+            "ladder_step_pct": 50.0,
+            "leg_weights": [1, 1, 1, 1, 1],
+        },
+    )
+
+    assert result["ready"] is False
+    assert result["reason"] == "shared_projected_cash_below_new_slot"
+    assert result["planned_base_margin_usd"] == 630.0
+    assert result["required_available_usd"] > gateway.balance["available"]
+
+
+def test_shared_entry_blocks_fourth_slot_when_rescue_envelope_is_consumed(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        entry_cap=4,
+        prefund_enabled=True,
+        margin_manager_policy=MARGIN_MANAGER_V3_SHARED,
+    )
+    gateway = FakePumpGateway()
+    gateway.balance.update({"total": 3_000.0, "wallet": 3_000.0, "available": 3_000.0})
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "active_strategy_capital_usd": 3_000.0,
+        "application_enabled": True,
+    }
+    config = risk_policy_config(RISK_POLICY_V2, controller.config())
+    open_items = [
+        {
+            "symbol": f"P{index}USDT",
+            "qty": 100.0,
+            "liq_price": 2.0,
+            "margin_topup_usd": 600.0,
+            "legs": [
+                {
+                    "step": 1,
+                    "status": "filled",
+                    "trigger_price": 1.0,
+                    "margin_usd": 525.0,
+                }
+            ],
+        }
+        for index in range(3)
+    ]
+
+    result = controller._shared_entry_admission(  # pylint: disable=protected-access
+        balance=gateway.balance,
+        open_items=open_items,
+        candidate_config=config,
+        tier={
+            "ladder_legs": 5,
+            "ladder_step_pct": 50.0,
+            "leg_weights": [1, 1, 1, 1, 1],
+        },
+    )
+
+    assert result["ready"] is False
+    assert result["reason"] == "shared_projected_topup_cap_below_new_slot"
+    assert result["desired_total_topup_usd"] == 3_245.0
+    assert result["max_total_topup_usd"] == 2_825.0
+
+
+def test_margin_manager_switch_is_runtime_dynamic_for_legacy_position_snapshot() -> None:
+    old_snapshot = risk_policy_snapshot(
+        RISK_POLICY_V1,
+        PumpLiveConfig(margin_manager_policy_id=MARGIN_MANAGER_V2_CURRENT),
+    )
+    active = config_from_risk_snapshot(
+        old_snapshot,
+        PumpLiveConfig(
+            margin_manager_policy_id=MARGIN_MANAGER_V3_SHARED,
+            projected_final_fill_buffer_pct=25.0,
+            shared_rescue_facility_cap_usd=600.0,
+            shared_max_position_topup_usd=1_100.0,
+        ),
+    )
+
+    assert active.margin_manager_policy_id == MARGIN_MANAGER_V3_SHARED
+    assert active.projected_final_fill_buffer_pct == 25.0
+    assert active.shared_rescue_facility_cap_usd == 600.0
+    assert active.shared_max_position_topup_usd == 1_100.0
+    assert active.total_capital_usd == 1_000.0
+
+
+def test_shared_projected_admission_blocks_order_before_market_submission(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        entry_cap=4,
+        prefund_enabled=True,
+        margin_manager_policy=MARGIN_MANAGER_V3_SHARED,
+    )
+    gateway = FakePumpGateway()
+    gateway.balance.update({"total": 3_000.0, "wallet": 3_000.0, "available": 3_000.0})
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "active_strategy_capital_usd": 3_000.0,
+        "application_enabled": True,
+    }
+    armed_at = int(controller.arm(ARM_CONFIRMATION_V2)["armed_at_ms"])
+    decision = ready_decision(armed_at + 1)
+    decision["tier"] = {
+        "rule_slug": "step50_legs5_equal_tp25_720",
+        "ladder_step_pct": 50.0,
+        "ladder_legs": 5,
+        "leg_weights": [1, 1, 1, 1, 1],
+        "tp_pct": 25.0,
+        "max_hold_h": 720,
+    }
+    assert controller.submit_decisions([decision])["accepted"] == 1
+    gateway.balance["available"] = 1_000.0
+
+    status = controller.run_cycle()
+
+    assert status["entry_armed"] is False
+    assert status["blocked_reason"] == "shared_projected_cash_below_new_slot"
+    assert status["positions"] == []
+    assert not any(operation.startswith("market_sell:") for operation in gateway.operations)
+
+
+def test_shared_projected_gate_cancels_old_stop_race_then_recreates_l3(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        entry_cap=4,
+        prefund_enabled=True,
+        margin_manager_policy=MARGIN_MANAGER_V3_SHARED,
+    )
+    gateway = FakePumpGateway()
+    gateway.balance.update({"total": 3_000.0, "wallet": 3_000.0, "available": 2_000.0})
+    gateway.positions = [
+        {
+            "symbol": "BLUAIUSDT",
+            "side": "short",
+            "qty": 9_810.0,
+            "avg_price": 0.02138577,
+            "mark_price": 0.0277,
+            "liq_price": 0.037698,
+            "unrealized_pnl": -60.0,
+        }
+    ]
+    gateway.orders = [
+        {
+            "id": "bluai-l3-old",
+            "symbol": "BLUAIUSDT",
+            "status": "open",
+            "filled": 0.0,
+            "average": None,
+            "reduce_only": False,
+        }
+    ]
+    gateway.liq_after_add_sequence = [0.047, 0.0471]
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "active_strategy_capital_usd": 3_000.0,
+        "application_enabled": True,
+    }
+    controller._state["positions"] = [  # pylint: disable=protected-access
+        {
+            "live_id": "bluai",
+            "symbol": "BLUAIUSDT",
+            "status": "open",
+            "qty": 9_810.0,
+            "avg_entry_price": 0.02138577,
+            "mark_price": 0.0277,
+            "liq_price": 0.037698,
+            "margin_topup_usd": 105.0,
+            "margin_prefund_floor_usd": 105.0,
+            "risk_policy_id": RISK_POLICY_V1,
+            "risk_policy": risk_policy_snapshot(RISK_POLICY_V1, controller.config()),
+            "tier": {"tp_pct": 25.0},
+            "opened_at_ms": int(time.time() * 1000),
+            "legs": [
+                {"step": 1, "status": "filled", "trigger_price": 0.017841, "notional_usd": 105.0},
+                {"step": 2, "status": "filled", "trigger_price": 0.0267615, "notional_usd": 105.0},
+                {"step": 3, "status": "open", "trigger_price": 0.035682, "notional_usd": 105.0, "margin_usd": 35.0, "order_id": "bluai-l3-old"},
+                {"step": 4, "status": "planned", "trigger_price": 0.0446025, "notional_usd": 105.0, "margin_usd": 35.0},
+                {"step": 5, "status": "planned", "trigger_price": 0.053523, "notional_usd": 105.0, "margin_usd": 35.0},
+            ],
+        }
+    ]
+
+    status = controller.run_cycle()
+    item = status["positions"][0]
+
+    assert status["last_error"] is None
+    assert gateway.canceled == ["bluai-l3-old"]
+    assert gateway.margin_adds == [("BLUAIUSDT", 95.0), ("BLUAIUSDT", 5.0)]
+    assert item["margin_topup_usd"] == 205.0
+    assert item["margin_prefund_floor_usd"] == 205.0
+    assert item["margin_continuation_policy_id"] == MARGIN_MANAGER_V3_SHARED
+    assert item["margin_prefund_verification"]["ready"] is True
+    assert item["margin_prefund_verification"]["projected"]["ready"] is True
+    assert item["legs"][2]["status"] == "open"
+    assert item["legs"][2]["order_id"] != "bluai-l3-old"
 
 
 def test_prefund_failure_keeps_first_leg_protected_and_does_not_place_ladders(

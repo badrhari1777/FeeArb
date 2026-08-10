@@ -161,6 +161,8 @@
     var balance = pump.balance || {};
     var notifications = pump.notifications || {};
     var regime = pump.capital_regime || {};
+    var marginManager = pump.margin_manager || {};
+    var sharedPool = pump.shared_pool || {};
     var autoTransfer = pump.auto_transfer || {};
     var cards = $('pp-pump-cards');
     var totalTopup = positions.reduce(function (sum, row) {
@@ -173,6 +175,13 @@
     setText('pp-pump-topup', money(totalTopup));
     setText('pp-pump-temporary', money(balance.temporary_occupied_usd || 0));
     setText('pp-pump-regime', String(regime.mode || '-').toUpperCase());
+    setText('pp-pump-margin-manager', marginManager.policy_id || '-');
+    setText(
+      'pp-pump-entry-headroom',
+      sharedPool.entry_headroom_usd === null || sharedPool.entry_headroom_usd === undefined
+        ? '-'
+        : money(sharedPool.entry_headroom_usd)
+    );
     setText(
       'pp-pump-auto-transfer',
       autoTransfer.enabled

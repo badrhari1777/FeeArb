@@ -61,13 +61,13 @@ POLICIES: tuple[SharedMarginPolicy, ...] = (
         max_portfolio_topup_usd=825.0,
     ),
     SharedMarginPolicy(
-        "safe_pool_525_loan1000",
+        "safe_pool_525_rescue2000",
         525.0,
         "projected_next_step",
-        1_000.0,
+        2_000.0,
         False,
-        max_position_topup_usd=1_000.0,
-        max_portfolio_topup_usd=1_825.0,
+        max_position_topup_usd=2_000.0,
+        max_portfolio_topup_usd=2_825.0,
     ),
     SharedMarginPolicy(
         "safe_pool_600_loan1000",

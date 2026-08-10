@@ -18,8 +18,15 @@ def build_positions_overview(
     main_cards = [dict(item) for item in main.get("cards") or [] if isinstance(item, Mapping)]
     pump_config = dict(pump.get("config") or {})
     pump_active_policy = dict(pump.get("active_risk_policy") or pump_config)
+    pump_margin_manager = dict(pump.get("margin_manager") or {})
     pump_positions = [
-        _pump_position_card(item, pump_config, pump_active_policy, now_value)
+        _pump_position_card(
+            item,
+            pump_config,
+            pump_active_policy,
+            pump_margin_manager,
+            now_value,
+        )
         for item in pump.get("positions") or []
         if isinstance(item, Mapping) and str(item.get("status") or "") != "closed"
     ]
@@ -104,6 +111,8 @@ def build_positions_overview(
             },
             "balance": _pump_balance(pump),
             "capital_regime": dict(pump.get("capital_regime") or {}),
+            "margin_manager": pump_margin_manager,
+            "shared_pool": dict(pump.get("shared_pool") or {}),
             "capital_rescue_shadow": dict(pump.get("capital_rescue_shadow") or {}),
             "auto_transfer": dict(
                 (pump.get("transfers") or {}).get("auto_risk") or {}
@@ -119,6 +128,7 @@ def _pump_position_card(
     row: Mapping[str, Any],
     config: Mapping[str, Any],
     active_policy: Mapping[str, Any],
+    margin_manager: Mapping[str, Any],
     now_ms: int,
 ) -> dict[str, Any]:
     opened_at_ms = _integer(row.get("opened_at_ms"))
@@ -139,6 +149,7 @@ def _pump_position_card(
     margin_topup_cap = max(
         _number(position_policy.get("max_position_topup_usd")) or 0.0,
         _number(active_policy.get("max_position_topup_usd")) or 0.0,
+        _number(margin_manager.get("shared_max_position_topup_usd")) or 0.0,
     )
     return {
         "module": "pump_live",

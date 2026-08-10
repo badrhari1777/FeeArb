@@ -180,6 +180,8 @@
     var balance = live.last_balance || (preflight.account || {});
     var capital = live.capital_manager || {};
     var regime = live.capital_regime || {};
+    var marginManager = live.margin_manager || {};
+    var sharedPool = live.shared_pool || {};
     var autoTransfer = ((live.transfers || {}).auto_risk) || {};
     var open = Number(live.open_positions || 0);
     var cap = Number(config.entry_cap || 1);
@@ -198,6 +200,13 @@
     setText('pss-live-reserve', money(activePolicy.reserve_usd || 300));
     setText('pss-live-temporary', money(capital.temporary_transfer_outstanding_usd || 0));
     setText('pss-live-regime', String(regime.mode || '-').toUpperCase());
+    setText('pss-live-margin-manager', marginManager.policy_id || '-');
+    setText(
+      'pss-live-entry-headroom',
+      sharedPool.entry_headroom_usd === null || sharedPool.entry_headroom_usd === undefined
+        ? '-'
+        : money(sharedPool.entry_headroom_usd)
+    );
     setText('pss-live-auto-transfer', autoTransfer.enabled ? 'ON' : 'OFF');
     setText('pss-live-auto-main-floor', money(autoTransfer.main_min_available_usd || 0));
     setText(

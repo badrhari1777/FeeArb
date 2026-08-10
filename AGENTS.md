@@ -109,6 +109,18 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live shared margin management was versioned on 2026-08-11. The former
+  nearest-ladder manager remains available as `v2_current_next`; the approved
+  `v3_shared_projected` manager keeps isolated margin and immutable `$525` new
+  ladders while pooling Pump cash dynamically across only existing positions.
+  It walks the complete remaining ladder path for admission, projects each full
+  fill before its order can remain live, reserves bounded exchange-correction
+  increments and uses a 20% final-fill continuation buffer. Main funds are
+  rescue-only and excluded from entry headroom; aggregate and per-position
+  rescue envelopes are `$2000`, while every real transfer still needs the
+  existing fresh main-risk projection and operational request limit. UI/API
+  now expose manager version, shared headroom and effective cap. Canonical
+  behavior and rollback: `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`.
 - Pump Live shared-margin research on 2026-08-10 identified a fill-to-stop race
   in the sequential ladder gate: the higher short fill improves projected
   liquidation, but the old Full stop remains until the next synchronization.

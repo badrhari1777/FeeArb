@@ -825,3 +825,47 @@ the following ladder. Main funds are rescue-only after fresh main-risk
 projection, never normal entry capital. Unlimited final-leg rescue is rejected;
 use a bounded facility, then donor reduction and threatened-position derisk.
 No margin, ladder, sizing or transfer setting was changed by this research.
+
+## Shared projected margin manager v3 (2026-08-11)
+
+The current sequential manager is retained as the explicit rollback version
+`v2_current_next`. The approved manager is `v3_shared_projected`; it is selected
+only by `PUMP_LIVE_MARGIN_MANAGER_POLICY` and every backend restart remains
+fail-closed until the operator supplies the capital-matched ARM phrase.
+
+Both versions keep exchange positions on isolated margin. Existing ladder
+notional is immutable, and every new `v2_3000` position still has exactly a
+`$525` full ladder. `v3_shared_projected` changes cash allocation and safety
+gates, not the entry strategy:
+
+- For every nearest live/planned ladder, project its complete fill from fresh
+  exchange quantity and liquidation. The current and projected post-fill Full
+  stop must both clear the following ladder. For the final ladder, the stop
+  must retain a bounded `20%` continuation buffer.
+- Before admitting a new symbol, walk all remaining steps of every open
+  position and the candidate. Reserve future base margin, all projected margin
+  additions, up to three `$5` correction increments at each gate, and the
+  `$75` operating floor. Therefore fewer than four symbols are valid whenever
+  their complete safe paths consume the shared pool.
+- Pump-owned available cash alone decides new entry. Main-account money is a
+  rescue-only facility: temporarily borrowed principal is subtracted from
+  entry headroom even if it is visible in Pump available balance.
+- The rescue ceiling is `$2000` aggregate and `$2000` for one position, but it
+  is not a promise or automatic debit. Each real transfer still passes fresh
+  main-account margin/liquidation/freshness checks, idempotent confirmation and
+  the lower operational per-request limit. If funding cannot be confirmed, the
+  next ladder is deferred; protection monitoring remains active.
+- Shared capacity is dynamic: full ladder capital is reserved for positions
+  that actually exist, not four fixed private envelopes. Lowest liquidation
+  buffer is maintained first. An already-live ladder that fails the new gate
+  is cancelled and confirmed before margin work, then recreated only after a
+  fresh exchange read and Full TP/SL confirmation.
+- `v3_shared_projected` uses a hard target. The old relative `0..2%` tolerance
+  remains only for `v2_current_next`; it can describe harmless model rounding
+  but cannot approve a projected stop below the required boundary.
+
+The Pump page and `/api/positions/overview` expose `margin_manager`,
+`shared_pool`, new-slot headroom and the effective per-position cap. Rollback
+requires changing only the manager variable back to `v2_current_next`, a safe
+restart, verification of all owned orders/protection and a fresh explicit ARM;
+it never rewrites historical position sizing.

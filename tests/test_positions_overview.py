@@ -53,6 +53,17 @@ def pump_payload() -> dict:
             "policy_id": "v2_3000",
             "max_position_topup_usd": 525.0,
         },
+        "margin_manager": {
+            "policy_id": "v3_shared_projected",
+            "shared_max_position_topup_usd": 2000.0,
+            "shared_max_total_topup_usd": 2825.0,
+            "main_funds_count_for_entry": False,
+        },
+        "shared_pool": {
+            "ready": True,
+            "new_slot_margin_usd": 525.0,
+            "entry_headroom_usd": 640.0,
+        },
         "credentials": {"api_secret_present": True},
         "last_balance": {"total": 1000.0, "available": 825.0, "used": 175.0},
         "notifications": {"configured": True, "last_status": "ok"},
@@ -120,12 +131,14 @@ def test_overview_keeps_main_and_pump_groups_separate() -> None:
     assert payload["pump"]["positions"][0]["legs_filled"] == 1
     assert payload["pump"]["positions"][0]["margin_prefund_floor_usd"] == 25.0
     assert payload["pump"]["positions"][0]["margin_prefund_status"] == "confirmed"
-    assert payload["pump"]["positions"][0]["margin_topup_cap_usd"] == 525.0
+    assert payload["pump"]["positions"][0]["margin_topup_cap_usd"] == 2_000.0
     assert payload["pump"]["positions"][0]["ladder_gate_status"] == "ready"
     assert payload["pump"]["positions"][0]["ladder_gate_step"] == 2
     assert payload["pump"]["positions"][0]["remaining_hold_h"] > 335.0
     assert payload["pump"]["balance"]["temporary_occupied_usd"] == 50.0
     assert payload["pump"]["capital_regime"]["mode"] == "stress"
+    assert payload["pump"]["margin_manager"]["policy_id"] == "v3_shared_projected"
+    assert payload["pump"]["shared_pool"]["new_slot_margin_usd"] == 525.0
     assert payload["pump"]["auto_transfer"]["enabled"] is True
     assert "credentials" not in payload["pump"]
 
@@ -177,6 +190,8 @@ class PositionsOverviewApiTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Position Control Center", body)
         self.assertIn("/static/positions.js", body)
         self.assertIn("/pump-short-strategies", body)
+        self.assertIn("pp-pump-margin-manager", body)
+        self.assertIn("pp-pump-entry-headroom", body)
         self.assertNotIn("Emergency close all", body)
 
     async def test_main_page_exposes_all_main_and_pump_position_tabs(self) -> None:
