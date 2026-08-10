@@ -106,6 +106,19 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live completed the operator-authorized `$3000` migration on 2026-08-10.
+  A fresh no-position/no-transition main-account gate permitted a real `$2000`
+  main -> Pump transfer. The controller capitalized exactly `$1912.195164`,
+  returned `$87.8048`, and retained the exchange's untransferable `$0.000036`
+  four-decimal remainder as excluded rounding dust rather than returnable
+  temporary principal. Pump wallet/effective capital became
+  `$3000.000036 / $3000`; explicit `ARM PUMP LIVE 3000` passed and three cycles
+  retained two protected immutable-v1 positions, ten orders and zero protection
+  issues. No v2 entry had opened; the next eligible entry is one `$525` canary.
+  Sub-cent outstanding values are now migrated on load and settled after both
+  promotion and return while the negative equity adjustment keeps them out of
+  strategy PnL. Targeted Pump transfer/live tests passed (`86`), followed by
+  the complete Python regression (`676 passed`, `11 warnings`).
 - Pump Live mixed-capital migration was implemented on 2026-08-10. Existing
   positions receive immutable `v1_1000` snapshots; explicit capitalization of
   confirmed temporary principal can activate `v2_3000` only for future entries,

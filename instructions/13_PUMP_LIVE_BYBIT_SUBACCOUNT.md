@@ -598,7 +598,7 @@ the fresh projected main-account state: the exact post-debit available balance,
 margin ratio, position protection, liquidation buffers and data age must pass
 before the universal transfer is submitted.
 
-Deployment evidence, 2026-08-10: commits `8825663` and `06efe96` passed the
+Pre-transfer deployment evidence, 2026-08-10: commits `8825663` and `06efe96` passed the
 complete Python regression (`673 passed`, `11 warnings`). A supervised backend
 restart found no active Grid execution, pending Grid transition, or running
 manual execution. Pump recovered `1000RATSUSDT` and `BLUAIUSDT` with ten owned
@@ -611,4 +611,20 @@ exact external amount to `$3000` was `$1912.195164`. Fresh main-account
 projection passed both that amount (about `$1119.93` Bybit main remaining) and
 a round `$2000` debit (about `$1032.13` remaining), with zero projected Bybit
 margin use, verified stops and minimum cross-account position buffer `31.30%`.
-Recalculate immediately before the eventual transfer because balances move.
+The operator subsequently authorized the transfer after a fresh repeat of all
+gates. FeeArb transferred `$2000` main -> Pump, confirmed it on Bybit, and
+capitalized only `$1912.195164`. The remaining `$87.804836` stayed temporary;
+`$87.8048` was safely returned Pump -> main. Bybit's four-decimal
+`transferSafeAmount` left `$0.000036` in the Pump wallet. Because that amount is
+below the project `$0.01` transfer minimum, it is now recorded as excluded
+rounding dust rather than returnable `Temporarily occupied` principal. Its
+negative equity adjustment is retained, so it cannot appear as Pump profit.
+
+After promotion, the Pump wallet was `$3000.000036` and effective strategy
+capital was exactly `$3000`. Explicit `ARM PUMP LIVE 3000` succeeded; three
+following cycles stayed armed with the same two legacy positions, ten orders,
+zero protection issues and minimum liquidation buffer about `69.7..69.9%`.
+No v2 position had opened at that checkpoint. The next eligible new entry is
+the single `$525` v2 canary; existing positions remain immutable v1. The
+rounding-dust hardening passed the complete regression (`676 passed`, `11
+warnings`).

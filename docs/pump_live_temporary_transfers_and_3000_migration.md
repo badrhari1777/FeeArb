@@ -3,9 +3,10 @@
 ## Current decision
 
 Implementation status, 2026-08-10: the versioned mixed-cohort runtime and
-capitalization gate described below are complete. This supersedes older text
-in this document saying the runtime cannot yet mix cohorts. It still does not
-authorize a transfer or activate v2 automatically.
+capitalization gate described below are complete. The operator authorized the
+live migration after a fresh risk gate; v2 is active and explicitly armed, but
+only future entries use it. This supersedes older text in this document saying
+the runtime cannot yet mix cohorts.
 
 The transfer layer is fail-closed and does not enable live entries. Operator
 endpoints remain explicit; a separate bounded callback may now automatically
@@ -90,14 +91,19 @@ debit main must retain the configured available floor, acceptable margin
 ratio, fresh account data, protected positions and minimum liquidation buffer.
 Missing main portfolio evidence blocks submission before Bybit is called.
 
-Latest deployment gate, 2026-08-10: full regression passed (`673` tests), the
-new runtime was deployed without transferring or promoting capital, and Pump
-was explicitly resumed on `v1_1000`. Three healthy post-ARM cycles retained
-two protected legacy positions and ten owned orders. The captured exact amount
-to reach `$3000` was `$1912.195164`; a `$2000` manual debit also passed the
-fresh main projection and would have left about `$1032.13` on Bybit main. These
-numbers are evidence, not a reusable instruction: refresh wallet, outstanding
-principal and main risk immediately before submission.
+Latest live migration, 2026-08-10: after the earlier `673`-test deployment, a
+fresh gate again found no Grid/manual execution and confirmed safe projected
+main-account capacity. A real `$2000` main -> Pump transfer completed. Exactly
+`$1912.195164` was capitalized, `$87.8048` of the excess was returned, and
+Bybit's four-decimal transfer-safe amount left `$0.000036` in Pump. This
+sub-cent amount remains excluded from strategy growth through the equity
+adjustment and is classified as `rounding_dust_usd`, not returnable temporary
+principal. Pump then held `$3000.000036` wallet / exactly `$3000` effective
+capital. Explicit `ARM PUMP LIVE 3000` succeeded and three cycles retained two
+protected v1 positions, ten owned orders, zero protection issues and no v2
+entry yet. The next eligible new entry is one `$525` v2 canary.
+The rounding-dust migration and accounting paths passed the complete Python
+regression (`676 passed`, `11 warnings`).
 
 Return is bounded by all of:
 
@@ -124,6 +130,10 @@ the amount back to the adjustment and reduces outstanding principal.
 Accounting is idempotent by transfer UUID. Cumulative input and returned
 amounts remain visible even after outstanding principal returns to zero.
 Exchange-derived trade fees, funding and realized PnL remain separate.
+Any positive remainder below the project `$0.01` transfer minimum is migrated
+to a separate cumulative rounding-dust field. It remains excluded by
+`equity_adjustment_usd`, but no longer appears as returnable `Temporarily
+occupied` principal or blocks a completed round trip.
 
 ## Automatic rescue funding contract
 

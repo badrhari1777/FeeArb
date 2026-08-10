@@ -486,6 +486,35 @@ def test_minimum_round_trip_is_confirmed_and_accounted(tmp_path: Path) -> None:
     assert [item["amount_usdt"] for item in gateway.create_calls] == ["0.01", "0.01"]
 
 
+def test_subcent_transfer_remainder_is_excluded_rounding_dust(tmp_path: Path) -> None:
+    controller, gateway, _accounting = _controller(tmp_path)
+    gateway.balances["pump"].update(
+        {
+            "wallet_usd": 3000.000036,
+            "transfer_balance_usd": 100.0,
+            "transfer_safe_usd": 100.0,
+        }
+    )
+    controller._state["temporary_outstanding_usd"] = 87.804836  # pylint: disable=protected-access
+
+    result = controller.transfer_return(87.8048, PUMP_TRANSFER_RETURN_CONFIRMATION)
+
+    assert result["status"]["temporary_outstanding_usd"] == 0.0
+    assert result["status"]["rounding_dust_usd"] == 0.000036
+
+
+def test_existing_subcent_outstanding_migrates_to_rounding_dust(tmp_path: Path) -> None:
+    (tmp_path / "temporary_transfers.json").write_text(
+        '{"temporary_outstanding_usd": 0.000036}',
+        encoding="utf-8",
+    )
+
+    controller, _gateway, _accounting = _controller(tmp_path)
+
+    assert controller.status()["temporary_outstanding_usd"] == 0.0
+    assert controller.status()["rounding_dust_usd"] == 0.000036
+
+
 def test_inbound_requires_complete_round_trip_capability(tmp_path: Path) -> None:
     controller, gateway, _accounting = _controller(tmp_path)
     gateway.preflight = lambda: {  # type: ignore[method-assign]
@@ -619,3 +648,54 @@ def test_pump_capital_manager_excludes_temporary_cashflow_idempotently(tmp_path:
     assert returned["effective_strategy_capital_usd"] == 1000.0
     assert returned["temporary_transfer_outstanding_usd"] == 0.0
     assert returned["temporary_transfer_returned_usd"] == 100.0
+
+
+def test_pump_capital_manager_keeps_subcent_dust_excluded(tmp_path: Path) -> None:
+    class MinimalPumpGateway:
+        def credentials_status(self) -> dict[str, Any]:
+            return {"ready": False}
+
+    state_dir = tmp_path / "state"
+    controller = PumpLiveController(
+        gateway=MinimalPumpGateway(),  # type: ignore[arg-type]
+        state_dir=state_dir,
+        env_path=tmp_path / "pump.env",
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["last_balance"] = {  # pylint: disable=protected-access
+        "wallet": 1087.804836,
+        "total": 1087.804836,
+        "available": 1087.804836,
+    }
+    controller.record_temporary_transfer(
+        direction="main_to_pump",
+        amount_usd=87.804836,
+        transfer_id="dust-in",
+    )
+    controller._state["last_balance"] = {  # pylint: disable=protected-access
+        "wallet": 1000.000036,
+        "total": 1000.000036,
+        "available": 1000.000036,
+    }
+
+    returned = controller.record_temporary_transfer(
+        direction="pump_to_main",
+        amount_usd=87.8048,
+        transfer_id="dust-out",
+    )
+
+    assert returned["temporary_transfer_outstanding_usd"] == 0.0
+    assert returned["temporary_transfer_rounding_dust_usd"] == 0.000036
+    assert returned["equity_adjustment_usd"] == -0.000036
+    assert returned["effective_strategy_capital_usd"] == 1000.0
+
+    restarted = PumpLiveController(
+        gateway=MinimalPumpGateway(),  # type: ignore[arg-type]
+        state_dir=state_dir,
+        env_path=tmp_path / "pump.env",
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    assert restarted.status()["capital_manager"]["temporary_transfer_outstanding_usd"] == 0.0
+    assert restarted.status()["capital_manager"]["temporary_transfer_rounding_dust_usd"] == 0.000036

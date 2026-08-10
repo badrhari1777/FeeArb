@@ -731,9 +731,15 @@ class PumpTemporaryTransferController:
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
+        outstanding = max(0.0, _number(payload.get("temporary_outstanding_usd")))
+        rounding_dust = max(0.0, _number(payload.get("rounding_dust_usd")))
+        if 0 < outstanding < float(PUMP_TRANSFER_MIN_USDT):
+            rounding_dust += outstanding
+            outstanding = 0.0
         return {
             "schema": "pump_temporary_transfers_v1",
-            "temporary_outstanding_usd": round(_number(payload.get("temporary_outstanding_usd")), 6),
+            "temporary_outstanding_usd": round(outstanding, 6),
+            "rounding_dust_usd": round(rounding_dust, 6),
             "cumulative_in_usd": round(_number(payload.get("cumulative_in_usd")), 6),
             "cumulative_returned_usd": round(_number(payload.get("cumulative_returned_usd")), 6),
             "cumulative_promoted_usd": round(_number(payload.get("cumulative_promoted_usd")), 6),
@@ -1072,10 +1078,14 @@ class PumpTemporaryTransferController:
             current = _number(self._state.get("temporary_outstanding_usd"))
             if promoted > current + 0.01:
                 raise RuntimeError("pump_capital_promotion_outstanding_underflow")
-            self._state["temporary_outstanding_usd"] = round(
-                max(0.0, current - promoted),
-                6,
-            )
+            remaining = max(0.0, current - promoted)
+            if 0 < remaining < float(PUMP_TRANSFER_MIN_USDT):
+                self._state["rounding_dust_usd"] = round(
+                    _number(self._state.get("rounding_dust_usd")) + remaining,
+                    6,
+                )
+                remaining = 0.0
+            self._state["temporary_outstanding_usd"] = round(remaining, 6)
             self._state["cumulative_promoted_usd"] = round(
                 _number(self._state.get("cumulative_promoted_usd")) + promoted,
                 6,
@@ -1241,7 +1251,14 @@ class PumpTemporaryTransferController:
                 current = _number(self._state.get("temporary_outstanding_usd"))
                 if amount > current + 1e-9:
                     raise RuntimeError("pump_temporary_transfer_accounting_outstanding_underflow")
-                self._state["temporary_outstanding_usd"] = round(max(0.0, current - amount), 6)
+                remaining = max(0.0, current - amount)
+                if 0 < remaining < float(PUMP_TRANSFER_MIN_USDT):
+                    self._state["rounding_dust_usd"] = round(
+                        _number(self._state.get("rounding_dust_usd")) + remaining,
+                        6,
+                    )
+                    remaining = 0.0
+                self._state["temporary_outstanding_usd"] = round(remaining, 6)
                 self._state["cumulative_returned_usd"] = round(
                     _number(self._state.get("cumulative_returned_usd")) + amount,
                     6,
@@ -1265,6 +1282,7 @@ class PumpTemporaryTransferController:
                 "direction": direction,
                 "amount_usd": amount,
                 "temporary_outstanding_usd": self._state["temporary_outstanding_usd"],
+                "rounding_dust_usd": self._state["rounding_dust_usd"],
             },
         )
         return {"operation": pending, "accounting": accounting_result, "status": self.status()}

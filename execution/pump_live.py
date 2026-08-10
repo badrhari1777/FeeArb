@@ -41,6 +41,7 @@ CAPITAL_GROWTH_TRIGGER_PCT = 10.0
 CAPITAL_REDUCTION_TRIGGER_PCT = 5.0
 CAPITAL_MAX_INCREASE_STEP_PCT = 25.0
 CAPITAL_SLOT_ROUND_USD = 5.0
+TEMPORARY_TRANSFER_DUST_THRESHOLD_USD = 0.01
 RISK_POLICY_V1 = "v1_1000"
 RISK_POLICY_V2 = "v2_3000"
 PREFUND_VERIFY_READ_DELAYS_SEC = (0.0, 0.05, 0.1)
@@ -1252,6 +1253,10 @@ class PumpLiveController:
                 manager.get("temporary_transfer_returned_usd"),
                 0.0,
             )
+            rounding_dust = _safe_float(
+                manager.get("temporary_transfer_rounding_dust_usd"),
+                0.0,
+            )
             if direction == "main_to_pump":
                 outstanding += amount
                 cumulative_in += amount
@@ -1260,6 +1265,9 @@ class PumpLiveController:
                 if amount > outstanding + 1e-9:
                     raise RuntimeError("pump_temporary_transfer_outstanding_underflow")
                 outstanding = max(0.0, outstanding - amount)
+                if 0 < outstanding < TEMPORARY_TRANSFER_DUST_THRESHOLD_USD:
+                    rounding_dust += outstanding
+                    outstanding = 0.0
                 cumulative_returned += amount
                 adjustment += amount
             manager.update(
@@ -1268,6 +1276,7 @@ class PumpLiveController:
                     "temporary_transfer_outstanding_usd": round(outstanding, 6),
                     "temporary_transfer_in_usd": round(cumulative_in, 6),
                     "temporary_transfer_returned_usd": round(cumulative_returned, 6),
+                    "temporary_transfer_rounding_dust_usd": round(rounding_dust, 6),
                     "temporary_transfer_ids": recorded_ids + [operation_id],
                     "last_temporary_transfer_id": operation_id,
                     "last_temporary_transfer_direction": direction,
@@ -1285,6 +1294,7 @@ class PumpLiveController:
                 "direction": direction,
                 "amount_usd": round(amount, 6),
                 "temporary_outstanding_usd": round(outstanding, 6),
+                "rounding_dust_usd": round(rounding_dust, 6),
                 "excluded_from_strategy_growth": True,
             },
         )
@@ -1344,6 +1354,14 @@ class PumpLiveController:
             if required > outstanding + 0.01:
                 raise RuntimeError("pump_live_capital_promotion_principal_insufficient")
             promoted = min(outstanding, required)
+            remaining_temporary = max(0.0, outstanding - promoted)
+            rounding_dust = _safe_float(
+                manager.get("temporary_transfer_rounding_dust_usd"),
+                0.0,
+            )
+            if 0 < remaining_temporary < TEMPORARY_TRANSFER_DUST_THRESHOLD_USD:
+                rounding_dust += remaining_temporary
+                remaining_temporary = 0.0
             manager.update(
                 {
                     "mode": "mixed_canary",
@@ -1352,10 +1370,8 @@ class PumpLiveController:
                     "declared_strategy_capital_usd": target,
                     "declared_account_wallet_usd": round(wallet, 6),
                     "equity_adjustment_usd": round(adjustment + promoted, 6),
-                    "temporary_transfer_outstanding_usd": round(
-                        max(0.0, outstanding - promoted),
-                        6,
-                    ),
+                    "temporary_transfer_outstanding_usd": round(remaining_temporary, 6),
+                    "temporary_transfer_rounding_dust_usd": round(rounding_dust, 6),
                     "external_strategy_contribution_usd": round(
                         _safe_float(manager.get("external_strategy_contribution_usd"), 0.0)
                         + promoted,
@@ -1390,9 +1406,10 @@ class PumpLiveController:
                 "target_capital_usd": target,
                 "promoted_principal_usd": round(promoted, 6),
                 "remaining_temporary_principal_usd": round(
-                    max(0.0, outstanding - promoted),
+                    remaining_temporary,
                     6,
                 ),
+                "rounding_dust_usd": round(rounding_dust, 6),
                 "risk_policy_id": RISK_POLICY_V2,
                 "v2_concurrent_entry_cap": 1,
             },
@@ -3230,6 +3247,19 @@ class PumpLiveController:
             }
         manager.setdefault("active_risk_policy_id", RISK_POLICY_V1)
         manager.setdefault("policy_application_mode", "legacy")
+        outstanding = max(
+            0.0,
+            _safe_float(manager.get("temporary_transfer_outstanding_usd"), 0.0),
+        )
+        rounding_dust = max(
+            0.0,
+            _safe_float(manager.get("temporary_transfer_rounding_dust_usd"), 0.0),
+        )
+        if 0 < outstanding < TEMPORARY_TRANSFER_DUST_THRESHOLD_USD:
+            rounding_dust += outstanding
+            outstanding = 0.0
+        manager["temporary_transfer_outstanding_usd"] = round(outstanding, 6)
+        manager["temporary_transfer_rounding_dust_usd"] = round(rounding_dust, 6)
         return {
             "schema": "pump_live_state_v1",
             "status": payload.get("status") or "disabled",
@@ -3849,6 +3879,10 @@ def build_capital_manager_status(
         ),
         "temporary_transfer_returned_usd": round(
             _safe_float(manager.get("temporary_transfer_returned_usd"), 0.0),
+            6,
+        ),
+        "temporary_transfer_rounding_dust_usd": round(
+            _safe_float(manager.get("temporary_transfer_rounding_dust_usd"), 0.0),
             6,
         ),
     }
