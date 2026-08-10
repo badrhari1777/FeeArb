@@ -126,7 +126,13 @@ Recent Changes
   positionMM`; when the strict following-ladder target is physically
   impossible it requires a hard 8% immediate-ladder reaction buffer and uses
   5-second hot-ladder reconciliation. This fallback is audited separately and
-  does not inherit the strict replay's zero-race claim.
+  does not inherit the strict replay's zero-race claim. Cancelled Bybit ladder
+  client IDs are never reused: exact `110072` duplicate-link failures may be
+  recovered only after a fresh exchange read proves that no non-reduce order
+  remains, then the leg receives a persisted generation suffix and only the
+  nearest leg is recreated. Pump-lab tests now always construct an isolated
+  temporary controller when `FEEARB_TESTING=1`; targeted and complete regressions
+  must verify that the real Pump state and event hashes remain unchanged.
 - Pump Live shared-margin research on 2026-08-10 identified a fill-to-stop race
   in the sequential ladder gate: the higher short fill improves projected
   liquidation, but the old Full stop remains until the next synchronization.

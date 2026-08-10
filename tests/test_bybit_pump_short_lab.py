@@ -34,6 +34,14 @@ from webapp.bybit_pump_short_lab import (
 
 
 class BybitPumpShortLabTestCase(unittest.TestCase):
+    def test_default_test_lab_uses_isolated_pump_controller(self) -> None:
+        lab = BybitPumpShortLab(restore_shadow_schedule=False)
+        controller = lab._pump_live  # pylint: disable=protected-access
+
+        self.assertIn("feearb-pump-lab-test-", str(controller.state_dir))
+        self.assertFalse(controller._background_monitor)  # pylint: disable=protected-access
+        self.assertNotIn("bybit_pump_short_live", str(controller.state_path))
+
     def test_start_returns_status_without_waiting_for_worker_lock(self) -> None:
         lab = BybitPumpShortLab(restore_shadow_schedule=False)
         config = normalize_run_config(max_symbols=1, sleep_sec=0.1)

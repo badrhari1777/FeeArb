@@ -3,7 +3,9 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import os
 import re
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -288,7 +290,19 @@ class BybitPumpShortLab:
         self._shadow_schedule_state: dict[str, Any] = self._initial_shadow_schedule_state()
         self._paper_monitor_state: dict[str, Any] = self._initial_paper_monitor_state()
         self._strategy_monitor_last_audit_key: str | None = None
-        self._pump_live = pump_live_controller or PumpLiveController(notifier=notifier)
+        if pump_live_controller is not None:
+            self._pump_live = pump_live_controller
+        elif os.getenv("FEEARB_TESTING") == "1":
+            test_state_dir = Path(tempfile.mkdtemp(prefix="feearb-pump-lab-test-"))
+            self._pump_live = PumpLiveController(
+                notifier=notifier,
+                state_dir=test_state_dir,
+                env_path=test_state_dir / "pump_live.env",
+                start_recovery_monitor=False,
+                background_monitor=False,
+            )
+        else:
+            self._pump_live = PumpLiveController(notifier=notifier)
         self._pump_transfers = pump_transfer_controller
         if self._pump_transfers is None and isinstance(self._pump_live, PumpLiveController):
             self._pump_transfers = PumpTemporaryTransferController(

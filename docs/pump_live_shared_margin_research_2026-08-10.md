@@ -218,3 +218,12 @@ its first required adds are `$10`, `$20`, and `$25`, each followed by an exact
 exchange reread before any ladder recreation. The earlier zero-race historical
 result belongs to the strict mathematical target; the live `8% + 5s` fallback
 needs separate evidence and must not inherit that claim.
+
+That attempt also exposed Bybit client-link retention: a cancelled ladder ID
+cannot be submitted again and returns `110072`. Recovery is deliberately
+narrow. The exact duplicate error is eligible only after a fresh exchange read
+proves there is no non-reduce order for the symbol; the leg then receives a
+persisted generation suffix and only the nearest ladder is recreated. Unknown
+orders remain fail-closed. Pump-lab default controllers are now isolated under
+`FEEARB_TESTING=1`; the focused `115`-test run and complete `716`-test run both
+passed while production state/event hashes stayed byte-for-byte unchanged.

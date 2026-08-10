@@ -870,6 +870,15 @@ gates, not the entry strategy:
   order. This is recorded as `exchange_margin_cap_reaction_buffer`, never as a
   strict following-step guarantee. The old relative `0..2%` tolerance remains
   only for `v2_current_next`; neither v3 boundary accepts a shortfall.
+- Bybit retains used `orderLinkId` values after cancellation. A ladder rejected
+  with exact `110072` duplicate-link evidence is recoverable only when a fresh
+  exchange read finds zero non-reduce orders for that symbol. The controller
+  then persists the next link generation (`L2R1`, etc.) and recreates only the
+  nearest leg. Any unknown live order keeps the position fail-closed.
+- Under `FEEARB_TESTING=1`, every default Pump-lab instance uses a private
+  temporary state directory with recovery/background monitors disabled. The
+  required release check hashes the production `live_state.json` and
+  `live_events.jsonl` before and after targeted and complete pytest runs.
 
 The Pump page and `/api/positions/overview` expose `margin_manager`,
 `shared_pool`, new-slot headroom and the effective per-position cap. Rollback

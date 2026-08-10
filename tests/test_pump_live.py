@@ -2135,6 +2135,108 @@ def test_shared_projected_gate_cancels_old_stop_race_then_recreates_l3(
     assert item["legs"][2]["order_id"] != "bluai-l3-old"
 
 
+def test_duplicate_canceled_ladder_link_is_reissued_with_new_generation(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, margin_manager_policy=MARGIN_MANAGER_V3_SHARED)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    item = {
+        "live_id": "duplicate-link",
+        "symbol": "TESTUSDT",
+        "status": "open_degraded",
+        "last_error": "bybit 110072 OrderLinkedID is duplicate",
+        "legs": [
+            {"step": 1, "status": "filled"},
+            {
+                "step": 2,
+                "status": "error",
+                "notional_usd": 100.0,
+                "trigger_price": 15.0,
+                "error": "bybit 110072 OrderLinkedID is duplicate",
+            },
+            {
+                "step": 3,
+                "status": "error",
+                "notional_usd": 100.0,
+                "trigger_price": 20.0,
+                "error": "bybit 110072 OrderLinkedID is duplicate",
+            },
+        ],
+    }
+    controller._state["positions"] = [item]  # pylint: disable=protected-access
+
+    controller._recover_duplicate_ladder_links(  # pylint: disable=protected-access
+        item,
+        item["legs"],
+    )
+    errors = controller._place_planned_ladders(item)  # pylint: disable=protected-access
+
+    assert errors == []
+    assert item["status"] == "open"
+    assert item["last_error"] is None
+    assert item["legs"][1]["status"] == "open"
+    assert item["legs"][1]["order_link_generation"] == 1
+    assert item["legs"][1]["order_link_id"].endswith("L2R1")
+    assert item["legs"][2]["status"] == "planned"
+    assert item["legs"][2]["order_link_generation"] == 1
+    assert len(gateway.orders) == 1
+
+
+def test_duplicate_ladder_link_recovery_fails_closed_with_unknown_order(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, margin_manager_policy=MARGIN_MANAGER_V3_SHARED)
+    gateway = FakePumpGateway()
+    gateway.orders = [
+        {
+            "id": "unknown-l2",
+            "symbol": "TESTUSDT",
+            "status": "open",
+            "reduce_only": False,
+        }
+    ]
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    item = {
+        "live_id": "duplicate-link",
+        "symbol": "TESTUSDT",
+        "status": "open_degraded",
+        "legs": [
+            {"step": 1, "status": "filled"},
+            {
+                "step": 2,
+                "status": "error",
+                "error": "bybit 110072 OrderLinkedID is duplicate",
+            },
+        ],
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="pump_live_duplicate_link_recovery_unknown_open_order",
+    ):
+        controller._recover_duplicate_ladder_links(  # pylint: disable=protected-access
+            item,
+            item["legs"],
+        )
+
+    assert item["legs"][1]["status"] == "error"
+
+
 def test_prefund_failure_keeps_first_leg_protected_and_does_not_place_ladders(
     tmp_path: Path,
 ) -> None:

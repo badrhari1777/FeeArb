@@ -2860,8 +2860,10 @@ class PumpLiveController:
                 leg["error"] = error
                 ladder_errors.append(error)
                 continue
+            generation = max(0, _safe_int(leg.get("order_link_generation"), 0))
+            suffix = f"L{index}" if generation <= 0 else f"L{index}R{generation}"
             ladder_link_id = str(
-                leg.get("order_link_id") or _order_link(live_id, f"L{index}")
+                leg.get("order_link_id") or _order_link(live_id, suffix)
             )
             leg["order_link_id"] = ladder_link_id
             with self._lock:
@@ -2886,6 +2888,7 @@ class PumpLiveController:
                 leg["status"] = "error"
                 leg["error"] = _clean_error(exc)
                 ladder_errors.append(leg["error"])
+                break
         with self._lock:
             item["updated_at_ms"] = _now_ms()
             if ladder_errors:
@@ -3446,11 +3449,13 @@ class PumpLiveController:
         reason: str,
     ) -> None:
         old_order_id = str(leg.get("order_id") or "")
+        generation = max(0, _safe_int(leg.get("order_link_generation"), 0)) + 1
         leg.update(
             {
                 "status": "planned",
                 "order_id": None,
                 "order_link_id": None,
+                "order_link_generation": generation,
                 "error": None,
             }
         )
@@ -3465,6 +3470,57 @@ class PumpLiveController:
                 "step": _safe_int(leg.get("step"), 0),
                 "old_order_id": old_order_id or None,
                 "reason": reason,
+            },
+        )
+
+    def _recover_duplicate_ladder_links(
+        self,
+        item: dict[str, Any],
+        legs: list[dict[str, Any]],
+    ) -> None:
+        candidates = [
+            leg
+            for leg in legs[1:]
+            if leg.get("status") == "error"
+            and "110072" in str(leg.get("error") or "")
+            and "duplicate" in str(leg.get("error") or "").lower()
+            and not leg.get("order_id")
+        ]
+        if not candidates:
+            return
+        symbol = _normalize_symbol(item.get("symbol"))
+        nonreduce_open = [
+            order
+            for order in self.gateway.fetch_open_orders(symbol)
+            if not bool(order.get("reduce_only"))
+        ]
+        if nonreduce_open:
+            raise RuntimeError("pump_live_duplicate_link_recovery_unknown_open_order")
+        recovered_steps: list[int] = []
+        for leg in candidates:
+            generation = max(0, _safe_int(leg.get("order_link_generation"), 0)) + 1
+            leg.update(
+                {
+                    "status": "planned",
+                    "order_id": None,
+                    "order_link_id": None,
+                    "order_link_generation": generation,
+                }
+            )
+            leg.pop("error", None)
+            recovered_steps.append(_safe_int(leg.get("step"), 0))
+        with self._lock:
+            if item.get("status") == "open_degraded":
+                item["status"] = "open"
+            item["last_error"] = None
+            item["updated_at_ms"] = _now_ms()
+            self._save_state_locked()
+        self._event(
+            "duplicate_ladder_links_recovered",
+            {
+                "symbol": symbol,
+                "steps": recovered_steps,
+                "nonreduce_open_orders": 0,
             },
         )
 
@@ -3511,6 +3567,7 @@ class PumpLiveController:
         legs = list(item.get("legs") or [])
         if len(legs) < 2:
             return
+        self._recover_duplicate_ladder_links(item, legs)
         self._restore_gate_deferred_legs(item, legs)
         active = [
             leg
