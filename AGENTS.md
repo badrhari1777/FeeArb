@@ -109,11 +109,14 @@ Recent Changes
 - Commit `b4151b0` was deployed by supervised FeeArb backend restart on
   2026-08-10. Preflight had zero active Manual/Grid executions. Pump Live
   recovered owned `1000RATSUSDT` and `BLUAIUSDT` positions in monitoring mode
-  with entries disarmed, visible TP/SL, no last error, no portfolio risk freeze,
-  and three clean 15-second cycles; `v2_3000` remains intentionally unarmed
-  until explicit `ARM PUMP LIVE 3000`. Fresh TUT API output used current
-  exposures near `$1222 / $1231`, kept KuCoin native `$1722` diagnostic-only,
-  and estimated the next signed funding near `-$0.332 / +$1.264`.
+  with entries initially disarmed, visible TP/SL, no last error, no portfolio
+  risk freeze, and three clean 15-second cycles. The operator then supplied
+  exact `ARM PUMP LIVE 3000`; the ownership-aware preflight returned ready and
+  `v2_3000` became armed. Three further cycles remained clean with both
+  positions, no pending signal, and minimum Pump buffer near `76.39%`. Fresh
+  TUT API output used current exposures near `$1222 / $1231`, kept KuCoin
+  native `$1722` diagnostic-only, and estimated the next signed funding near
+  `-$0.332 / +$1.264`.
 - Main-position valuation was normalized across every supported exchange on
   2026-08-10 after the TUT Binance/KuCoin view mixed Binance current Mark
   notional with KuCoin entry `posCost`. Public Main rows now calculate

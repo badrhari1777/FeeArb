@@ -85,3 +85,10 @@ Fresh TUT validation after deployment showed current exposures near
 remained near `$1722.09`. The signed next-funding estimates were approximately
 `-$0.332 / +$1.264`, or `+$0.931` net for the next venue payments at that
 snapshot.
+
+The operator subsequently supplied the exact `ARM PUMP LIVE 3000`
+confirmation. The ownership-aware resume preflight returned `ready=true` and
+the controller entered `armed` under `v2_3000`. Three following monitor cycles
+kept both positions and TP/SL intact, reported no error/block/risk freeze, held
+the minimum Pump liquidation buffer near `76.39%`, and observed no pending or
+new signal during that verification window.
