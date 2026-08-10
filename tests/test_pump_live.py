@@ -1123,6 +1123,7 @@ def test_flat_position_needs_two_cycles_then_cancels_ladder(tmp_path: Path) -> N
     env_path = tmp_path / "pump_live.env"
     write_env(env_path)
     gateway = FakePumpGateway()
+    gateway.closed_trade_summary = {"status": "complete"}
     controller = PumpLiveController(
         gateway=gateway,
         state_dir=tmp_path / "state",
@@ -1143,6 +1144,43 @@ def test_flat_position_needs_two_cycles_then_cancels_ladder(tmp_path: Path) -> N
     second = controller.run_cycle()
     assert second["open_positions"] == 0
     assert len(gateway.canceled) == 2
+    assert second["entry_armed"] is False
+    assert second["close_recovery_healthy_cycles"] == 1
+    recovered = controller.run_cycle()
+    assert recovered["entry_armed"] is True
+    assert recovered["blocked_reason"] is None
+    assert recovered["status"] == "armed"
+    assert any(
+        row["event"] == "position_close_recovered"
+        for row in recovered["recent_events"]
+    )
+
+
+def test_flat_position_does_not_override_prior_operator_disarm(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    gateway.closed_trade_summary = {"status": "complete"}
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    controller.disarm("operator_disarm")
+    gateway.positions = []
+
+    controller.run_cycle()
+    controller.run_cycle()
+    status = controller.run_cycle()
+
+    assert status["entry_armed"] is False
+    assert status["blocked_reason"] == "position_absent_unconfirmed"
+    assert status["close_recovery_pending"] is False
 
 
 def test_flat_position_persists_exact_exchange_accounting(tmp_path: Path) -> None:

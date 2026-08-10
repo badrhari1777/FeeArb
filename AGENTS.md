@@ -106,6 +106,13 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live normal-close recovery was hardened on 2026-08-10 after a confirmed
+  HEI take-profit left entries blocked by `position_absent_unconfirmed`. A
+  close may now auto-rearm only when entries were armed before the first
+  absence, exchange flatness and complete accounting are confirmed, and two
+  additional scans verify no unknown orders/positions plus intact TP/SL on
+  every remaining position. Manual disarm, emergency/error states, incomplete
+  accounting, and restarts remain fail-closed.
 - Pump capital rescue became projection-driven on 2026-08-09. Automatic
   main -> Pump funding no longer requires a GREEN main-account label or waits
   for a financial cooldown. It projects the exact transfer against fresh

@@ -563,3 +563,14 @@ Do not describe this as a live risk-trigger transfer test: the real transfer
 rail was validated by the earlier `$0.01` round trip, while warning/emergency
 trigger behavior was covered by regression without deliberately stressing a
 live position.
+
+Update 2026-08-10: a normal exchange-side TP/flat close no longer leaves new
+entries permanently blocked by `position_absent_unconfirmed`. Automatic
+re-arming is deliberately narrow: entries must have been armed before the
+first missing-position scan, the position must be flat for two scans, close
+accounting must be complete, no unknown position/order may exist, and every
+remaining Pump position must be open with confirmed TP/SL for two additional
+healthy scans. Operator disarm, emergency close, incomplete accounting, an
+unknown exchange object, or degraded protection is never overridden. A
+restart also clears the pending automatic recovery and still requires the
+normal explicit ARM/resume verification.
