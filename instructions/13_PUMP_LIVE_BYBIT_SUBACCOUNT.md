@@ -880,6 +880,17 @@ gates, not the entry strategy:
   required release check hashes the production `live_state.json` and
   `live_events.jsonl` before and after targeted and complete pytest runs.
 
+Live migration result on 2026-08-11: the ledger was reconciled to confirmed
+exchange/event totals of `$35` for RATS, `$125` for BLUAI and `$165` for ACE;
+this reconciliation did not submit a transfer or margin request. Exact
+duplicate-link recovery then created one `R1` nearest ladder per symbol while
+leaving later legs `planned`. Four consecutive hot monitor cycles stayed
+healthy with three non-reduce ladders and six Full reduce-only TP/SL orders.
+The operator-authorized `ARM PUMP LIVE 3000` succeeded with manager
+`v3_shared_projected`, strategy capital `$3000`, and new-position ladder size
+`$525`. A fourth entry is currently denied by the projected complete-path cap;
+visible free cash alone is intentionally insufficient evidence for admission.
+
 The Pump page and `/api/positions/overview` expose `margin_manager`,
 `shared_pool`, new-slot headroom and the effective per-position cap. Rollback
 requires changing only the manager variable back to `v2_current_next`, a safe

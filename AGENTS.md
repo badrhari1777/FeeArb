@@ -132,7 +132,17 @@ Recent Changes
   remains, then the leg receives a persisted generation suffix and only the
   nearest leg is recreated. Pump-lab tests now always construct an isolated
   temporary controller when `FEEARB_TESTING=1`; targeted and complete regressions
-  must verify that the real Pump state and event hashes remain unchanged.
+  must verify that the real Pump state and event hashes remain unchanged. The
+  final regression passed `716` tests plus `8` subtests and preserved both
+  production hashes. During the first migration, pre-isolation test controllers
+  had added `$20` to BLUAI and three confirmed `$25` increments to ACE; the
+  durable ledger was reconciled to exchange/event truth (`$125` BLUAI, `$165`
+  ACE, `$35` RATS) without another transfer. Unique `R1` nearest ladders were
+  then restored, four healthy 5-second cycles retained exactly `3` non-reduce
+  ladders plus `6` Full TP/SL orders, and Pump was explicitly armed with
+  `ARM PUMP LIVE 3000`. Three positions are protected/ready; fourth-symbol
+  admission is currently blocked by complete-path shared capacity, not by a
+  fixed cash reserve.
 - Pump Live shared-margin research on 2026-08-10 identified a fill-to-stop race
   in the sequential ladder gate: the higher short fill improves projected
   liquidation, but the old Full stop remains until the next synchronization.

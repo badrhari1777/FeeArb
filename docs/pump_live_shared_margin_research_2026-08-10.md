@@ -227,3 +227,16 @@ persisted generation suffix and only the nearest ladder is recreated. Unknown
 orders remain fail-closed. Pump-lab default controllers are now isolated under
 `FEEARB_TESTING=1`; the focused `115`-test run and complete `716`-test run both
 passed while production state/event hashes stayed byte-for-byte unchanged.
+
+The pre-isolation regression had already caused one real `$20` BLUAI add and
+three real `$25` ACE adds through separately constructed stale controllers.
+The exchange and durable margin events confirmed those mutations. With the
+backend stopped, tracked top-up/floor values were therefore reconciled to
+`$125` BLUAI and `$165` ACE; RATS was already correct at `$35`. No new add or
+transfer was sent during reconciliation or after restart. The new generation
+recovery recreated exactly one nearest `R1` ladder for each position and left
+all farther legs planned. Four observed hot cycles were `armed`, error-free and
+stable at three non-reduce ladders plus six Full TP/SL orders after explicit
+`ARM PUMP LIVE 3000`. The shared planner rejects another five-leg candidate at
+the current state because its complete projected path exceeds the combined
+top-up capacity, despite about `$2270` exchange-available cash.
