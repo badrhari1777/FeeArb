@@ -109,6 +109,15 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live shared-margin research on 2026-08-10 identified a fill-to-stop race
+  in the sequential ladder gate: the higher short fill improves projected
+  liquidation, but the old Full stop remains until the next synchronization.
+  A reproducible replay rebuilt 126 cases after the 2024 boundary and 40
+  eligible candidates. Current `$525` sizing had one capacity breach and 38
+  race-exposed fills; a projected-fill/next-step `$525` policy retained 35
+  trades with zero modelled breaches/races and a conservative `$355` peak main
+  loan. `$600` is a later shadow candidate only. Canonical analysis and staged
+  decision: `docs/pump_live_shared_margin_research_2026-08-10.md`.
 - Pump Live sequential ladder margin gating was added on 2026-08-10 after BLUAI
   filled L2 while its legacy stop still sat below L3 and the promoted `$3000`
   wallet had substantial unused cash. Only the nearest unfilled ladder may now

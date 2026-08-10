@@ -798,3 +798,30 @@ position/order errors; explicit `ARM PUMP LIVE 3000` then passed the ownership
 and protection-aware resume preflight. Three following complete monitor cycles
 remained armed with no blocked reason, last error, risk freeze, or pending
 signal. Minimum Pump liquidation buffer was about `79.5%` at final verification.
+
+## Shared-margin and post-fill decision (2026-08-10)
+
+`ARM PUMP LIVE 3000` was explicitly requested and accepted with three tracked
+positions. Three following 15-second cycles remained armed in `CALM`, with a
+live monitor, no blocked reason/error, about `$2375.44` available and about
+`$1170.44` fourth-slot headroom. BLUAI had L3 live at `0.035682`, Full stop
+`0.03675555`, liquidation `0.037698` and only `3.009%` old-stop clearance.
+
+The current gate protects access to the next ladder before its fill but leaves
+the previous Full stop unchanged until the monitor observes that fill. Higher
+short fills improve the projected liquidation, but a fast continuation can hit
+the old stop first. The research-only replay in
+`docs/pump_live_shared_margin_research_2026-08-10.md` rebuilds 126 cases since
+the 2024 boundary and 40 eligible candidates. The current `$525` gate has one
+historical capacity breach and 38 old-stop race fills. A `$525` projected
+fill/next-step gate retains 35 trades with zero modelled breaches/races and a
+conservative `$355` peak main loan; `$600` is the later shadow candidate, not
+an approved live resize.
+
+Canonical next implementation: retain exchange-isolated positions, pool Pump
+cash at portfolio level, project the complete next fill before placing its
+order, and verify enough margin for both the old and projected stop to clear
+the following ladder. Main funds are rescue-only after fresh main-risk
+projection, never normal entry capital. Unlimited final-leg rescue is rejected;
+use a bounded facility, then donor reduction and threatened-position derisk.
+No margin, ladder, sizing or transfer setting was changed by this research.
