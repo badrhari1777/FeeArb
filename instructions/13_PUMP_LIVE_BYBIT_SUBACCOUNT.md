@@ -597,3 +597,18 @@ Manual capital funding above the `$0.01` rail test is now also fail-closed on
 the fresh projected main-account state: the exact post-debit available balance,
 margin ratio, position protection, liquidation buffers and data age must pass
 before the universal transfer is submitted.
+
+Deployment evidence, 2026-08-10: commits `8825663` and `06efe96` passed the
+complete Python regression (`673 passed`, `11 warnings`). A supervised backend
+restart found no active Grid execution, pending Grid transition, or running
+manual execution. Pump recovered `1000RATSUSDT` and `BLUAIUSDT` with ten owned
+orders, immutable `v1_1000` snapshots and zero protection issues. Explicit
+`ARM PUMP LIVE 1000` passed `tracked_positions_verified`; three following
+monitor cycles stayed armed with no blocked reason/error and minimum
+liquidation buffer about `69.6..69.8%`. No transfer or capital promotion was
+performed. At that snapshot Pump effective capital was `$1087.804836`, so the
+exact external amount to `$3000` was `$1912.195164`. Fresh main-account
+projection passed both that amount (about `$1119.93` Bybit main remaining) and
+a round `$2000` debit (about `$1032.13` remaining), with zero projected Bybit
+margin use, verified stops and minimum cross-account position buffer `31.30%`.
+Recalculate immediately before the eventual transfer because balances move.

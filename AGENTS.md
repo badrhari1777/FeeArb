@@ -117,6 +117,12 @@ Recent Changes
   preflight/restart recovery requires `ARM PUMP LIVE 3000`. Manual capital
   transfer above the `$0.01` rail test also requires a fresh safe post-debit
   projection of the main account before Bybit submission.
+  Commits `8825663` and `06efe96` passed the full suite (`673`, `11 warnings`).
+  Supervised deployment recovered two v1 positions and ten orders, explicit
+  v1 ARM passed ownership/protection verification, and three cycles stayed
+  armed with zero protection issues. No transfer/promotion occurred. The live
+  snapshot needed `$1912.195164` to reach `$3000`; both that debit and `$2000`
+  passed main projection, but must be recalculated immediately before use.
 - Pump Live normal-close recovery was hardened on 2026-08-10 after a confirmed
   HEI take-profit left entries blocked by `position_absent_unconfirmed`. A
   close may now auto-rearm only when entries were armed before the first

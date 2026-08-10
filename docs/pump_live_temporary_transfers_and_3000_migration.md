@@ -90,6 +90,15 @@ debit main must retain the configured available floor, acceptable margin
 ratio, fresh account data, protected positions and minimum liquidation buffer.
 Missing main portfolio evidence blocks submission before Bybit is called.
 
+Latest deployment gate, 2026-08-10: full regression passed (`673` tests), the
+new runtime was deployed without transferring or promoting capital, and Pump
+was explicitly resumed on `v1_1000`. Three healthy post-ARM cycles retained
+two protected legacy positions and ten owned orders. The captured exact amount
+to reach `$3000` was `$1912.195164`; a `$2000` manual debit also passed the
+fresh main projection and would have left about `$1032.13` on Bybit main. These
+numbers are evidence, not a reusable instruction: refresh wallet, outstanding
+principal and main risk immediately before submission.
+
 Return is bounded by all of:
 
 - confirmed outstanding temporary principal;
