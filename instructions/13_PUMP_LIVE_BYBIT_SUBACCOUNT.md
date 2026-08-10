@@ -860,9 +860,16 @@ gates, not the entry strategy:
   buffer is maintained first. An already-live ladder that fails the new gate
   is cancelled and confirmed before margin work, then recreated only after a
   fresh exchange read and Full TP/SL confirmation.
-- `v3_shared_projected` uses a hard target. The old relative `0..2%` tolerance
-  remains only for `v2_current_next`; it can describe harmless model rounding
-  but cannot approve a projected stop below the required boundary.
+- `v3_shared_projected` uses hard exchange-confirmed targets. Bybit forbids
+  isolated `position margin > position value`; if that makes the strict
+  following-step prefund impossible, fresh `positionValue`, `positionIM` and
+  `positionMM` define a conservative exchange add ceiling. The fallback then
+  requires both current and projected stops at least `8%` above the immediate
+  filling ladder and reconciles live ladders every `5s`. After a fill, it
+  rereads the larger position and funds the next gate before placing another
+  order. This is recorded as `exchange_margin_cap_reaction_buffer`, never as a
+  strict following-step guarantee. The old relative `0..2%` tolerance remains
+  only for `v2_current_next`; neither v3 boundary accepts a shortfall.
 
 The Pump page and `/api/positions/overview` expose `margin_manager`,
 `shared_pool`, new-slot headroom and the effective per-position cap. Rollback

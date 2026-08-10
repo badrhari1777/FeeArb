@@ -121,6 +121,12 @@ Recent Changes
   existing fresh main-risk projection and operational request limit. UI/API
   now expose manager version, shared headroom and effective cap. Canonical
   behavior and rollback: `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`.
+  First deployment also proved Bybit rejects isolated position margin above
+  position value (`retCode 10001`). V3 now reads `positionValue/positionIM/
+  positionMM`; when the strict following-ladder target is physically
+  impossible it requires a hard 8% immediate-ladder reaction buffer and uses
+  5-second hot-ladder reconciliation. This fallback is audited separately and
+  does not inherit the strict replay's zero-race claim.
 - Pump Live shared-margin research on 2026-08-10 identified a fill-to-stop race
   in the sequential ladder gate: the higher short fill improves projected
   liquidation, but the old Full stop remains until the next synchronization.

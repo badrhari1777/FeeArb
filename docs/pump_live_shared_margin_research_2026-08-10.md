@@ -158,9 +158,9 @@ new v2 entry ladders fixed at `$525`. It changes only portfolio admission and
 margin defence:
 
 1. Before an order for the next ladder can remain live, it projects the full
-   fill using the actual exchange quantity and liquidation price. Both the
-   current stop and the projected post-fill stop must clear the following
-   ladder. The last ladder instead uses a bounded `20%` continuation buffer.
+   fill using the actual exchange quantity and liquidation price. The strict
+   target asks both the current stop and projected post-fill stop to clear the
+   following ladder; the last ladder asks for a `20%` continuation buffer.
 2. The manager also walks every remaining ladder sequentially when deciding
    whether a new symbol fits. It reserves all future base margins, all
    projected margin additions, up to three `$5` exchange-correction steps per
@@ -178,10 +178,18 @@ margin defence:
    exchange-confirmed before margin is changed. After margin and Full TP/SL are
    reread and confirmed, only that nearest ladder is recreated. A fill race or
    uncertain cancel remains fail-closed.
-6. The earlier relative `0..2%` tolerance remains available only in the
-   rollback manager. The projected manager records estimate deviation but
-   requires the hard exchange-confirmed target; a shortfall is never accepted
-   as safe.
+6. Bybit also enforces `position margin <= position value`. When that exchange
+   ceiling makes the strict following-ladder target physically impossible,
+   the manager does not retry an impossible add. It derives a conservative
+   add ceiling from fresh `positionValue`, `positionIM` and `positionMM`, then
+   requires both current and projected stops to be at least `8%` above the
+   immediate filling ladder. The hot-ladder reconciliation interval drops from
+   `15s` to `5s`; after the fill, the larger position is reread and the next
+   gate is funded before another ladder can be placed. This fallback is
+   explicitly recorded and is not reported as the strict guarantee.
+7. The earlier relative `0..2%` tolerance remains available only in the
+   rollback manager. Both the strict target and the exchange-cap `8%` fallback
+   use hard exchange-confirmed boundaries; a shortfall is never accepted.
 
 The Pump control page and unified positions API/page expose the active manager,
 dynamic new-slot headroom and effective per-position top-up cap. The research
@@ -191,9 +199,22 @@ runner now labels the deployed replay candidate
 breaches, zero old-stop races and `$355` peak main rescue use. These replay
 returns remain survivor-biased and do not guarantee live results.
 
-Pre-deployment regression on 2026-08-11 passed `88` focused Pump tests,
-`96` Pump/research/positions tests, Python compilation, frontend contract
-coverage and the complete project suite (`711 passed`, `8` subtests,
+Pre-deployment regression on 2026-08-11 passed `90` focused Pump tests,
+`99` Pump/research/positions tests, Python compilation, frontend contract
+coverage and the complete project suite (`713 passed`, `8` subtests,
 `13` pre-existing warnings). Node.js is not installed in this Windows
 environment, so JavaScript was covered by the page/API contracts and diff
 review rather than `node --check`.
+
+The first fail-closed deployment attempt exposed the Bybit ceiling before ARM.
+All three old nearest ladders were cancelled and confirmed, while Full TP/SL
+remained present. Strict requested adds were `$70` for 1000RATS, `$95` for
+BLUAI and `$200` for ACE; Bybit rejected them with `retCode 10001` / `can not
+set pm more than pv`. Fresh raw exchange fields showed respectively about
+`$74.95/$54.19`, `$272.44/$175.24`, and `$325.09/$195.40` position value versus
+position margin. No margin was added, no ladder was recreated, and entries
+remained disarmed. The exchange-cap fallback was added from that evidence;
+its first required adds are `$10`, `$20`, and `$25`, each followed by an exact
+exchange reread before any ladder recreation. The earlier zero-race historical
+result belongs to the strict mathematical target; the live `8% + 5s` fallback
+needs separate evidence and must not inherit that claim.

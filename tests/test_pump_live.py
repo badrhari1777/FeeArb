@@ -542,6 +542,7 @@ def write_env(
                 "PUMP_LIVE_MARGIN_PREFUND_TOLERANCE_PCT=2.0",
                 f"PUMP_LIVE_MARGIN_MANAGER_POLICY={margin_manager_policy}",
                 "PUMP_LIVE_PROJECTED_FINAL_FILL_BUFFER_PCT=20",
+                "PUMP_LIVE_PROJECTED_EXCHANGE_CAP_REACTION_BUFFER_PCT=8",
                 "PUMP_LIVE_SHARED_RESCUE_FACILITY_CAP_USD=2000",
                 "PUMP_LIVE_SHARED_MAX_POSITION_TOPUP_USD=2000",
             ]
@@ -1663,6 +1664,7 @@ def test_margin_manager_versions_are_separate_and_current_is_default(
 
     assert shared.margin_manager_policy_id == MARGIN_MANAGER_V3_SHARED
     assert shared.projected_final_fill_buffer_pct == 20.0
+    assert shared.projected_exchange_cap_reaction_buffer_pct == 8.0
     assert shared.shared_rescue_facility_cap_usd == 2_000.0
     assert shared.shared_max_position_topup_usd == 2_000.0
 
@@ -1698,6 +1700,68 @@ def test_projected_prefund_uses_bluai_full_fill_and_following_ladder() -> None:
     assert plan["required_add_usd"] == 95.0
     assert plan["projected_qty"] > 12_750
     assert plan["hard_target_enforced"] is True
+
+
+def test_projected_manager_uses_exchange_cap_reaction_buffer_for_bluai(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        entry_cap=4,
+        prefund_enabled=True,
+        margin_manager_policy=MARGIN_MANAGER_V3_SHARED,
+    )
+    controller = PumpLiveController(
+        gateway=FakePumpGateway(),
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    legs = [
+        {"step": 1, "status": "filled", "trigger_price": 0.017841, "notional_usd": 105.0},
+        {"step": 2, "status": "filled", "trigger_price": 0.0267615, "notional_usd": 105.0},
+        {"step": 3, "status": "planned", "trigger_price": 0.035682, "notional_usd": 105.0},
+        {"step": 4, "status": "planned", "trigger_price": 0.0446025, "notional_usd": 105.0},
+        {"step": 5, "status": "planned", "trigger_price": 0.053523, "notional_usd": 105.0},
+    ]
+    item = {
+        "symbol": "BLUAIUSDT",
+        "qty": 9_810.0,
+        "liq_price": 0.037698,
+        "position_value_usd": 272.44332,
+        "position_margin_usd": 175.23916387,
+        "maintenance_margin_usd": 11.20543195,
+        "legs": legs,
+    }
+
+    plan, check = controller._build_prefund_plan_and_check(  # pylint: disable=protected-access
+        item,
+        controller.config(),
+        target_leg=legs[2],
+    )
+
+    assert check["ready"] is False
+    assert plan["target_kind"] == "exchange_margin_cap_reaction_buffer"
+    assert plan["exchange_margin_add_capacity_usd"] == 80.0
+    assert plan["strict_required_add_usd"] == 95.0
+    assert plan["required_add_usd"] == 20.0
+    assert plan["clearance_pct"] == 8.0
+    assert plan["hard_target_enforced"] is False
+
+    item["liq_price"] = 0.0398
+    item["position_margin_usd"] = 195.23916387
+    verified_plan, verified = controller._build_prefund_plan_and_check(  # pylint: disable=protected-access
+        item,
+        controller.config(),
+        target_leg=legs[2],
+    )
+
+    assert verified_plan["target_kind"] == "exchange_margin_cap_reaction_buffer"
+    assert verified["ready"] is True
+    assert verified["current"]["verified_clearance_pct"] >= 8.0
+    assert verified["projected"]["ready"] is True
 
 
 @pytest.mark.parametrize(
@@ -1926,6 +1990,7 @@ def test_margin_manager_switch_is_runtime_dynamic_for_legacy_position_snapshot()
         PumpLiveConfig(
             margin_manager_policy_id=MARGIN_MANAGER_V3_SHARED,
             projected_final_fill_buffer_pct=25.0,
+            projected_exchange_cap_reaction_buffer_pct=12.0,
             shared_rescue_facility_cap_usd=600.0,
             shared_max_position_topup_usd=1_100.0,
         ),
@@ -1933,6 +1998,7 @@ def test_margin_manager_switch_is_runtime_dynamic_for_legacy_position_snapshot()
 
     assert active.margin_manager_policy_id == MARGIN_MANAGER_V3_SHARED
     assert active.projected_final_fill_buffer_pct == 25.0
+    assert active.projected_exchange_cap_reaction_buffer_pct == 12.0
     assert active.shared_rescue_facility_cap_usd == 600.0
     assert active.shared_max_position_topup_usd == 1_100.0
     assert active.total_capital_usd == 1_000.0
@@ -3311,6 +3377,48 @@ def test_bybit_balance_uses_exact_usdt_wallet_not_usd_conversion(
     assert balance["wallet"] == 1_043.94342401
     assert balance["available"] == 1_043.94342401
     assert balance["used"] == 0.0
+
+
+def test_bybit_positions_preserve_exchange_margin_capacity_fields(
+    monkeypatch: Any,
+) -> None:
+    class PositionClient:
+        @staticmethod
+        def fetch_positions(
+            symbols: Any,
+            params: dict[str, Any],
+        ) -> list[dict[str, Any]]:
+            assert symbols is None
+            assert params == {"category": "linear", "settleCoin": "USDT"}
+            return [
+                {
+                    "symbol": "BLUAI/USDT:USDT",
+                    "side": "short",
+                    "contracts": 9_810.0,
+                    "entryPrice": 0.02138577,
+                    "markPrice": 0.027772,
+                    "liquidationPrice": 0.037698,
+                    "leverage": 3.0,
+                    "marginMode": "isolated",
+                    "unrealizedPnl": -62.0,
+                    "info": {
+                        "symbol": "BLUAIUSDT",
+                        "positionValue": "272.44332",
+                        "positionIM": "175.23916387",
+                        "positionMM": "11.20543195",
+                        "positionIdx": "0",
+                    },
+                }
+            ]
+
+    gateway = BybitPumpLiveGateway()
+    monkeypatch.setattr(gateway, "_ensure_client", lambda: PositionClient())
+
+    position = gateway.fetch_positions()[0]
+
+    assert position["position_value_usd"] == 272.44332
+    assert position["position_margin_usd"] == 175.23916387
+    assert position["maintenance_margin_usd"] == 11.20543195
 
 
 def test_bybit_private_read_resyncs_time_and_retries_once(

@@ -53,6 +53,7 @@ MARGIN_MANAGER_POLICIES = {
 }
 PREFUND_VERIFY_READ_DELAYS_SEC = (0.0, 0.05, 0.1)
 PREFUND_MAX_CORRECTION_STEPS = 3
+PREFUND_HOT_LADDER_POLL_SEC = 5
 LADDER_CANCEL_VERIFY_READ_DELAYS_SEC = (0.0, 0.05, 0.1)
 
 
@@ -83,6 +84,7 @@ class PumpLiveConfig:
     entry_margin_prefund_taker_fee_rate: float = 0.00055
     margin_manager_policy_id: str = MARGIN_MANAGER_V2_CURRENT
     projected_final_fill_buffer_pct: float = 20.0
+    projected_exchange_cap_reaction_buffer_pct: float = 8.0
     shared_rescue_facility_cap_usd: float = 2_000.0
     shared_max_position_topup_usd: float = 2_000.0
     operating_cash_floor_usd: float = 25.0
@@ -143,6 +145,7 @@ def config_from_risk_snapshot(
     dynamic_margin_fields = {
         "margin_manager_policy_id",
         "projected_final_fill_buffer_pct",
+        "projected_exchange_cap_reaction_buffer_pct",
         "shared_rescue_facility_cap_usd",
         "shared_max_position_topup_usd",
     }
@@ -361,6 +364,10 @@ def load_pump_live_config(path: Path = PUMP_LIVE_ENV_PATH) -> PumpLiveConfig:
         values.get("PUMP_LIVE_PROJECTED_FINAL_FILL_BUFFER_PCT"),
         20.0,
     )
+    exchange_cap_reaction_buffer = _safe_float(
+        values.get("PUMP_LIVE_PROJECTED_EXCHANGE_CAP_REACTION_BUFFER_PCT"),
+        8.0,
+    )
     shared_rescue_cap = _safe_float(
         values.get("PUMP_LIVE_SHARED_RESCUE_FACILITY_CAP_USD"),
         2_000.0,
@@ -384,6 +391,10 @@ def load_pump_live_config(path: Path = PUMP_LIVE_ENV_PATH) -> PumpLiveConfig:
         ),
         margin_manager_policy_id=margin_manager_policy,
         projected_final_fill_buffer_pct=max(5.0, min(50.0, final_fill_buffer)),
+        projected_exchange_cap_reaction_buffer_pct=max(
+            5.0,
+            min(20.0, exchange_cap_reaction_buffer),
+        ),
         shared_rescue_facility_cap_usd=max(0.0, min(2_000.0, shared_rescue_cap)),
         shared_max_position_topup_usd=max(
             0.0,
@@ -710,6 +721,11 @@ class BybitPumpLiveGateway:
                         "avg_price": _safe_float(row.get("entryPrice") or info.get("avgPrice"), 0.0),
                         "mark_price": _safe_float(row.get("markPrice") or info.get("markPrice"), 0.0),
                         "liq_price": _optional_float(row.get("liquidationPrice") or info.get("liqPrice")),
+                        "position_value_usd": _optional_float(info.get("positionValue")),
+                        "position_margin_usd": _optional_float(
+                            info.get("positionIM") or info.get("positionBalance")
+                        ),
+                        "maintenance_margin_usd": _optional_float(info.get("positionMM")),
                         "leverage": _safe_float(row.get("leverage") or info.get("leverage"), 0.0),
                         "margin_mode": str(row.get("marginMode") or info.get("tradeMode") or ""),
                         "position_idx": _safe_int(info.get("positionIdx"), 0),
@@ -1272,6 +1288,11 @@ class PumpLiveController:
                 config.projected_final_fill_buffer_pct,
                 6,
             ),
+            "exchange_cap_reaction_buffer_pct": round(
+                config.projected_exchange_cap_reaction_buffer_pct,
+                6,
+            ),
+            "hot_ladder_poll_interval_sec": PREFUND_HOT_LADDER_POLL_SEC,
             "main_funds_count_for_entry": False,
             "exchange_margin_mode": "isolated",
         }
@@ -2148,7 +2169,19 @@ class PumpLiveController:
             if not enabled:
                 return
             self.run_cycle()
-            self._wake.wait(self.config().poll_interval_sec)
+            config = self.config()
+            with self._lock:
+                hot_ladder = any(
+                    leg.get("status") in {"open", "submitted"}
+                    for item in self._open_positions(self._state)
+                    for leg in list(item.get("legs") or [])[1:]
+                )
+            wait_sec = (
+                min(config.poll_interval_sec, PREFUND_HOT_LADDER_POLL_SEC)
+                if hot_ladder
+                else config.poll_interval_sec
+            )
+            self._wake.wait(wait_sec)
             self._wake.clear()
 
     def _portfolio_entry_risk_snapshot(
@@ -2950,6 +2983,15 @@ class PumpLiveController:
                     "avg_entry_price": _safe_float(exchange.get("avg_price"), 0.0),
                     "mark_price": mark_price,
                     "liq_price": liq_price,
+                    "position_value_usd": _optional_float(
+                        exchange.get("position_value_usd")
+                    ),
+                    "position_margin_usd": _optional_float(
+                        exchange.get("position_margin_usd")
+                    ),
+                    "maintenance_margin_usd": _optional_float(
+                        exchange.get("maintenance_margin_usd")
+                    ),
                     "liq_buffer_pct": _short_liq_buffer_pct(mark_price, liq_price),
                     "unrealized_pnl_usd": _safe_float(exchange.get("unrealized_pnl"), 0.0),
                     "flat_confirm_count": 0,
@@ -3114,13 +3156,20 @@ class PumpLiveController:
             - total_topup
             - reserved_for_other_positions,
         )
-        risk_allowed = min(desired, position_capacity, portfolio_capacity)
+        exchange_capacity = self._exchange_margin_add_capacity(item, config)
+        risk_allowed = min(
+            desired,
+            position_capacity,
+            portfolio_capacity,
+            exchange_capacity if exchange_capacity is not None else math.inf,
+        )
         cash_allowed = max(0.0, available - portfolio_config.operating_cash_floor_usd)
         allowed = min(
             desired,
             position_capacity,
             portfolio_capacity,
             cash_allowed,
+            exchange_capacity if exchange_capacity is not None else math.inf,
         )
         if (
             risk_allowed >= 1.0
@@ -3273,6 +3322,7 @@ class PumpLiveController:
         balance = self.gateway.fetch_balance()
         available = _safe_float(balance.get("available"), 0.0)
         defense_config = self._position_margin_defense_config(item, runtime_config)
+        exchange_capacity = self._exchange_margin_add_capacity(item, config)
         allowed = min(
             max(0.0, defense_config.max_position_topup_usd - position_topup),
             max(
@@ -3282,6 +3332,7 @@ class PumpLiveController:
                 - reserved_for_other_positions,
             ),
             max(0.0, available - portfolio_config.operating_cash_floor_usd),
+            exchange_capacity if exchange_capacity is not None else math.inf,
         )
         return allowed, available, total_topup
 
@@ -3294,6 +3345,7 @@ class PumpLiveController:
         portfolio_config = self._active_margin_envelope_config(runtime_config)
         defense_config = self._position_margin_defense_config(item, runtime_config)
         position_topup = _safe_float(item.get("margin_topup_usd"), 0.0)
+        exchange_capacity = self._exchange_margin_add_capacity(item, config)
         with self._lock:
             open_items = self._open_positions(self._state)
             total_topup = sum(
@@ -3317,6 +3369,7 @@ class PumpLiveController:
                 - total_topup
                 - reserved_for_other_positions,
             ),
+            exchange_capacity if exchange_capacity is not None else math.inf,
         )
 
     def _try_entry_prefund_transfer(
@@ -3656,6 +3709,13 @@ class PumpLiveController:
             taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
             round_up_increment_usd=config.entry_margin_prefund_round_usd,
         )
+        if policy_id == MARGIN_MANAGER_V3_SHARED:
+            plan = self._apply_exchange_margin_cap_fallback(
+                item,
+                config,
+                target_leg=target_leg,
+                strict_plan=plan,
+            )
         tolerance = (
             0.0
             if policy_id == MARGIN_MANAGER_V3_SHARED
@@ -3696,8 +3756,112 @@ class PumpLiveController:
             "verified_stop_price": current_check.get("verified_stop_price"),
             "target_stop_price": plan.get("target_stop_price"),
             "reference_price": plan.get("reference_price"),
-            "hard_target_enforced": policy_id == MARGIN_MANAGER_V3_SHARED,
+            "hard_target_enforced": bool(plan.get("hard_target_enforced")),
+            "exchange_cap_fallback": bool(plan.get("exchange_cap_fallback")),
         }
+
+    @staticmethod
+    def _exchange_margin_add_capacity(
+        item: Mapping[str, Any],
+        config: PumpLiveConfig,
+    ) -> float | None:
+        position_value = _optional_float(item.get("position_value_usd"))
+        position_margin = _optional_float(item.get("position_margin_usd"))
+        maintenance_margin = _optional_float(item.get("maintenance_margin_usd"))
+        if (
+            position_value is None
+            or position_margin is None
+            or maintenance_margin is None
+            or position_value <= 0
+        ):
+            return None
+        exchange_headroom = max(
+            0.0,
+            position_value
+            - position_margin
+            - maintenance_margin
+            - max(5.0, position_value * 0.01),
+        )
+        increment = max(0.0001, config.entry_margin_prefund_round_usd)
+        return max(0.0, math.floor(exchange_headroom / increment + 1e-12) * increment)
+
+    def _apply_exchange_margin_cap_fallback(
+        self,
+        item: Mapping[str, Any],
+        config: PumpLiveConfig,
+        *,
+        target_leg: Mapping[str, Any],
+        strict_plan: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        capacity = self._exchange_margin_add_capacity(item, config)
+        strict_required = _safe_float(strict_plan.get("required_add_usd"), 0.0)
+        if capacity is None or strict_required <= capacity + 1e-9:
+            return dict(strict_plan)
+        qty = _safe_float(item.get("qty"), 0.0)
+        liq = _safe_float(item.get("liq_price"), 0.0)
+        target_price = _safe_float(target_leg.get("trigger_price"), 0.0)
+        target_notional = _safe_float(target_leg.get("notional_usd"), 0.0)
+        reaction = config.projected_exchange_cap_reaction_buffer_pct
+        fallback_stop = target_price * (1.0 + reaction / 100.0)
+        current_required = required_entry_prefund_usd(
+            qty=qty,
+            current_liq_price=liq,
+            next_ladder_price=target_price,
+            stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
+            safety_above_next_ladder_pct=reaction,
+            maintenance_margin_rate=config.entry_margin_prefund_mmr,
+            taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
+            round_up_usd=config.entry_margin_prefund_round_usd,
+        )
+        projected_qty, projected_liq = projected_short_liquidation_after_fill(
+            qty=qty,
+            current_liq_price=liq,
+            added_notional_usd=target_notional,
+            added_price=target_price,
+            leverage=config.leverage,
+            maintenance_margin_rate=config.entry_margin_prefund_mmr,
+        )
+        projected_required = required_entry_prefund_usd(
+            qty=projected_qty,
+            current_liq_price=projected_liq,
+            next_ladder_price=target_price,
+            stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
+            safety_above_next_ladder_pct=reaction,
+            maintenance_margin_rate=config.entry_margin_prefund_mmr,
+            taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
+            round_up_usd=config.entry_margin_prefund_round_usd,
+        )
+        required = max(current_required, projected_required)
+        fallback = {
+            **dict(strict_plan),
+            "target_kind": "exchange_margin_cap_reaction_buffer",
+            "reference_price": target_price,
+            "clearance_pct": reaction,
+            "target_stop_price": fallback_stop,
+            "current_required_add_usd": round(current_required, 6),
+            "projected_required_add_usd": round(projected_required, 6),
+            "required_add_usd": round(required, 6),
+            "projected_qty": round(projected_qty, 12),
+            "projected_liq_price": round(projected_liq, 12),
+            "projected_stop_price": round(
+                projected_liq
+                * (
+                    1.0
+                    - max(0.1, min(20.0, config.exchange_stop_gap_from_liq_pct))
+                    / 100.0
+                ),
+                12,
+            ),
+            "exchange_margin_add_capacity_usd": round(capacity, 6),
+            "strict_required_add_usd": round(strict_required, 6),
+            "strict_target_stop_price": strict_plan.get("target_stop_price"),
+            "strict_reference_price": strict_plan.get("reference_price"),
+            "hard_target_enforced": False,
+            "exchange_cap_fallback": True,
+        }
+        if required > capacity + 1e-9:
+            fallback["exchange_cap_fallback_blocked"] = True
+        return fallback
 
     def _verify_entry_prefund_target(
         self,
