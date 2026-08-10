@@ -1,0 +1,550 @@
+# Strategy Lab Candidate Observatory
+
+## Название и назначение
+
+Каноническое название нового исследовательского контура:
+`Strategy Lab Candidate Observatory` (`SLC Observatory`). В разговоре пользователя
+`модуль исследования`, `поиск стратегий`, `анализ funding/spread`, `наблюдение
+кандидатов` и `Strategy Lab Observatory` означают именно этот контур.
+
+Observatory должен заранее и без торговли собирать prospective-данные, из которых
+после заморозки выборки Strategy Lab сможет искать безопасные и прибыльные правила:
+
+- появления, усиления, охлаждения и смены cadence funding;
+- расширения, остановки, схождения и повторного расширения межбиржевого базиса;
+- выбора пары бирж, удержания, выхода, частичного выхода и roll одной ноги;
+- связи funding/spread с OI, volume, price, mark/index/premium и режимом рынка;
+- последующего сравнения лучших правил в live-shadow без заявок.
+
+Observatory не является торговым модулем и не получает права ARM, открытия,
+закрытия, roll, перевода средств или изменения маржи.
+
+## Утверждённые решения
+
+1. Первый контур ограничен пятью биржами:
+   `Binance`, `Bybit`, `OKX`, `KuCoin`, `Gate`.
+2. Пять бирж — это доступный universe, а не требование опрашивать каждую биржу с
+   одинаковой частотой для каждой монеты.
+3. Единица наблюдения — монета с вектором состояний доступных бирж, а не заранее
+   фиксированная пара. Из пяти состояний строятся до `10` ненаправленных или `20`
+   направленных пар без дополнительных API-запросов.
+4. Точная пара и направление внешнего кандидата, например Coinglass, сохраняются,
+   но одновременно оцениваются все доступные альтернативные ноги для median и roll.
+5. Глубина стакана намеренно имеет минимальный исследовательский вес:
+   - она не участвует в отборе кандидатов и не является alpha-признаком;
+   - полный исторический depth не является обязательным условием начала shadow;
+   - сохраняются best bid/ask, freshness и, если поле приходит бесплатно, top size;
+   - фактическая исполнимость проверяется maker-first/chunk поведением в shadow.
+6. Отсутствующий или stale BBO, неверный symbol mapping, закрытый контракт и
+   невозможность безопасно построить две ноги остаются техническими `VETO`. Это не
+   depth-фильтр, а проверка существования цены и инструмента.
+7. Текущий узкий Stage 3.1 не продолжается без изменений. Его causal validation,
+   spread features и outcome replay переиспользуются после prospective-сбора в
+   совместном `carry + basis + lifecycle` анализе.
+8. Первый месяц — checkpoint качества и количества событий, а не автоматическое
+   окончание сбора. Достаточность определяется независимыми событиями и режимами.
+
+## Главная исследовательская цель
+
+Для каждого момента и каждой допустимой направленной пары ответить:
+
+```text
+если открыть long на L и short на S сейчас,
+каковы распределение net PnL, MAE, время до результата и риск
+на 15m / 1h / 4h / 8h / 24h / ближайших funding settlements;
+лучше ENTER, WAIT, HOLD, EXIT, PARTIAL_EXIT, ROLL или VETO?
+```
+
+Оптимизация идёт не по максимальному win rate. Цель — максимальная консервативная
+net-доходность при ограниченных tail loss, MAE, drawdown, времени удержания и
+потребности в марже.
+
+## Почему нужен новый prospective-массив
+
+Старые Pump/Dump, Coin Analysis, funding history и operational logs сохраняются как:
+
+- development set для схемы, признаков и воспроизводимости;
+- источник редких исторических режимов;
+- проверка импортёров, labels и расчёта результатов.
+
+Они не являются достаточным финальным доказательством, потому что имеют разный
+sampling, selection bias, неполное межбиржевое покрытие и повторяющиеся решения.
+Новый массив должен собираться до знания будущего результата по заранее
+зафиксированному контракту.
+
+## Текущее состояние проекта и найденные ограничения
+
+На read-only аудите `2026-08-10`:
+
+- Coinglass отдавал `20` строк, но pipeline превращал их в base-symbol universe и
+  повторно выбирал пару среди включённых бирж; ни одна из `15` внутренних
+  opportunities не сохранила точную исходную пару Coinglass;
+- `OKX`, `KuCoin` и `Gate` adapters требуют suffixed symbol (`BOMEUSDT`), тогда как
+  Coinglass universe содержит base symbol (`BOME`), поэтому текущий общий scanner
+  может вернуть по ним ноль до запроса сети;
+- Coin Analysis жёстко ограничен `Binance + KuCoin`, а его автоматический candidate
+  shortlist фактически не соединён с текущим main scanner;
+- существующий `MarketDataBus` умеет все пять выбранных бирж, но создаёт отдельный
+  WebSocket loop на каждую пару `exchange + symbol`; `20 x 5` означали бы около
+  `100` соединений вместо пяти мультиплексированных feeds;
+- текущий REST-путь с `20` нормализованными символами на пяти биржах не завершился
+  за `90s`; одиночный BTC в разовом локальном замере занял примерно
+  `3.17s Binance / 1.43s Bybit / 2.26s OKX / 2.54s KuCoin / 36.54s Gate`.
+
+Это не оценка предельной мощности бирж. Это доказательство, что Observatory нельзя
+строить поверх текущего синхронного REST fan-out и per-symbol WebSocket loops.
+
+## Целевая транспортная архитектура
+
+### Instrument Registry
+
+Раз в `15m` строится каноническая карта USDT perpetuals:
+
+```text
+canonical_symbol
+exchange
+exchange_symbol
+available / prelaunch / reduce_only / delisting
+contract_multiplier
+funding_interval
+funding_cap / funding_floor
+first_seen / last_seen
+mapping_source
+```
+
+Registry является единственным местом преобразования `BOME -> BOMEUSDT /
+BOME-USDT-SWAP / BOMEUSDTM / BOME_USDT`.
+
+### Multiplexed feeds
+
+Цель — один устойчивый public feed на биржу и не более одного резервного:
+
+- Binance: all-market mark/funding и BBO либо individual BBO только для hot;
+- Bybit: ticker topics; один ticker уже содержит BBO, mark, index, OI, volume,
+  funding, interval и next funding time;
+- OKX: public ticker/funding/open-interest/mark/index channels;
+- KuCoin: bulk contracts snapshot для funding/mark/index/OI/volume и общий
+  WebSocket с BBO topics только для watch/hot;
+- Gate: futures tickers/contract stats и BBO topics; не использовать тяжёлый
+  текущий bulk REST цикл как hot path.
+
+Reconnect, heartbeat, staleness и subscription audit сохраняются отдельно по
+бирже. Feed failure одной биржи не должен останавливать остальные, но пары с этой
+биржей получают `data_veto`.
+
+## Реалистичная пропускная способность первой версии
+
+### Уровни
+
+| Уровень | Максимум | Биржи | Persist cadence | Назначение |
+|---|---:|---:|---:|---|
+| Registry/discovery | все общие контракты | до 5 | агрегат `60s`, registry `15m` | заметить funding/spread/OI/volume аномалию |
+| Baseline | `60` монет | до 5 | `60s` | до-событийная история и controls |
+| Watch | `25` монет | до 5 | `30s` | полный multi-venue вектор и roll alternatives |
+| Hot | `8` монет, включая позиции | обычно 3 | `5s` BBO/state | текущие ноги плюс лучшая roll-нога |
+
+Если открытые позиции занимают hot-cap, новые кандидаты не вытесняют их: уменьшается
+число новых hot-кандидатов. Funding/mark/OI состояния остальных доступных бирж всё
+равно остаются на Watch cadence.
+
+### Расчёт верхней записи
+
+Без дедупликации пересечений:
+
+```text
+baseline: 60 * 5 * 1,440       = 432,000 venue rows/day
+watch:    25 * 5 * 2,880       = 360,000 venue rows/day
+hot:       8 * 3 * 17,280      = 414,720 venue rows/day
+total upper bound              = 1,206,720 venue rows/day
+30-day upper bound             = 36,201,600 venue rows
+```
+
+Pair rows постоянно не дублируются: они вычисляются из venue rows. Для `60` монет
+полная матрица — всего `1,200` направленных расчётов на evaluation tick. Это
+незначительная CPU-нагрузка по сравнению с сетью и сериализацией.
+
+Хранение:
+
+- immutable узкие numeric partitions (предпочтительно Parquet) по date/exchange;
+- SQLite только для registry, candidate/event/decision/shadow lifecycle и индексов;
+- raw WebSocket JSON сохраняется лишь вокруг ошибок и ограниченных event windows;
+- ориентир первой версии — не более `10 GB/month`, но окончательный лимит задаётся
+  только после `24h` preflight по фактическому compressed bytes/row.
+
+Следовательно, пять бирж достижимы при multiplexing и tiering. Пять бирж через
+текущий REST fan-out — недостижимы с нужной cadence.
+
+## Отбор кандидатов: основной принцип
+
+Во время сбора нельзя использовать один «торговый score» и брать только красивые
+случаи: это создаст selection bias. Используется несколько независимых корзин с
+квотами. Один symbol/event может иметь несколько `source_tags`.
+
+```text
+coinglass_exact_pair
+funding_level
+funding_acceleration
+funding_dispersion
+funding_cadence_change
+spread_level
+spread_residual
+spread_velocity
+premium_dislocation
+oi_volume_price_anomaly
+held_position
+manual_pin
+matched_control
+```
+
+Monitoring priority распределяет ограниченные Watch/Hot места, но не утверждает,
+что сделка прибыльна.
+
+### Начальное распределение Baseline/Watch
+
+Корзины имеют мягкие квоты и дедуплицируются по symbol. Это не означает, что
+каждая корзина обязана ежедневно быть заполнена:
+
+| Источник | Целевой максимум в Baseline | Обычный Watch приоритет |
+|---|---:|---|
+| Открытые позиции и manual pins | без квоты, всегда первые | `P0` |
+| Exact Coinglass среди пяти бирж | до `15` | `P1`, если подтверждён своим feed |
+| Funding level/acceleration/dispersion | до `15` | `P1/P2` |
+| Spread level/residual/velocity | до `15` | `P1/P2` |
+| OI-volume-price/premium anomalies | до `10` | `P1/P2` |
+| Matched controls | минимум `10`, не менее `15–20%` | `P3` |
+
+После объединения итоговый Baseline ограничен `60`, Watch — `25`. Монета с тремя
+trigger families занимает одно место, но получает повышенный приоритет и все
+source tags. Если P0 занимает большую часть Watch, квоты внешних источников
+сжимаются, controls сохраняются минимум в разумном объёме для честного сравнения.
+
+Начальные research-intake triggers должны быть намеренно широкими и адаптивными,
+например top/bottom `5%`, robust `|z| >= 2.5` либо два согласованных умеренных
+сигнала. Абсолютный safety-net residual может собирать события от `0.5 п.п.`, но
+это не entry threshold. После `7d` QA пороги можно менять только для достижения
+coverage/квот, не на основании PnL; version и причина изменения обязательны.
+
+Candidate identity:
+
+```text
+symbol + directed source pair + trigger family + clustered event start
+```
+
+Срабатывания одного family в пределах `15m` объединяются в событие. Новый family
+добавляет tag, а не создаёт дубликат. Исчезнувший сигнал остаётся в Watch минимум
+`2h` и не менее одного полного relevant settlement tail; Coinglass-кандидат после
+исчезновения из рейтинга сохраняется минимум до двух ближайших settlement checks.
+
+### Приоритеты
+
+1. `P0`: открытые позиции и manual pins — всегда Watch, текущие ноги — Hot.
+2. `P1`: одновременно сработали два и более независимых семейства либо источник
+   Coinglass подтверждён собственными данными.
+3. `P2`: сильный одиночный funding/spread/OI-volume trigger.
+4. `P3`: matched controls и обычные состояния.
+
+Используется hysteresis: кандидат не удаляется сразу после ухода ниже порога.
+Нужны pre-event buffer, minimum watch time и post-event cooling tail.
+
+## Корзины кандидатов
+
+### A. Coinglass exact candidates
+
+Сохранять без перетолкования:
+
+- точные long/short exchange;
+- funding каждой ноги и interval;
+- spread, APR, OI, settlement и source timestamp;
+- source rank и requested notional;
+- поддерживается ли каждая нога выбранной пятёркой.
+
+После этого строить свой пятибиржевой вектор. Coinglass pair остаётся источником
+события, но не запрещает найти лучшую пару или roll.
+
+### B. Funding candidates
+
+Отбирать по нескольким независимым признакам:
+
+- max-minus-min funding cashflow между биржами;
+- deviation каждой биржи от cross-venue median;
+- raw rate, bps/hour и точный cashflow ближайшего settlement отдельно;
+- изменение за `5m/15m/1h/4h` и ускорение;
+- приближение к cap/floor;
+- изменение cadence `8h -> 4h -> 1h` и обратно;
+- число последовательных settlements одного знака;
+- расхождение current/predicted/последней realised ставки, где поля доступны;
+- время до каждого settlement, потому что часы на биржах могут не совпадать.
+
+### C. Spread/basis candidates
+
+Для каждой направленной пары хранить:
+
+```text
+entry_basis(L,S) = bid_S / ask_L - 1
+exit_basis(L,S)  = bid_L / ask_S - 1
+pair_mid_basis
+mark_basis
+index/premium-normalized basis
+```
+
+Главный кандидатный признак — не только абсолютный spread, а отклонение от
+собственной устойчивой нормы пары:
+
+- rolling median `1h/4h/24h/7d`;
+- robust MAD/z-score и percentile;
+- residual `current - rolling median`;
+- velocity/acceleration `1m/5m/15m`;
+- persistence и число пересечений equilibrium;
+- cross-venue median при наличии минимум трёх бирж.
+
+Пример пользователя: если Binance/Bybit обычно держатся около `-2%`, а сейчас
+стало `-4%`, событие имеет residual около `-2 п.п.` независимо от того, велик ли
+абсолютный spread по общему порогу. При двух доступных биржах используется только
+историческая норма конкретной пары; «глобальная медиана» не выдумывается.
+
+### D. OI / volume / price / premium candidates
+
+OI сравнивается прежде всего с собственной историей той же биржи: raw OI разных
+бирж может иметь разные единицы, multiplier и качество отчётности.
+
+Триггеры:
+
+- OI change и robust z-score `5m/15m/1h/4h/24h`;
+- volume/turnover anomaly на тех же окнах;
+- price return, realised range/volatility и acceleration;
+- одновременный OI + volume spike;
+- price/OI divergence;
+- mark-index premium и отклонение premium одной биржи от остальных;
+- межбиржевое lead/lag: какая биржа первой изменила price, funding или OI;
+- liquidation и long/short ratio как optional enrichment, но не обязательный gate.
+
+Квадранты `price up/down x OI up/down` сохраняются как признаки, а не как заранее
+истинные объяснения «новые long», «short covering» и т.п. Их ценность должна быть
+доказана outcomes.
+
+### E. Positions and roll candidates
+
+Каждая открытая пара автоматически становится кандидатом и получает все доступные
+альтернативные ноги. Для current `long=L, short=S` оцениваются:
+
+- оставить обе ноги;
+- заменить только long `L -> K`;
+- заменить только short `S -> K`;
+- закрыть обе ноги;
+- временный трёхногий bridge во время roll;
+- split-leg/multi-leg только как отдельная поздняя shadow-гипотеза.
+
+Research roll edge:
+
+```text
+roll_value(horizon) =
+    improvement in expected funding cashflow
+  + improvement in expected basis path
+  - close(old leg) costs
+  - open(new leg) costs
+  - temporary hedge/margin risk penalty
+```
+
+Для каждой позиции сохраняется таблица всех доступных вариантов на каждом decision
+tick, а не только победитель. Это позволит позже понять, когда roll был действительно
+лучше HOLD/EXIT и когда красивый funding был съеден новым basis.
+
+### F. Matched controls
+
+Минимум `15–20%` Baseline/Watch мест резервируется для событий без сильного
+сигнала, сопоставленных по:
+
+- symbol age и ценовому диапазону;
+- volatility и market regime;
+- числу доступных бирж;
+- времени до settlement;
+- времени суток/дню недели.
+
+Controls необходимы для поиска предвестников funding/spread spike и честной оценки
+false positive rate.
+
+## Роль стакана и исполнения
+
+Depth намеренно исключается из primary hypothesis mining. Система не должна
+отбрасывать малоликвидную maker-биржу только потому, что видимый taker depth мал.
+Это согласуется с текущим исполнением: passive order ставится на менее ликвидной
+стороне, фактический fill немедленно хеджируется на более ликвидной стороне, а
+объём разбивается на chunks.
+
+На prospective-сборе достаточно:
+
+- best bid/ask и freshness;
+- top size, только если уже приходит в ticker;
+- tradeability/status/contract multiplier;
+- грубой volume/OI context без depth-score.
+
+На live-shadow каждого варианта дополнительно измеряются:
+
+- сколько времени maker order ожидал fill;
+- доля и последовательность partial fills;
+- число chunks;
+- цена hedge и задержка;
+- фактическое adverse movement между fill и hedge;
+- effective entry/exit basis и полные комиссии.
+
+Таким образом depth не решает, есть ли alpha. Реальное поведение исполнителя само
+показывает, какие сигналы переживают maker-first/chunk execution.
+
+## Candidate lifecycle
+
+```text
+DISCOVERED
+  -> BASELINE_BUFFERED
+  -> WATCH
+  -> HOT
+  -> EVENT_ACTIVE
+  -> COOLING
+  -> CLOSED_FOR_LABELS
+```
+
+Отдельный future shadow lifecycle:
+
+```text
+SHADOW_WAIT
+  -> SHADOW_ENTER
+  -> SHADOW_HOLD
+  -> SHADOW_PARTIAL_EXIT / SHADOW_ROLL
+  -> SHADOW_EXIT
+  -> OUTCOME_FINAL
+```
+
+Collector lifecycle и strategy lifecycle не смешиваются: добавление/удаление
+кандидата не должно само открывать или закрывать даже shadow-позицию.
+
+## Что сохранять в каждой venue observation
+
+Обязательное:
+
+- event time exchange + receive time local + latency/staleness;
+- canonical/exchange symbol и instrument version;
+- bid/ask, mid, last, mark, index;
+- funding raw, funding bps/hour, interval, next settlement;
+- realised funding после settlement;
+- OI raw и normalized notional, если корректно известен multiplier;
+- volume/turnover, price change/range;
+- contract availability/status и source health;
+- candidate tags и sampling tier.
+
+Опциональное:
+
+- top bid/ask size;
+- liquidation stream;
+- long/short ratios;
+- exchange-specific predicted funding;
+- public trade imbalance.
+
+Отсутствующее поле остаётся `missing` с причиной и не заменяется нулём.
+
+## Выводы из внешнего исследования
+
+Публичные scanner-практики обычно комбинируют funding, spread, time-to-settlement,
+spread duration, OI/volume и fee-adjusted result. Это подтверждает выбранные
+семейства, но не даёт проверенного универсального entry/exit правила.
+
+Hummingbot Cross-Exchange Market Making документирует ровно применяемую в FeeArb
+идею: passive maker order на менее ликвидной площадке и taker hedge на более
+ликвидной после fill. Поэтому полный depth разумно вынести из alpha selection в
+shadow execution evidence.
+
+Публичные обсуждения трейдеров дополнительно упоминают persistence сигнала,
+funding interval, premium/oracle spread, OI, volume, fees и фактические fills.
+Это anecdotal hypothesis input, а не доказательство доходности.
+
+Исследования perpetual futures предупреждают о двух важных ограничениях:
+
+- perpetual spread не обязан сходиться к фиксированной дате, в отличие от
+  обычного срочного фьючерса;
+- raw OI может быть несопоставим или некорректно опубликован разными биржами.
+
+Поэтому pair-specific equilibrium и within-exchange OI changes важнее абсолютного
+сравнения raw OI между площадками.
+
+Проверенные источники на дату проектирования:
+
+- Coinglass funding arbitrage API:
+  https://docs.coinglass.com/reference/fr-arbitrage
+- Hummingbot cross-exchange market making:
+  https://hummingbot.org/strategies/v1-strategies/cross-exchange-market-making/
+- Binance futures all BBO stream:
+  https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/All-Book-Tickers-Stream
+- Bybit public ticker:
+  https://bybit-exchange.github.io/docs/v5/websocket/public/ticker
+- OKX API/WebSocket guide:
+  https://www.okx.com/docs-v5/en/
+- KuCoin symbol contract data and WebSocket limits:
+  https://www.kucoin.com/docs-new/rest/futures-trading/market-data/get-symbol
+  https://www.kucoin.com/docs-new/rate-limit
+- Gate futures WebSocket:
+  https://www.gate.com/docs/developers/futures/ws/en/
+- Fundamentals of Perpetual Futures:
+  https://arxiv.org/abs/2212.06888
+- Reconciling Open Interest with Traded Volume in Perpetual Swaps:
+  https://arxiv.org/abs/2310.14973
+- Community discussion of funding drivers (anecdotal, hypothesis-only):
+  https://www.reddit.com/r/algotradingcrypto/comments/1v1o58n/learning_material_on_funding_rates/
+- Community discussion of persistent perp spread entry (anecdotal,
+  hypothesis-only):
+  https://www.reddit.com/r/algotradingcrypto/comments/1u6b2rj/roughly_3_months_of_arbitrage_started_with_2k_usdt/
+
+## Пошаговый план реализации
+
+### Phase O0 — data contract and bounded preflight
+
+1. Зафиксировать schema/version, sign convention, candidate/event identity.
+2. Реализовать общий Instrument Registry для пяти бирж.
+3. Сделать multiplexed public feed prototype без постоянного long run.
+4. Проверить coverage common symbols, freshness, reconnect и field availability.
+5. Провести bounded `1h`, затем `24h` preflight и измерить calls/messages,
+   missingness, compressed bytes/row, CPU/RAM и gaps.
+6. Обновить реальные caps только по результату preflight.
+
+### Phase O1 — prospective collector
+
+1. Запустить Registry/Discovery/Baseline/Watch/Hot без trading decisions.
+2. Добавить immutable candidate ledger, controls и lifecycle.
+3. Ввести ежедневный QA: gaps, stale feeds, mapping, duplicates, clock skew,
+   venue/symbol coverage и disk forecast.
+4. Первый audit через `7d`, первый research freeze через `30d`; продолжить сбор,
+   если независимых событий или режимов недостаточно.
+
+### Phase O2 — broad hypothesis search
+
+1. Старые данные — development only; prospective dataset делится chronologically.
+2. Проверить funding spike/cooling, pair equilibrium/reversion/expansion,
+   OI-volume-price regimes, entry timing, exit timing и roll.
+3. Использовать train/validation/locked future holdout, unseen-symbol и
+   unseen-pair holdout, multiple-testing protection и concentration metrics.
+4. Выбрать несколько устойчивых семейств, а не один лучший backtest.
+
+### Phase O3 — live-shadow strategies
+
+1. Зафиксировать версии правил до новых событий.
+2. Сравнивать ENTER/WAIT/HOLD/EXIT/PARTIAL_EXIT/ROLL без заявок.
+3. Использовать реальный maker-first/chunk simulator и записывать execution
+   evidence вместо предварительного depth-фильтра.
+4. Не переходить к paper, пока execution-aware prospective holdout не положителен
+   и tail-risk gates не пройдены.
+
+## Точный следующий безопасный шаг
+
+Следующий change block — только `Phase O0`:
+
+- schema и tests;
+- пятибиржевой Instrument Registry;
+- bounded multiplexed feed prototype;
+- без долгого запуска, shadow positions, orders, ARM и изменений live-модулей.
+
+После тестов нужен отдельный операторский verdict перед `1h/24h` preflight, а после
+preflight — отдельное подтверждение перед месячным prospective-сбором.
+
+## Правило сопровождения для ИИ-агентов
+
+После каждого meaningful блока Observatory этот документ обновляется в том же
+коммите: что реализовано, coverage/QA, фактические caps, тесты, ограничения,
+runtime status и точный следующий шаг. Нельзя объявлять проектный cap фактической
+пропускной способностью до bounded preflight.

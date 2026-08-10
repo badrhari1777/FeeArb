@@ -14,8 +14,8 @@
 Если реализация и этот документ расходятся, сначала проверить код и свежие
 артефакты, затем исправить roadmap в том же логическом коммите.
 
-Последнее обновление: `2026-08-09`.
-Текущий этап: `Executable Spread Timing v1 core реализован; простой spread-threshold опровергнут, Stage 3 selective filters pending`.
+Последнее обновление: `2026-08-10`.
+Текущий этап: `Candidate Observatory design зафиксирован; Phase O0 data contract / Instrument Registry / bounded feed prototype pending`.
 Текущий режим: `research_only_no_trading`.
 
 ## Цель
@@ -511,7 +511,7 @@ Shadow -> live:
 - Возобновление начинается ровно с Stage 3.1 по пунктам ниже, после отдельного
   завершения и коммита защитного блока.
 
-## Точный следующий шаг
+## Прежний checkpoint Stage 3.1 (заменён решением 2026-08-10 ниже)
 
 1. добавить Stage 3.1 selective policy research без изменения live: сравнить
    velocity/expansion-stop, mark/index gap, funding sign/cadence, OI и volume;
@@ -521,3 +521,37 @@ Shadow -> live:
    нескольких уровней depth, не переписывая существующие operational logs;
 4. только при положительном execution-aware holdout решить вопрос unified
    paper state machine; текущий общий spread threshold остаётся отвергнутым.
+
+### 2026-08-10 — переход к Candidate Observatory
+
+- По решению пользователя прежний узкий Stage 3.1 не продолжается как немедленный
+  перебор selective thresholds. Сначала создаётся новый prospective-массив для
+  совместного анализа funding, directed basis, entry/exit и roll.
+- Каноническое имя runtime/research-контура:
+  `Strategy Lab Candidate Observatory`; подробный контракт и план находятся в
+  `instructions/18_STRATEGY_LAB_CANDIDATE_OBSERVATORY.md`.
+- Первый venue universe ограничен `Binance / Bybit / OKX / KuCoin / Gate`.
+  Все пять хранят медленное состояние, но hot BBO обычно нужен только для текущих
+  двух ног и лучшей альтернативной roll-ноги.
+- Полный depth исключён из alpha selection и получает минимальный приоритет.
+  Обязательны только fresh BBO/tradeability; maker-first, chunks и фактическое
+  исполнение оцениваются позднее в live-shadow.
+- Отбор не сводится к Coinglass: используются exact Coinglass pairs, внутренние
+  funding/spread anomalies, OI-volume-price/premium triggers, позиции/manual pins
+  и matched controls.
+- Для каждой монеты строится пятибиржевой vector, до `20` directed pairs,
+  pair-specific rolling median/residual и варианты HOLD/EXIT/ROLL. Это покрывает
+  случай, когда привычный Binance/Bybit basis `-2%` временно становится `-4%`, а
+  KuCoin или Gate одновременно предлагают лучшую альтернативную ногу.
+- Read-only audit обнаружил несовместимый base/suffixed symbol contract для
+  Coinglass против OKX/KuCoin/Gate и непригодность текущего REST fan-out для
+  нужной cadence: нормализованный пятибиржевой проход `20` symbols превысил `90s`.
+  Поэтому Phase O0 требует общего Instrument Registry и multiplexed feeds, а не
+  расширения существующих per-symbol loops.
+- Проектный первый cap до preflight: Baseline `60` symbols at `60s`, Watch `25`
+  at `30s`, Hot `8` symbols / обычно `3` venues at `5s`; верхняя оценка около
+  `1,206,720` narrow venue rows/day до дедупликации. Это не подтверждённая
+  пропускная способность: обязательны bounded `1h`, затем `24h` preflight.
+- Следующий safe change block: Phase O0 schema/tests, five-venue Instrument
+  Registry и bounded multiplexed feed prototype. Никакого long run, shadow
+  position, paper/live promotion, ARM или заявки это решение не разрешает.

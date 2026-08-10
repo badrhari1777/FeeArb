@@ -109,6 +109,23 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab Candidate Observatory was designed on 2026-08-10 as the new
+  canonical prospective research path before further Stage 3.1 threshold
+  mining. The first venue universe is limited to Binance, Bybit, OKX, KuCoin,
+  and Gate; each symbol is represented as a multi-venue vector so pair-specific
+  median/residual, alternative legs, roll, and temporary multi-leg hypotheses
+  can be evaluated. Full order-book depth is deliberately de-emphasized: fresh
+  BBO/tradeability remain technical gates, while maker-first/chunk execution is
+  to be measured in later live-shadow. Candidate intake combines exact
+  Coinglass pairs, internal funding/spread anomalies, OI-volume-price/premium
+  triggers, held/manual symbols, and matched controls. A read-only probe exposed
+  base/suffixed symbol incompatibility for OKX/KuCoin/Gate and showed the current
+  five-venue REST fan-out cannot meet the required cadence, so Phase O0 must add
+  a shared Instrument Registry and multiplexed public feeds. The initial design
+  caps are Baseline 60/60s, Watch 25/30s, and Hot 8 symbols on usually three
+  venues/5s; these remain unconfirmed until bounded 1h and 24h preflights.
+  Canonical contract: `instructions/18_STRATEGY_LAB_CANDIDATE_OBSERVATORY.md`.
+  No collector, long run, shadow position, ARM, order, or live setting changed.
 - Pump signal auditing was expanded on 2026-08-10 without changing any trading
   rule. Every classified strategy decision now carries a versioned, JSON-safe
   snapshot of every source scanner column, including returns, pump/trigger/

@@ -46,6 +46,9 @@
   [`16_STRATEGY_LAB.md`](16_STRATEGY_LAB.md)
 - Живой пошаговый roadmap и журнал Strategy Lab для следующих ИИ-агентов:
   [`17_STRATEGY_LAB_ROADMAP.md`](17_STRATEGY_LAB_ROADMAP.md)
+- Канонический план prospective-сбора funding/spread кандидатов, multi-venue median
+  и roll для Strategy Lab Candidate Observatory:
+  [`18_STRATEGY_LAB_CANDIDATE_OBSERVATORY.md`](18_STRATEGY_LAB_CANDIDATE_OBSERVATORY.md)
 
 ## Важно
 
