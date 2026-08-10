@@ -119,6 +119,12 @@ Recent Changes
   promotion and return while the negative equity adjustment keeps them out of
   strategy PnL. Targeted Pump transfer/live tests passed (`86`), followed by
   the complete Python regression (`676 passed`, `11 warnings`).
+  Commit `fddfdcc` was deployed after zero Grid/manual executions were
+  confirmed. Restart disarmed entries, migrated both ledgers to `$0`
+  outstanding / `$0.000036` dust, rejected legacy ARM and accepted
+  `ARM PUMP LIVE 3000`. Three cycles remained armed/error-free with two v1
+  positions, zero v2 positions and ten orders; final `CALM` minimum buffer was
+  `71.62%` with `$1223.16` new-slot headroom.
 - Pump Live mixed-capital migration was implemented on 2026-08-10. Existing
   positions receive immutable `v1_1000` snapshots; explicit capitalization of
   confirmed temporary principal can activate `v2_3000` only for future entries,

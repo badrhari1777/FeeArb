@@ -628,3 +628,14 @@ No v2 position had opened at that checkpoint. The next eligible new entry is
 the single `$525` v2 canary; existing positions remain immutable v1. The
 rounding-dust hardening passed the complete regression (`676 passed`, `11
 warnings`).
+
+Post-hardening deployment evidence: commit `fddfdcc` was deployed by the
+supervised stop/start scripts only after Grid showed zero active executions and
+pending transitions and Manual showed zero running executions. Restart was
+fail-closed (`entry_armed=false`) and migrated both ledgers to `$0` temporary
+outstanding plus `$0.000036` excluded dust. Legacy `ARM PUMP LIVE 1000` was
+rejected with HTTP 400; explicit `ARM PUMP LIVE 3000` passed ownership and
+protection recovery. Three complete monitor cycles stayed armed with no blocked
+reason/error, two v1 positions, zero v2 positions, ten orders and a live
+monitor. Final regime was `CALM`, minimum liquidation buffer `71.62%`, and new
+slot headroom `$1223.16`.

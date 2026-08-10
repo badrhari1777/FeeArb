@@ -104,6 +104,13 @@ protected v1 positions, ten owned orders, zero protection issues and no v2
 entry yet. The next eligible new entry is one `$525` v2 canary.
 The rounding-dust migration and accounting paths passed the complete Python
 regression (`676 passed`, `11 warnings`).
+Commit `fddfdcc` was then deployed after confirming zero Grid transitions and
+zero running Manual executions. Restart correctly disarmed entries and
+migrated both durable views to `$0` outstanding / `$0.000036` excluded dust.
+The legacy ARM string was rejected; `ARM PUMP LIVE 3000` succeeded. Three
+following monitor cycles stayed armed and error-free with two v1 positions,
+zero v2 positions and ten orders. The final snapshot was `CALM`, with `71.62%`
+minimum liquidation buffer and `$1223.16` new-slot headroom.
 
 Return is bounded by all of:
 
