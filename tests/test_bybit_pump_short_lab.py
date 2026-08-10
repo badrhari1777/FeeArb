@@ -179,11 +179,21 @@ class BybitPumpShortLabTestCase(unittest.TestCase):
                 "status": "entry_candidate",
                 "symbol": "EARLYUSDT",
                 "event_id": "EARLY-1",
+                "return_24h_pct": "32.5",
                 "trigger_pump_pct": "140",
                 "pullback_from_high_pct": "21",
                 "funding_prev_24h_pct": "-0.2",
+                "oi_change_4h_pct": "4.5",
                 "oi_change_24h_pct": "12",
                 "long_ratio": "0.52",
+                "premium_latest_pct": "-0.11",
+                "premium_min_24h_pct": "-0.42",
+                "premium_relief_1h_pct": "0.18",
+                "volume_z_24h": "3.7",
+                "matched_profile": "pump_pullback",
+                "data_quality": json.dumps(
+                    {"funding": "ok", "open_interest": "ok"}
+                ),
                 "last_close": "1.0",
             }
 
@@ -221,6 +231,16 @@ class BybitPumpShortLabTestCase(unittest.TestCase):
         self.assertEqual(len(recorder.calls), 2)
         self.assertEqual(recorder.calls[0][0]["symbol"], "EARLYUSDT")
         self.assertEqual(recorder.calls[0][0]["ts_ms"], "1900000123456")
+        snapshot = recorder.calls[0][0]["scanner_snapshot"]
+        self.assertEqual(snapshot["schema"], "pump_signal_scanner_snapshot_v1")
+        self.assertTrue(set(row).issubset(snapshot))
+        self.assertEqual(snapshot["observed_at_ms"], 1900000123456)
+        self.assertEqual(snapshot["premium_latest_pct"], -0.11)
+        self.assertEqual(snapshot["volume_z_24h"], 3.7)
+        self.assertEqual(
+            snapshot["data_quality"],
+            {"funding": "ok", "open_interest": "ok"},
+        )
         self.assertEqual(metadata["pump_live_signals_accepted"], 1)
 
     def test_shadow_schedule_restores_from_persisted_enabled_state(self) -> None:

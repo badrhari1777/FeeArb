@@ -109,6 +109,20 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump signal auditing was expanded on 2026-08-10 without changing any trading
+  rule. Every classified strategy decision now carries a versioned, JSON-safe
+  snapshot of every source scanner column, including returns, pump/trigger/
+  pullback data, funding, OI 4h/24h, long/short ratio, premium-index features,
+  volume z-score, slow-pump fields, profile metadata, request counters, and
+  parsed data quality. Pump Live persists it through pending state,
+  `position.open_decision`, `signals_queued`, `live_position_opened`, and
+  `live_entry_failed`; future scanner fields are retained automatically.
+  Historical positions remain unmodified because later observations cannot be
+  substituted for entry-time facts. The five real-event shadow variants and
+  cycle/candidate paper accounting are unchanged; only
+  `main_pullback_tier/entry_ready` can feed live execution. Focused Pump/Lab
+  regression passed (`94 passed`); the complete suite passed (`690 passed`,
+  `8 subtests`).
 - Manual Trade dual sizing was added and deployed on 2026-08-10. The desktop web form now
   exposes both base-quantity and per-leg USDT caps. The backend applies the
   same authoritative rule to Enter, Exit, and Roll: when both are supplied,

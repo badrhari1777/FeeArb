@@ -98,6 +98,54 @@ PUMP_PAPER_MONITOR_BAR_INTERVAL = "1"
 PUMP_PAPER_MONITOR_BAR_MS = 60_000
 PUMP_PAPER_MONITOR_BACKFILL_HOURS = 24
 PUMP_PAPER_MONITOR_MAX_SYMBOLS = 12
+PUMP_SIGNAL_SCANNER_SNAPSHOT_SCHEMA = "pump_signal_scanner_snapshot_v1"
+
+PUMP_SIGNAL_INTEGER_FIELDS = {
+    "ts_ms",
+    "observed_at_ms",
+    "trigger_ts",
+    "config_window_h",
+    "scan_index",
+    "requests_made",
+    "slow_pump_trigger_ts",
+    "slow_pump_window_h",
+}
+PUMP_SIGNAL_FLOAT_FIELDS = {
+    "last_close",
+    "return_24h_pct",
+    "return_3d_pct",
+    "return_7d_pct",
+    "pump_score",
+    "continuation_risk_score",
+    "hours_since_trigger",
+    "config_threshold_pct",
+    "trigger_pump_pct",
+    "trigger_close",
+    "high_from_trigger_pct",
+    "pullback_from_high_pct",
+    "oi_change_4h_pct",
+    "oi_change_24h_pct",
+    "long_ratio",
+    "funding_prev_24h_pct",
+    "premium_latest_pct",
+    "premium_min_24h_pct",
+    "premium_relief_1h_pct",
+    "volume_z_24h",
+    "matched_profile_rank",
+    "slow_pump_hours_since_trigger",
+    "slow_pump_threshold_pct",
+    "slow_pump_return_pct",
+    "slow_pump_velocity_pct_per_h",
+    "slow_pump_trigger_close",
+    "slow_pump_high_since_trigger_pct",
+    "slow_pump_pullback_from_high_pct",
+    "slow_pump_funding_prev_24h_pct",
+    "slow_pump_oi_change_4h_pct",
+    "slow_pump_oi_change_24h_pct",
+    "slow_pump_long_ratio",
+    "slow_pump_premium_latest_pct",
+    "slow_pump_volume_z_24h",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -4176,7 +4224,61 @@ def classify_strategy_signal(strategy: dict[str, Any], row: dict[str, Any]) -> d
         "last_close": row.get("last_close"),
         "hours_since_trigger": row.get("hours_since_trigger"),
         "tier": enriched_tier,
+        "scanner_snapshot": build_signal_scanner_snapshot(row),
     }
+
+
+def build_signal_scanner_snapshot(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return every scanner field as a bounded, JSON-safe live audit snapshot."""
+    snapshot: dict[str, Any] = {
+        "schema": PUMP_SIGNAL_SCANNER_SNAPSHOT_SCHEMA,
+    }
+    for raw_key, raw_value in row.items():
+        key = str(raw_key)
+        if key in PUMP_SIGNAL_INTEGER_FIELDS:
+            snapshot[key] = to_int(raw_value)
+            continue
+        if key in PUMP_SIGNAL_FLOAT_FIELDS:
+            snapshot[key] = to_optional_float(raw_value)
+            continue
+        if key == "data_quality":
+            snapshot[key] = normalize_signal_data_quality(raw_value)
+            continue
+        if isinstance(raw_value, Mapping):
+            snapshot[key] = dict(raw_value)
+            continue
+        if isinstance(raw_value, (list, tuple)):
+            snapshot[key] = list(raw_value)
+            continue
+        if raw_value is None:
+            snapshot[key] = None
+            continue
+        if isinstance(raw_value, (bool, int, float)):
+            snapshot[key] = raw_value
+            continue
+        text = str(raw_value).strip()
+        snapshot[key] = text if text else None
+    return snapshot
+
+
+def normalize_signal_data_quality(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if value is None:
+        return None
+    current: Any = str(value).strip()
+    if not current:
+        return None
+    for _ in range(2):
+        if not isinstance(current, str):
+            break
+        try:
+            current = json.loads(current)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            break
+    return current
 
 
 def select_strategy_tier(strategy: dict[str, Any], pump_pct: float | None) -> dict[str, Any] | None:

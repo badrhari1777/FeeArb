@@ -769,6 +769,90 @@ def test_arm_ignores_old_signal_and_opens_new_main_signal(tmp_path: Path) -> Non
     assert open_items[0]["stop_price"] == 14.625
 
 
+def test_entry_persists_full_scanner_snapshot_in_state_and_events(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    state_dir = tmp_path / "state"
+    controller = PumpLiveController(
+        gateway=FakePumpGateway(),
+        state_dir=state_dir,
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    decision = ready_decision(armed_at + 1, symbol="AUDITUSDT", event_id="audit-1")
+    decision.update(
+        {
+            "source_status": "entry_candidate",
+            "source_reason": "eligible",
+            "scan_ts_ms": armed_at + 1,
+            "pullback_from_high_pct": 22.0,
+            "funding_prev_24h_pct": -0.2,
+            "oi_change_24h_pct": 12.0,
+            "long_ratio": 0.52,
+            "hours_since_trigger": 4.0,
+            "scanner_snapshot": {
+                "schema": "pump_signal_scanner_snapshot_v1",
+                "symbol": "AUDITUSDT",
+                "event_id": "audit-1",
+                "return_24h_pct": 32.5,
+                "trigger_pump_pct": 120.0,
+                "pullback_from_high_pct": 22.0,
+                "funding_prev_24h_pct": -0.2,
+                "oi_change_4h_pct": 4.5,
+                "oi_change_24h_pct": 12.0,
+                "long_ratio": 0.52,
+                "premium_latest_pct": -0.11,
+                "premium_min_24h_pct": -0.42,
+                "premium_relief_1h_pct": 0.18,
+                "volume_z_24h": 3.7,
+                "data_quality": {"funding": "ok", "open_interest": "ok"},
+            },
+        }
+    )
+
+    assert controller.submit_decisions([decision])["accepted"] == 1
+    pending = controller.status()["pending_signals"][0]
+    assert pending["scanner_snapshot"] == decision["scanner_snapshot"]
+
+    status = controller.run_cycle()
+    position = next(
+        item
+        for item in status["positions"]
+        if item["symbol"] == "AUDITUSDT" and item["status"] != "closed"
+    )
+    assert position["open_decision"]["scanner_snapshot"] == decision["scanner_snapshot"]
+    assert position["open_decision"]["funding_prev_24h_pct"] == -0.2
+    assert position["open_decision"]["oi_change_24h_pct"] == 12.0
+
+    events = [
+        json.loads(line)
+        for line in controller.events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    queued = next(item for item in events if item["event"] == "signals_queued")
+    opened = next(item for item in events if item["event"] == "live_position_opened")
+    assert queued["decisions"][0]["scanner_snapshot"] == decision["scanner_snapshot"]
+    assert opened["open_decision"]["scanner_snapshot"] == decision["scanner_snapshot"]
+
+    recovered = PumpLiveController(
+        gateway=FakePumpGateway(),
+        state_dir=state_dir,
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    ).status()
+    recovered_position = next(
+        item for item in recovered["positions"] if item["symbol"] == "AUDITUSDT"
+    )
+    assert recovered_position["open_decision"]["scanner_snapshot"] == decision[
+        "scanner_snapshot"
+    ]
+
+
 def test_entry_prefunds_margin_before_ladders_without_changing_strategy(
     tmp_path: Path,
 ) -> None:

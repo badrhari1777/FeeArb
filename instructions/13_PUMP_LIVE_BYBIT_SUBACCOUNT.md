@@ -134,6 +134,29 @@ Unknown, missing, or degraded state remains blocked. A successful resume is
 reported as a ready `tracked_positions_verified` preflight instead of leaving
 the UI on the expected existing-position warning.
 
+Every newly classified strategy decision contains a versioned
+`pump_signal_scanner_snapshot_v1` audit snapshot. It preserves every field in
+the source scanner row, including price returns, pump/continuation scores,
+trigger and pullback data, funding, OI changes, long/short ratio, premium-index
+features, volume z-score, matched profile, slow-pump fields, request metadata,
+and parsed data-quality counts. Pump Live keeps the snapshot while the signal
+is pending and in `position.open_decision`; `signals_queued`,
+`live_position_opened`, and `live_entry_failed` also retain it in
+`live_events.jsonl`. New scanner columns are copied automatically, so adding an
+indicator does not require separately extending the live audit schema. This is
+observability only and does not change classification, sizing, entry, ladder,
+protection, or exit behavior. Positions opened before this format was deployed
+keep their historical compact decision and are not backfilled from a newer
+scan, because that would mix entry-time and later observations.
+
+The same public Bybit event rows continue through all shadow/paper branches.
+`main_pullback_tier` is both the primary shadow model and the only branch that
+may submit an `entry_ready` decision to Pump Live. `conservative_control`,
+`super_pump_shadow`, `pb20_baseline`, and `pb25_deeper_pullback` continue to
+calculate independent paper positions and results on real observed events but
+cannot place an exchange order. Cycle and candidate paper tracks remain
+independent from the live position limit and capital ledger.
+
 ## 5. What the First Position Does
 
 - The first ladder leg is a guarded market short.

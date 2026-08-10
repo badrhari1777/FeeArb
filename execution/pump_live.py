@@ -1689,6 +1689,7 @@ class PumpLiveController:
         return self.status()
 
     def submit_decisions(self, decisions: list[dict[str, Any]]) -> dict[str, Any]:
+        accepted_decisions: list[dict[str, Any]] = []
         with self._lock:
             now = _now_ms()
             self._state["last_signal_batch_at_ms"] = now
@@ -1716,14 +1717,22 @@ class PumpLiveController:
                 key = _decision_key(decision)
                 if not key or key in seen or key in pending_keys:
                     continue
-                pending.append(_compact_decision(decision))
+                compact_decision = _compact_decision(decision)
+                pending.append(compact_decision)
+                accepted_decisions.append(compact_decision)
                 pending_keys.add(key)
                 accepted += 1
             self._state["pending_signals"] = pending[-100:]
             self._state["updated_at_ms"] = now
             self._save_state_locked()
         if accepted:
-            self._event("signals_queued", {"accepted": accepted})
+            self._event(
+                "signals_queued",
+                {
+                    "accepted": accepted,
+                    "decisions": accepted_decisions,
+                },
+            )
             self._wake.set()
         return {"accepted": accepted, "armed": True}
 
@@ -2324,6 +2333,7 @@ class PumpLiveController:
                         position.get("margin_prefund_floor_usd"),
                         0.0,
                     ),
+                    "open_decision": dict(position.get("open_decision") or {}),
                 },
             )
             self._maintain_single_position(position, config)
@@ -2341,7 +2351,15 @@ class PumpLiveController:
                     self._remove_pending_locked(decision)
                 self._save_state_locked()
             self.disarm("entry_execution_error")
-            self._event("live_entry_failed", {"symbol": symbol, "event_key": key, "error": error})
+            self._event(
+                "live_entry_failed",
+                {
+                    "symbol": symbol,
+                    "event_key": key,
+                    "error": error,
+                    "open_decision": _compact_decision(decision),
+                },
+            )
 
     def _place_planned_ladders(self, item: dict[str, Any]) -> list[str]:
         symbol = _normalize_symbol(item.get("symbol"))
@@ -4440,17 +4458,43 @@ def _compact_exchange_result(payload: Any) -> dict[str, Any]:
 
 
 def _compact_decision(decision: Mapping[str, Any]) -> dict[str, Any]:
-    return {
+    result = {
         "strategy_id": decision.get("strategy_id"),
         "symbol": _normalize_symbol(decision.get("symbol")),
         "event_id": decision.get("event_id"),
+        "source_status": decision.get("source_status"),
+        "source_reason": decision.get("source_reason"),
         "state": decision.get("state"),
         "reason": decision.get("reason"),
         "ts_ms": _safe_int(decision.get("ts_ms"), 0),
+        "scan_ts_ms": _safe_int(decision.get("scan_ts_ms"), 0) or None,
         "last_close": _optional_float(decision.get("last_close")),
         "pump_pct": _optional_float(decision.get("pump_pct")),
+        "pullback_from_high_pct": _optional_float(
+            decision.get("pullback_from_high_pct")
+        ),
+        "funding_prev_24h_pct": _optional_float(
+            decision.get("funding_prev_24h_pct")
+        ),
+        "oi_change_24h_pct": _optional_float(decision.get("oi_change_24h_pct")),
+        "long_ratio": _optional_float(decision.get("long_ratio")),
+        "hours_since_trigger": _optional_float(decision.get("hours_since_trigger")),
         "tier": dict(decision.get("tier") or {}),
     }
+    snapshot = decision.get("scanner_snapshot")
+    if isinstance(snapshot, Mapping):
+        try:
+            result["scanner_snapshot"] = json.loads(
+                json.dumps(dict(snapshot), ensure_ascii=True, allow_nan=False)
+            )
+        except (TypeError, ValueError):
+            result["scanner_snapshot"] = {
+                "schema": "pump_signal_scanner_snapshot_invalid",
+                "error": "snapshot_not_json_serializable",
+            }
+    else:
+        result["scanner_snapshot"] = None
+    return result
 
 
 def _decision_key(decision: Mapping[str, Any]) -> str:
