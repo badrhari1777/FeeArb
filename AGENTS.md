@@ -125,7 +125,12 @@ Recent Changes
   passed (`211 passed`, `6 warnings`),
   and the complete suite passed (`743 passed`, `8` subtests, `13` pre-existing
   warnings). Canonical operation and rollout evidence are in
-  `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`.
+  `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`. Safe live deployment added
+  `$45` each to ACE/BMT and confirmed `12.25%/18.08%` plus `12.17%/20.55%`
+  current/projected clearances. RATS needed `$15` while Bybit allowed `$5`, so
+  its L2 was safely cancelled and left planned with Full TP/SL intact. Explicit
+  `ARM PUMP LIVE 3000` succeeded and five cycles stayed armed/error-free; the
+  shared entry pool remains fail-closed until the RATS 12% gate can be funded.
 - Strategy Lab Candidate Observatory selection was made deterministic on
   2026-08-11 without enabling any collector or trading path. Baseline/Watch/Hot
   remain `60/25/8`, but now use explicit P0/control formulas, multi-family-first

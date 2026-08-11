@@ -1068,3 +1068,20 @@ Pump/API/lab set (`211 passed`, `6 warnings`), and the complete project suite
 (`743 passed`, `8` subtests, `13` pre-existing warnings). The production event
 journal hash was unchanged by the test runs; the live state file continued to
 advance normally under the already-running monitor.
+
+Live deployment used an explicit disarm and safe backend restart. The first
+12% reconciliation added `$45` each to ACE and BMT, moving their tracked
+top-ups to `$135/$170` and confirming current/projected clearances
+`12.25%/18.08%` and `12.17%/20.55%`. Their one nearest L2 orders were recreated
+and remained unfilled.
+
+RATS correctly failed closed: it required another `$15`, while Bybit's current
+position-value ceiling allowed only `$5`. Its old L2 was cancelled and remains
+planned; Full TP/SL stays live. At the observed position margin, the exchange
+capacity should become sufficient around mark `0.0435`, far below its L2
+`0.074835`, but every retry still uses fresh exchange values. The first
+post-restart block produced one event and later identical hot cycles produced
+none. `ARM PUMP LIVE 3000` then succeeded. Five observed cycles remained armed
+without monitor error or blocked reason. The common entry pool remains
+fail-closed with `ondemand_existing_next_gate_not_ready`, so no new symbol can
+enter until RATS confirms 12% and restores its nearest ladder.
