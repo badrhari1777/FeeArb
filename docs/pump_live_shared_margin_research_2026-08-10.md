@@ -340,3 +340,17 @@ production `live_events.jsonl` SHA-256 remained unchanged throughout testing.
 The browser contract explicitly recognizes `v3_3000_pool600` as a `$3000`
 cohort and therefore requests `ARM PUMP LIVE 3000`; obsolete `$175/$525`
 operator text was removed and the static cache version was advanced.
+
+Deployment result: the safe restart first restored monitoring with entries
+disarmed, selected `v4_shared_ondemand` plus `v3_3000_pool600`, and reconciled
+the existing three positions and nine orders. After the initial complete
+monitor cycle, all three immediate ladder gates were ready. Ownership-aware
+`ARM PUMP LIVE 3000` succeeded. Three further 15-second cycles remained armed
+with no monitor error, no block, one live nearest ladder per position, and no
+balance, transfer, margin-add or margin-remove mutation. Final read-only state
+showed wallet/available about `$2999.72/$2270.39`, 75.69% free cash, `CALM`,
+zero temporary outstanding principal and zero protection issues. The displayed
+five-leg sample required `$360` for L1 + the next order + immediate safety and
+would leave about 63.69% Pump-owned free cash, so admission was ready. Manual
+executions remained empty; TUT Grid kept its stored `completed_no_fill`
+transition and had no active execution.

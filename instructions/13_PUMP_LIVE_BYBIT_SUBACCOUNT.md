@@ -967,3 +967,15 @@ Operational contract:
 The `$3000` cohort, including `v3_3000_pool600`, uses the exact confirmation
 `ARM PUMP LIVE 3000`. Every backend restart remains disarmed regardless of the
 previous state.
+
+First v4 deployment completed on 2026-08-11. The backend restarted disarmed,
+reconciled three owned Pump positions and nine Bybit orders, and selected
+`v4_shared_ondemand / v3_3000_pool600`. After one complete monitor cycle every
+immediate ladder gate was ready; explicit `ARM PUMP LIVE 3000` succeeded.
+Three later cycles stayed armed with one nearest ladder per position, no error,
+no blocked reason, and no transfer or margin mutation. Final observed
+wallet/available was about `$2999.72/$2270.39` (75.69% free, `CALM`), temporary
+outstanding principal was zero, and the unified view reported zero protection
+issues. The default five-leg admission sample required `$360` now and projected
+63.69% free Pump-owned cash after that action, so a fourth candidate was ready
+subject to its real tier and signal gates.

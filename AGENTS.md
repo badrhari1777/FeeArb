@@ -131,7 +131,15 @@ Recent Changes
   Verified Pump/transfer regression (`126 passed`), the expanded Pump/API/lab
   set (`159 passed`, `6 warnings`), Python compilation and the complete suite
   (`730 passed`, `8` subtests, `13` pre-existing warnings). The production Pump
-  event journal hash was unchanged by both targeted and complete tests.
+  event journal hash was unchanged by both targeted and complete tests. Safe
+  deployment then restarted the backend disarmed, reconciled three owned
+  positions and nine exchange orders, and accepted explicit
+  `ARM PUMP LIVE 3000`. Three subsequent monitor cycles stayed armed with every
+  nearest gate ready, no error, no balance/margin mutation and zero protection
+  issues. Final Pump wallet/available was about `$2999.72/$2270.39`; the sample
+  next action needed `$360` and would leave about 63.69% Pump-owned free cash.
+  Manual executions remained empty; TUT Grid retained its no-fill pending
+  transition with no active execution.
 - Pump Live shared margin management was versioned on 2026-08-11. The former
   nearest-ladder manager remains available as `v2_current_next`; the approved
   `v3_shared_projected` manager keeps isolated margin and immutable `$525` new
