@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ from execution.pump_live import (
     ladder_prefund_plan,
     projected_ladder_margin_reserve,
     load_pump_live_config,
+    plan_safe_margin_reduction,
     required_entry_prefund_usd,
     required_margin_for_liq_buffer_usd,
     required_available_for_new_slot,
@@ -103,6 +105,274 @@ def test_on_demand_policy_derives_600_new_position_budget_from_3000() -> None:
     assert [row["margin_usd"] for row in five] == [120.0] * 5
     assert [row["margin_usd"] for row in three] == [100.0, 200.0, 300.0]
     assert [row["margin_usd"] for row in two] == [200.0, 400.0]
+
+
+@pytest.mark.parametrize(
+    ("legs_count", "weights"),
+    [
+        (2, [1, 2]),
+        (3, [1, 2, 3]),
+        (5, [1, 1, 1, 1, 1]),
+    ],
+)
+def test_on_demand_every_next_fill_keeps_old_and_projected_stop_clear(
+    legs_count: int,
+    weights: list[float],
+) -> None:
+    config = risk_policy_config(
+        RISK_POLICY_V3,
+        PumpLiveConfig(margin_manager_policy_id=MARGIN_MANAGER_V4_ON_DEMAND),
+    )
+    legs = build_live_legs(
+        tier={
+            "ladder_legs": legs_count,
+            "ladder_step_pct": 50.0,
+            "leg_weights": weights,
+        },
+        slot_margin_usd=config.slot_margin_usd,
+        leverage=config.leverage,
+        reference_price=1.0,
+    )
+    qty = float(legs[0]["notional_usd"]) / float(legs[0]["trigger_price"])
+    current_liq = (
+        (1.0 + 1.0 / config.leverage)
+        / (1.0 + config.entry_margin_prefund_mmr)
+    )
+    factor = (
+        qty
+        * (1.0 + config.entry_margin_prefund_mmr)
+        * (1.0 + config.entry_margin_prefund_taker_fee_rate)
+    )
+
+    for target_leg in legs[1:]:
+        plan = ladder_prefund_plan(
+            policy_id=MARGIN_MANAGER_V4_ON_DEMAND,
+            qty=qty,
+            current_liq_price=current_liq,
+            legs=legs,
+            target_leg=target_leg,
+            leverage=config.leverage,
+            stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
+            safety_above_next_ladder_pct=config.entry_margin_prefund_safety_pct,
+            final_fill_buffer_pct=config.projected_final_fill_buffer_pct,
+            maintenance_margin_rate=config.entry_margin_prefund_mmr,
+            taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
+            round_up_increment_usd=config.entry_margin_prefund_round_usd,
+            projected_reaction_buffer_pct=(
+                config.projected_exchange_cap_reaction_buffer_pct
+            ),
+        )
+        required = float(plan["required_add_usd"])
+        current_liq += required / factor
+        verified = ladder_prefund_plan(
+            policy_id=MARGIN_MANAGER_V4_ON_DEMAND,
+            qty=qty,
+            current_liq_price=current_liq,
+            legs=legs,
+            target_leg=target_leg,
+            leverage=config.leverage,
+            stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
+            safety_above_next_ladder_pct=config.entry_margin_prefund_safety_pct,
+            final_fill_buffer_pct=config.projected_final_fill_buffer_pct,
+            maintenance_margin_rate=config.entry_margin_prefund_mmr,
+            taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
+            round_up_increment_usd=config.entry_margin_prefund_round_usd,
+            projected_reaction_buffer_pct=(
+                config.projected_exchange_cap_reaction_buffer_pct
+            ),
+        )
+        fill_price = float(target_leg["trigger_price"])
+        old_stop = current_liq * (
+            1.0 - config.exchange_stop_gap_from_liq_pct / 100.0
+        )
+        projected_stop = float(verified["projected_stop_price"])
+
+        assert verified["required_add_usd"] == 0.0
+        assert old_stop / fill_price - 1.0 >= (
+            config.entry_margin_prefund_safety_pct / 100.0 - 1e-9
+        )
+        assert projected_stop / fill_price - 1.0 >= (
+            config.projected_exchange_cap_reaction_buffer_pct / 100.0 - 1e-9
+        )
+
+        qty = float(verified["projected_qty"])
+        current_liq = float(verified["projected_liq_price"])
+        factor = (
+            qty
+            * (1.0 + config.entry_margin_prefund_mmr)
+            * (1.0 + config.entry_margin_prefund_taker_fee_rate)
+        )
+
+
+def test_current_live_like_margin_release_is_capped_by_next_gate() -> None:
+    cases = [
+        {
+            "symbol": "1000RATSUSDT",
+            "qty": 1_750.0,
+            "liq": 0.08431,
+            "mark": 0.03985,
+            "topup": 35.0,
+            "expected": 10.0,
+            "legs": [
+                {"step": 1, "trigger_price": 0.04989, "notional_usd": 87.5},
+                {"step": 2, "trigger_price": 0.074835, "notional_usd": 175.0},
+                {"step": 3, "trigger_price": 0.09978, "notional_usd": 262.5},
+            ],
+            "next_index": 1,
+        },
+        {
+            "symbol": "BLUAIUSDT",
+            "qty": 9_810.0,
+            "liq": 0.039656,
+            "mark": 0.027909,
+            "topup": 125.0,
+            "expected": 20.0,
+            "legs": [
+                {"step": 1, "trigger_price": 0.017841, "notional_usd": 105.0},
+                {"step": 2, "trigger_price": 0.0267615, "notional_usd": 105.0},
+                {"step": 3, "trigger_price": 0.035682, "notional_usd": 105.0},
+                {"step": 4, "trigger_price": 0.0446025, "notional_usd": 105.0},
+                {"step": 5, "trigger_price": 0.053523, "notional_usd": 105.0},
+            ],
+            "next_index": 2,
+        },
+        {
+            "symbol": "ACEUSDT",
+            "qty": 2_690.9,
+            "liq": 0.21304,
+            "mark": 0.10869,
+            "topup": 165.0,
+            "expected": 75.0,
+            "legs": [
+                {"step": 1, "trigger_price": 0.11704, "notional_usd": 315.0},
+                {"step": 2, "trigger_price": 0.17556, "notional_usd": 315.0},
+                {"step": 3, "trigger_price": 0.23408, "notional_usd": 315.0},
+                {"step": 4, "trigger_price": 0.2926, "notional_usd": 315.0},
+                {"step": 5, "trigger_price": 0.35112, "notional_usd": 315.0},
+            ],
+            "next_index": 1,
+        },
+    ]
+
+    for case in cases:
+        plan = plan_safe_margin_reduction(
+            qty=float(case["qty"]),
+            current_liq_price=float(case["liq"]),
+            mark_price=float(case["mark"]),
+            removable_margin_usd=float(case["topup"]),
+            target_buffer_pct=25.0,
+            legs=case["legs"],
+            target_leg=case["legs"][int(case["next_index"])],
+            leverage=3.0,
+            stop_gap_from_liq_pct=2.5,
+            safety_above_next_ladder_pct=2.5,
+            final_fill_buffer_pct=20.0,
+            maintenance_margin_rate=0.025,
+            taker_fee_rate=0.00055,
+            round_down_increment_usd=5.0,
+            projected_reaction_buffer_pct=8.0,
+        )
+
+        assert plan["reason"] == "ready", case["symbol"]
+        assert plan["amount_usd"] == case["expected"], case["symbol"]
+        assert plan["simulated_buffer_pct"] >= 25.0
+        assert plan["next_gate_plan"]["required_add_usd"] == 0.0
+
+
+def test_on_demand_full_next_fill_survives_old_stop_and_arms_following_step(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        entry_cap=4,
+        prefund_enabled=True,
+        margin_manager_policy=MARGIN_MANAGER_V4_ON_DEMAND,
+    )
+    gateway = FakePumpGateway()
+    gateway.balance.update(
+        {"total": 3_000.0, "wallet": 3_000.0, "available": 3_000.0}
+    )
+    gateway.liq_after_add_sequence = [15.82]
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "active_strategy_capital_usd": 3_000.0,
+        "application_enabled": True,
+    }
+    armed_at = int(controller.arm(ARM_CONFIRMATION_V2)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+
+    first = controller.run_cycle()
+    item = first["positions"][0]
+    second_leg = item["legs"][1]
+    fill_price = float(second_leg["trigger_price"])
+    stop_before_fill = float(item["stop_price"])
+    projected_liq = float(item["margin_prefund_plan"]["projected_liq_price"])
+    projected_qty = float(item["margin_prefund_plan"]["projected_qty"])
+
+    assert stop_before_fill / fill_price - 1.0 >= 0.025
+    assert item["margin_prefund_verification"]["projected"]["ready"] is True
+    for order in gateway.orders:
+        if order.get("id") == second_leg["order_id"]:
+            order.update(
+                {
+                    "status": "filled",
+                    "filled": projected_qty - float(item["qty"]),
+                    "average": fill_price,
+                }
+            )
+    gateway.positions[0].update(
+        {
+            "qty": projected_qty,
+            "avg_price": (
+                float(item["qty"]) * float(item["avg_entry_price"])
+                + (projected_qty - float(item["qty"])) * fill_price
+            )
+            / projected_qty,
+            "mark_price": fill_price,
+            "liq_price": projected_liq,
+        }
+    )
+    third_leg = item["legs"][2]
+    third_plan = ladder_prefund_plan(
+        policy_id=MARGIN_MANAGER_V4_ON_DEMAND,
+        qty=projected_qty,
+        current_liq_price=projected_liq,
+        legs=item["legs"],
+        target_leg=third_leg,
+        leverage=3.0,
+        stop_gap_from_liq_pct=2.5,
+        safety_above_next_ladder_pct=2.5,
+        final_fill_buffer_pct=20.0,
+        maintenance_margin_rate=0.025,
+        taker_fee_rate=0.00055,
+        round_up_increment_usd=5.0,
+        projected_reaction_buffer_pct=8.0,
+    )
+    factor = projected_qty * 1.025 * 1.00055
+    gateway.liq_after_add_sequence = [
+        projected_liq + float(third_plan["required_add_usd"]) / factor
+    ]
+    protection_count = len(gateway.protections)
+
+    after_fill = controller.run_cycle()
+    updated = after_fill["positions"][0]
+    newly_synced_stops = [row[2] for row in gateway.protections[protection_count:]]
+
+    assert updated["status"] == "open"
+    assert updated["legs"][1]["status"] == "filled"
+    assert updated["legs"][2]["status"] == "open"
+    assert updated["ladder_gate_status"] == "ready"
+    assert newly_synced_stops
+    assert min(newly_synced_stops) / fill_price - 1.0 >= 0.08
+    assert not any(op.startswith("market_reduce:") for op in gateway.operations)
 
 
 def test_risk_snapshot_remains_immutable_when_runtime_defaults_change() -> None:
@@ -3387,6 +3657,57 @@ def test_unsafe_margin_reduction_is_rolled_back_immediately(tmp_path: Path) -> N
     assert gateway.margin_adds == [("TESTUSDT", 25.0), ("TESTUSDT", 25.0)]
     assert status["positions"][0]["margin_topup_usd"] == 25.0
     assert status["positions"][0]["liq_price"] == 15.0
+
+
+def test_on_demand_margin_reduction_defers_without_exchange_trial(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        margin_manager_policy=MARGIN_MANAGER_V4_ON_DEMAND,
+    )
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    item = {
+        "symbol": "BLUAIUSDT",
+        "status": "open",
+        "qty": 9_810.0,
+        "mark_price": 0.027909,
+        "liq_price": 0.0378,
+        "margin_topup_usd": 105.0,
+        "margin_prefund_floor_usd": 105.0,
+        "last_topup_at_ms": int(time.time() * 1000) - 1_900_000,
+        "legs": [
+            {"step": 1, "status": "filled", "trigger_price": 0.017841, "notional_usd": 105.0},
+            {"step": 2, "status": "filled", "trigger_price": 0.0267615, "notional_usd": 105.0},
+            {"step": 3, "status": "open", "trigger_price": 0.035682, "notional_usd": 105.0},
+            {"step": 4, "status": "planned", "trigger_price": 0.0446025, "notional_usd": 105.0},
+            {"step": 5, "status": "planned", "trigger_price": 0.053523, "notional_usd": 105.0},
+        ],
+    }
+    controller._state["positions"] = [item]  # pylint: disable=protected-access
+    config = replace(
+        controller.config(),
+        margin_reduce_trigger_buffer_pct=30.0,
+        margin_reduce_cooldown_sec=0,
+    )
+    buffer_pct = (float(item["liq_price"]) / float(item["mark_price"]) - 1.0) * 100.0
+
+    controller._maybe_reduce_bot_margin(item, config, buffer_pct)  # pylint: disable=protected-access
+    controller._maybe_reduce_bot_margin(item, config, buffer_pct)  # pylint: disable=protected-access
+
+    assert gateway.margin_removes == []
+    assert gateway.margin_adds == []
+    assert item["margin_reduce_confirm_count"] == 2
+    assert item["margin_reduce_deferred_reason"] == "next_ladder_safety_floor"
+    assert item["margin_reduce_plan"]["amount_usd"] == 0.0
 
 
 def test_exchange_stop_is_resynced_when_liquidation_price_moves(tmp_path: Path) -> None:

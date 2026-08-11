@@ -109,6 +109,23 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live next-fill and margin-release safety was tightened on 2026-08-11.
+  A live read confirmed three physical non-reduce nearest ladders plus six
+  reduce-only Full TP/SL orders. For every v4 2/3/5-leg transition, regression
+  now proves the pre-fill exchange stop clears the filling order by at least
+  2.5% and the projected post-fill stop clears it by at least 8%; an integration
+  case fills L2 completely, resyncs qty/average/liquidation and Full TP/SL, and
+  permits L3 only after its fresh gate. Margin release no longer discovers an
+  unsafe amount by calling Bybit remove then add. A pure binary-search planner
+  first caps the `$5` increment by the 25% liquidation target and the complete
+  next-fill gate; only the largest safe amount is submitted, while zero-safe
+  cases remain untouched and auditable. The captured RATS/BLUAI/ACE state
+  planned `$10/$20/$75` release versus the former `$35/$25/$165` trial/rollback.
+  The two-cycle and 30-minute hysteresis remain, and the post-write exchange
+  verification/rollback remains a final defence against model/exchange drift.
+  Verified Python compilation, the expanded Pump/API/lab set (`165 passed`,
+  `6 warnings`) and the full project suite (`736 passed`, `8` subtests,
+  `13` pre-existing warnings).
 - Pump Live capital allocation moved to the versioned on-demand manager on
   2026-08-11. `v4_shared_ondemand` preserves exchange-isolated positions and
   every legacy per-position snapshot, while future `$3000` entries use the new
@@ -135,8 +152,11 @@ Recent Changes
   deployment then restarted the backend disarmed, reconciled three owned
   positions and nine exchange orders, and accepted explicit
   `ARM PUMP LIVE 3000`. Three subsequent monitor cycles stayed armed with every
-  nearest gate ready, no error, no balance/margin mutation and zero protection
-  issues. Final Pump wallet/available was about `$2999.72/$2270.39`; the sample
+  nearest gate ready, no error, unchanged net balance/top-up and zero protection
+  issues. Before ARM, v4 trial-removed and immediately restored `$25` BLUAI,
+  `$165` ACE and `$35` RATS because their next gates failed; the newer pre-write
+  planner above supersedes that behaviour. Final Pump wallet/available was
+  about `$2999.72/$2270.39`; the sample
   next action needed `$360` and would leave about 63.69% Pump-owned free cash.
   Manual executions remained empty; TUT Grid retained its no-fill pending
   transition with no active execution.

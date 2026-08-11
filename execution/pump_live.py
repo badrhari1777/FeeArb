@@ -5046,10 +5046,18 @@ class PumpLiveController:
                 item["margin_reduce_confirm_count"] = 0
                 self._save_state_locked()
             return
-        confirm_count = _safe_int(item.get("margin_reduce_confirm_count"), 0) + 1
-        with self._lock:
-            item["margin_reduce_confirm_count"] = confirm_count
-            self._save_state_locked()
+        previous_confirm_count = _safe_int(
+            item.get("margin_reduce_confirm_count"),
+            0,
+        )
+        confirm_count = min(
+            config.margin_reduce_confirm_cycles,
+            previous_confirm_count + 1,
+        )
+        if confirm_count != previous_confirm_count:
+            with self._lock:
+                item["margin_reduce_confirm_count"] = confirm_count
+                self._save_state_locked()
         if confirm_count < config.margin_reduce_confirm_cycles:
             return
         now = _now_ms()
@@ -5065,21 +5073,76 @@ class PumpLiveController:
             qty = _safe_float(item.get("qty"), 0.0)
             liq = _safe_float(item.get("liq_price"), 0.0)
             mark = _safe_float(item.get("mark_price"), 0.0)
-            target_liq = mark * (
-                1.0 + config.margin_reduce_target_buffer_pct / 100.0
+            next_leg = next(
+                (
+                    leg
+                    for leg in list(item.get("legs") or [])[1:]
+                    if leg.get("status") in {"planned", "open", "submitted"}
+                ),
+                None,
             )
-            raw_removable = max(
-                0.0,
-                (liq - target_liq)
-                * qty
-                * (1.0 + config.entry_margin_prefund_mmr)
-                * (1.0 + config.entry_margin_prefund_taker_fee_rate),
+            reduction_plan = plan_safe_margin_reduction(
+                qty=qty,
+                current_liq_price=liq,
+                mark_price=mark,
+                removable_margin_usd=removable_topup,
+                target_buffer_pct=config.margin_reduce_target_buffer_pct,
+                legs=item.get("legs") or [],
+                target_leg=next_leg,
+                leverage=config.leverage,
+                stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
+                safety_above_next_ladder_pct=(
+                    config.entry_margin_prefund_safety_pct
+                ),
+                final_fill_buffer_pct=config.projected_final_fill_buffer_pct,
+                maintenance_margin_rate=config.entry_margin_prefund_mmr,
+                taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
+                round_down_increment_usd=config.entry_margin_prefund_round_usd,
+                projected_reaction_buffer_pct=(
+                    config.projected_exchange_cap_reaction_buffer_pct
+                ),
             )
-            increment = max(0.0001, config.entry_margin_prefund_round_usd)
-            amount = min(
-                removable_topup,
-                math.floor(raw_removable / increment + 1e-12) * increment,
-            )
+            amount = _safe_float(reduction_plan.get("amount_usd"), 0.0)
+            compact_plan = {
+                "amount_usd": amount,
+                "reason": reduction_plan.get("reason"),
+                "buffer_limited_amount_usd": reduction_plan.get(
+                    "buffer_limited_amount_usd"
+                ),
+                "simulated_liq_price": reduction_plan.get(
+                    "simulated_liq_price"
+                ),
+                "simulated_buffer_pct": reduction_plan.get(
+                    "simulated_buffer_pct"
+                ),
+                "next_step": (
+                    _safe_int(next_leg.get("step"), 0)
+                    if next_leg is not None
+                    else None
+                ),
+            }
+            previous_deferred = str(item.get("margin_reduce_deferred_reason") or "")
+            with self._lock:
+                item["margin_reduce_plan"] = compact_plan
+                if amount >= 1.0:
+                    item["margin_reduce_deferred_reason"] = None
+                else:
+                    item["margin_reduce_deferred_reason"] = reduction_plan.get(
+                        "reason"
+                    )
+                item["updated_at_ms"] = now
+                self._save_state_locked()
+            if amount < 1.0:
+                deferred_reason = str(reduction_plan.get("reason") or "unsafe")
+                if previous_deferred != deferred_reason:
+                    self._event(
+                        "margin_reduce_deferred",
+                        {
+                            "symbol": symbol,
+                            **compact_plan,
+                        },
+                    )
+                return
         if amount < 1.0:
             return
         self.gateway.remove_margin(symbol, amount)
@@ -5145,6 +5208,7 @@ class PumpLiveController:
             item["margin_topup_usd"] = remaining
             if _is_on_demand_margin_manager(config.margin_manager_policy_id):
                 item["margin_prefund_floor_usd"] = 0.0
+                item["margin_reduce_deferred_reason"] = None
             item["last_margin_reduce_at_ms"] = now
             item["margin_reduce_confirm_count"] = 0
             item["updated_at_ms"] = now
@@ -6220,6 +6284,121 @@ def ladder_prefund_plan(
     }
 
 
+def plan_safe_margin_reduction(
+    *,
+    qty: float,
+    current_liq_price: float,
+    mark_price: float,
+    removable_margin_usd: float,
+    target_buffer_pct: float,
+    legs: Iterable[Mapping[str, Any]],
+    target_leg: Mapping[str, Any] | None,
+    leverage: float,
+    stop_gap_from_liq_pct: float,
+    safety_above_next_ladder_pct: float,
+    final_fill_buffer_pct: float,
+    maintenance_margin_rate: float,
+    taker_fee_rate: float,
+    round_down_increment_usd: float,
+    projected_reaction_buffer_pct: float,
+) -> dict[str, Any]:
+    """Plan a removal without first mutating exchange margin.
+
+    For a short, removing isolated margin moves liquidation downward. The
+    largest increment is accepted only when the post-removal liquidation
+    buffer remains at the configured target and the old stop plus the fully
+    filled next-step projected stop retain their v4 clearances.
+    """
+    if qty <= 0 or current_liq_price <= 0 or mark_price <= 0:
+        raise ValueError("pump_live_margin_reduce_plan_inputs_invalid")
+    increment = max(0.0001, round_down_increment_usd)
+    factor = (
+        qty
+        * (1.0 + max(0.0, maintenance_margin_rate))
+        * (1.0 + max(0.0, taker_fee_rate))
+    )
+    target_liq = mark_price * (1.0 + max(0.0, target_buffer_pct) / 100.0)
+    raw_buffer_limit = max(0.0, (current_liq_price - target_liq) * factor)
+    buffer_limited = min(max(0.0, removable_margin_usd), raw_buffer_limit)
+    max_units = max(0, math.floor(buffer_limited / increment + 1e-12))
+
+    def simulate(units: int) -> tuple[bool, float, float, dict[str, Any] | None]:
+        amount = units * increment
+        simulated_liq = current_liq_price - amount / factor
+        simulated_buffer = (simulated_liq / mark_price - 1.0) * 100.0
+        if simulated_buffer + 1e-9 < target_buffer_pct:
+            return False, simulated_liq, simulated_buffer, None
+        if target_leg is None:
+            return True, simulated_liq, simulated_buffer, None
+        plan = ladder_prefund_plan(
+            policy_id=MARGIN_MANAGER_V4_ON_DEMAND,
+            qty=qty,
+            current_liq_price=simulated_liq,
+            legs=legs,
+            target_leg=target_leg,
+            leverage=leverage,
+            stop_gap_from_liq_pct=stop_gap_from_liq_pct,
+            safety_above_next_ladder_pct=safety_above_next_ladder_pct,
+            final_fill_buffer_pct=final_fill_buffer_pct,
+            maintenance_margin_rate=maintenance_margin_rate,
+            taker_fee_rate=taker_fee_rate,
+            round_up_increment_usd=increment,
+            projected_reaction_buffer_pct=projected_reaction_buffer_pct,
+        )
+        return (
+            _safe_float(plan.get("required_add_usd"), 0.0) <= 1e-9,
+            simulated_liq,
+            simulated_buffer,
+            plan,
+        )
+
+    zero_ready, zero_liq, zero_buffer, zero_plan = simulate(0)
+    if not zero_ready:
+        return {
+            "amount_usd": 0.0,
+            "reason": "current_next_gate_not_ready",
+            "buffer_limited_amount_usd": round(buffer_limited, 6),
+            "simulated_liq_price": round(zero_liq, 12),
+            "simulated_buffer_pct": round(zero_buffer, 9),
+            "next_gate_plan": zero_plan,
+        }
+    if max_units <= 0:
+        return {
+            "amount_usd": 0.0,
+            "reason": "target_buffer_floor",
+            "buffer_limited_amount_usd": round(buffer_limited, 6),
+            "simulated_liq_price": round(current_liq_price, 12),
+            "simulated_buffer_pct": round(
+                (current_liq_price / mark_price - 1.0) * 100.0,
+                9,
+            ),
+            "next_gate_plan": zero_plan,
+        }
+
+    low = 0
+    high = max_units
+    best = (0, zero_liq, zero_buffer, zero_plan)
+    while low <= high:
+        middle = (low + high) // 2
+        ready, simulated_liq, simulated_buffer, plan = simulate(middle)
+        if ready:
+            best = (middle, simulated_liq, simulated_buffer, plan)
+            low = middle + 1
+        else:
+            high = middle - 1
+    units, simulated_liq, simulated_buffer, plan = best
+    amount = units * increment
+    reason = "ready" if amount >= 1.0 else "next_ladder_safety_floor"
+    return {
+        "amount_usd": round(amount, 6),
+        "reason": reason,
+        "buffer_limited_amount_usd": round(buffer_limited, 6),
+        "simulated_liq_price": round(simulated_liq, 12),
+        "simulated_buffer_pct": round(simulated_buffer, 9),
+        "next_gate_plan": plan,
+    }
+
+
 def projected_ladder_margin_reserve(
     *,
     qty: float,
@@ -7050,5 +7229,6 @@ __all__ = [
     "required_margin_for_liq_buffer_usd",
     "projected_short_liquidation_after_fill",
     "projected_ladder_margin_reserve",
+    "plan_safe_margin_reduction",
     "shared_margin_target",
 ]

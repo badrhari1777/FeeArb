@@ -973,9 +973,40 @@ reconciled three owned Pump positions and nine Bybit orders, and selected
 `v4_shared_ondemand / v3_3000_pool600`. After one complete monitor cycle every
 immediate ladder gate was ready; explicit `ARM PUMP LIVE 3000` succeeded.
 Three later cycles stayed armed with one nearest ladder per position, no error,
-no blocked reason, and no transfer or margin mutation. Final observed
+no blocked reason, and no net balance/top-up change. Before ARM, the initial v4
+cycle trial-removed and immediately restored `$25` BLUAI, `$165` ACE and `$35`
+RATS after their next gates failed. The pre-write planner below supersedes that
+exchange churn. Final observed
 wallet/available was about `$2999.72/$2270.39` (75.69% free, `CALM`), temporary
 outstanding principal was zero, and the unified view reported zero protection
 issues. The default five-leg admission sample required `$360` now and projected
 63.69% free Pump-owned cash after that action, so a fourth candidate was ready
 subject to its real tier and signal gates.
+
+## Next-ladder fill and safe margin release (2026-08-11)
+
+Exactly one non-reduce next-ladder order may be physically open for each Pump
+position. Its `margin_usd` is the order's 3x initial-margin budget: Bybit
+reserves it from available cash while the order is open, and it becomes initial
+margin for the added contracts when filled. It is not sufficient by itself for
+the short reaction window, so v4 also verifies isolated prefund before the
+order may remain live.
+
+The two boundaries are mandatory and accept no tolerance:
+
+1. The currently active Full Stop must be at least 2.5% above the next order's
+   fill price. Therefore touching/filling that order cannot immediately trigger
+   the old stop while the monitor has not yet observed the larger quantity.
+2. A full-order fill is projected in advance, including its 3x initial margin.
+   The Full Stop derived from projected liquidation must be at least 8% above
+   the same fill price. After the fill, the monitor rereads quantity, average
+   and liquidation, synchronizes Full TP/SL, and only then funds/places the
+   following ladder.
+
+Margin release uses the inverse sequence. It still requires two consecutive
+`>=35%` position-buffer reads and 30 minutes since the last add/remove. Before
+calling Bybit, `plan_safe_margin_reduction` finds the largest `$5` increment
+that leaves at least a 25% buffer and preserves both next-fill boundaries. If
+no `$5` increment is safe, no exchange call is made. A submitted removal is
+still reread from Bybit; any unexpected buffer or next-gate failure causes an
+immediate rollback and Full TP/SL resync.

@@ -347,10 +347,51 @@ the existing three positions and nine orders. After the initial complete
 monitor cycle, all three immediate ladder gates were ready. Ownership-aware
 `ARM PUMP LIVE 3000` succeeded. Three further 15-second cycles remained armed
 with no monitor error, no block, one live nearest ladder per position, and no
-balance, transfer, margin-add or margin-remove mutation. Final read-only state
+net balance/top-up change. Before ARM, the first v4 cycle trial-removed and
+immediately restored `$25` BLUAI, `$165` ACE and `$35` RATS because their next
+gates failed after removal. Protection stayed valid, but that exchange churn is
+superseded by the pre-write planner below. Final read-only state
 showed wallet/available about `$2999.72/$2270.39`, 75.69% free cash, `CALM`,
 zero temporary outstanding principal and zero protection issues. The displayed
 five-leg sample required `$360` for L1 + the next order + immediate safety and
 would leave about 63.69% Pump-owned free cash, so admission was ready. Manual
 executions remained empty; TUT Grid kept its stored `completed_no_fill`
 transition and had no active execution.
+
+## Pre-write margin release and full-fill transition regression (2026-08-11)
+
+The first v4 deployment exposed a conservative but noisy implementation detail:
+the controller derived a 25% buffer amount, submitted `remove_margin`, then
+rolled it back if the immediate next-fill gate failed. Net margin was unchanged,
+but a predictable unsafe removal should never reach Bybit.
+
+`plan_safe_margin_reduction` now runs before any private write. It first caps
+the candidate by the amount that leaves a 25% liquidation buffer, then uses a
+binary search over `$5` increments. Every candidate simulates the lower short
+liquidation price and reruns the same v4 current-plus-full-fill ladder plan. A
+candidate is safe only when the current desired stop still clears the order by
+2.5% and the fully filled projected stop clears it by 8%. Only the largest safe
+increment can reach `remove_margin`; zero-safe results write no exchange request.
+The real exchange read and immediate rollback remain after a submitted removal
+as protection against fee/MMR/model or exchange rounding drift.
+
+On the captured state, the planner selected `$10` for RATS, `$20` for BLUAI and
+`$75` for ACE, rather than the former `$35/$25/$165` trial amounts. These values
+are snapshot-dependent and are recalculated from fresh mark, liquidation,
+quantity and next-leg data when the normal two-cycle/30-minute release gate is
+eligible.
+
+The complementary transition regression walks every next fill for `$600`
+2/3/5-leg ladders. Before a live order may exist, the old Full Stop must be at
+least 2.5% above its fill price; the projected liquidation after the entire
+order notional fills must place the next Full Stop at least 8% above the same
+price. An integration test then completely fills L2, updates exchange
+quantity/average/liquidation, verifies that no stop/close occurs, synchronizes
+Full TP/SL, funds L3 if required, and places L3 only after that new gate passes.
+The 3x initial margin reserved by the exchange order is included in the
+post-fill projection; separate isolated prefund covers the reaction window and
+is not double-counted as order notional.
+
+Pre-deployment validation passed Python compilation, `165` expanded
+Pump/transfer/API/lab/positions tests and the full project suite (`736 passed`,
+`8` subtests, `13` pre-existing warnings).
