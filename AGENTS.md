@@ -121,8 +121,14 @@ Recent Changes
   Price that has already crossed an absent ladder is never chased. Thresholds
   and per-position proximity are exposed in the Pump APIs and web views.
   Canonical operation is in
-  `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`; live rollout evidence must
-  be appended after the safe restart and explicit `ARM PUMP LIVE 3000`.
+  `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`. Live rollout completed on
+  2026-08-12 after the full regression (`745 passed`, `8` subtests): RATS and
+  ACE became dormant only after exchange-confirmed ladder cancellation and
+  returned `$25/$135`, while BMT remained active with its L2 and `$170` top-up.
+  Available balance rose to `$2446.08`; all three Full TP/SL pairs plus the one
+  BMT L2 reconciled, the shared entry pool became ready, and explicit
+  `ARM PUMP LIVE 3000` resumed without monitor error, block, or risk freeze.
+  Implementation commit: `854e4d0`.
 - Pump Live v4 next-fill reaction safety was raised to `12%/12%` on
   2026-08-11 after the BMT audit measured roughly `7.35s` hot-ladder cycle
   starts and found that the former 2.5% pre-fill stop gap could be crossed by a

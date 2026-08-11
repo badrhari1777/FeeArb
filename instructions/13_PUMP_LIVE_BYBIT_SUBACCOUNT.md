@@ -1137,5 +1137,33 @@ Regression covers initial L1 deferral at the ordinary 50% L2 distance, hot
 watch, activation below 35%, strict `margin -> verified protection -> order`
 sequencing, L2 fill followed by L3 activation, two-cycle/30-minute release,
 dormant-margin return, dormant-gate entry admission, and missed-ladder
-fail-closed behavior. Live rollout evidence is recorded only after the safe
-restart and explicit `ARM PUMP LIVE 3000` verification.
+fail-closed behavior. Python compilation, the focused Pump set (`114 passed`),
+the expanded Pump/API set (`130 passed`, `6 warnings`), and the complete suite
+(`745 passed`, `8` subtests, `13` pre-existing warnings) passed before rollout.
+
+Live rollout completed on 2026-08-12. The backend was explicitly disarmed only
+after confirming zero running Manual executions and zero active/pending
+Grid/Auto-Arb transitions, then stopped and restarted with the canonical
+Windows scripts. Recovery began disarmed and kept all three exchange positions
+and Full TP/SL protection. Two healthy proximity cycles then produced the
+expected migration:
+
+- `1000RATSUSDT` at roughly `95%` distance became `dormant`; its `$25`
+  tracked top-up returned and the refreshed liquidation buffer remained about
+  `69.2%`.
+- `ACEUSDT` at roughly `65.6%` distance moved through `cooling` to `dormant`;
+  cancellation of its old L2 was exchange-confirmed before its `$135` top-up
+  returned. The refreshed liquidation buffer remained about `44.3%`.
+- `BMTUSDT` at roughly `33.5%` distance remained `active`; its one L2 order,
+  `$170` tracked top-up, and 12% current/projected protection were retained.
+
+Available Pump balance rose from about `$2180.35` to `$2446.08`, while wallet
+balance remained `$3052.58`. The shared admission pool changed to `ready=true`
+and calculated `$2251.08` headroom after the required `$195` action floor.
+The preflight correctly reported the owned existing-position/open-order state;
+verified-resume synchronized all three Full TP/SL pairs and accepted explicit
+`ARM PUMP LIVE 3000`. Subsequent cycles remained `armed`, with a live monitor,
+no monitor error, blocked reason, transient recovery, or portfolio risk freeze.
+Exchange reconciliation showed exactly seven open orders: six reduce-only
+TP/SL orders plus the single non-reduce BMT L2. Implementation commit:
+`854e4d0`.
