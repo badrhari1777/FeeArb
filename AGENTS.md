@@ -109,6 +109,22 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- A funding-corrected Pump Short replay was added on 2026-08-11 after the HUSDT
+  audit found that fixed 8h pagination truncated its hourly funding history.
+  The public collector now paginates backwards by the oldest returned
+  settlement. The new replay requires a complete interval-aware 24h funding
+  window, uses actual settlement cash flow and mark prices, current `$600` v4
+  ladders, synchronized four-slot cash paths, the 30% plus `$75` admission
+  floor, and excludes temporary rescue principal from return. HUSDT's invalid
+  `2026-06-10 03:00 UTC` entry had restored funding24 `-41.230291%` and forced
+  net `-$1077.53`; the first all-gates entry moved to `2026-06-12 10:00 UTC`
+  and replayed at `+$197.57` with `$2439.19` peak Pump cash. Across 360 events,
+  current v4 selected 79 trades at 92.41% wins and `$8340.70` net on fixed
+  `$3000`. See `docs/pump_short_funding_corrected_portfolio_2026-08-11.md`.
+  This research does not change the live classifier or live ARM state.
+  Verified collector/new-replay tests (`11 passed`), expanded Pump research
+  regression (`64 passed`, `4 warnings`), full regression (`742 passed`, `8`
+  subtests, `13 warnings`), and a deterministic saved-raw rebuild.
 - Pump Live next-fill and margin-release safety was tightened on 2026-08-11.
   A live read confirmed three physical non-reduce nearest ladders plus six
   reduce-only Full TP/SL orders. For every v4 2/3/5-leg transition, regression

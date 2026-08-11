@@ -343,32 +343,41 @@ class BybitPumpShortCollector:
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         parsed: list[dict[str, Any]] = []
-        # 200 funding points usually covers ~66 days at 8h. Use smaller windows
-        # so 90d+ runs do not silently truncate history.
-        window_ms = max(1, limit - 1) * 8 * 3_600_000
-        cursor_start = start_ms
-        while cursor_start <= end_ms:
-            cursor_end = min(end_ms, cursor_start + window_ms)
+        # Funding intervals are instrument-specific and can change (notably
+        # HUSDT settled hourly). Paginate backwards from the oldest returned
+        # row instead of assuming every instrument settles every eight hours.
+        cursor_end = end_ms
+        while cursor_end >= start_ms:
             payload = self._get_json(
                 "/v5/market/funding/history",
                 {
                     "category": "linear",
                     "symbol": symbol,
-                    "startTime": cursor_start,
+                    "startTime": start_ms,
                     "endTime": cursor_end,
                     "limit": limit,
                 },
             )
             rows = ((payload.get("result") or {}).get("list") or []) if isinstance(payload, dict) else []
-            parsed.extend(
+            page = [
                 {
                     "ts_ms": to_int(row.get("fundingRateTimestamp")),
                     "funding_rate": to_float(row.get("fundingRate")),
                 }
                 for row in rows
                 if isinstance(row, dict)
-            )
-            cursor_start = cursor_end + 1
+            ]
+            page = [row for row in page if row["ts_ms"]]
+            if not page:
+                break
+            parsed.extend(page)
+            oldest = min(row["ts_ms"] for row in page)
+            if oldest <= start_ms or len(page) < limit:
+                break
+            next_end = oldest - 1
+            if next_end >= cursor_end:
+                break
+            cursor_end = next_end
         return dedupe_sort_by_ts(parsed)
 
     def fetch_open_interest(

@@ -90,6 +90,45 @@ class _FakeBybitPumpShortCollector(BybitPumpShortCollector):
 
 
 class BybitPumpShortCollectorTestCase(unittest.TestCase):
+    def test_funding_history_paginates_hourly_without_8h_assumption(self) -> None:
+        hour_ms = 3_600_000
+        start_ms = 1_800_000_000_000
+        source = [
+            {
+                "fundingRateTimestamp": str(start_ms + index * hour_ms),
+                "fundingRate": "-0.001",
+            }
+            for index in range(450)
+        ]
+
+        class FakeCollector(BybitPumpShortCollector):
+            def __init__(self) -> None:
+                super().__init__(BybitCollectorConfig(sleep_sec=0.0))
+                self.calls = 0
+
+            def _get_json(self, path: str, params: dict) -> dict:  # type: ignore[override]
+                self.calls += 1
+                rows = [
+                    row
+                    for row in source
+                    if int(params["startTime"]) <= int(row["fundingRateTimestamp"]) <= int(params["endTime"])
+                ]
+                rows = list(reversed(rows))[: int(params["limit"])]
+                return {"result": {"list": rows}}
+
+        collector = FakeCollector()
+        result = collector.fetch_funding_history(
+            "HUSDT",
+            start_ms=start_ms,
+            end_ms=start_ms + 449 * hour_ms,
+            limit=200,
+        )
+
+        self.assertEqual(len(result), 450)
+        self.assertEqual(result[0]["ts_ms"], start_ms)
+        self.assertEqual(result[-1]["ts_ms"], start_ms + 449 * hour_ms)
+        self.assertEqual(collector.calls, 3)
+
     def test_summary_scores_pump_and_funding_features(self) -> None:
         instrument = BybitInstrument(
             symbol="PUMPUSDT",
