@@ -63,6 +63,7 @@ def pump_payload() -> dict:
             "ready": True,
             "new_slot_margin_usd": 525.0,
             "entry_headroom_usd": 640.0,
+            "stress_headroom_usd": -240.0,
         },
         "credentials": {"api_secret_present": True},
         "last_balance": {"total": 1000.0, "available": 825.0, "used": 175.0},
@@ -139,6 +140,7 @@ def test_overview_keeps_main_and_pump_groups_separate() -> None:
     assert payload["pump"]["capital_regime"]["mode"] == "stress"
     assert payload["pump"]["margin_manager"]["policy_id"] == "v3_shared_projected"
     assert payload["pump"]["shared_pool"]["new_slot_margin_usd"] == 525.0
+    assert payload["pump"]["shared_pool"]["stress_headroom_usd"] == -240.0
     assert payload["pump"]["auto_transfer"]["enabled"] is True
     assert "credentials" not in payload["pump"]
 
@@ -192,6 +194,7 @@ class PositionsOverviewApiTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/pump-short-strategies", body)
         self.assertIn("pp-pump-margin-manager", body)
         self.assertIn("pp-pump-entry-headroom", body)
+        self.assertIn("pp-pump-stress-headroom", body)
         self.assertNotIn("Emergency close all", body)
 
     async def test_main_page_exposes_all_main_and_pump_position_tabs(self) -> None:

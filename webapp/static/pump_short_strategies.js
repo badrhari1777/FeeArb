@@ -207,6 +207,12 @@
         ? '-'
         : money(sharedPool.entry_headroom_usd)
     );
+    setText(
+      'pss-live-stress-headroom',
+      sharedPool.stress_headroom_usd === null || sharedPool.stress_headroom_usd === undefined
+        ? '-'
+        : money(sharedPool.stress_headroom_usd)
+    );
     setText('pss-live-auto-transfer', autoTransfer.enabled ? 'ON' : 'OFF');
     setText('pss-live-auto-main-floor', money(autoTransfer.main_min_available_usd || 0));
     setText(

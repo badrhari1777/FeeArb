@@ -161,14 +161,17 @@ margin defence:
    fill using the actual exchange quantity and liquidation price. The strict
    target asks both the current stop and projected post-fill stop to clear the
    following ladder; the last ladder asks for a `20%` continuation buffer.
-2. The manager also walks every remaining ladder sequentially when deciding
-   whether a new symbol fits. It reserves all future base margins, all
-   projected margin additions, up to three `$5` exchange-correction steps per
-   margin gate, and the `$75` Pump operating floor.
-3. The shared Pump pool is dynamic. It reserves the complete ladder size only
+2. The manager hard-reserves future base ladder margins plus the immediately
+   executable next-gate margin for all open positions and the candidate, up to
+   three `$5` exchange-correction steps for that gate, and the `$75` Pump
+   operating floor. It still walks the full remaining path, but reports that
+   separately as stress instead of blocking cash: no distant order can become
+   live before another exchange-confirmed gate.
+3. The shared Pump pool is dynamic. It reserves complete base ladder size only
    for positions that actually exist; it does not permanently strand four
-   private `$525` envelopes. If two positions consume the safe path, the third
-   is rejected; likewise for the fourth.
+   private `$525` envelopes. Immediate unsafe gates block admission; negative
+   full-path stress warns that later rescue/defer may be needed but cannot cause
+   an unguarded fill because only the nearest ladder is live.
 4. The bounded rescue envelope is `$2000` aggregate and `$2000` per position.
    This is only permission to protect an existing position. The actual main to
    Pump transfer still requires fresh main safety, idempotent confirmation and
@@ -240,3 +243,28 @@ stable at three non-reduce ladders plus six Full TP/SL orders after explicit
 `ARM PUMP LIVE 3000`. The shared planner rejects another five-leg candidate at
 the current state because its complete projected path exceeds the combined
 top-up capacity, despite about `$2270` exchange-available cash.
+
+## Next-gate admission correction (2026-08-11)
+
+The complete-path block above was too conservative for the enforced execution
+state machine. Only the nearest ladder can be live, so distant fills cannot
+consume their hypothetical margin before an intervening exchange read, margin
+gate and Full TP/SL synchronization. Admission now hard-gates future base
+ladder margin plus the immediate next gate for every existing position and the
+actual 2/3/5-leg candidate. The exchange-capped complete path remains visible
+as stress headroom.
+
+On the captured RATS/BLUAI/ACE state, existing immediate safety shortfall was
+`$0`. Required Pump available/headroom was approximately `$1532.50/+737.89`
+for a two-leg candidate, `$1577.50/+692.89` for three legs and
+`$1382.50/+887.89` for five equal legs. Corresponding full-path stress
+headroom remained negative (`-$1077.11`, `-$1457.11`, `-$2062.11`). Thus a
+fourth signal may be admitted now, but every later fill remains sequentially
+gated; stress is not presented as guaranteed funded capacity.
+
+The BLUAI `10001` incident also gained an exact circuit breaker. One rejected
+margin write records qty/step and current position value, refreshes once and
+uses the 8% exchange-cap fallback. It neither repeats the write nor duplicates
+blocked events until exposure changes or position value grows more than 5%.
+Focused regression passed `124`; the complete suite passed `720` plus `8`
+subtests, with both production Pump state/event hashes unchanged.

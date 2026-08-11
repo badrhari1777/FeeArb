@@ -183,6 +183,12 @@
         : money(sharedPool.entry_headroom_usd)
     );
     setText(
+      'pp-pump-stress-headroom',
+      sharedPool.stress_headroom_usd === null || sharedPool.stress_headroom_usd === undefined
+        ? '-'
+        : money(sharedPool.stress_headroom_usd)
+    );
+    setText(
       'pp-pump-auto-transfer',
       autoTransfer.enabled
         ? ('ON · daily used ' + money(autoTransfer.daily_used_usd || 0))

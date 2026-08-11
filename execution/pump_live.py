@@ -2486,7 +2486,8 @@ class PumpLiveController:
         *,
         tier: Mapping[str, Any],
         config: PumpLiveConfig,
-    ) -> float:
+        complete_path: bool,
+    ) -> dict[str, Any]:
         legs = build_live_legs(
             tier=tier,
             slot_margin_usd=config.slot_margin_usd,
@@ -2494,7 +2495,11 @@ class PumpLiveController:
             reference_price=1.0,
         )
         if len(legs) < 2:
-            return 0.0
+            return {
+                "total_reserve_usd": 0.0,
+                "path_cap_ready": True,
+                "steps": [],
+            }
         first = legs[0]
         first_qty = _safe_float(first.get("notional_usd"), 0.0)
         theoretical_liq = (
@@ -2505,7 +2510,7 @@ class PumpLiveController:
             qty=first_qty,
             current_liq_price=theoretical_liq,
             legs=legs,
-            target_legs=legs[1:],
+            target_legs=(legs[1:] if complete_path else legs[1:2]),
             leverage=config.leverage,
             stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
             safety_above_next_ladder_pct=config.entry_margin_prefund_safety_pct,
@@ -2514,8 +2519,12 @@ class PumpLiveController:
             taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
             round_up_increment_usd=config.entry_margin_prefund_round_usd,
             correction_steps=PREFUND_MAX_CORRECTION_STEPS,
+            position_margin_usd=_safe_float(first.get("margin_usd"), 0.0),
+            exchange_cap_reaction_buffer_pct=(
+                config.projected_exchange_cap_reaction_buffer_pct
+            ),
         )
-        return _safe_float(reserve.get("total_reserve_usd"), 0.0)
+        return reserve
 
     def _shared_entry_admission(
         self,
@@ -2534,8 +2543,10 @@ class PumpLiveController:
         )
         planned_base = 0.0
         safety_shortfall = 0.0
+        full_path_safety = 0.0
         desired_total_topup = 0.0
         position_cap_ready = True
+        full_path_cap_ready = True
         position_rows: list[dict[str, Any]] = []
         for item in items:
             legs = list(item.get("legs") or [])
@@ -2556,7 +2567,9 @@ class PumpLiveController:
                 and leg.get("status") in {"planned", "open", "submitted"}
             ]
             required = 0.0
+            full_path_required = 0.0
             error: str | None = None
+            full_path_error: str | None = None
             immediate_ready = True
             if remaining_legs:
                 try:
@@ -2574,19 +2587,47 @@ class PumpLiveController:
                         taker_fee_rate=position_config.entry_margin_prefund_taker_fee_rate,
                         round_up_increment_usd=position_config.entry_margin_prefund_round_usd,
                         correction_steps=PREFUND_MAX_CORRECTION_STEPS,
+                        position_margin_usd=_optional_float(
+                            item.get("position_margin_usd")
+                        ),
+                        exchange_cap_reaction_buffer_pct=(
+                            position_config.projected_exchange_cap_reaction_buffer_pct
+                        ),
                     )
-                    required = _safe_float(reserve.get("total_reserve_usd"), 0.0)
-                    _, immediate_check = self._build_prefund_plan_and_check(
+                    full_path_required = _safe_float(
+                        reserve.get("total_reserve_usd"),
+                        0.0,
+                    )
+                    if not bool(reserve.get("path_cap_ready", True)):
+                        full_path_error = "projected_exchange_margin_cap_below_path"
+                    immediate_plan, immediate_check = self._build_prefund_plan_and_check(
                         item,
                         position_config,
                         target_leg=remaining_legs[0],
                     )
                     immediate_ready = bool(immediate_check.get("ready"))
+                    if not immediate_ready:
+                        required = _safe_float(
+                            immediate_plan.get("required_add_usd"),
+                            0.0,
+                        )
+                        if required > 0:
+                            required += (
+                                PREFUND_MAX_CORRECTION_STEPS
+                                * position_config.entry_margin_prefund_round_usd
+                            )
+                        if bool(
+                            immediate_plan.get("exchange_cap_fallback_blocked")
+                        ):
+                            error = "projected_exchange_margin_cap_below_next_gate"
+                            required = math.inf
                 except Exception as exc:
                     immediate_ready = False
                     error = _clean_error(exc)
                     required = math.inf
+                    full_path_required = math.inf
             safety_shortfall += required
+            full_path_safety += full_path_required
             desired_total_topup += current_topup + required
             row_cap_ready = bool(
                 math.isfinite(required)
@@ -2594,6 +2635,13 @@ class PumpLiveController:
                 <= envelope.max_position_topup_usd + 1e-9
             )
             position_cap_ready = position_cap_ready and row_cap_ready
+            row_full_path_cap_ready = bool(
+                math.isfinite(full_path_required)
+                and current_topup + full_path_required
+                <= envelope.max_position_topup_usd + 1e-9
+                and full_path_error is None
+            )
+            full_path_cap_ready = full_path_cap_ready and row_full_path_cap_ready
             position_rows.append(
                 {
                     "symbol": _normalize_symbol(item.get("symbol")),
@@ -2603,19 +2651,46 @@ class PumpLiveController:
                         round(required, 6) if math.isfinite(required) else None
                     ),
                     "immediate_ready": immediate_ready,
-                    "full_path_cap_ready": row_cap_ready,
+                    "next_gate_cap_ready": row_cap_ready,
+                    "full_path_safety_usd": (
+                        round(full_path_required, 6)
+                        if math.isfinite(full_path_required)
+                        else None
+                    ),
+                    "full_path_cap_ready": row_full_path_cap_ready,
                     "error": error,
+                    "full_path_error": full_path_error,
                 }
             )
-        new_safety = self._initial_projected_prefund_reserve(
+        new_immediate_reserve = self._initial_projected_prefund_reserve(
             tier=tier,
             config=candidate_config,
+            complete_path=False,
+        )
+        new_full_path_reserve = self._initial_projected_prefund_reserve(
+            tier=tier,
+            config=candidate_config,
+            complete_path=True,
+        )
+        new_safety = _safe_float(
+            new_immediate_reserve.get("total_reserve_usd"),
+            0.0,
+        )
+        new_full_path_safety = _safe_float(
+            new_full_path_reserve.get("total_reserve_usd"),
+            0.0,
         )
         desired_total_topup += new_safety
         new_position_cap_ready = bool(
             new_safety <= envelope.max_position_topup_usd + 1e-9
+            and new_immediate_reserve.get("path_cap_ready", True)
         )
         position_cap_ready = position_cap_ready and new_position_cap_ready
+        new_full_path_cap_ready = bool(
+            new_full_path_safety <= envelope.max_position_topup_usd + 1e-9
+            and new_full_path_reserve.get("path_cap_ready", True)
+        )
+        full_path_cap_ready = full_path_cap_ready and new_full_path_cap_ready
         available = max(0.0, _safe_float(balance.get("available"), 0.0))
         with self._lock:
             manager = dict(self._state.get("capital_manager") or {})
@@ -2628,6 +2703,14 @@ class PumpLiveController:
             + safety_shortfall
             + candidate_config.slot_margin_usd
             + new_safety
+            + envelope.operating_cash_floor_usd
+            + rescue_only_temporary
+        )
+        stress_required_available = (
+            planned_base
+            + full_path_safety
+            + candidate_config.slot_margin_usd
+            + new_full_path_safety
             + envelope.operating_cash_floor_usd
             + rescue_only_temporary
         )
@@ -2664,11 +2747,19 @@ class PumpLiveController:
                 if math.isfinite(safety_shortfall)
                 else None
             ),
+            "existing_full_path_safety_usd": (
+                round(full_path_safety, 6)
+                if math.isfinite(full_path_safety)
+                else None
+            ),
             "new_slot_margin_usd": round(candidate_config.slot_margin_usd, 6),
             "new_initial_safety_usd": round(new_safety, 6),
+            "new_full_path_safety_usd": round(new_full_path_safety, 6),
             "candidate_ladder_legs": _safe_int(tier.get("ladder_legs"), 0),
             "candidate_leg_weights": list(tier.get("leg_weights") or []),
             "new_position_cap_ready": new_position_cap_ready,
+            "new_full_path_cap_ready": new_full_path_cap_ready,
+            "full_path_stress_cap_ready": full_path_cap_ready,
             "operating_floor_usd": round(envelope.operating_cash_floor_usd, 6),
             "rescue_only_temporary_lock_usd": round(rescue_only_temporary, 6),
             "required_available_usd": (
@@ -2679,6 +2770,16 @@ class PumpLiveController:
             "entry_headroom_usd": (
                 round(available - required_available, 6)
                 if math.isfinite(required_available)
+                else None
+            ),
+            "stress_required_available_usd": (
+                round(stress_required_available, 6)
+                if math.isfinite(stress_required_available)
+                else None
+            ),
+            "stress_headroom_usd": (
+                round(available - stress_required_available, 6)
+                if math.isfinite(stress_required_available)
                 else None
             ),
             "desired_total_topup_usd": (
@@ -3670,21 +3771,27 @@ class PumpLiveController:
                             },
                         )
                         return
+                gate_error = _clean_error(exc)
                 with self._lock:
+                    repeated_gate_block = bool(
+                        item.get("ladder_gate_status") == "blocked"
+                        and item.get("ladder_gate_error") == gate_error
+                    )
                     item["ladder_gate_status"] = "blocked"
                     item["ladder_gate_step"] = _safe_int(next_leg.get("step"), 0)
-                    item["ladder_gate_error"] = _clean_error(exc)
+                    item["ladder_gate_error"] = gate_error
                     item["updated_at_ms"] = _now_ms()
                     self._save_state_locked()
-                self.disarm("next_ladder_margin_not_confirmed")
-                self._event(
-                    "next_ladder_gate_blocked",
-                    {
-                        "symbol": _normalize_symbol(item.get("symbol")),
-                        "step": _safe_int(next_leg.get("step"), 0),
-                        "error": _clean_error(exc),
-                    },
-                )
+                if not repeated_gate_block:
+                    self.disarm("next_ladder_margin_not_confirmed")
+                    self._event(
+                        "next_ladder_gate_blocked",
+                        {
+                            "symbol": _normalize_symbol(item.get("symbol")),
+                            "step": _safe_int(next_leg.get("step"), 0),
+                            "error": gate_error,
+                        },
+                    )
                 return
         if next_leg.get("status") == "planned":
             errors = self._place_planned_ladders(item)
@@ -3842,6 +3949,60 @@ class PumpLiveController:
         increment = max(0.0001, config.entry_margin_prefund_round_usd)
         return max(0.0, math.floor(exchange_headroom / increment + 1e-12) * increment)
 
+    @staticmethod
+    def _exchange_cap_rejection_matches(
+        item: Mapping[str, Any],
+        target_leg: Mapping[str, Any],
+    ) -> bool:
+        rejection = item.get("exchange_margin_cap_rejection")
+        if not isinstance(rejection, Mapping):
+            return False
+        rejected_value = _safe_float(rejection.get("position_value_usd"), 0.0)
+        current_value = _safe_float(item.get("position_value_usd"), 0.0)
+        capacity_materially_changed = bool(
+            rejected_value > 0 and current_value > rejected_value * 1.05
+        )
+        return bool(
+            _safe_int(rejection.get("step"), 0)
+            == _safe_int(target_leg.get("step"), 0)
+            and math.isclose(
+                _safe_float(rejection.get("qty"), 0.0),
+                _safe_float(item.get("qty"), 0.0),
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            )
+            and not capacity_materially_changed
+        )
+
+    def _record_exchange_cap_rejection(
+        self,
+        item: dict[str, Any],
+        target_leg: Mapping[str, Any],
+        *,
+        attempted_add_usd: float,
+        error: str,
+    ) -> None:
+        rejection = {
+            "step": _safe_int(target_leg.get("step"), 0),
+            "qty": _safe_float(item.get("qty"), 0.0),
+            "attempted_add_usd": round(max(0.0, attempted_add_usd), 6),
+            "position_value_usd": _optional_float(item.get("position_value_usd")),
+            "position_margin_usd": _optional_float(item.get("position_margin_usd")),
+            "error": error,
+            "recorded_at_ms": _now_ms(),
+        }
+        with self._lock:
+            item["exchange_margin_cap_rejection"] = rejection
+            item["updated_at_ms"] = _now_ms()
+            self._save_state_locked()
+        self._event(
+            "exchange_margin_cap_rejection",
+            {
+                "symbol": _normalize_symbol(item.get("symbol")),
+                **rejection,
+            },
+        )
+
     def _apply_exchange_margin_cap_fallback(
         self,
         item: Mapping[str, Any],
@@ -3852,8 +4013,13 @@ class PumpLiveController:
     ) -> dict[str, Any]:
         capacity = self._exchange_margin_add_capacity(item, config)
         strict_required = _safe_float(strict_plan.get("required_add_usd"), 0.0)
-        if capacity is None or strict_required <= capacity + 1e-9:
+        rejection_active = self._exchange_cap_rejection_matches(item, target_leg)
+        if not rejection_active and (
+            capacity is None or strict_required <= capacity + 1e-9
+        ):
             return dict(strict_plan)
+        if capacity is None:
+            capacity = 0.0
         qty = _safe_float(item.get("qty"), 0.0)
         liq = _safe_float(item.get("liq_price"), 0.0)
         target_price = _safe_float(target_leg.get("trigger_price"), 0.0)
@@ -3915,6 +4081,7 @@ class PumpLiveController:
             "strict_reference_price": strict_plan.get("reference_price"),
             "hard_target_enforced": False,
             "exchange_cap_fallback": True,
+            "exchange_cap_rejection_active": rejection_active,
         }
         if required > capacity + 1e-9:
             fallback["exchange_cap_fallback_blocked"] = True
@@ -4029,6 +4196,13 @@ class PumpLiveController:
                 self._save_state_locked()
             return
 
+        if self._exchange_cap_rejection_matches(item, selected_leg):
+            with self._lock:
+                item["margin_prefund_status"] = "exchange_cap_deferred"
+                item["updated_at_ms"] = _now_ms()
+                self._save_state_locked()
+            raise RuntimeError("pump_live_exchange_margin_cap_deferred")
+
         required = _safe_float(plan.get("required_add_usd"), 0.0)
         if required < 1e-9:
             required = config.entry_margin_prefund_round_usd
@@ -4061,7 +4235,54 @@ class PumpLiveController:
         previous_liq = liq
         total_added = required
         correction_steps = 0
-        self.gateway.add_margin(symbol, required)
+        try:
+            self.gateway.add_margin(symbol, required)
+        except Exception as exc:
+            if (
+                config.margin_manager_policy_id != MARGIN_MANAGER_V3_SHARED
+                or not _is_bybit_position_margin_cap_error(exc)
+            ):
+                raise
+            refreshed = self._fetch_exchange_short(symbol)
+            if refreshed is not None:
+                self._apply_exchange_position(item, refreshed)
+            error = _clean_error(exc)
+            self._record_exchange_cap_rejection(
+                item,
+                selected_leg,
+                attempted_add_usd=required,
+                error=error,
+            )
+            recovered_plan, recovered_check = self._build_prefund_plan_and_check(
+                item,
+                config,
+                target_leg=selected_leg,
+            )
+            with self._lock:
+                item["margin_prefund_plan"] = recovered_plan
+                item["margin_prefund_verification"] = recovered_check
+                item["margin_prefund_status"] = (
+                    "already_protected_exchange_cap"
+                    if recovered_check["ready"]
+                    else "exchange_cap_deferred"
+                )
+                if recovered_check["ready"]:
+                    item["margin_prefund_floor_usd"] = position_topup
+                    item["margin_prefund_confirmed_at_ms"] = _now_ms()
+                item["updated_at_ms"] = _now_ms()
+                self._save_state_locked()
+            if recovered_check["ready"]:
+                self._event(
+                    "exchange_margin_cap_fallback_ready",
+                    {
+                        "symbol": symbol,
+                        "step": _safe_int(selected_leg.get("step"), 0),
+                        "attempted_add_usd": required,
+                        "verification": recovered_check,
+                    },
+                )
+                return
+            raise RuntimeError("pump_live_exchange_margin_cap_deferred") from exc
         position_topup_after = self._record_entry_prefund_add(
             item,
             amount_usd=required,
@@ -5354,6 +5575,8 @@ def projected_ladder_margin_reserve(
     taker_fee_rate: float,
     round_up_increment_usd: float,
     correction_steps: int,
+    position_margin_usd: float | None = None,
+    exchange_cap_reaction_buffer_pct: float | None = None,
 ) -> dict[str, Any]:
     """Reserve the complete remaining ladder path from past/current state only."""
     projected_qty = qty
@@ -5370,6 +5593,12 @@ def projected_ladder_margin_reserve(
         raise ValueError("pump_live_projected_reserve_inputs_invalid")
     required_total = 0.0
     correction_total = 0.0
+    tracked_position_margin = (
+        max(0.0, float(position_margin_usd))
+        if position_margin_usd is not None
+        else None
+    )
+    path_cap_ready = True
     steps: list[dict[str, Any]] = []
     for target_leg in ordered_targets:
         plan = ladder_prefund_plan(
@@ -5386,20 +5615,95 @@ def projected_ladder_margin_reserve(
             taker_fee_rate=taker_fee_rate,
             round_up_increment_usd=round_up_increment_usd,
         )
+        target_price = _safe_float(target_leg.get("trigger_price"), 0.0)
+        target_notional = _safe_float(target_leg.get("notional_usd"), 0.0)
+        exchange_capacity: float | None = None
+        exchange_cap_fallback = False
+        if (
+            tracked_position_margin is not None
+            and exchange_cap_reaction_buffer_pct is not None
+            and target_price > 0
+        ):
+            projected_position_value = projected_qty * target_price
+            projected_maintenance = (
+                projected_position_value * max(0.0, maintenance_margin_rate)
+            )
+            exchange_headroom = max(
+                0.0,
+                projected_position_value
+                - tracked_position_margin
+                - projected_maintenance
+                - max(5.0, projected_position_value * 0.01),
+            )
+            increment = max(0.0001, round_up_increment_usd)
+            exchange_capacity = max(
+                0.0,
+                math.floor(exchange_headroom / increment + 1e-12) * increment,
+            )
+            strict_required = _safe_float(plan.get("required_add_usd"), 0.0)
+            if strict_required > exchange_capacity + 1e-9:
+                reaction = max(0.0, exchange_cap_reaction_buffer_pct)
+                current_required = required_entry_prefund_usd(
+                    qty=projected_qty,
+                    current_liq_price=projected_liq,
+                    next_ladder_price=target_price,
+                    stop_gap_from_liq_pct=stop_gap_from_liq_pct,
+                    safety_above_next_ladder_pct=reaction,
+                    maintenance_margin_rate=maintenance_margin_rate,
+                    taker_fee_rate=taker_fee_rate,
+                    round_up_usd=round_up_increment_usd,
+                )
+                after_qty, after_liq = projected_short_liquidation_after_fill(
+                    qty=projected_qty,
+                    current_liq_price=projected_liq,
+                    added_notional_usd=target_notional,
+                    added_price=target_price,
+                    leverage=leverage,
+                    maintenance_margin_rate=maintenance_margin_rate,
+                )
+                projected_required = required_entry_prefund_usd(
+                    qty=after_qty,
+                    current_liq_price=after_liq,
+                    next_ladder_price=target_price,
+                    stop_gap_from_liq_pct=stop_gap_from_liq_pct,
+                    safety_above_next_ladder_pct=reaction,
+                    maintenance_margin_rate=maintenance_margin_rate,
+                    taker_fee_rate=taker_fee_rate,
+                    round_up_usd=round_up_increment_usd,
+                )
+                fallback_required = max(current_required, projected_required)
+                plan = {
+                    **plan,
+                    "target_kind": "exchange_margin_cap_reaction_buffer",
+                    "reference_price": target_price,
+                    "clearance_pct": reaction,
+                    "target_stop_price": target_price * (1.0 + reaction / 100.0),
+                    "current_required_add_usd": round(current_required, 6),
+                    "projected_required_add_usd": round(projected_required, 6),
+                    "required_add_usd": round(fallback_required, 6),
+                    "exchange_cap_fallback": True,
+                    "hard_target_enforced": False,
+                }
+                exchange_cap_fallback = True
         required = _safe_float(plan.get("required_add_usd"), 0.0)
         correction = (
             max(0, int(correction_steps)) * max(0.0, round_up_increment_usd)
             if required > 0
             else 0.0
         )
+        step_cap_ready = bool(
+            exchange_capacity is None
+            or required + correction <= exchange_capacity + 1e-9
+        )
+        path_cap_ready = path_cap_ready and step_cap_ready
         required_total += required
         correction_total += correction
         if required > 0:
             projected_liq += required / (
                 projected_qty * (1.0 + max(0.0, maintenance_margin_rate))
             )
-        target_price = _safe_float(target_leg.get("trigger_price"), 0.0)
-        target_notional = _safe_float(target_leg.get("notional_usd"), 0.0)
+            if tracked_position_margin is not None:
+                tracked_position_margin += required
         projected_qty, projected_liq = projected_short_liquidation_after_fill(
             qty=projected_qty,
             current_liq_price=projected_liq,
@@ -5408,6 +5712,8 @@ def projected_ladder_margin_reserve(
             leverage=leverage,
             maintenance_margin_rate=maintenance_margin_rate,
         )
+        if tracked_position_margin is not None:
+            tracked_position_margin += target_notional / max(leverage, 1e-9)
         steps.append(
             {
                 "step": _safe_int(target_leg.get("step"), 0),
@@ -5417,6 +5723,13 @@ def projected_ladder_margin_reserve(
                 "projected_liq_after_fill": round(projected_liq, 12),
                 "target_kind": plan.get("target_kind"),
                 "reference_price": plan.get("reference_price"),
+                "exchange_margin_add_capacity_usd": (
+                    round(exchange_capacity, 6)
+                    if exchange_capacity is not None
+                    else None
+                ),
+                "exchange_cap_fallback": exchange_cap_fallback,
+                "exchange_cap_ready": step_cap_ready,
             }
         )
     return {
@@ -5424,6 +5737,7 @@ def projected_ladder_margin_reserve(
         "required_add_usd": round(required_total, 6),
         "correction_reserve_usd": round(correction_total, 6),
         "total_reserve_usd": round(required_total + correction_total, 6),
+        "path_cap_ready": path_cap_ready,
         "steps": steps,
     }
 
@@ -5926,6 +6240,15 @@ def _is_bybit_time_sync_error(exc: Any) -> bool:
             "req_timestamp" in message
             and ("recv_window" in message or "recvwindow" in message)
         )
+    )
+
+
+def _is_bybit_position_margin_cap_error(exc: Any) -> bool:
+    message = str(exc).lower()
+    return bool(
+        "bybit" in message
+        and "10001" in message
+        and "can not set pm more than pv" in message
     )
 
 

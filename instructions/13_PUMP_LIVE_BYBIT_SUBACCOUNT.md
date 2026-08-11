@@ -842,11 +842,12 @@ gates, not the entry strategy:
   exchange quantity and liquidation. The current and projected post-fill Full
   stop must both clear the following ladder. For the final ladder, the stop
   must retain a bounded `20%` continuation buffer.
-- Before admitting a new symbol, walk all remaining steps of every open
-  position and the candidate. Reserve future base margin, all projected margin
-  additions, up to three `$5` correction increments at each gate, and the
-  `$75` operating floor. Therefore fewer than four symbols are valid whenever
-  their complete safe paths consume the shared pool.
+- Before admitting a new symbol, hard-reserve all future base ladder margin,
+  the immediately executable next-gate margin for every open position and the
+  candidate, up to three `$5` correction increments for that gate, and the
+  `$75` operating floor. The full remaining path is calculated separately as
+  `full-path stress`; it does not block entry because distant orders are not
+  live and each later step must pass the same gate after the preceding fill.
 - Pump-owned available cash alone decides new entry. Main-account money is a
   rescue-only facility: temporarily borrowed principal is subtracted from
   entry headroom even if it is visible in Pump available balance.
@@ -870,6 +871,12 @@ gates, not the entry strategy:
   order. This is recorded as `exchange_margin_cap_reaction_buffer`, never as a
   strict following-step guarantee. The old relative `0..2%` tolerance remains
   only for `v2_current_next`; neither v3 boundary accepts a shortfall.
+- Exact Bybit `10001 / can not set pm more than pv` rejection is treated as
+  exchange-cap evidence, not a generic retryable failure. The controller reads
+  the position once, records a qty/step circuit breaker and evaluates the 8%
+  fallback. If already protected it proceeds without another add; otherwise it
+  defers the ladder and emits one blocked event. The write is not retried until
+  qty/step changes or position value increases materially (more than 5%).
 - Bybit retains used `orderLinkId` values after cancellation. A ladder rejected
   with exact `110072` duplicate-link evidence is recoverable only when a fresh
   exchange read finds zero non-reduce orders for that symbol. The controller
@@ -888,11 +895,13 @@ leaving later legs `planned`. Four consecutive hot monitor cycles stayed
 healthy with three non-reduce ladders and six Full reduce-only TP/SL orders.
 The operator-authorized `ARM PUMP LIVE 3000` succeeded with manager
 `v3_shared_projected`, strategy capital `$3000`, and new-position ladder size
-`$525`. A fourth entry is currently denied by the projected complete-path cap;
-visible free cash alone is intentionally insufficient evidence for admission.
+`$525`. That first deployment snapshot denied a fourth entry under the former
+complete-path cash gate. The same-day next-gate refinement supersedes that
+decision while preserving the negative full-path value as a stress warning.
 
 The Pump page and `/api/positions/overview` expose `margin_manager`,
-`shared_pool`, new-slot headroom and the effective per-position cap. Rollback
+`shared_pool`, next-gate headroom, full-path stress headroom and the effective
+per-position cap. Rollback
 requires changing only the manager variable back to `v2_current_next`, a safe
 restart, verification of all owned orders/protection and a fresh explicit ARM;
 it never rewrites historical position sizing.

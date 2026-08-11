@@ -113,9 +113,11 @@ Recent Changes
   nearest-ladder manager remains available as `v2_current_next`; the approved
   `v3_shared_projected` manager keeps isolated margin and immutable `$525` new
   ladders while pooling Pump cash dynamically across only existing positions.
-  It walks the complete remaining ladder path for admission, projects each full
-  fill before its order can remain live, reserves bounded exchange-correction
-  increments and uses a 20% final-fill continuation buffer. Main funds are
+  It hard-gates admission on the immediately executable next step of every
+  position, projects each full fill before its order can remain live, reserves
+  bounded exchange-correction increments and uses a 20% final-fill continuation
+  buffer. The complete remaining path is retained as a visible stress metric,
+  not a cash block, because only one next ladder can be live. Main funds are
   rescue-only and excluded from entry headroom; aggregate and per-position
   rescue envelopes are `$2000`, while every real transfer still needs the
   existing fresh main-risk projection and operational request limit. UI/API
@@ -140,9 +142,15 @@ Recent Changes
   ACE, `$35` RATS) without another transfer. Unique `R1` nearest ladders were
   then restored, four healthy 5-second cycles retained exactly `3` non-reduce
   ladders plus `6` Full TP/SL orders, and Pump was explicitly armed with
-  `ARM PUMP LIVE 3000`. Three positions are protected/ready; fourth-symbol
-  admission is currently blocked by complete-path shared capacity, not by a
-  fixed cash reserve.
+  `ARM PUMP LIVE 3000`. A later BLUAI `10001 can not set pm more than pv`
+  incident exposed boundary churn: exact margin-cap rejection now records a
+  qty/step circuit breaker, refreshes exchange state once, switches to the 8%
+  fallback and never repeats the write until qty/step or position value changes
+  materially. Identical blocked events are deduplicated. Admission now applies
+  the same exchange-cap model step by step; on the captured three-position
+  state, 2/3/5-leg next-gate headroom becomes positive while full-path stress
+  remains negative and visible. Related regression passed `124`; complete
+  regression passed `720` plus `8` subtests with unchanged production hashes.
 - Pump Live shared-margin research on 2026-08-10 identified a fill-to-stop race
   in the sequential ladder gate: the higher short fill improves projected
   liquidation, but the old Full stop remains until the next synchronization.
