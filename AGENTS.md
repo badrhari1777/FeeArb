@@ -109,6 +109,21 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live v4 next-fill reaction safety was raised to `12%/12%` on
+  2026-08-11 after the BMT audit measured roughly `7.35s` hot-ladder cycle
+  starts and found that the former 2.5% pre-fill stop gap could be crossed by a
+  fast mark-price move before quantity/protection reconciliation. New dynamic
+  `PUMP_LIVE_ON_DEMAND_FILL_REACTION_BUFFER_PCT=12` applies only to
+  `v4_shared_ondemand`, including already-open positions after restart; rollback
+  managers retain their 2.5%/8% inputs. Before any nearest ladder remains live,
+  both the still-active Full Stop and the fully-filled projected Full Stop must
+  clear that ladder by at least 12% with zero tolerance. The exact BMT three-leg
+  model requires about `$45` before L2 and `$315` before L3 and retains more
+  than 20% projected liquidation buffer after L3. Margin release uses the same
+  v4 boundary. Pump/API/lab regression passed (`211 passed`, `6 warnings`),
+  and the complete suite passed (`743 passed`, `8` subtests, `13` pre-existing
+  warnings). Canonical operation and rollout evidence are in
+  `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`.
 - Strategy Lab Candidate Observatory selection was made deterministic on
   2026-08-11 without enabling any collector or trading path. Baseline/Watch/Hot
   remain `60/25/8`, but now use explicit P0/control formulas, multi-family-first

@@ -153,13 +153,15 @@ def test_on_demand_every_next_fill_keeps_old_and_projected_stop_clear(
             target_leg=target_leg,
             leverage=config.leverage,
             stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
-            safety_above_next_ladder_pct=config.entry_margin_prefund_safety_pct,
+            safety_above_next_ladder_pct=(
+                config.on_demand_fill_reaction_buffer_pct
+            ),
             final_fill_buffer_pct=config.projected_final_fill_buffer_pct,
             maintenance_margin_rate=config.entry_margin_prefund_mmr,
             taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
             round_up_increment_usd=config.entry_margin_prefund_round_usd,
             projected_reaction_buffer_pct=(
-                config.projected_exchange_cap_reaction_buffer_pct
+                config.on_demand_fill_reaction_buffer_pct
             ),
         )
         required = float(plan["required_add_usd"])
@@ -172,13 +174,15 @@ def test_on_demand_every_next_fill_keeps_old_and_projected_stop_clear(
             target_leg=target_leg,
             leverage=config.leverage,
             stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
-            safety_above_next_ladder_pct=config.entry_margin_prefund_safety_pct,
+            safety_above_next_ladder_pct=(
+                config.on_demand_fill_reaction_buffer_pct
+            ),
             final_fill_buffer_pct=config.projected_final_fill_buffer_pct,
             maintenance_margin_rate=config.entry_margin_prefund_mmr,
             taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
             round_up_increment_usd=config.entry_margin_prefund_round_usd,
             projected_reaction_buffer_pct=(
-                config.projected_exchange_cap_reaction_buffer_pct
+                config.on_demand_fill_reaction_buffer_pct
             ),
         )
         fill_price = float(target_leg["trigger_price"])
@@ -189,10 +193,10 @@ def test_on_demand_every_next_fill_keeps_old_and_projected_stop_clear(
 
         assert verified["required_add_usd"] == 0.0
         assert old_stop / fill_price - 1.0 >= (
-            config.entry_margin_prefund_safety_pct / 100.0 - 1e-9
+            config.on_demand_fill_reaction_buffer_pct / 100.0 - 1e-9
         )
         assert projected_stop / fill_price - 1.0 >= (
-            config.projected_exchange_cap_reaction_buffer_pct / 100.0 - 1e-9
+            config.on_demand_fill_reaction_buffer_pct / 100.0 - 1e-9
         )
 
         qty = float(verified["projected_qty"])
@@ -293,7 +297,7 @@ def test_on_demand_full_next_fill_survives_old_stop_and_arms_following_step(
     gateway.balance.update(
         {"total": 3_000.0, "wallet": 3_000.0, "available": 3_000.0}
     )
-    gateway.liq_after_add_sequence = [15.82]
+    gateway.liq_after_add_sequence = [18.0]
     controller = PumpLiveController(
         gateway=gateway,
         state_dir=tmp_path / "state",
@@ -317,7 +321,7 @@ def test_on_demand_full_next_fill_survives_old_stop_and_arms_following_step(
     projected_liq = float(item["margin_prefund_plan"]["projected_liq_price"])
     projected_qty = float(item["margin_prefund_plan"]["projected_qty"])
 
-    assert stop_before_fill / fill_price - 1.0 >= 0.025
+    assert stop_before_fill / fill_price - 1.0 >= 0.12
     assert item["margin_prefund_verification"]["projected"]["ready"] is True
     for order in gateway.orders:
         if order.get("id") == second_leg["order_id"]:
@@ -349,12 +353,12 @@ def test_on_demand_full_next_fill_survives_old_stop_and_arms_following_step(
         target_leg=third_leg,
         leverage=3.0,
         stop_gap_from_liq_pct=2.5,
-        safety_above_next_ladder_pct=2.5,
+        safety_above_next_ladder_pct=12.0,
         final_fill_buffer_pct=20.0,
         maintenance_margin_rate=0.025,
         taker_fee_rate=0.00055,
         round_up_increment_usd=5.0,
-        projected_reaction_buffer_pct=8.0,
+        projected_reaction_buffer_pct=12.0,
     )
     factor = projected_qty * 1.025 * 1.00055
     gateway.liq_after_add_sequence = [
@@ -371,8 +375,99 @@ def test_on_demand_full_next_fill_survives_old_stop_and_arms_following_step(
     assert updated["legs"][2]["status"] == "open"
     assert updated["ladder_gate_status"] == "ready"
     assert newly_synced_stops
-    assert min(newly_synced_stops) / fill_price - 1.0 >= 0.08
+    assert min(newly_synced_stops) / fill_price - 1.0 >= 0.12
     assert not any(op.startswith("market_reduce:") for op in gateway.operations)
+
+
+def test_on_demand_bmt_three_leg_path_prefunds_12_pct_before_each_fill() -> None:
+    config = risk_policy_config(
+        RISK_POLICY_V3,
+        PumpLiveConfig(margin_manager_policy_id=MARGIN_MANAGER_V4_ON_DEMAND),
+    )
+    legs = [
+        {
+            "step": 1,
+            "trigger_price": 0.019848,
+            "notional_usd": 300.0,
+            "status": "filled",
+        },
+        {
+            "step": 2,
+            "trigger_price": 0.029772,
+            "notional_usd": 600.0,
+            "status": "planned",
+        },
+        {
+            "step": 3,
+            "trigger_price": 0.039696,
+            "notional_usd": 900.0,
+            "status": "planned",
+        },
+    ]
+    qty = 15_117.0
+    liq = 0.03155
+    required_by_step: list[float] = []
+
+    for target_leg in legs[1:]:
+        plan = ladder_prefund_plan(
+            policy_id=MARGIN_MANAGER_V4_ON_DEMAND,
+            qty=qty,
+            current_liq_price=liq,
+            legs=legs,
+            target_leg=target_leg,
+            leverage=config.leverage,
+            stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
+            safety_above_next_ladder_pct=(
+                config.on_demand_fill_reaction_buffer_pct
+            ),
+            final_fill_buffer_pct=config.projected_final_fill_buffer_pct,
+            maintenance_margin_rate=config.entry_margin_prefund_mmr,
+            taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
+            round_up_increment_usd=config.entry_margin_prefund_round_usd,
+            projected_reaction_buffer_pct=(
+                config.on_demand_fill_reaction_buffer_pct
+            ),
+        )
+        required = float(plan["required_add_usd"])
+        required_by_step.append(required)
+        factor = (
+            qty
+            * (1.0 + config.entry_margin_prefund_mmr)
+            * (1.0 + config.entry_margin_prefund_taker_fee_rate)
+        )
+        liq += required / factor
+        fill_price = float(target_leg["trigger_price"])
+        old_stop = liq * (1.0 - config.exchange_stop_gap_from_liq_pct / 100.0)
+        assert old_stop / fill_price - 1.0 >= 0.12
+
+        verified = ladder_prefund_plan(
+            policy_id=MARGIN_MANAGER_V4_ON_DEMAND,
+            qty=qty,
+            current_liq_price=liq,
+            legs=legs,
+            target_leg=target_leg,
+            leverage=config.leverage,
+            stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
+            safety_above_next_ladder_pct=(
+                config.on_demand_fill_reaction_buffer_pct
+            ),
+            final_fill_buffer_pct=config.projected_final_fill_buffer_pct,
+            maintenance_margin_rate=config.entry_margin_prefund_mmr,
+            taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
+            round_up_increment_usd=config.entry_margin_prefund_round_usd,
+            projected_reaction_buffer_pct=(
+                config.on_demand_fill_reaction_buffer_pct
+            ),
+        )
+        assert verified["required_add_usd"] == 0.0
+        projected_stop = float(verified["projected_stop_price"])
+        assert projected_stop / fill_price - 1.0 >= 0.12
+        qty = float(verified["projected_qty"])
+        liq = float(verified["projected_liq_price"])
+        target_leg["status"] = "filled"
+
+    assert required_by_step == [45.0, 315.0]
+    assert (liq / float(legs[-1]["trigger_price"]) - 1.0) * 100.0 >= 20.0
 
 
 def test_risk_snapshot_remains_immutable_when_runtime_defaults_change() -> None:
@@ -930,6 +1025,7 @@ def write_env(
                 f"PUMP_LIVE_MARGIN_MANAGER_POLICY={margin_manager_policy}",
                 "PUMP_LIVE_PROJECTED_FINAL_FILL_BUFFER_PCT=20",
                 "PUMP_LIVE_PROJECTED_EXCHANGE_CAP_REACTION_BUFFER_PCT=8",
+                "PUMP_LIVE_ON_DEMAND_FILL_REACTION_BUFFER_PCT=12",
                 "PUMP_LIVE_SHARED_RESCUE_FACILITY_CAP_USD=2000",
                 (
                     "PUMP_LIVE_SHARED_MAX_POSITION_TOPUP_USD=5000"
@@ -2064,6 +2160,7 @@ def test_margin_manager_versions_are_separate_and_current_is_default(
     assert shared.margin_manager_policy_id == MARGIN_MANAGER_V3_SHARED
     assert shared.projected_final_fill_buffer_pct == 20.0
     assert shared.projected_exchange_cap_reaction_buffer_pct == 8.0
+    assert shared.on_demand_fill_reaction_buffer_pct == 12.0
     assert shared.shared_rescue_facility_cap_usd == 2_000.0
     assert shared.shared_max_position_topup_usd == 2_000.0
 
@@ -2606,17 +2703,19 @@ def test_margin_manager_switch_is_runtime_dynamic_for_legacy_position_snapshot()
     active = config_from_risk_snapshot(
         old_snapshot,
         PumpLiveConfig(
-            margin_manager_policy_id=MARGIN_MANAGER_V3_SHARED,
+            margin_manager_policy_id=MARGIN_MANAGER_V4_ON_DEMAND,
             projected_final_fill_buffer_pct=25.0,
             projected_exchange_cap_reaction_buffer_pct=12.0,
+            on_demand_fill_reaction_buffer_pct=14.0,
             shared_rescue_facility_cap_usd=600.0,
             shared_max_position_topup_usd=1_100.0,
         ),
     )
 
-    assert active.margin_manager_policy_id == MARGIN_MANAGER_V3_SHARED
+    assert active.margin_manager_policy_id == MARGIN_MANAGER_V4_ON_DEMAND
     assert active.projected_final_fill_buffer_pct == 25.0
     assert active.projected_exchange_cap_reaction_buffer_pct == 12.0
+    assert active.on_demand_fill_reaction_buffer_pct == 14.0
     assert active.shared_rescue_facility_cap_usd == 600.0
     assert active.shared_max_position_topup_usd == 1_100.0
     assert active.total_capital_usd == 1_000.0
@@ -3706,7 +3805,7 @@ def test_on_demand_margin_reduction_defers_without_exchange_trial(
     assert gateway.margin_removes == []
     assert gateway.margin_adds == []
     assert item["margin_reduce_confirm_count"] == 2
-    assert item["margin_reduce_deferred_reason"] == "next_ladder_safety_floor"
+    assert item["margin_reduce_deferred_reason"] == "current_next_gate_not_ready"
     assert item["margin_reduce_plan"]["amount_usd"] == 0.0
 
 

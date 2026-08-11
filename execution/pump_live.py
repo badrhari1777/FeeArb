@@ -88,6 +88,7 @@ class PumpLiveConfig:
     margin_manager_policy_id: str = MARGIN_MANAGER_V2_CURRENT
     projected_final_fill_buffer_pct: float = 20.0
     projected_exchange_cap_reaction_buffer_pct: float = 8.0
+    on_demand_fill_reaction_buffer_pct: float = 12.0
     shared_rescue_facility_cap_usd: float = 2_000.0
     shared_max_position_topup_usd: float = 5_000.0
     operating_cash_floor_usd: float = 25.0
@@ -169,6 +170,7 @@ def config_from_risk_snapshot(
         "margin_manager_policy_id",
         "projected_final_fill_buffer_pct",
         "projected_exchange_cap_reaction_buffer_pct",
+        "on_demand_fill_reaction_buffer_pct",
         "shared_rescue_facility_cap_usd",
         "shared_max_position_topup_usd",
         "account_entry_free_pct",
@@ -399,6 +401,10 @@ def load_pump_live_config(path: Path = PUMP_LIVE_ENV_PATH) -> PumpLiveConfig:
         values.get("PUMP_LIVE_PROJECTED_EXCHANGE_CAP_REACTION_BUFFER_PCT"),
         8.0,
     )
+    on_demand_fill_reaction_buffer = _safe_float(
+        values.get("PUMP_LIVE_ON_DEMAND_FILL_REACTION_BUFFER_PCT"),
+        12.0,
+    )
     shared_rescue_cap = _safe_float(
         values.get("PUMP_LIVE_SHARED_RESCUE_FACILITY_CAP_USD"),
         2_000.0,
@@ -450,6 +456,10 @@ def load_pump_live_config(path: Path = PUMP_LIVE_ENV_PATH) -> PumpLiveConfig:
             5.0,
             min(20.0, exchange_cap_reaction_buffer),
         ),
+        on_demand_fill_reaction_buffer_pct=max(
+            5.0,
+            min(25.0, on_demand_fill_reaction_buffer),
+        ),
         shared_rescue_facility_cap_usd=max(0.0, min(2_000.0, shared_rescue_cap)),
         shared_max_position_topup_usd=max(
             0.0,
@@ -468,6 +478,20 @@ def _is_shared_margin_manager(policy_id: str) -> bool:
 
 def _is_on_demand_margin_manager(policy_id: str) -> bool:
     return policy_id == MARGIN_MANAGER_V4_ON_DEMAND
+
+
+def _next_fill_current_clearance_pct(config: PumpLiveConfig) -> float:
+    """Keep the exchange stop clear while v4 has not observed the fill yet."""
+    if _is_on_demand_margin_manager(config.margin_manager_policy_id):
+        return config.on_demand_fill_reaction_buffer_pct
+    return config.entry_margin_prefund_safety_pct
+
+
+def _next_fill_projected_clearance_pct(config: PumpLiveConfig) -> float:
+    """Keep the recalculated stop clear after the complete next-order fill."""
+    if _is_on_demand_margin_manager(config.margin_manager_policy_id):
+        return config.on_demand_fill_reaction_buffer_pct
+    return config.projected_exchange_cap_reaction_buffer_pct
 
 
 def _effective_active_risk_policy_id(
@@ -1381,6 +1405,10 @@ class PumpLiveController:
             ),
             "exchange_cap_reaction_buffer_pct": round(
                 config.projected_exchange_cap_reaction_buffer_pct,
+                6,
+            ),
+            "fill_reaction_buffer_pct": round(
+                _next_fill_current_clearance_pct(config),
                 6,
             ),
             "hot_ladder_poll_interval_sec": PREFUND_HOT_LADDER_POLL_SEC,
@@ -2620,7 +2648,7 @@ class PumpLiveController:
             target_legs=(legs[1:] if complete_path else legs[1:2]),
             leverage=config.leverage,
             stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
-            safety_above_next_ladder_pct=config.entry_margin_prefund_safety_pct,
+            safety_above_next_ladder_pct=_next_fill_current_clearance_pct(config),
             final_fill_buffer_pct=config.projected_final_fill_buffer_pct,
             maintenance_margin_rate=config.entry_margin_prefund_mmr,
             taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
@@ -2628,7 +2656,7 @@ class PumpLiveController:
             correction_steps=PREFUND_MAX_CORRECTION_STEPS,
             position_margin_usd=_safe_float(first.get("margin_usd"), 0.0),
             exchange_cap_reaction_buffer_pct=(
-                config.projected_exchange_cap_reaction_buffer_pct
+                _next_fill_projected_clearance_pct(config)
             ),
         )
         return reserve
@@ -2731,14 +2759,14 @@ class PumpLiveController:
                 leverage=candidate_config.leverage,
                 stop_gap_from_liq_pct=candidate_config.exchange_stop_gap_from_liq_pct,
                 safety_above_next_ladder_pct=(
-                    candidate_config.entry_margin_prefund_safety_pct
+                    _next_fill_current_clearance_pct(candidate_config)
                 ),
                 final_fill_buffer_pct=candidate_config.projected_final_fill_buffer_pct,
                 maintenance_margin_rate=candidate_config.entry_margin_prefund_mmr,
                 taker_fee_rate=candidate_config.entry_margin_prefund_taker_fee_rate,
                 round_up_increment_usd=candidate_config.entry_margin_prefund_round_usd,
                 projected_reaction_buffer_pct=(
-                    candidate_config.projected_exchange_cap_reaction_buffer_pct
+                    _next_fill_projected_clearance_pct(candidate_config)
                 ),
             )
             initial_safety = _safe_float(initial_plan.get("required_add_usd"), 0.0)
@@ -2873,7 +2901,9 @@ class PumpLiveController:
                         target_legs=remaining_legs,
                         leverage=position_config.leverage,
                         stop_gap_from_liq_pct=position_config.exchange_stop_gap_from_liq_pct,
-                        safety_above_next_ladder_pct=position_config.entry_margin_prefund_safety_pct,
+                        safety_above_next_ladder_pct=_next_fill_current_clearance_pct(
+                            position_config
+                        ),
                         final_fill_buffer_pct=position_config.projected_final_fill_buffer_pct,
                         maintenance_margin_rate=position_config.entry_margin_prefund_mmr,
                         taker_fee_rate=position_config.entry_margin_prefund_taker_fee_rate,
@@ -2883,7 +2913,7 @@ class PumpLiveController:
                             item.get("position_margin_usd")
                         ),
                         exchange_cap_reaction_buffer_pct=(
-                            position_config.projected_exchange_cap_reaction_buffer_pct
+                            _next_fill_projected_clearance_pct(position_config)
                         ),
                     )
                     full_path_required = _safe_float(
@@ -4389,13 +4419,13 @@ class PumpLiveController:
             target_leg=target_leg,
             leverage=config.leverage,
             stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
-            safety_above_next_ladder_pct=config.entry_margin_prefund_safety_pct,
+            safety_above_next_ladder_pct=_next_fill_current_clearance_pct(config),
             final_fill_buffer_pct=config.projected_final_fill_buffer_pct,
             maintenance_margin_rate=config.entry_margin_prefund_mmr,
             taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
             round_up_increment_usd=config.entry_margin_prefund_round_usd,
             projected_reaction_buffer_pct=(
-                config.projected_exchange_cap_reaction_buffer_pct
+                _next_fill_projected_clearance_pct(config)
             ),
         )
         if policy_id == MARGIN_MANAGER_V3_SHARED:
@@ -5092,14 +5122,14 @@ class PumpLiveController:
                 leverage=config.leverage,
                 stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
                 safety_above_next_ladder_pct=(
-                    config.entry_margin_prefund_safety_pct
+                    _next_fill_current_clearance_pct(config)
                 ),
                 final_fill_buffer_pct=config.projected_final_fill_buffer_pct,
                 maintenance_margin_rate=config.entry_margin_prefund_mmr,
                 taker_fee_rate=config.entry_margin_prefund_taker_fee_rate,
                 round_down_increment_usd=config.entry_margin_prefund_round_usd,
                 projected_reaction_buffer_pct=(
-                    config.projected_exchange_cap_reaction_buffer_pct
+                    _next_fill_projected_clearance_pct(config)
                 ),
             )
             amount = _safe_float(reduction_plan.get("amount_usd"), 0.0)

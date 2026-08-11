@@ -992,16 +992,25 @@ margin for the added contracts when filled. It is not sufficient by itself for
 the short reaction window, so v4 also verifies isolated prefund before the
 order may remain live.
 
-The two boundaries are mandatory and accept no tolerance:
+For `v4_shared_ondemand`, both boundaries now use the same dedicated
+`PUMP_LIVE_ON_DEMAND_FILL_REACTION_BUFFER_PCT=12` value and accept no
+tolerance:
 
-1. The currently active Full Stop must be at least 2.5% above the next order's
-   fill price. Therefore touching/filling that order cannot immediately trigger
-   the old stop while the monitor has not yet observed the larger quantity.
+1. The currently active Full Stop must be at least 12% above the next order's
+   fill price. This is the pre-fill reaction budget while the monitor has not
+   yet observed the larger quantity.
 2. A full-order fill is projected in advance, including its 3x initial margin.
-   The Full Stop derived from projected liquidation must be at least 8% above
+   The Full Stop derived from projected liquidation must also be at least 12% above
    the same fill price. After the fill, the monitor rereads quantity, average
    and liquidation, synchronizes Full TP/SL, and only then funds/places the
    following ladder.
+
+The older `PUMP_LIVE_MARGIN_PREFUND_SAFETY_PCT=2.5` and
+`PUMP_LIVE_PROJECTED_EXCHANGE_CAP_REACTION_BUFFER_PCT=8` remain rollback
+inputs for `v2_current_next` and `v3_shared_projected`; they do not weaken the
+active v4 boundary. The v4 value is dynamic, so after a safe restart it also
+applies to already-open positions whose immutable entry-sizing snapshot was
+created under an earlier margin-manager version.
 
 Margin release uses the inverse sequence. It still requires two consecutive
 `>=35%` position-buffer reads and 30 minutes since the last add/remove. Before
@@ -1022,3 +1031,33 @@ no error/block and all gates ready. Current/projected clearances were
 RATS `2.59%/16.45%`, BLUAI `3.01%/8.51%`, and ACE `3.15%/12.62%`, versus the
 required `2.5%/8%`; the unified positions endpoint reported zero protection
 issues.
+
+## 12% v4 fill-reaction hardening (2026-08-11)
+
+A fresh BMT audit found that the earlier current/projected `2.5%/8%` pair did
+not fully cover the period between a Bybit ladder fill and the next exchange
+reconciliation. The hot-ladder loop sleeps for `5s`, but measured start-to-start
+cycles were about `7.35s` including network and processing time. BMT Mark Price
+also produced post-entry one-minute rises above the old current-stop clearance.
+The risk was a protected Full SL exit before the controller could resync the
+larger position, not an unprotected liquidation.
+
+The active v4 contract is therefore `12%/12%` before every physical next
+ladder may remain open. The pre-write gate cancels and confirms an existing
+nearest order if necessary, adds and verifies isolated margin, resynchronizes
+Full TP/SL, and only then recreates that one order. No distant ladder is made
+live. Margin release uses the same 12% boundary, so surplus cannot be removed
+when it would reopen the fill-reaction window.
+
+The exact BMT three-leg regression starts from exchange-like state
+`qty=15117`, `liq=0.03155`, L2 `0.029772` and L3 `0.039696`. It requires about
+`$45` before L2 and `$315` before L3, verifies the still-active stop and the
+fully-filled projected stop at or above 12% for both transitions, and leaves
+the projected post-L3 liquidation buffer above 20%. These values are model
+outputs rounded to `$5`; live Bybit reads remain authoritative.
+
+Verified Python compilation, focused Pump tests (`112 passed`), the expanded
+Pump/API/lab set (`211 passed`, `6 warnings`), and the complete project suite
+(`743 passed`, `8` subtests, `13` pre-existing warnings). The production event
+journal hash was unchanged by the test runs; the live state file continued to
+advance normally under the already-running monitor.
