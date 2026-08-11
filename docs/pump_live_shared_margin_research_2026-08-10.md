@@ -361,12 +361,12 @@ transition and had no active execution.
 ## Pre-write margin release and full-fill transition regression (2026-08-11)
 
 The first v4 deployment exposed a conservative but noisy implementation detail:
-the controller derived a 25% buffer amount, submitted `remove_margin`, then
+the controller derived a 30% buffer amount, submitted `remove_margin`, then
 rolled it back if the immediate next-fill gate failed. Net margin was unchanged,
 but a predictable unsafe removal should never reach Bybit.
 
 `plan_safe_margin_reduction` now runs before any private write. It first caps
-the candidate by the amount that leaves a 25% liquidation buffer, then uses a
+the candidate by the amount that leaves a 30% liquidation buffer, then uses a
 binary search over `$5` increments. Every candidate simulates the lower short
 liquidation price and reruns the same v4 current-plus-full-fill ladder plan. A
 candidate is safe only when the current desired stop still clears the order by
@@ -395,3 +395,17 @@ is not double-counted as order notional.
 Pre-deployment validation passed Python compilation, `165` expanded
 Pump/transfer/API/lab/positions tests and the full project suite (`736 passed`,
 `8` subtests, `13` pre-existing warnings).
+
+The change was then deployed through the normal disarmed restart and explicit
+`ARM PUMP LIVE 3000`. After the existing 30-minute hysteresis elapsed, the live
+planner removed `$10` RATS, `$20` BLUAI and `$75` ACE exactly as precomputed.
+Available Pump cash increased from `$2270.39` to `$2375.39`; tracked added
+margin became `$25/$105/$90`, and no rollback event followed. Later monitor
+cycles stayed armed with no error/block, three positions and nine exchange
+orders. Direct Bybit inspection showed one non-reduce nearest ladder for every
+position plus two reduce-only Full TP/SL orders per position. Fresh
+current/projected clearances were RATS `2.59%/16.45%`, BLUAI `3.01%/8.51%` and
+ACE `3.15%/12.62%`; every nearest gate remained ready and the unified view
+reported zero protection issues. This is a successful live canary of both the
+pre-write reduction and the full-fill guard, not evidence that every future
+price/liquidation state will permit another reduction.

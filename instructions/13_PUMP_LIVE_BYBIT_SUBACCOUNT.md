@@ -1006,7 +1006,19 @@ The two boundaries are mandatory and accept no tolerance:
 Margin release uses the inverse sequence. It still requires two consecutive
 `>=35%` position-buffer reads and 30 minutes since the last add/remove. Before
 calling Bybit, `plan_safe_margin_reduction` finds the largest `$5` increment
-that leaves at least a 25% buffer and preserves both next-fill boundaries. If
+that leaves at least a 30% buffer and preserves both next-fill boundaries. If
 no `$5` increment is safe, no exchange call is made. A submitted removal is
 still reread from Bybit; any unexpected buffer or next-gate failure causes an
 immediate rollback and Full TP/SL resync.
+
+Live rollout evidence: after a safe disarmed restart and explicit
+`ARM PUMP LIVE 3000`, the first eligible reduction cycle released `$10` RATS,
+`$20` BLUAI and `$75` ACE. Pump available cash rose from about `$2270.39` to
+`$2375.39`; the resulting tracked top-ups were `$25/$105/$90`, with no
+rollback. Direct Bybit read showed nine orders: physical RATS L2 at `0.074835`
+(exchange display tick `0.07484`), BLUAI L3 at `0.035682`, ACE L2 at `0.17556`,
+and six reduce-only Full TP/SL orders. Later monitor reads remained armed with
+no error/block and all gates ready. Current/projected clearances were
+RATS `2.59%/16.45%`, BLUAI `3.01%/8.51%`, and ACE `3.15%/12.62%`, versus the
+required `2.5%/8%`; the unified positions endpoint reported zero protection
+issues.

@@ -117,7 +117,7 @@ Recent Changes
   case fills L2 completely, resyncs qty/average/liquidation and Full TP/SL, and
   permits L3 only after its fresh gate. Margin release no longer discovers an
   unsafe amount by calling Bybit remove then add. A pure binary-search planner
-  first caps the `$5` increment by the 25% liquidation target and the complete
+  first caps the `$5` increment by the 30% liquidation target and the complete
   next-fill gate; only the largest safe amount is submitted, while zero-safe
   cases remain untouched and auditable. The captured RATS/BLUAI/ACE state
   planned `$10/$20/$75` release versus the former `$35/$25/$165` trial/rollback.
@@ -125,7 +125,15 @@ Recent Changes
   verification/rollback remains a final defence against model/exchange drift.
   Verified Python compilation, the expanded Pump/API/lab set (`165 passed`,
   `6 warnings`) and the full project suite (`736 passed`, `8` subtests,
-  `13` pre-existing warnings).
+  `13` pre-existing warnings). Safe deployment restarted disarmed and explicit
+  `ARM PUMP LIVE 3000` restored entry ownership. The first eligible live cycle
+  then removed exactly `$10/$20/$75` from RATS/BLUAI/ACE, freeing `$105`
+  (`$2270.39 -> $2375.39` available) without rollback. Subsequent exchange and
+  API reads remained armed with three positions, three physical non-reduce
+  ladders plus six Full TP/SL orders, all nearest gates ready and zero
+  protection issues. Current/projected stop clearance was respectively
+  `2.59%/16.45%`, `3.01%/8.51%`, and `3.15%/12.62%` against the mandatory
+  `2.5%/8%` floors.
 - Pump Live capital allocation moved to the versioned on-demand manager on
   2026-08-11. `v4_shared_ondemand` preserves exchange-isolated positions and
   every legacy per-position snapshot, while future `$3000` entries use the new
