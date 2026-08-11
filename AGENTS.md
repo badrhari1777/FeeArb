@@ -109,6 +109,20 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab Candidate Observatory selection was made deterministic on
+  2026-08-11 without enabling any collector or trading path. Baseline/Watch/Hot
+  remain `60/25/8`, but now use explicit P0/control formulas, multi-family-first
+  plus capped round-robin selection across external, funding, basis, momentum,
+  and OI/volume/premium pools. A new own-feed top-movers basket ranks 5m, 15m,
+  1h, 4h, 24h, 72h and 7d gainers/losers from uniform 60s bulk snapshots, with
+  absolute-or-robust-z intake, acceleration, venue dispersion, lead/lag, and
+  new-listing quality states. A public read-only probe returned 730 Binance,
+  812 Bybit, 442 OKX and 677 KuCoin raw ticker rows; Gate bulk REST exceeded a
+  50s timeout and therefore stays WebSocket/isolated slow fallback. Coinglass
+  price-change is an external cross-check and CoinMarketCap movers are context,
+  not separate perpetual quotas. Canonical details and exact formulas are in
+  `instructions/18_STRATEGY_LAB_CANDIDATE_OBSERVATORY.md`; Phase O0 remains the
+  next safe block and no long run, shadow/paper, ARM or live change is approved.
 - A funding-corrected Pump Short replay was added on 2026-08-11 after the HUSDT
   audit found that fixed 8h pagination truncated its hourly funding history.
   The public collector now paginates backwards by the oldest returned

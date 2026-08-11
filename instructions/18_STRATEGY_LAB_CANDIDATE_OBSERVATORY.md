@@ -336,6 +336,9 @@ funding_cadence_change
 spread_level
 spread_residual
 spread_velocity
+price_momentum_rank
+price_acceleration
+cross_venue_price_lead
 premium_dislocation
 oi_volume_price_anomaly
 held_position
@@ -354,9 +357,10 @@ Monitoring priority распределяет ограниченные Watch/Hot 
 | Источник | Целевой максимум в Baseline | Обычный Watch приоритет |
 |---|---:|---|
 | Открытые позиции и manual pins | без квоты, всегда первые | `P0` |
-| Exact Coinglass среди пяти бирж | до `15` | `P1`, если подтверждён своим feed |
+| External exact-five seeds: Coinglass/ArbitrageScanner | до `15` вместе | `P1`, если подтверждён своим feed |
 | Funding level/acceleration/dispersion | до `15` | `P1/P2` |
 | Spread level/residual/velocity | до `15` | `P1/P2` |
+| Price momentum/rank/acceleration | до `15` | `P1/P2` |
 | OI-volume-price/premium anomalies | до `10` | `P1/P2` |
 | Matched controls | минимум `10`, не менее `15–20%` | `P3` |
 
@@ -370,6 +374,60 @@ source tags. Если P0 занимает большую часть Watch, кв�
 сигнала. Абсолютный safety-net residual может собирать события от `0.5 п.п.`, но
 это не entry threshold. После `7d` QA пороги можно менять только для достижения
 coverage/квот, не на основании PnL; version и причина изменения обязательны.
+
+### Точный алгоритм формирования 60 / 25 / 8
+
+Чтобы слово «квота» не оставалось неоднозначным, первая версия использует
+детерминированный порядок.
+
+`Discovery` раз в `60s` получает узкие bulk-снимки всех торгуемых USDT perpetuals
+из Instrument Registry. Это ещё не список из 60 монет и не per-symbol REST loop.
+Из него независимо строятся пять ranked pools:
+
+1. external exact-five seeds: до `15` уникальных symbols после объединения
+   Coinglass и ArbitrageScanner;
+2. funding: до `15`;
+3. directed spread/basis: до `15`;
+4. price momentum/rank: до `15`;
+5. OI-volume-premium: до `10`.
+
+Одна монета в трёх pools занимает одно место и сохраняет три source tags.
+
+Итоговый `Baseline=60`:
+
+```text
+K = число held positions + manual pins
+controls = 10
+event_slots = max(0, 50 - K)
+baseline = K P0 + event_slots events + 10 controls
+```
+
+Event slots сначала получают все подтверждённые own-feed кандидаты с двумя и
+более независимыми trigger families, затем заполняются round-robin из пяти pools.
+Пока остальные pools имеют пригодные строки, один family не может занимать более
+`40%` event slots. Внутри family сортировка идёт по percentile/robust-z severity,
+source freshness и числу подтверждающих venues, а не по историческому PnL. Если
+`K > 50`, P0 не удаляется: Baseline временно расширяется до `K + 10 controls`.
+
+Итоговый `Watch=25`:
+
+```text
+K = все P0 symbols
+controls = 5
+watch_events = max(0, 20 - K)
+watch = K P0 + watch_events + 5 matched controls
+```
+
+Watch events сначала включают multi-family `P1`, затем заполняются тем же
+family-balanced round-robin. Исчезнувший trigger остаётся минимум `2h` и полный
+relevant funding tail; поэтому место освобождается по lifecycle, а не мгновенно.
+Если P0 занял больше 20 мест, P0 сохраняется, controls уменьшаются первыми.
+
+Итоговый `Hot=8`: все symbols реальных открытых ног занимают места первыми;
+оставшиеся места получают только own-feed-confirmed P1 или экстремальный P2.
+Matched controls в Hot не входят. Для Hot подписываются текущие две ноги и лучшая
+roll-нога, а не все пять бирж с полным стаканом. Если открытых symbols больше
+восьми, cap временно расширяется: существующая позиция не теряет risk monitoring.
 
 Candidate identity:
 
@@ -449,7 +507,53 @@ index/premium-normalized basis
 абсолютный spread по общему порогу. При двух доступных биржах используется только
 историческая норма конкретной пары; «глобальная медиана» не выдумывается.
 
-### D. OI / volume / price / premium candidates
+### D. Price momentum / top movers
+
+Готовый рейтинг сайта не нужен как основной источник. Раз в `60s` сохраняется
+цена каждого доступного venue из bulk ticker/mark feed. Для каждого symbol
+считаются per-venue returns, затем robust median по свежим venues и отдельно
+межбиржевая dispersion/leader:
+
+```text
+5m / 15m / 1h / 4h / 24h / 72h / 7d return
+current 15m - previous 15m acceleration
+current 1h - previous 1h acceleration
+cross-venue return dispersion
+first venue to move / lagging venues
+```
+
+Для каждого окна сохраняются top `3` gainers и top `3` losers. В candidate pool
+попадает только строка, которая одновременно входит в top-3 и проходит хотя бы
+одно широкое intake-условие:
+
+| Window | Initial absolute move |
+|---|---:|
+| `5m` | `1.5%` |
+| `15m` | `2.5%` |
+| `1h` | `5%` |
+| `4h` | `8%` |
+| `24h` | `15%` |
+| `72h` | `25%` |
+| `7d` | `40%` |
+
+Вместо absolute move достаточно robust `|z| >= 2.5` относительно собственной
+истории symbol/window. Порог является intake, не entry. После `7d` QA его можно
+корректировать только для разумного event coverage. Монета с одной доступной
+биржей не выбрасывается, но получает `single_venue`; отсутствие полного окна
+даёт `insufficient_history`, а не нулевой return. New listings сохраняются
+отдельной cohort, чтобы их не сравнивать с устоявшимися контрактами.
+
+Native 24h поля бирж сохраняются как cross-check, но канонические `1h/24h/72h/7d`
+рейтинги считаются из одинаковых собственных timestamped snapshots. Это устраняет
+разницу rolling-24h против UTC-day и даёт KuCoin те же окна без тяжёлого
+per-symbol kline fan-out.
+
+Coinglass `coins-price-change` может независимо подтвердить `5m..24h` mover, но
+остаётся plan-dependent external tag. CoinMarketCap gainers/losers относится к
+spot/top-market-cap universe и полезен только как слабый внешний context: он не
+должен занимать отдельную квоту perpetual candidates.
+
+### E. OI / volume / price / premium candidates
 
 OI сравнивается прежде всего с собственной историей той же биржи: raw OI разных
 бирж может иметь разные единицы, multiplier и качество отчётности.
@@ -469,7 +573,7 @@ OI сравнивается прежде всего с собственной и
 истинные объяснения «новые long», «short covering» и т.п. Их ценность должна быть
 доказана outcomes.
 
-### E. Positions and roll candidates
+### F. Positions and roll candidates
 
 Каждая открытая пара автоматически становится кандидатом и получает все доступные
 альтернативные ноги. Для current `long=L, short=S` оцениваются:
@@ -496,7 +600,7 @@ roll_value(horizon) =
 tick, а не только победитель. Это позволит позже понять, когда roll был действительно
 лучше HOLD/EXIT и когда красивый funding был съеден новым basis.
 
-### F. Matched controls
+### G. Matched controls
 
 Минимум `15–20%` Baseline/Watch мест резервируется для событий без сильного
 сигнала, сопоставленных по:

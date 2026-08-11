@@ -584,3 +584,29 @@ Shadow -> live:
   exact aliases/sign tests и research-only adapters. Источники остаются disabled
   до отдельного bounded preflight; long run, shadow positions, paper/live, ARM и
   торговые настройки этим checkpoint не разрешены.
+
+### 2026-08-11 — точный candidate mix и собственный top-movers intake
+
+- Baseline/Watch/Hot теперь имеют детерминированную формулу `60/25/8`: P0
+  позиции/manual pins не вытесняются, Baseline сохраняет 10 matched controls,
+  Watch — 5, а остальные места заполняются multi-family first и затем
+  family-balanced round-robin. Один trigger family не может занять более 40%
+  event slots при наличии альтернатив.
+- Пять ranked pools: external exact-five, funding, directed basis, собственный
+  price momentum и OI-volume-premium. До итоговой дедупликации они дают максимум
+  `15/15/15/15/10`; совпадение источников повышает monitoring priority, но не
+  считается доказательством alpha.
+- Новый `price_momentum_rank` считается самостоятельно из 60-секундных bulk
+  snapshots на `5m/15m/1h/4h/24h/72h/7d`: top-3 gainers и losers по каждому
+  окну плюс absolute/z-score intake, acceleration, cross-venue dispersion и
+  lead/lag. Native 24h бирж — cross-check, а не смешанная каноническая база.
+- Read-only public probe вернул `730 Binance / 812 Bybit / 442 OKX / 677 KuCoin`
+  raw ticker rows; Gate bulk REST не ответил даже за 50s. Это подтверждает
+  доступность дешёвого собственного ranking на первых четырёх venues и
+  необходимость Gate WebSocket/slow isolated fallback, а не последовательного
+  REST hot path.
+- Coinglass имеет официальный multi-window `coins-price-change` API и остаётся
+  независимым plan-dependent validation tag. CoinMarketCap top gainers — spot и
+  market-cap/volume filtered context, не источник отдельной perpetual-квоты.
+- Это уточнение design-only: collector, long run, shadow/paper, ARM, заявки и
+  live-модули не запускались и не менялись. Следующий safe block остаётся Phase O0.
