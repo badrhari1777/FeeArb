@@ -89,6 +89,9 @@ class PumpLiveConfig:
     projected_final_fill_buffer_pct: float = 20.0
     projected_exchange_cap_reaction_buffer_pct: float = 8.0
     on_demand_fill_reaction_buffer_pct: float = 12.0
+    ladder_watch_distance_pct: float = 55.0
+    ladder_activation_distance_pct: float = 35.0
+    ladder_release_distance_pct: float = 45.0
     shared_rescue_facility_cap_usd: float = 2_000.0
     shared_max_position_topup_usd: float = 5_000.0
     operating_cash_floor_usd: float = 25.0
@@ -171,6 +174,9 @@ def config_from_risk_snapshot(
         "projected_final_fill_buffer_pct",
         "projected_exchange_cap_reaction_buffer_pct",
         "on_demand_fill_reaction_buffer_pct",
+        "ladder_watch_distance_pct",
+        "ladder_activation_distance_pct",
+        "ladder_release_distance_pct",
         "shared_rescue_facility_cap_usd",
         "shared_max_position_topup_usd",
         "account_entry_free_pct",
@@ -405,6 +411,18 @@ def load_pump_live_config(path: Path = PUMP_LIVE_ENV_PATH) -> PumpLiveConfig:
         values.get("PUMP_LIVE_ON_DEMAND_FILL_REACTION_BUFFER_PCT"),
         12.0,
     )
+    ladder_activation_distance = _safe_float(
+        values.get("PUMP_LIVE_LADDER_ACTIVATION_DISTANCE_PCT"),
+        35.0,
+    )
+    ladder_release_distance = _safe_float(
+        values.get("PUMP_LIVE_LADDER_RELEASE_DISTANCE_PCT"),
+        45.0,
+    )
+    ladder_watch_distance = _safe_float(
+        values.get("PUMP_LIVE_LADDER_WATCH_DISTANCE_PCT"),
+        55.0,
+    )
     shared_rescue_cap = _safe_float(
         values.get("PUMP_LIVE_SHARED_RESCUE_FACILITY_CAP_USD"),
         2_000.0,
@@ -437,6 +455,18 @@ def load_pump_live_config(path: Path = PUMP_LIVE_ENV_PATH) -> PumpLiveConfig:
         account_warning_free,
         max(1.0, min(40.0, account_stress_free)),
     )
+    ladder_activation_distance = max(
+        5.0,
+        min(75.0, ladder_activation_distance),
+    )
+    ladder_release_distance = max(
+        ladder_activation_distance + 1.0,
+        min(90.0, ladder_release_distance),
+    )
+    ladder_watch_distance = max(
+        ladder_release_distance,
+        min(100.0, ladder_watch_distance),
+    )
     return PumpLiveConfig(
         entry_cap=max(1, min(4, entry_cap)),
         poll_interval_sec=max(5, min(60, poll_interval)),
@@ -460,6 +490,9 @@ def load_pump_live_config(path: Path = PUMP_LIVE_ENV_PATH) -> PumpLiveConfig:
             5.0,
             min(25.0, on_demand_fill_reaction_buffer),
         ),
+        ladder_watch_distance_pct=ladder_watch_distance,
+        ladder_activation_distance_pct=ladder_activation_distance,
+        ladder_release_distance_pct=ladder_release_distance,
         shared_rescue_facility_cap_usd=max(0.0, min(2_000.0, shared_rescue_cap)),
         shared_max_position_topup_usd=max(
             0.0,
@@ -492,6 +525,33 @@ def _next_fill_projected_clearance_pct(config: PumpLiveConfig) -> float:
     if _is_on_demand_margin_manager(config.margin_manager_policy_id):
         return config.on_demand_fill_reaction_buffer_pct
     return config.projected_exchange_cap_reaction_buffer_pct
+
+
+def _next_ladder_distance_pct(
+    item: Mapping[str, Any],
+    target_leg: Mapping[str, Any],
+) -> float | None:
+    """Return the remaining multiplicative rise from Mark to the next fill."""
+    mark = _safe_float(item.get("mark_price"), 0.0)
+    target = _safe_float(target_leg.get("trigger_price"), 0.0)
+    if mark <= 0 or target <= 0:
+        return None
+    return (target / mark - 1.0) * 100.0
+
+
+def _next_ladder_requires_gate(
+    item: Mapping[str, Any],
+    target_leg: Mapping[str, Any],
+    config: PumpLiveConfig,
+) -> bool:
+    if target_leg.get("status") in {"open", "submitted"}:
+        return True
+    distance = _next_ladder_distance_pct(item, target_leg)
+    if distance is None:
+        return True
+    return bool(
+        distance <= config.ladder_activation_distance_pct + 1e-9
+    )
 
 
 def _effective_active_risk_policy_id(
@@ -1411,6 +1471,18 @@ class PumpLiveController:
                 _next_fill_current_clearance_pct(config),
                 6,
             ),
+            "ladder_watch_distance_pct": round(
+                config.ladder_watch_distance_pct,
+                6,
+            ),
+            "ladder_activation_distance_pct": round(
+                config.ladder_activation_distance_pct,
+                6,
+            ),
+            "ladder_release_distance_pct": round(
+                config.ladder_release_distance_pct,
+                6,
+            ),
             "hot_ladder_poll_interval_sec": PREFUND_HOT_LADDER_POLL_SEC,
             "main_funds_count_for_entry": False,
             "exchange_margin_mode": "isolated",
@@ -2301,11 +2373,26 @@ class PumpLiveController:
             self.run_cycle()
             config = self.config()
             with self._lock:
-                hot_ladder = any(
-                    leg.get("status") in {"open", "submitted"}
-                    for item in self._open_positions(self._state)
-                    for leg in list(item.get("legs") or [])[1:]
-                )
+                hot_ladder = False
+                for item in self._open_positions(self._state):
+                    next_leg = next(
+                        (
+                            leg
+                            for leg in list(item.get("legs") or [])[1:]
+                            if leg.get("status")
+                            in {"planned", "open", "submitted"}
+                        ),
+                        None,
+                    )
+                    if next_leg is None:
+                        continue
+                    distance = _next_ladder_distance_pct(item, next_leg)
+                    if next_leg.get("status") in {"open", "submitted"} or (
+                        distance is not None
+                        and distance <= config.ladder_watch_distance_pct + 1e-9
+                    ):
+                        hot_ladder = True
+                        break
             wait_sec = (
                 min(config.poll_interval_sec, PREFUND_HOT_LADDER_POLL_SEC)
                 if hot_ladder
@@ -2697,9 +2784,18 @@ class PumpLiveController:
             ready = True
             required = 0.0
             error: str | None = None
+            gate_required = False
+            distance_pct: float | None = None
             if next_leg is not None:
+                position_config = self._position_config(item, runtime_config)
+                distance_pct = _next_ladder_distance_pct(item, next_leg)
+                gate_required = _next_ladder_requires_gate(
+                    item,
+                    next_leg,
+                    position_config,
+                )
+            if next_leg is not None and gate_required:
                 try:
-                    position_config = self._position_config(item, runtime_config)
                     plan, check = self._build_prefund_plan_and_check(
                         item,
                         position_config,
@@ -2729,6 +2825,12 @@ class PumpLiveController:
                     "next_gate_shortfall_usd": (
                         round(required, 6) if math.isfinite(required) else None
                     ),
+                    "next_gate_required": gate_required,
+                    "next_distance_pct": (
+                        round(distance_pct, 6)
+                        if distance_pct is not None
+                        else None
+                    ),
                     "error": error,
                 }
             )
@@ -2741,7 +2843,7 @@ class PumpLiveController:
         )
         first_margin = _safe_float((legs[0] if legs else {}).get("margin_usd"), 0.0)
         next_margin = _safe_float((legs[1] if len(legs) > 1 else {}).get("margin_usd"), 0.0)
-        initial_safety = 0.0
+        deferred_initial_safety = 0.0
         new_position_cap_ready = True
         initial_plan: dict[str, Any] | None = None
         if len(legs) > 1 and first_margin > 0:
@@ -2769,15 +2871,15 @@ class PumpLiveController:
                     _next_fill_projected_clearance_pct(candidate_config)
                 ),
             )
-            initial_safety = _safe_float(initial_plan.get("required_add_usd"), 0.0)
-            if initial_safety > 0:
-                initial_safety += (
+            deferred_initial_safety = _safe_float(
+                initial_plan.get("required_add_usd"),
+                0.0,
+            )
+            if deferred_initial_safety > 0:
+                deferred_initial_safety += (
                     PREFUND_MAX_CORRECTION_STEPS
                     * candidate_config.entry_margin_prefund_round_usd
                 )
-            new_position_cap_ready = bool(
-                initial_safety <= envelope.max_position_topup_usd + 1e-9
-            )
 
         available = max(0.0, _safe_float(balance.get("available"), 0.0))
         wallet = max(0.0, _capital_wallet_balance(balance))
@@ -2789,7 +2891,7 @@ class PumpLiveController:
         )
         own_available = max(0.0, available - temporary)
         own_wallet = max(0.0, wallet - temporary)
-        action_cash = first_margin + next_margin + initial_safety
+        action_cash = first_margin
         post_action_available = own_available - action_cash
         post_action_free_pct = (
             post_action_available / own_wallet * 100.0 if own_wallet > 0 else -1.0
@@ -2820,8 +2922,10 @@ class PumpLiveController:
             "temporary_rescue_cash_excluded_usd": round(temporary, 6),
             "new_slot_margin_usd": round(candidate_config.slot_margin_usd, 6),
             "new_first_leg_margin_usd": round(first_margin, 6),
-            "new_next_order_margin_usd": round(next_margin, 6),
-            "new_initial_safety_usd": round(initial_safety, 6),
+            "new_next_order_margin_usd": 0.0,
+            "new_initial_safety_usd": 0.0,
+            "deferred_next_order_margin_usd": round(next_margin, 6),
+            "deferred_initial_safety_usd": round(deferred_initial_safety, 6),
             "new_action_cash_usd": round(action_cash, 6),
             "required_available_usd": round(
                 action_cash + envelope.operating_cash_floor_usd,
@@ -2838,7 +2942,8 @@ class PumpLiveController:
                 6,
             ),
             "future_ladders_reserved": False,
-            "only_next_ladder_reserved": True,
+            "only_next_ladder_reserved": False,
+            "next_ladder_deferred_by_distance": True,
             "candidate_ladder_legs": len(legs),
             "candidate_leg_weights": [leg.get("weight") for leg in legs],
             "new_position_cap_ready": new_position_cap_ready,
@@ -3222,8 +3327,12 @@ class PumpLiveController:
                 position["updated_at_ms"] = _now_ms()
                 self._save_state_locked()
             self._maintain_single_position(position, config, maintain_ladder_gate=False)
-            self._ensure_entry_margin_prefund(position, config)
-            ladder_errors = self._place_planned_ladders(position)
+            if _is_on_demand_margin_manager(config.margin_manager_policy_id):
+                self._maintain_ladder_gate(position, config)
+                ladder_errors = []
+            else:
+                self._ensure_entry_margin_prefund(position, config)
+                ladder_errors = self._place_planned_ladders(position)
             self._event(
                 "live_position_opened",
                 {
@@ -4208,6 +4317,75 @@ class PumpLiveController:
         self._reset_ladder_to_planned(item, leg, reason=reason)
         return False
 
+    def _set_ladder_proximity_state(
+        self,
+        item: dict[str, Any],
+        config: PumpLiveConfig,
+        *,
+        state: str,
+        next_leg: Mapping[str, Any],
+        distance_pct: float,
+    ) -> None:
+        previous = str(item.get("ladder_proximity_state") or "")
+        now = _now_ms()
+        with self._lock:
+            item["ladder_proximity_state"] = state
+            item["ladder_distance_pct"] = round(distance_pct, 9)
+            item["ladder_watch_distance_pct"] = config.ladder_watch_distance_pct
+            item["ladder_activation_distance_pct"] = (
+                config.ladder_activation_distance_pct
+            )
+            item["ladder_release_distance_pct"] = config.ladder_release_distance_pct
+            item["updated_at_ms"] = now
+            self._save_state_locked()
+        if previous != state:
+            self._event(
+                "ladder_proximity_state_changed",
+                {
+                    "symbol": _normalize_symbol(item.get("symbol")),
+                    "step": _safe_int(next_leg.get("step"), 0),
+                    "previous_state": previous or None,
+                    "state": state,
+                    "distance_pct": round(distance_pct, 6),
+                    "watch_distance_pct": config.ladder_watch_distance_pct,
+                    "activation_distance_pct": (
+                        config.ladder_activation_distance_pct
+                    ),
+                    "release_distance_pct": config.ladder_release_distance_pct,
+                },
+            )
+
+    def _defer_ladder_by_distance(
+        self,
+        item: dict[str, Any],
+        config: PumpLiveConfig,
+        *,
+        next_leg: Mapping[str, Any],
+        distance_pct: float,
+    ) -> None:
+        state = (
+            "watch"
+            if distance_pct <= config.ladder_watch_distance_pct + 1e-9
+            else "dormant"
+        )
+        self._set_ladder_proximity_state(
+            item,
+            config,
+            state=state,
+            next_leg=next_leg,
+            distance_pct=distance_pct,
+        )
+        with self._lock:
+            item["ladder_gate_status"] = "deferred_distance"
+            item["ladder_gate_step"] = _safe_int(next_leg.get("step"), 0)
+            item["ladder_gate_error"] = None
+            item["ladder_release_confirm_count"] = 0
+            item["margin_prefund_status"] = "deferred_distance"
+            item["margin_prefund_floor_usd"] = 0.0
+            item["margin_continuation_policy_id"] = config.margin_manager_policy_id
+            item["updated_at_ms"] = _now_ms()
+            self._save_state_locked()
+
     def _maintain_ladder_gate(
         self,
         item: dict[str, Any],
@@ -4260,15 +4438,173 @@ class PumpLiveController:
         liq = _optional_float(item.get("liq_price"))
         if liq is None or next_price <= 0:
             raise RuntimeError("pump_live_ladder_gate_inputs_missing")
-        plan, check = self._build_prefund_plan_and_check(
-            item,
-            config,
-            target_leg=next_leg,
-        )
-        with self._lock:
-            item["margin_prefund_plan"] = plan
-            item["margin_prefund_verification"] = check
-            self._save_state_locked()
+        distance_pct = _next_ladder_distance_pct(item, next_leg)
+        if distance_pct is None:
+            raise RuntimeError("pump_live_ladder_gate_mark_missing")
+        plan: dict[str, Any] | None = None
+        check: dict[str, Any] | None = None
+        had_live_order = next_leg.get("status") in {"open", "submitted"}
+        if _is_on_demand_margin_manager(config.margin_manager_policy_id):
+            if had_live_order:
+                plan, check = self._build_prefund_plan_and_check(
+                    item,
+                    config,
+                    target_leg=next_leg,
+                )
+                with self._lock:
+                    item["margin_prefund_plan"] = plan
+                    item["margin_prefund_verification"] = check
+                    self._save_state_locked()
+                if not check["ready"] and (
+                    distance_pct > config.ladder_activation_distance_pct + 1e-9
+                ):
+                    fill_race = self._cancel_ladder_for_gate(
+                        item,
+                        next_leg,
+                        reason="distance_deferred_gate_not_ready",
+                    )
+                    if fill_race:
+                        exchange = self._fetch_exchange_short(
+                            _normalize_symbol(item.get("symbol"))
+                        )
+                        if exchange is not None:
+                            self._apply_exchange_position(item, exchange)
+                        self.disarm("ladder_gate_fill_race")
+                        return
+                    self._defer_ladder_by_distance(
+                        item,
+                        config,
+                        next_leg=next_leg,
+                        distance_pct=distance_pct,
+                    )
+                    return
+                if distance_pct >= config.ladder_release_distance_pct - 1e-9:
+                    previous_count = _safe_int(
+                        item.get("ladder_release_confirm_count"),
+                        0,
+                    )
+                    confirm_count = min(2, previous_count + 1)
+                    with self._lock:
+                        item["ladder_release_confirm_count"] = confirm_count
+                        self._save_state_locked()
+                    self._set_ladder_proximity_state(
+                        item,
+                        config,
+                        state="cooling",
+                        next_leg=next_leg,
+                        distance_pct=distance_pct,
+                    )
+                    last_adjust = max(
+                        _safe_int(item.get("last_topup_at_ms"), 0),
+                        _safe_int(item.get("last_margin_reduce_at_ms"), 0),
+                        _safe_int(item.get("ladder_activated_at_ms"), 0),
+                    )
+                    cooldown_ready = bool(
+                        _now_ms() - last_adjust
+                        >= config.margin_reduce_cooldown_sec * 1000
+                    )
+                    if confirm_count < 2 or not cooldown_ready:
+                        return
+                    fill_race = self._cancel_ladder_for_gate(
+                        item,
+                        next_leg,
+                        reason="distance_release_hysteresis",
+                    )
+                    if fill_race:
+                        exchange = self._fetch_exchange_short(
+                            _normalize_symbol(item.get("symbol"))
+                        )
+                        if exchange is not None:
+                            self._apply_exchange_position(item, exchange)
+                        self.disarm("ladder_gate_fill_race")
+                        return
+                    with self._lock:
+                        item["ladder_deactivated_at_ms"] = _now_ms()
+                        self._save_state_locked()
+                    self._event(
+                        "ladder_deactivated_by_distance",
+                        {
+                            "symbol": _normalize_symbol(item.get("symbol")),
+                            "step": _safe_int(next_leg.get("step"), 0),
+                            "distance_pct": round(distance_pct, 6),
+                            "release_distance_pct": (
+                                config.ladder_release_distance_pct
+                            ),
+                        },
+                    )
+                    self._defer_ladder_by_distance(
+                        item,
+                        config,
+                        next_leg=next_leg,
+                        distance_pct=distance_pct,
+                    )
+                    return
+                with self._lock:
+                    item["ladder_release_confirm_count"] = 0
+                    self._save_state_locked()
+                self._set_ladder_proximity_state(
+                    item,
+                    config,
+                    state="active",
+                    next_leg=next_leg,
+                    distance_pct=distance_pct,
+                )
+            elif distance_pct <= 0:
+                gate_error = "pump_live_ladder_activation_missed"
+                repeated = bool(
+                    item.get("ladder_gate_status") == "blocked"
+                    and item.get("ladder_gate_error") == gate_error
+                )
+                self._set_ladder_proximity_state(
+                    item,
+                    config,
+                    state="activation_missed",
+                    next_leg=next_leg,
+                    distance_pct=distance_pct,
+                )
+                with self._lock:
+                    item["ladder_gate_status"] = "blocked"
+                    item["ladder_gate_step"] = _safe_int(next_leg.get("step"), 0)
+                    item["ladder_gate_error"] = gate_error
+                    item["updated_at_ms"] = _now_ms()
+                    self._save_state_locked()
+                if not repeated:
+                    self.disarm("next_ladder_activation_missed")
+                    self._event(
+                        "next_ladder_activation_missed",
+                        {
+                            "symbol": _normalize_symbol(item.get("symbol")),
+                            "step": _safe_int(next_leg.get("step"), 0),
+                            "distance_pct": round(distance_pct, 6),
+                        },
+                    )
+                return
+            elif distance_pct > config.ladder_activation_distance_pct + 1e-9:
+                self._defer_ladder_by_distance(
+                    item,
+                    config,
+                    next_leg=next_leg,
+                    distance_pct=distance_pct,
+                )
+                return
+            else:
+                self._set_ladder_proximity_state(
+                    item,
+                    config,
+                    state="activating",
+                    next_leg=next_leg,
+                    distance_pct=distance_pct,
+                )
+        if plan is None or check is None:
+            plan, check = self._build_prefund_plan_and_check(
+                item,
+                config,
+                target_leg=next_leg,
+            )
+            with self._lock:
+                item["margin_prefund_plan"] = plan
+                item["margin_prefund_verification"] = check
+                self._save_state_locked()
         if not check["ready"]:
             if (
                 _is_shared_margin_manager(config.margin_manager_policy_id)
@@ -4301,6 +4637,20 @@ class PumpLiveController:
                     target_leg=next_leg,
                     reason="next_ladder_gate",
                 )
+                if _is_on_demand_margin_manager(config.margin_manager_policy_id):
+                    plan, check = self._build_prefund_plan_and_check(
+                        item,
+                        config,
+                        target_leg=next_leg,
+                    )
+                    with self._lock:
+                        item["margin_prefund_plan"] = plan
+                        item["margin_prefund_verification"] = check
+                        self._save_state_locked()
+                    if not check["ready"]:
+                        raise RuntimeError(
+                            "pump_live_margin_prefund_target_unconfirmed"
+                        )
             except Exception as exc:
                 if next_leg.get("status") in {"open", "submitted"}:
                     cancel_fill_race = self._cancel_ladder_for_gate(
@@ -4358,6 +4708,21 @@ class PumpLiveController:
                 if _is_shared_margin_manager(config.margin_manager_policy_id)
                 else self._active_policy_id()
             )
+            if _is_on_demand_margin_manager(config.margin_manager_policy_id):
+                target_step = _safe_int(next_leg.get("step"), 0)
+                item["ladder_proximity_state"] = "active"
+                item["ladder_distance_pct"] = round(distance_pct, 9)
+                item["ladder_release_confirm_count"] = 0
+                if _safe_int(item.get("ladder_activated_step"), 0) != target_step:
+                    item["ladder_activated_step"] = target_step
+                    item["ladder_activated_at_ms"] = (
+                        max(
+                            _safe_int(item.get("last_topup_at_ms"), 0),
+                            _safe_int(item.get("last_margin_reduce_at_ms"), 0),
+                        )
+                        if had_live_order
+                        else _now_ms()
+                    )
             item["updated_at_ms"] = _now_ms()
             self._save_state_locked()
 
@@ -5086,6 +5451,15 @@ class PumpLiveController:
         if _is_on_demand_margin_manager(config.margin_manager_policy_id):
             prefund_floor = 0.0
         removable_topup = max(0.0, tracked_topup - prefund_floor)
+        if _is_on_demand_margin_manager(config.margin_manager_policy_id) and any(
+            leg.get("status") in {"open", "submitted"}
+            for leg in list(item.get("legs") or [])[1:]
+        ):
+            with self._lock:
+                item["margin_reduce_confirm_count"] = 0
+                item["margin_reduce_deferred_reason"] = "live_next_ladder_order"
+                self._save_state_locked()
+            return
         if (
             removable_topup < 1.0
             or buffer_pct < config.margin_reduce_trigger_buffer_pct
@@ -5129,6 +5503,12 @@ class PumpLiveController:
                 ),
                 None,
             )
+            protected_next_leg = (
+                next_leg
+                if next_leg is not None
+                and _next_ladder_requires_gate(item, next_leg, config)
+                else None
+            )
             reduction_plan = plan_safe_margin_reduction(
                 qty=qty,
                 current_liq_price=liq,
@@ -5136,7 +5516,7 @@ class PumpLiveController:
                 removable_margin_usd=removable_topup,
                 target_buffer_pct=config.margin_reduce_target_buffer_pct,
                 legs=item.get("legs") or [],
-                target_leg=next_leg,
+                target_leg=protected_next_leg,
                 leverage=config.leverage,
                 stop_gap_from_liq_pct=config.exchange_stop_gap_from_liq_pct,
                 safety_above_next_ladder_pct=(
@@ -5164,8 +5544,8 @@ class PumpLiveController:
                     "simulated_buffer_pct"
                 ),
                 "next_step": (
-                    _safe_int(next_leg.get("step"), 0)
-                    if next_leg is not None
+                    _safe_int(protected_next_leg.get("step"), 0)
+                    if protected_next_leg is not None
                     else None
                 ),
             }
@@ -5217,7 +5597,11 @@ class PumpLiveController:
                 ),
                 None,
             )
-            if next_leg is not None:
+            if next_leg is not None and _next_ladder_requires_gate(
+                item,
+                next_leg,
+                config,
+            ):
                 try:
                     _plan, gate_check = self._build_prefund_plan_and_check(
                         item,

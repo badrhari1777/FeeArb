@@ -109,6 +109,20 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live v4 next ladders became price-proximity gated on 2026-08-11 by
+  explicit operator decision. Distance is `(next fill / Mark - 1) * 100`:
+  `>55%` is dormant at the normal poll, `35..55%` is planned-only with the
+  5-second watch, and `<=35%` performs the strict margin -> Bybit verification
+  -> Full TP/SL -> one-order transaction. A live order cools only at `>=45%`
+  for two cycles plus the existing 30-minute adjustment cooldown; cancellation
+  is confirmed before dormant margin may return to the 30% current-position
+  buffer. Dormant/watch gates no longer block a new symbol, whose admission
+  counts only L1 cash and exposes later L2/prefund amounts as diagnostics.
+  Price that has already crossed an absent ladder is never chased. Thresholds
+  and per-position proximity are exposed in the Pump APIs and web views.
+  Canonical operation is in
+  `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`; live rollout evidence must
+  be appended after the safe restart and explicit `ARM PUMP LIVE 3000`.
 - Pump Live v4 next-fill reaction safety was raised to `12%/12%` on
   2026-08-11 after the BMT audit measured roughly `7.35s` hot-ladder cycle
   starts and found that the former 2.5% pre-fill stop gap could be crossed by a

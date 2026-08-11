@@ -175,7 +175,13 @@
     setText('pp-pump-topup', money(totalTopup));
     setText('pp-pump-temporary', money(balance.temporary_occupied_usd || 0));
     setText('pp-pump-regime', String(regime.mode || '-').toUpperCase());
-    setText('pp-pump-margin-manager', marginManager.policy_id || '-');
+    setText(
+      'pp-pump-margin-manager',
+      (marginManager.policy_id || '-') +
+        ' · W' + number(marginManager.ladder_watch_distance_pct || 0, 0) +
+        ' / A' + number(marginManager.ladder_activation_distance_pct || 0, 0) +
+        ' / R' + number(marginManager.ladder_release_distance_pct || 0, 0)
+    );
     setText(
       'pp-pump-entry-headroom',
       sharedPool.entry_headroom_usd === null || sharedPool.entry_headroom_usd === undefined
@@ -229,6 +235,10 @@
         '<div><span>Top-up / Base / Cap</span><strong>' + money(row.margin_topup_usd || 0) + ' / ' + money(row.margin_prefund_floor_usd || 0) + ' / ' + money(row.margin_topup_cap_usd) + '</strong></div>' +
         '<div><span>Ladder gate</span><strong>' + escapeHtml(row.ladder_gate_status || '-') +
           (row.ladder_gate_step ? ' · L' + escapeHtml(row.ladder_gate_step) : '') + '</strong></div>' +
+        '<div><span>Ladder proximity</span><strong>' + escapeHtml(row.ladder_proximity_state || '-') +
+          (row.ladder_distance_pct === null || row.ladder_distance_pct === undefined
+            ? ''
+            : ' · ' + number(row.ladder_distance_pct, 1) + '%') + '</strong></div>' +
         '<div><span>Hold left</span><strong>' + number(row.remaining_hold_h, 1) + 'h / ' + number(row.max_hold_h, 1) + 'h</strong></div>' +
         '<div><span>Ladder</span><strong>' + esc(row.legs_filled || 0) + ' filled · ' + esc(row.legs_open || 0) + ' open</strong></div>' +
         '</div><details><summary>Show ladder and exchange order state</summary>' + ladderTable(row) + '</details></article>';

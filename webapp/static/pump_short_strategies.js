@@ -200,7 +200,13 @@
     setText('pss-live-reserve', money(activePolicy.reserve_usd || 0));
     setText('pss-live-temporary', money(capital.temporary_transfer_outstanding_usd || 0));
     setText('pss-live-regime', String(regime.mode || '-').toUpperCase());
-    setText('pss-live-margin-manager', marginManager.policy_id || '-');
+    setText(
+      'pss-live-margin-manager',
+      (marginManager.policy_id || '-') +
+        ' · W' + fmt(marginManager.ladder_watch_distance_pct || 0, 0) +
+        ' / A' + fmt(marginManager.ladder_activation_distance_pct || 0, 0) +
+        ' / R' + fmt(marginManager.ladder_release_distance_pct || 0, 0)
+    );
     setText(
       'pss-live-entry-headroom',
       sharedPool.entry_headroom_usd === null || sharedPool.entry_headroom_usd === undefined

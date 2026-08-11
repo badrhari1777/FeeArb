@@ -931,10 +931,11 @@ Operational contract:
    Existing positions continue with the exact risk-policy snapshot stored when
    they entered. The other `$600` in `$3000 - 4 x $600` is not a separately
    held reserve; actual availability is decided by the free-cash gates.
-3. A new symbol is admitted only if its L1, its one next order, and immediate
-   safety prefund fit now and still leave at least 30% Pump-owned free cash plus
-   the `$75` floor. Unsubmitted future steps are not reserved. Temporary main
-   rescue principal is subtracted before this calculation.
+3. Under `v4_shared_ondemand`, a new symbol is admitted only if its L1 action
+   fits now and still leaves at least 30% Pump-owned free cash plus the `$75`
+   floor. Its next order and safety prefund remain deferred until the price
+   proximity gate activates. Temporary main rescue principal is subtracted
+   before this calculation.
 4. Displayed account cash bands are calm at `>=30%`, warning at `20..30%`,
    stress at `10..20%`, and emergency below `10%`. They combine with the worst
    position liquidation buffer. A failed 30% admission gate blocks only the
@@ -956,9 +957,10 @@ Operational contract:
    separately tested cancel/rescale/re-protect transaction. A threatened
    position at or below the 10% emergency buffer is closed directly.
 8. Surplus isolated margin can be returned only after two healthy `>=35%`
-   reads and the existing 30-minute adjustment cooldown. Removal targets 25%,
-   must preserve the immediate next-ladder safety gate, is confirmed from
-   Bybit, and is rolled back if either condition fails.
+   reads and the existing 30-minute adjustment cooldown. A physically live
+   next order keeps all of its prefund. After a distant order is confirmed
+   cancelled, removal targets a 30% current-position buffer without preserving
+   a dormant future gate; Bybit confirmation and rollback remain mandatory.
 9. Capital observation calculates a proportional future budget at 20% of
    Pump-owned strategy capital, rounded down to `$5`. Periodic automatic
    adoption is not enabled in this release. A later approved rebase will apply
@@ -1085,3 +1087,55 @@ none. `ARM PUMP LIVE 3000` then succeeded. Five observed cycles remained armed
 without monitor error or blocked reason. The common entry pool remains
 fail-closed with `ondemand_existing_next_gate_not_ready`, so no new symbol can
 enter until RATS confirms 12% and restores its nearest ladder.
+
+## Distance-gated next ladders: 55 / 35 / 45 (2026-08-11)
+
+The previous v4 deployment still prepared every nearest ladder immediately.
+That tied both Bybit order margin and isolated safety margin even when a symbol
+was far below its next step, and a distant unready RATS gate blocked otherwise
+affordable new entries. The operator approved a conservative proximity state
+machine. Distance always means `(next_fill_price / Mark Price - 1) * 100`.
+
+- `distance > 55%`: `dormant`. The leg is durable `planned`, with no physical
+  non-reduce order and no future-gate reservation. Normal `15s` polling applies.
+- `35% < distance <= 55%`: `watch`. The leg is still only `planned`, but the
+  controller uses the `5s` hot-ladder poll so it can react before activation.
+- `distance <= 35%`: `activating/active`. The controller adds the exact margin,
+  rereads Bybit liquidation, verifies both 12% boundaries, synchronizes Full
+  TP/SL, and only then creates the one nearest non-reduce ladder order.
+- A live order remains active until distance reaches at least `45%` for two
+  healthy cycles and 30 minutes have elapsed since its last add/remove or
+  activation. The order is cancelled and confirmed first; only later healthy
+  cycles may return surplus isolated margin to a 30% current-position buffer.
+
+The `45%` release line is deliberately below the `55%` watch line and above
+the `35%` activation line. This hysteresis prevents repeated cancel/recreate
+churn while retaining hot polling after release. Configuration is explicit:
+
+```text
+PUMP_LIVE_LADDER_WATCH_DISTANCE_PCT=55
+PUMP_LIVE_LADDER_ACTIVATION_DISTANCE_PCT=35
+PUMP_LIVE_LADDER_RELEASE_DISTANCE_PCT=45
+```
+
+A dormant or watch-only gate is reported as
+`ladder_gate_status=deferred_distance`, is included in API/UI diagnostics with
+its live distance, and does not block a new symbol. A gate becomes
+admission-blocking only when a physical order is live or the price has entered
+the 35% activation zone. A planned leg whose Mark Price has already crossed
+its fill price is never chased with a marketable limit: it becomes
+`activation_missed`, disarms new entries, keeps current Full TP/SL, and
+notifies the operator.
+
+The action-based entry calculation now counts only the new L1 margin. It still
+shows the deferred next-order margin and projected safety amount for diagnosis,
+but neither is reserved before proximity activation. Existing Pump cash bands,
+20% position warning, exact restore-to-25% top-up, main-account rescue order,
+isolated margin, four-symbol cap, and 12%/12% fill protection are unchanged.
+
+Regression covers initial L1 deferral at the ordinary 50% L2 distance, hot
+watch, activation below 35%, strict `margin -> verified protection -> order`
+sequencing, L2 fill followed by L3 activation, two-cycle/30-minute release,
+dormant-margin return, dormant-gate entry admission, and missed-ladder
+fail-closed behavior. Live rollout evidence is recorded only after the safe
+restart and explicit `ARM PUMP LIVE 3000` verification.

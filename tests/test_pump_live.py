@@ -56,6 +56,9 @@ def test_pump_live_page_supports_pool600_arm_contract() -> None:
     assert "v3_3000_pool600" in javascript
     assert "policy === 'v2_3000' || policy === 'v3_3000_pool600'" in javascript
     assert "new v2 $525 canary" not in javascript
+    assert "ladder_watch_distance_pct" in javascript
+    assert "ladder_activation_distance_pct" in javascript
+    assert "ladder_release_distance_pct" in javascript
 
 
 def test_versioned_risk_policies_have_fixed_1000_and_3000_envelopes() -> None:
@@ -315,6 +318,15 @@ def test_on_demand_full_next_fill_survives_old_stop_and_arms_following_step(
 
     first = controller.run_cycle()
     item = first["positions"][0]
+    assert item["ladder_gate_status"] == "deferred_distance"
+    assert item["ladder_proximity_state"] == "watch"
+    assert item["legs"][1]["status"] == "planned"
+    assert gateway.margin_adds == []
+    assert gateway.orders == []
+
+    gateway.positions[0]["mark_price"] = 11.2
+    activated = controller.run_cycle()
+    item = activated["positions"][0]
     second_leg = item["legs"][1]
     fill_price = float(second_leg["trigger_price"])
     stop_before_fill = float(item["stop_price"])
@@ -377,6 +389,134 @@ def test_on_demand_full_next_fill_survives_old_stop_and_arms_following_step(
     assert newly_synced_stops
     assert min(newly_synced_stops) / fill_price - 1.0 >= 0.12
     assert not any(op.startswith("market_reduce:") for op in gateway.operations)
+
+
+def test_on_demand_ladder_uses_55_35_45_proximity_hysteresis(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        entry_cap=4,
+        prefund_enabled=True,
+        margin_manager_policy=MARGIN_MANAGER_V4_ON_DEMAND,
+    )
+    gateway = FakePumpGateway()
+    gateway.balance.update(
+        {"total": 3_000.0, "wallet": 3_000.0, "available": 3_000.0}
+    )
+    gateway.liq_after_add_sequence = [18.0]
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "active_strategy_capital_usd": 3_000.0,
+        "application_enabled": True,
+    }
+    armed_at = int(controller.arm(ARM_CONFIRMATION_V2)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+
+    deferred = controller.run_cycle()["positions"][0]
+    assert deferred["ladder_distance_pct"] == 50.0
+    assert deferred["ladder_proximity_state"] == "watch"
+    assert deferred["ladder_gate_status"] == "deferred_distance"
+    assert deferred["legs"][1]["status"] == "planned"
+    assert gateway.margin_adds == []
+    assert gateway.orders == []
+
+    operation_count = len(gateway.operations)
+    gateway.positions[0]["mark_price"] = 11.2
+    active = controller.run_cycle()["positions"][0]
+    activation_ops = gateway.operations[operation_count:]
+    add_index = next(
+        i for i, op in enumerate(activation_ops) if op.startswith("add_margin:")
+    )
+    protection_index = next(
+        i for i, op in enumerate(activation_ops) if op.startswith("protection:")
+    )
+    ladder_index = next(
+        i for i, op in enumerate(activation_ops) if op.startswith("ladder:")
+    )
+    assert add_index < protection_index < ladder_index
+    assert active["ladder_proximity_state"] == "active"
+    assert active["ladder_gate_status"] == "ready"
+    assert active["legs"][1]["status"] == "open"
+
+    old = int(time.time() * 1000) - 1_900_000
+    live_item = controller._state["positions"][0]  # pylint: disable=protected-access
+    live_item["last_topup_at_ms"] = old
+    live_item["ladder_activated_at_ms"] = old
+    gateway.positions[0]["mark_price"] = 10.0
+
+    cooling = controller.run_cycle()["positions"][0]
+    assert cooling["ladder_proximity_state"] == "cooling"
+    assert cooling["ladder_release_confirm_count"] == 1
+    assert cooling["legs"][1]["status"] == "open"
+
+    released = controller.run_cycle()["positions"][0]
+    assert released["ladder_proximity_state"] == "watch"
+    assert released["ladder_gate_status"] == "deferred_distance"
+    assert released["legs"][1]["status"] == "planned"
+    assert gateway.canceled
+
+    controller.run_cycle()
+    controller.run_cycle()
+    assert gateway.margin_removes
+
+
+def test_on_demand_missed_ladder_is_not_chased_with_marketable_order(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        prefund_enabled=True,
+        margin_manager_policy=MARGIN_MANAGER_V4_ON_DEMAND,
+    )
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    item = {
+        "live_id": "missed",
+        "symbol": "MISSUSDT",
+        "status": "open",
+        "qty": 10.0,
+        "mark_price": 16.0,
+        "liq_price": 20.0,
+        "margin_topup_usd": 0.0,
+        "legs": [
+            {"step": 1, "status": "filled", "trigger_price": 10.0},
+            {
+                "step": 2,
+                "status": "planned",
+                "trigger_price": 15.0,
+                "notional_usd": 100.0,
+                "margin_usd": 33.333333,
+            },
+        ],
+    }
+    controller._state["positions"] = [item]  # pylint: disable=protected-access
+
+    controller._maintain_ladder_gate(  # pylint: disable=protected-access
+        item,
+        controller.config(),
+    )
+
+    assert item["ladder_proximity_state"] == "activation_missed"
+    assert item["ladder_gate_status"] == "blocked"
+    assert item["ladder_gate_error"] == "pump_live_ladder_activation_missed"
+    assert item["legs"][1]["status"] == "planned"
+    assert gateway.orders == []
 
 
 def test_on_demand_bmt_three_leg_path_prefunds_12_pct_before_each_fill() -> None:
@@ -954,6 +1094,7 @@ class FakePumpGateway:
         take_profit_price: float,
         stop_loss_price: float,
     ) -> dict[str, Any]:
+        self.operations.append(f"protection:{symbol}:{stop_loss_price}")
         self.take_profits.append((symbol, take_profit_price))
         self.protections.append((symbol, take_profit_price, stop_loss_price))
         return {"status": "ok"}
@@ -1026,6 +1167,9 @@ def write_env(
                 "PUMP_LIVE_PROJECTED_FINAL_FILL_BUFFER_PCT=20",
                 "PUMP_LIVE_PROJECTED_EXCHANGE_CAP_REACTION_BUFFER_PCT=8",
                 "PUMP_LIVE_ON_DEMAND_FILL_REACTION_BUFFER_PCT=12",
+                "PUMP_LIVE_LADDER_WATCH_DISTANCE_PCT=55",
+                "PUMP_LIVE_LADDER_ACTIVATION_DISTANCE_PCT=35",
+                "PUMP_LIVE_LADDER_RELEASE_DISTANCE_PCT=45",
                 "PUMP_LIVE_SHARED_RESCUE_FACILITY_CAP_USD=2000",
                 (
                     "PUMP_LIVE_SHARED_MAX_POSITION_TOPUP_USD=5000"
@@ -2153,6 +2297,9 @@ def test_margin_manager_versions_are_separate_and_current_is_default(
 ) -> None:
     missing = load_pump_live_config(tmp_path / "missing.env")
     assert missing.margin_manager_policy_id == MARGIN_MANAGER_V2_CURRENT
+    assert missing.ladder_watch_distance_pct == 55.0
+    assert missing.ladder_activation_distance_pct == 35.0
+    assert missing.ladder_release_distance_pct == 45.0
 
     env_path = tmp_path / "pump_live.env"
     write_env(
@@ -2166,6 +2313,9 @@ def test_margin_manager_versions_are_separate_and_current_is_default(
     assert shared.projected_final_fill_buffer_pct == 20.0
     assert shared.projected_exchange_cap_reaction_buffer_pct == 8.0
     assert shared.on_demand_fill_reaction_buffer_pct == 12.0
+    assert shared.ladder_watch_distance_pct == 55.0
+    assert shared.ladder_activation_distance_pct == 35.0
+    assert shared.ladder_release_distance_pct == 45.0
     assert shared.shared_rescue_facility_cap_usd == 2_000.0
     assert shared.shared_max_position_topup_usd == 2_000.0
 
@@ -2301,14 +2451,45 @@ def test_on_demand_entry_reserves_only_first_action_and_excludes_rescue_cash(
     assert ready["ready"] is True
     assert ready["new_slot_margin_usd"] == 600.0
     assert ready["new_first_leg_margin_usd"] == 100.0
-    assert ready["new_next_order_margin_usd"] == 200.0
+    assert ready["new_next_order_margin_usd"] == 0.0
+    assert ready["deferred_next_order_margin_usd"] == 200.0
+    assert ready["new_initial_safety_usd"] == 0.0
+    assert ready["deferred_initial_safety_usd"] > 0.0
     assert ready["future_ladders_reserved"] is False
-    assert ready["only_next_ladder_reserved"] is True
-    assert ready["new_action_cash_usd"] < 600.0
+    assert ready["only_next_ladder_reserved"] is False
+    assert ready["next_ladder_deferred_by_distance"] is True
+    assert ready["new_action_cash_usd"] == 100.0
+
+    dormant = {
+        "symbol": "DORMANTUSDT",
+        "status": "open",
+        "qty": 10.0,
+        "mark_price": 5.0,
+        "liq_price": 9.0,
+        "legs": [
+            {"step": 1, "status": "filled", "trigger_price": 5.0},
+            {
+                "step": 2,
+                "status": "planned",
+                "trigger_price": 10.0,
+                "notional_usd": 200.0,
+                "margin_usd": 100.0,
+            },
+        ],
+    }
+    with_dormant = controller._on_demand_entry_admission(  # pylint: disable=protected-access
+        balance=gateway.balance,
+        open_items=[dormant],
+        candidate_config=config,
+        tier={"ladder_legs": 3, "ladder_step_pct": 50.0, "leg_weights": [1, 2, 3]},
+    )
+    assert with_dormant["ready"] is True
+    assert with_dormant["positions"][0]["next_gate_required"] is False
+    assert with_dormant["positions"][0]["next_gate_ready"] is True
 
     controller._state["capital_manager"][  # pylint: disable=protected-access
         "temporary_transfer_outstanding_usd"
-    ] = 2_700.0
+    ] = 2_950.0
     blocked = controller._on_demand_entry_admission(  # pylint: disable=protected-access
         balance=gateway.balance,
         open_items=[],
@@ -2318,7 +2499,7 @@ def test_on_demand_entry_reserves_only_first_action_and_excludes_rescue_cash(
 
     assert blocked["ready"] is False
     assert blocked["reason"] == "ondemand_post_action_free_below_entry_floor"
-    assert blocked["temporary_rescue_cash_excluded_usd"] == 2_700.0
+    assert blocked["temporary_rescue_cash_excluded_usd"] == 2_950.0
 
 
 def test_on_demand_manager_keeps_old_snapshot_and_sizes_only_new_entry_at_600(
@@ -2712,6 +2893,9 @@ def test_margin_manager_switch_is_runtime_dynamic_for_legacy_position_snapshot()
             projected_final_fill_buffer_pct=25.0,
             projected_exchange_cap_reaction_buffer_pct=12.0,
             on_demand_fill_reaction_buffer_pct=14.0,
+            ladder_watch_distance_pct=60.0,
+            ladder_activation_distance_pct=30.0,
+            ladder_release_distance_pct=42.0,
             shared_rescue_facility_cap_usd=600.0,
             shared_max_position_topup_usd=1_100.0,
         ),
@@ -2721,6 +2905,9 @@ def test_margin_manager_switch_is_runtime_dynamic_for_legacy_position_snapshot()
     assert active.projected_final_fill_buffer_pct == 25.0
     assert active.projected_exchange_cap_reaction_buffer_pct == 12.0
     assert active.on_demand_fill_reaction_buffer_pct == 14.0
+    assert active.ladder_watch_distance_pct == 60.0
+    assert active.ladder_activation_distance_pct == 30.0
+    assert active.ladder_release_distance_pct == 42.0
     assert active.shared_rescue_facility_cap_usd == 600.0
     assert active.shared_max_position_topup_usd == 1_100.0
     assert active.total_capital_usd == 1_000.0
@@ -3763,7 +3950,7 @@ def test_unsafe_margin_reduction_is_rolled_back_immediately(tmp_path: Path) -> N
     assert status["positions"][0]["liq_price"] == 15.0
 
 
-def test_on_demand_margin_reduction_defers_without_exchange_trial(
+def test_on_demand_margin_reduction_keeps_live_next_order_prefund(
     tmp_path: Path,
 ) -> None:
     env_path = tmp_path / "pump_live.env"
@@ -3809,9 +3996,9 @@ def test_on_demand_margin_reduction_defers_without_exchange_trial(
 
     assert gateway.margin_removes == []
     assert gateway.margin_adds == []
-    assert item["margin_reduce_confirm_count"] == 2
-    assert item["margin_reduce_deferred_reason"] == "current_next_gate_not_ready"
-    assert item["margin_reduce_plan"]["amount_usd"] == 0.0
+    assert item["margin_reduce_confirm_count"] == 0
+    assert item["margin_reduce_deferred_reason"] == "live_next_ladder_order"
+    assert "margin_reduce_plan" not in item
 
 
 def test_exchange_stop_is_resynced_when_liquidation_price_moves(tmp_path: Path) -> None:
