@@ -274,3 +274,69 @@ ladders and six Full TP/SL orders. Explicit `ARM PUMP LIVE 3000` succeeded.
 Following monitor cycles stayed armed, next-gate admission stayed ready at
 about `+$887.89`, and no error or margin mutation occurred. TUT Grid and Manual
 execution state were unchanged.
+
+## On-demand shared-pool implementation v4 (2026-08-11)
+
+The operator rejected reservation arithmetic based on every possible future
+ladder. The production candidate is therefore `v4_shared_ondemand`, with
+`v2_current_next` and `v3_shared_projected` retained as restart-selectable
+rollback modes.
+
+The v4 accounting boundary is deliberately simple:
+
+- Bybit positions remain isolated. "Shared pool" means only that free Pump
+  USDT is allocated centrally when an action is due; losses and liquidation
+  prices do not become cross margin.
+- At declared Pump strategy capital `$3000`, a new symbol receives a complete
+  `$600` budget. Existing tier weights produce `$120 x 5`, `$100/$200/$300`,
+  or `$200/$400`. Existing positions retain their immutable `$175` or `$525`
+  snapshot and are never resized by a policy migration. The remaining `$600`
+  in the four-slot sizing identity is not a cash reserve and is not locked;
+  actual action admission is governed only by free cash and the bands below.
+- Admission accounts for exchange available balance, L1, the single next live
+  ladder and the immediate prefund needed to make that next action safe. It
+  does not reserve a distant, unsubmitted ladder. After that action, Pump-owned
+  cash must remain at least 30% of Pump-owned wallet and at least `$75`.
+- Confirmed temporary main-to-Pump principal is subtracted from both wallet and
+  available entry cash. It may rescue an existing position but can never admit
+  a new symbol. The aggregate outstanding facility is `$2000`; every transfer
+  still requires the existing fresh main-account projection, `$500` projected
+  main available floor, 75% maximum margin ratio and 25% minimum liquidation
+  buffer where positions exist.
+- Account cash bands are calm `>=30%`, warning `20..30%`, stress `10..20%`,
+  and emergency `<10%`. They are combined with the lowest position liquidation
+  buffer in the displayed regime. Entry admission naturally blocks below the
+  30% post-action boundary without permanently disarming position monitoring.
+- When a position reaches the 20% warning boundary, the controller derives the
+  rounded margin needed to restore a 25% exchange-read buffer. If free Pump cash
+  is insufficient it first tries the guarded main rescue transfer. It then
+  cancels and confirms only Pump-owned non-reduce ladder orders, largest other
+  order first; Full TP/SL remains untouched. Paused ladders return only after
+  free cash is again at least 30% and every position is above 20%.
+- If those steps still cannot fund the defence, the enabled first live version
+  closes one whole protected profitable donor, ranked by distance to TP and
+  profit, using reduce-only execution. With no eligible donor it closes the
+  threatened position. Partial donor cuts are deliberately deferred because a
+  correct partial implementation must also cancel, rescale and re-protect that
+  donor's remaining ladder. At or below the existing 10% emergency position
+  buffer, the threatened position is closed directly.
+- Above a 35% position buffer, the existing two-cycle and 30-minute hysteresis
+  may return only margin that leaves at least 25% and keeps the immediate next
+  ladder safe. A legacy prefund floor no longer strands cash under v4, but every
+  removal is exchange-verified and rolled back on a failed safety check.
+
+Capital sizing is intentionally split into two decisions. V4 activates the
+`$600` budget for new entries now. The observation layer already computes the
+same 20% proportion from Pump-owned capital, rounded down to `$5`, with +10%
+growth, -5% reduction and maximum +25% increase recommendations. Automatic
+periodic adoption remains disabled until a later capital-manager review; when
+implemented, a rebase may change only subsequent entries and may never rewrite
+an open position's risk snapshot.
+
+Pre-deployment verification passed Python compilation, `126` focused
+Pump/transfer tests, `159` expanded Pump/API/lab/positions tests and the full
+project suite (`730 passed`, `8` subtests, `13` pre-existing warnings). The
+production `live_events.jsonl` SHA-256 remained unchanged throughout testing.
+The browser contract explicitly recognizes `v3_3000_pool600` as a `$3000`
+cohort and therefore requests `ARM PUMP LIVE 3000`; obsolete `$175/$525`
+operator text was removed and the static cache version was advanced.

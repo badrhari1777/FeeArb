@@ -197,7 +197,7 @@
     setText('pss-live-balance', money(balance.total || balance.total_usdt || 0));
     setText('pss-live-available', money(balance.available || balance.available_usdt || 0));
     setText('pss-live-slots', open + ' / ' + cap + ' (max ' + Number(config.max_active_positions || 4) + ')');
-    setText('pss-live-reserve', money(activePolicy.reserve_usd || 300));
+    setText('pss-live-reserve', money(activePolicy.reserve_usd || 0));
     setText('pss-live-temporary', money(capital.temporary_transfer_outstanding_usd || 0));
     setText('pss-live-regime', String(regime.mode || '-').toUpperCase());
     setText('pss-live-margin-manager', marginManager.policy_id || '-');
@@ -263,6 +263,7 @@
     setDisabled(
       'pss-live-capital-promote',
       capital.active_risk_policy_id === 'v2_3000' ||
+        capital.active_risk_policy_id === 'v3_3000_pool600' ||
         !live.entry_armed ||
         Number(capital.temporary_transfer_outstanding_usd || 0) < 0.01 ||
         Number(capital.temporary_transfer_outstanding_usd || 0) + 0.01 <
@@ -336,7 +337,9 @@
   function liveArm() {
     var live = state.pump_live || {};
     var policy = ((live.capital_manager || {}).active_risk_policy_id || 'v1_1000');
-    var expected = policy === 'v2_3000' ? 'ARM PUMP LIVE 3000' : 'ARM PUMP LIVE 1000';
+    var expected = (
+      policy === 'v2_3000' || policy === 'v3_3000_pool600'
+    ) ? 'ARM PUMP LIVE 3000' : 'ARM PUMP LIVE 1000';
     var confirmation = window.prompt('REAL TRADING: new main-tier signals can place orders. Type: ' + expected);
     if (confirmation !== expected) {
       setStatus('Pump live arm canceled', true);
@@ -382,7 +385,7 @@
 
   function livePromoteCapital() {
     var confirmation = window.prompt(
-      'CAPITAL POLICY CHANGE: existing positions remain v1; only one concurrent new v2 $525 canary is enabled. Type: PROMOTE PUMP CAPITAL 3000'
+      'CAPITAL POLICY CHANGE: existing positions keep immutable sizing; only future entries use the active $3000 policy. Type: PROMOTE PUMP CAPITAL 3000'
     );
     if (confirmation !== 'PROMOTE PUMP CAPITAL 3000') {
       setStatus('Capital promotion canceled', true);
@@ -396,7 +399,7 @@
         setStatus(err.message, true);
         return;
       }
-      setStatus('v2_3000 mixed-cohort canary enabled for future entries', false);
+      setStatus('The $3000 mixed-cohort policy is enabled for future entries', false);
       refresh();
     });
   }

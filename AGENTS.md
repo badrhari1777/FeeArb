@@ -109,6 +109,29 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live capital allocation moved to the versioned on-demand manager on
+  2026-08-11. `v4_shared_ondemand` preserves exchange-isolated positions and
+  every legacy per-position snapshot, while future `$3000` entries use the new
+  `v3_3000_pool600` risk policy: `$600` total per symbol, split by the existing
+  2/3/5-leg strategy weights. Admission uses only Pump-owned free USDT and the
+  action executable now (L1, the one next order, and its immediate safety
+  margin); unsubmitted future ladders and temporary main rescue principal do
+  not count. The action must leave at least 30% Pump-owned free cash and the
+  `$75` operating floor. Position warning defence restores an exchange-read
+  liquidation buffer to 25% with an exact rounded top-up, tries the guarded
+  main rescue facility first, then cancels only non-reduce entry ladders, then
+  closes one protected profitable donor or the threatened position; Full TP/SL
+  orders are never cash-relief targets. The aggregate temporary facility is
+  capped at `$2000` and still passes fresh main margin/liquidation gates. Cash
+  bands are 30/20/10%; paused ladders resume only above 30% free cash with all
+  positions above the 20% warning line. Capital observation already calculates
+  a proportional 20% new-symbol budget, but periodic automatic adoption is a
+  later operator-approved change and can affect only future entries. Rollback
+  managers `v2_current_next` and `v3_shared_projected` remain available.
+  Verified Pump/transfer regression (`126 passed`), the expanded Pump/API/lab
+  set (`159 passed`, `6 warnings`), Python compilation and the complete suite
+  (`730 passed`, `8` subtests, `13` pre-existing warnings). The production Pump
+  event journal hash was unchanged by both targeted and complete tests.
 - Pump Live shared margin management was versioned on 2026-08-11. The former
   nearest-ladder manager remains available as `v2_current_next`; the approved
   `v3_shared_projected` manager keeps isolated margin and immutable `$525` new

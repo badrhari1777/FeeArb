@@ -913,3 +913,57 @@ per-position cap. Rollback
 requires changing only the manager variable back to `v2_current_next`, a safe
 restart, verification of all owned orders/protection and a fresh explicit ARM;
 it never rewrites historical position sizing.
+
+## Shared on-demand capital manager v4 (2026-08-11)
+
+The active operator policy is `v4_shared_ondemand`. Its rollback values are
+`v3_shared_projected` and `v2_current_next`; changing the environment value
+always requires a safe backend restart, exchange reconciliation and a new
+explicit ARM.
+
+Operational contract:
+
+1. All Pump positions stay on Bybit isolated margin. The common pool is the
+   allocator for free Pump USDT, not cross margin.
+2. At Pump strategy capital `$3000`, only a new symbol receives policy
+   `v3_3000_pool600` and a `$600` complete ladder. The unchanged strategy
+   weights split it as `$120 x 5`, `$100/$200/$300`, or `$200/$400`.
+   Existing positions continue with the exact risk-policy snapshot stored when
+   they entered. The other `$600` in `$3000 - 4 x $600` is not a separately
+   held reserve; actual availability is decided by the free-cash gates.
+3. A new symbol is admitted only if its L1, its one next order, and immediate
+   safety prefund fit now and still leave at least 30% Pump-owned free cash plus
+   the `$75` floor. Unsubmitted future steps are not reserved. Temporary main
+   rescue principal is subtracted before this calculation.
+4. Displayed account cash bands are calm at `>=30%`, warning at `20..30%`,
+   stress at `10..20%`, and emergency below `10%`. They combine with the worst
+   position liquidation buffer. A failed 30% admission gate blocks only the
+   candidate; it does not abandon monitoring of existing positions.
+5. Each position warning at `<=20%` asks for the exact `$5`-rounded margin that
+   restores a 25% exchange-read liquidation buffer. The controller first uses
+   existing Pump cash. If it is short, it tries the automatic main rescue
+   facility before any reduction. Outstanding temporary principal cannot
+   exceed `$2000`; the transfer still needs fresh main-account risk data and
+   the configured `$500 / 75% / 25%` projected main safety gates.
+6. If the transfer is unavailable or insufficient, the controller cancels and
+   confirms only non-reduce Pump ladder orders, never Full TP/SL. Ladders remain
+   paused until Pump free cash is at least 30% and all positions are above the
+   20% warning line.
+7. If defence is still unfunded and automatic rescue reduction is enabled, one
+   whole protected profitable donor closest to TP is closed reduce-only. If no
+   donor is eligible, the threatened position is closed. The first live version
+   intentionally does not perform a partial donor cut because that requires a
+   separately tested cancel/rescale/re-protect transaction. A threatened
+   position at or below the 10% emergency buffer is closed directly.
+8. Surplus isolated margin can be returned only after two healthy `>=35%`
+   reads and the existing 30-minute adjustment cooldown. Removal targets 25%,
+   must preserve the immediate next-ladder safety gate, is confirmed from
+   Bybit, and is rolled back if either condition fails.
+9. Capital observation calculates a proportional future budget at 20% of
+   Pump-owned strategy capital, rounded down to `$5`. Periodic automatic
+   adoption is not enabled in this release. A later approved rebase will apply
+   only to positions opened after that rebase.
+
+The `$3000` cohort, including `v3_3000_pool600`, uses the exact confirmation
+`ARM PUMP LIVE 3000`. Every backend restart remains disarmed regardless of the
+previous state.

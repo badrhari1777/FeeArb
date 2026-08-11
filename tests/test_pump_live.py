@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 from execution.pump_live import (
     ARM_CONFIRMATION,
     ARM_CONFIRMATION_V2,
@@ -16,8 +18,10 @@ from execution.pump_live import (
     PREFUND_NEXT_LADDER_CONFIRMATION_PREFIX,
     MARGIN_MANAGER_V2_CURRENT,
     MARGIN_MANAGER_V3_SHARED,
+    MARGIN_MANAGER_V4_ON_DEMAND,
     RISK_POLICY_V1,
     RISK_POLICY_V2,
+    RISK_POLICY_V3,
     PumpLiveConfig,
     PumpLiveController,
     build_capital_manager_status,
@@ -30,10 +34,26 @@ from execution.pump_live import (
     projected_ladder_margin_reserve,
     load_pump_live_config,
     required_entry_prefund_usd,
+    required_margin_for_liq_buffer_usd,
     required_available_for_new_slot,
     risk_policy_config,
     risk_policy_snapshot,
 )
+
+
+def test_pump_live_page_supports_pool600_arm_contract() -> None:
+    template = (
+        PROJECT_ROOT / "webapp" / "templates" / "pump_short_strategies.html"
+    ).read_text(encoding="utf-8")
+    javascript = (
+        PROJECT_ROOT / "webapp" / "static" / "pump_short_strategies.js"
+    ).read_text(encoding="utf-8")
+
+    assert "shared Pump cash" in template
+    assert "four $175 slots" not in template
+    assert "v3_3000_pool600" in javascript
+    assert "policy === 'v2_3000' || policy === 'v3_3000_pool600'" in javascript
+    assert "new v2 $525 canary" not in javascript
 
 
 def test_versioned_risk_policies_have_fixed_1000_and_3000_envelopes() -> None:
@@ -52,6 +72,37 @@ def test_versioned_risk_policies_have_fixed_1000_and_3000_envelopes() -> None:
     assert promoted.operating_cash_floor_usd == 75.0
     assert promoted.entry_cap == 3
     assert promoted.poll_interval_sec == 7
+
+
+def test_on_demand_policy_derives_600_new_position_budget_from_3000() -> None:
+    runtime = PumpLiveConfig(
+        margin_manager_policy_id=MARGIN_MANAGER_V4_ON_DEMAND,
+    )
+
+    policy = risk_policy_config(RISK_POLICY_V3, runtime)
+    five = build_live_legs(
+        tier={"ladder_legs": 5, "leg_weights": [1, 1, 1, 1, 1]},
+        slot_margin_usd=policy.slot_margin_usd,
+        leverage=policy.leverage,
+        reference_price=1.0,
+    )
+    three = build_live_legs(
+        tier={"ladder_legs": 3, "leg_weights": [1, 2, 3]},
+        slot_margin_usd=policy.slot_margin_usd,
+        leverage=policy.leverage,
+        reference_price=1.0,
+    )
+    two = build_live_legs(
+        tier={"ladder_legs": 2, "leg_weights": [1, 2]},
+        slot_margin_usd=policy.slot_margin_usd,
+        leverage=policy.leverage,
+        reference_price=1.0,
+    )
+
+    assert policy.slot_margin_usd == 600.0
+    assert [row["margin_usd"] for row in five] == [120.0] * 5
+    assert [row["margin_usd"] for row in three] == [100.0, 200.0, 300.0]
+    assert [row["margin_usd"] for row in two] == [200.0, 400.0]
 
 
 def test_risk_snapshot_remains_immutable_when_runtime_defaults_change() -> None:
@@ -221,6 +272,65 @@ def test_capital_regime_is_calm_without_open_positions() -> None:
 
     assert result["mode"] == "calm"
     assert result["min_liq_buffer_pct"] is None
+
+
+def test_on_demand_capital_regime_uses_account_free_cash_bands() -> None:
+    config = risk_policy_config(
+        RISK_POLICY_V3,
+        PumpLiveConfig(margin_manager_policy_id=MARGIN_MANAGER_V4_ON_DEMAND),
+    )
+    state = {
+        "last_balance": {"wallet": 3_000.0, "available": 750.0},
+        "capital_manager": {"active_risk_policy_id": RISK_POLICY_V2},
+        "positions": [{"status": "open", "symbol": "SAFEUSDT", "liq_buffer_pct": 60.0}],
+    }
+
+    warning = build_capital_regime_status(state, config)
+    state["last_balance"]["available"] = 450.0
+    stress = build_capital_regime_status(state, config)
+    state["last_balance"]["available"] = 250.0
+    emergency = build_capital_regime_status(state, config)
+
+    assert warning["cash_mode"] == "warning"
+    assert warning["available_free_pct"] == 25.0
+    assert stress["cash_mode"] == "stress"
+    assert emergency["cash_mode"] == "emergency"
+
+
+def test_on_demand_cash_thresholds_are_normalized_in_descending_order(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    env_path.write_text(
+        "\n".join(
+            [
+                "PUMP_LIVE_ACCOUNT_ENTRY_FREE_PCT=15",
+                "PUMP_LIVE_ACCOUNT_WARNING_FREE_PCT=30",
+                "PUMP_LIVE_ACCOUNT_STRESS_FREE_PCT=25",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_pump_live_config(env_path)
+
+    assert config.account_entry_free_pct == 15.0
+    assert config.account_warning_free_pct == 15.0
+    assert config.account_stress_free_pct == 15.0
+
+
+def test_exact_margin_target_restores_25_percent_buffer() -> None:
+    required = required_margin_for_liq_buffer_usd(
+        qty=100.0,
+        current_liq_price=12.0,
+        mark_price=10.0,
+        target_buffer_pct=25.0,
+        maintenance_margin_rate=0.025,
+        taker_fee_rate=0.00055,
+        round_up_increment_usd=5.0,
+    )
+
+    assert required == 55.0
 
 
 def test_capital_regime_uses_active_v2_portfolio_reserve_across_mixed_positions() -> None:
@@ -529,6 +639,7 @@ def write_env(
     entry_cap: int = 1,
     prefund_enabled: bool = False,
     margin_manager_policy: str = MARGIN_MANAGER_V2_CURRENT,
+    auto_rescue_reduction: bool = False,
 ) -> None:
     path.write_text(
         "\n".join(
@@ -550,7 +661,19 @@ def write_env(
                 "PUMP_LIVE_PROJECTED_FINAL_FILL_BUFFER_PCT=20",
                 "PUMP_LIVE_PROJECTED_EXCHANGE_CAP_REACTION_BUFFER_PCT=8",
                 "PUMP_LIVE_SHARED_RESCUE_FACILITY_CAP_USD=2000",
-                "PUMP_LIVE_SHARED_MAX_POSITION_TOPUP_USD=2000",
+                (
+                    "PUMP_LIVE_SHARED_MAX_POSITION_TOPUP_USD=5000"
+                    if margin_manager_policy == MARGIN_MANAGER_V4_ON_DEMAND
+                    else "PUMP_LIVE_SHARED_MAX_POSITION_TOPUP_USD=2000"
+                ),
+                "PUMP_LIVE_ACCOUNT_ENTRY_FREE_PCT=30",
+                "PUMP_LIVE_ACCOUNT_WARNING_FREE_PCT=20",
+                "PUMP_LIVE_ACCOUNT_STRESS_FREE_PCT=10",
+                (
+                    "PUMP_LIVE_AUTO_RESCUE_REDUCTION_ENABLED=1"
+                    if auto_rescue_reduction
+                    else "PUMP_LIVE_AUTO_RESCUE_REDUCTION_ENABLED=0"
+                ),
             ]
         ),
         encoding="utf-8",
@@ -1768,6 +1891,223 @@ def test_projected_manager_uses_exchange_cap_reaction_buffer_for_bluai(
     assert verified["ready"] is True
     assert verified["current"]["verified_clearance_pct"] >= 8.0
     assert verified["projected"]["ready"] is True
+
+
+def test_on_demand_entry_reserves_only_first_action_and_excludes_rescue_cash(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        entry_cap=4,
+        prefund_enabled=True,
+        margin_manager_policy=MARGIN_MANAGER_V4_ON_DEMAND,
+    )
+    gateway = FakePumpGateway()
+    gateway.balance.update({"total": 3_000.0, "wallet": 3_000.0, "available": 3_000.0})
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "active_strategy_capital_usd": 3_000.0,
+        "application_enabled": True,
+    }
+    config = risk_policy_config(RISK_POLICY_V3, controller.config())
+
+    ready = controller._on_demand_entry_admission(  # pylint: disable=protected-access
+        balance=gateway.balance,
+        open_items=[],
+        candidate_config=config,
+        tier={"ladder_legs": 3, "ladder_step_pct": 50.0, "leg_weights": [1, 2, 3]},
+    )
+
+    assert ready["ready"] is True
+    assert ready["new_slot_margin_usd"] == 600.0
+    assert ready["new_first_leg_margin_usd"] == 100.0
+    assert ready["new_next_order_margin_usd"] == 200.0
+    assert ready["future_ladders_reserved"] is False
+    assert ready["only_next_ladder_reserved"] is True
+    assert ready["new_action_cash_usd"] < 600.0
+
+    controller._state["capital_manager"][  # pylint: disable=protected-access
+        "temporary_transfer_outstanding_usd"
+    ] = 2_700.0
+    blocked = controller._on_demand_entry_admission(  # pylint: disable=protected-access
+        balance=gateway.balance,
+        open_items=[],
+        candidate_config=config,
+        tier={"ladder_legs": 3, "ladder_step_pct": 50.0, "leg_weights": [1, 2, 3]},
+    )
+
+    assert blocked["ready"] is False
+    assert blocked["reason"] == "ondemand_post_action_free_below_entry_floor"
+    assert blocked["temporary_rescue_cash_excluded_usd"] == 2_700.0
+
+
+def test_on_demand_manager_keeps_old_snapshot_and_sizes_only_new_entry_at_600(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        entry_cap=4,
+        prefund_enabled=False,
+        margin_manager_policy=MARGIN_MANAGER_V4_ON_DEMAND,
+    )
+    gateway = FakePumpGateway()
+    gateway.balance.update({"total": 3_000.0, "wallet": 3_000.0, "available": 3_000.0})
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["capital_manager"] = {  # pylint: disable=protected-access
+        "active_risk_policy_id": RISK_POLICY_V2,
+        "active_strategy_capital_usd": 3_000.0,
+        "application_enabled": True,
+    }
+    controller._state["positions"] = [  # pylint: disable=protected-access
+        {
+            "live_id": "old",
+            "symbol": "OLDUSDT",
+            "status": "closed",
+            "risk_policy_id": RISK_POLICY_V2,
+            "risk_policy": risk_policy_snapshot(RISK_POLICY_V2, PumpLiveConfig()),
+            "legs": build_live_legs(
+                tier={"ladder_legs": 5, "leg_weights": [1, 1, 1, 1, 1]},
+                slot_margin_usd=525.0,
+                leverage=3.0,
+                reference_price=1.0,
+            ),
+        }
+    ]
+    armed_at = int(controller.arm(ARM_CONFIRMATION_V2)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1, symbol="NEWUSDT")])
+
+    status = controller.run_cycle()
+    old = next(row for row in status["positions"] if row["symbol"] == "OLDUSDT")
+    new = next(row for row in status["positions"] if row["symbol"] == "NEWUSDT")
+
+    assert sum(float(leg["margin_usd"]) for leg in old["legs"]) == 525.0
+    assert new["risk_policy_id"] == RISK_POLICY_V3
+    assert sum(float(leg["margin_usd"]) for leg in new["legs"]) == 600.0
+
+
+def test_on_demand_cash_relief_cancels_only_entry_ladders(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path, margin_manager_policy=MARGIN_MANAGER_V4_ON_DEMAND)
+    gateway = FakePumpGateway()
+    gateway.orders = [
+        {"id": "a-l2", "symbol": "AUSDT", "status": "open"},
+        {"id": "b-l2", "symbol": "BUSDT", "status": "open"},
+    ]
+    notifier = FakePumpNotifier()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+        notifier=notifier,
+        background_notifications=False,
+    )
+    controller._state["positions"] = [  # pylint: disable=protected-access
+        {
+            "symbol": "AUSDT",
+            "status": "open",
+            "legs": [
+                {"step": 1, "status": "filled"},
+                {"step": 2, "status": "open", "order_id": "a-l2", "margin_usd": 100.0},
+            ],
+        },
+        {
+            "symbol": "BUSDT",
+            "status": "open",
+            "legs": [
+                {"step": 1, "status": "filled"},
+                {"step": 2, "status": "open", "order_id": "b-l2", "margin_usd": 200.0},
+            ],
+        },
+    ]
+
+    result = controller._cancel_ladders_for_cash_relief(  # pylint: disable=protected-access
+        threatened_symbol="AUSDT"
+    )
+
+    assert gateway.canceled == ["b-l2", "a-l2"]
+    assert result["released_order_margin_usd"] == 300.0
+    assert controller._state["account_ladders_paused"] is True  # pylint: disable=protected-access
+    assert all(
+        row["legs"][1]["status"] == "planned"
+        for row in controller._state["positions"]  # pylint: disable=protected-access
+    )
+    assert any(title == "Pump Live CASH RELIEF AUSDT" for title, _ in notifier.messages)
+
+
+def test_on_demand_rescue_closes_profitable_donor_before_loser(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(
+        env_path,
+        margin_manager_policy=MARGIN_MANAGER_V4_ON_DEMAND,
+        auto_rescue_reduction=True,
+    )
+    gateway = FakePumpGateway()
+    gateway.positions = [
+        {"symbol": "DONORUSDT", "side": "short", "qty": 10.0},
+        {"symbol": "THREATUSDT", "side": "short", "qty": 20.0},
+    ]
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    donor = {
+        "live_id": "donor",
+        "symbol": "DONORUSDT",
+        "status": "open",
+        "qty": 10.0,
+        "mark_price": 10.0,
+        "tp_price": 9.0,
+        "stop_price": 14.0,
+        "liq_buffer_pct": 50.0,
+        "unrealized_pnl_usd": 25.0,
+        "legs": [{"step": 1, "status": "filled"}],
+    }
+    threat = {
+        "live_id": "threat",
+        "symbol": "THREATUSDT",
+        "status": "open",
+        "qty": 20.0,
+        "mark_price": 10.0,
+        "tp_price": 8.0,
+        "stop_price": 11.0,
+        "liq_buffer_pct": 12.0,
+        "unrealized_pnl_usd": -200.0,
+        "legs": [{"step": 1, "status": "filled"}],
+    }
+    controller._state["positions"] = [donor, threat]  # pylint: disable=protected-access
+
+    result = controller._initiate_capital_rescue_reduction(  # pylint: disable=protected-access
+        threatened=threat,
+        config=controller.config(),
+        required_usd=100.0,
+    )
+
+    assert result is True
+    assert donor["status"] == "closing"
+    assert threat["status"] == "open"
+    assert "market_reduce:DONORUSDT" in gateway.operations
+    assert controller._state["entry_armed"] is False  # pylint: disable=protected-access
+    assert controller._state["blocked_reason"] == "capital_rescue_profitable_donor"  # pylint: disable=protected-access
 
 
 @pytest.mark.parametrize(

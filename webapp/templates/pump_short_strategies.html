@@ -68,7 +68,7 @@
       <div class="panel-heading">
         <div>
           <h2>Pump Live &middot; Bybit Subaccount</h2>
-          <p class="muted">Main pullback-tier only &middot; $700 deployable &middot; $300 reserve &middot; four $175 slots &middot; entries disabled after every backend restart.</p>
+          <p class="muted">Main pullback-tier only &middot; isolated positions &middot; shared Pump cash &middot; one live next ladder per position &middot; entries disabled after every backend restart.</p>
         </div>
         <div class="panel-actions">
           <button type="button" class="button button--ghost" id="pss-live-preflight">Read-only preflight</button>
@@ -86,12 +86,12 @@
         <div class="pump-dashboard-stat"><span>Balance</span><strong id="pss-live-balance">$0.00</strong></div>
         <div class="pump-dashboard-stat"><span>Available</span><strong id="pss-live-available">$0.00</strong></div>
         <div class="pump-dashboard-stat"><span>Open / cap</span><strong id="pss-live-slots">0 / 1</strong></div>
-        <div class="pump-dashboard-stat"><span>Reserve floor</span><strong id="pss-live-reserve">$300.00</strong></div>
+        <div class="pump-dashboard-stat"><span>4-slot remainder (not held)</span><strong id="pss-live-reserve">$0.00</strong></div>
         <div class="pump-dashboard-stat"><span>Temporarily occupied</span><strong id="pss-live-temporary">$0.00</strong></div>
         <div class="pump-dashboard-stat"><span>Capital regime</span><strong id="pss-live-regime">-</strong></div>
         <div class="pump-dashboard-stat"><span>Margin manager</span><strong id="pss-live-margin-manager">-</strong></div>
-        <div class="pump-dashboard-stat"><span>5-leg next-gate headroom</span><strong id="pss-live-entry-headroom">-</strong></div>
-        <div class="pump-dashboard-stat"><span>5-leg full-path stress</span><strong id="pss-live-stress-headroom">-</strong></div>
+        <div class="pump-dashboard-stat"><span>Next action headroom</span><strong id="pss-live-entry-headroom">-</strong></div>
+        <div class="pump-dashboard-stat"><span>Full-path stress (info)</span><strong id="pss-live-stress-headroom">-</strong></div>
         <div class="pump-dashboard-stat"><span>Auto rescue</span><strong id="pss-live-auto-transfer">OFF</strong></div>
         <div class="pump-dashboard-stat"><span>Main available floor</span><strong id="pss-live-auto-main-floor">$0.00</strong></div>
         <div class="pump-dashboard-stat"><span>Daily rescue used / alert</span><strong id="pss-live-auto-daily-left">$0.00</strong></div>
@@ -113,7 +113,7 @@
           <input id="pss-live-capital-note" type="text" maxlength="200" placeholder="Permanent deposit or excluded rescue reserve" />
         </label>
         <button type="button" class="button button--ghost" id="pss-live-capital-save">Save observed capital</button>
-        <button type="button" class="button button--ghost" id="pss-live-capital-promote">Promote exact capital to $3000 v2 canary</button>
+        <button type="button" class="button button--ghost" id="pss-live-capital-promote">Promote exact capital to $3000 policy</button>
       </form>
       <div class="pump-dashboard-band">
         <div class="pump-dashboard-stat"><span>Capital mode</span><strong id="pss-live-capital-mode">observe</strong></div>

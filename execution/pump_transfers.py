@@ -38,6 +38,7 @@ AUTO_TRANSFER_MAIN_MAX_MARGIN_RATIO = 0.75
 AUTO_TRANSFER_MAIN_MIN_LIQ_BUFFER_PCT = 25.0
 AUTO_TRANSFER_MAIN_MAX_DATA_AGE_SEC = 180
 AUTO_TRANSFER_MAX_INCIDENT_USD = 250.0
+AUTO_TRANSFER_FACILITY_CAP_USD = 2_000.0
 AUTO_TRANSFER_DAILY_ALERT_USD = 500.0
 AUTO_TRANSFER_ROUND_USD = 5.0
 
@@ -171,6 +172,13 @@ def load_auto_transfer_config(path: Path = PUMP_TRANSFER_ENV_PATH) -> dict[str, 
             _number(
                 values.get("PUMP_LIVE_AUTO_TRANSFER_MAX_INCIDENT_USD"),
                 AUTO_TRANSFER_MAX_INCIDENT_USD,
+            ),
+        ),
+        "facility_cap_usd": max(
+            float(PUMP_TRANSFER_MIN_USDT),
+            _number(
+                values.get("PUMP_LIVE_AUTO_TRANSFER_FACILITY_CAP_USD"),
+                AUTO_TRANSFER_FACILITY_CAP_USD,
             ),
         ),
         "daily_alert_usd": max(
@@ -804,6 +812,11 @@ class PumpTemporaryTransferController:
         rounded = math.ceil(requested / config["round_usd"] - 1e-12) * config["round_usd"]
         now = int(time.time() * 1000)
         auto_status = self._auto_status()
+        with self._lock:
+            outstanding = max(
+                0.0,
+                _number(self._state.get("temporary_outstanding_usd")),
+            )
         risk_band = (
             "emergency"
             if liq_buffer_pct <= 10.0
@@ -823,9 +836,22 @@ class PumpTemporaryTransferController:
         reason = None
         if self._state.get("pending"):
             reason = "pending_reconciliation"
+        facility_remaining = max(
+            0.0,
+            config["facility_cap_usd"] - outstanding,
+        )
+        if rounded > facility_remaining + 1e-9:
+            reason = "temporary_rescue_facility_cap_exceeded"
         if reason:
             return self._record_auto_result(
-                {"status": "blocked", "reason": reason, "amount_usd": rounded, **context},
+                {
+                    "status": "blocked",
+                    "reason": reason,
+                    "amount_usd": rounded,
+                    "temporary_outstanding_usd": round(outstanding, 6),
+                    "facility_remaining_usd": round(facility_remaining, 6),
+                    **context,
+                },
                 now=now,
             )
 

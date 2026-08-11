@@ -212,6 +212,7 @@ def _enable_auto_transfer(path: Path, **overrides: float) -> None:
         "PUMP_LIVE_AUTO_TRANSFER_MAIN_MIN_LIQ_BUFFER_PCT": "25",
         "PUMP_LIVE_AUTO_TRANSFER_MAIN_MAX_DATA_AGE_SEC": "180",
         "PUMP_LIVE_AUTO_TRANSFER_MAX_INCIDENT_USD": "250",
+        "PUMP_LIVE_AUTO_TRANSFER_FACILITY_CAP_USD": "2000",
         "PUMP_LIVE_AUTO_TRANSFER_DAILY_ALERT_USD": "500",
         "PUMP_LIVE_AUTO_TRANSFER_ROUND_USD": "5",
     }
@@ -294,6 +295,36 @@ def test_auto_risk_transfer_allows_consecutive_confirmed_incidents_without_coold
     assert len(gateway.create_calls) == 2
     assert first["transfer_id"] != second["transfer_id"]
     assert controller.status()["auto_risk"]["daily_used_usd"] == 20.0
+
+
+def test_auto_risk_transfer_enforces_aggregate_2000_facility_cap(tmp_path: Path) -> None:
+    controller, gateway, _accounting = _controller(tmp_path)
+    _enable_auto_transfer(
+        tmp_path / "pump.env",
+        PUMP_LIVE_AUTO_TRANSFER_MAX_INCIDENT_USD=2000,
+        PUMP_LIVE_AUTO_TRANSFER_FACILITY_CAP_USD=2000,
+    )
+    controller._state["temporary_outstanding_usd"] = 1_950.0  # pylint: disable=protected-access
+
+    blocked = controller.auto_transfer_for_risk(
+        requested_usd=55.0,
+        symbol="HEIUSDT",
+        liq_buffer_pct=18.0,
+        desired_topup_usd=55.0,
+        available_usd=0.0,
+    )
+    allowed = controller.auto_transfer_for_risk(
+        requested_usd=50.0,
+        symbol="HEIUSDT",
+        liq_buffer_pct=18.0,
+        desired_topup_usd=50.0,
+        available_usd=0.0,
+    )
+
+    assert blocked["status"] == "blocked"
+    assert blocked["reason"] == "temporary_rescue_facility_cap_exceeded"
+    assert allowed["status"] == "complete"
+    assert len(gateway.create_calls) == 1
 
 
 def test_auto_risk_transfer_allows_watch_account_when_projection_stays_safe(
