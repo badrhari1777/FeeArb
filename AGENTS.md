@@ -151,6 +151,12 @@ Recent Changes
   state, 2/3/5-leg next-gate headroom becomes positive while full-path stress
   remains negative and visible. Related regression passed `124`; complete
   regression passed `720` plus `8` subtests with unchanged production hashes.
+  Safe deployment retained `3` non-reduce ladders and `6` Full TP/SL orders;
+  explicit `ARM PUMP LIVE 3000` succeeded. Subsequent cycles stayed armed with
+  no error or margin mutation; 5-leg next-gate headroom was `$887.89`, while
+  full-path stress remained `-$2062.11`. TUT Grid stayed
+  `partial_enter_waiting_trigger` with no active execution and Manual had zero
+  runs.
 - Pump Live shared-margin research on 2026-08-10 identified a fill-to-stop race
   in the sequential ladder gate: the higher short fill improves projected
   liquidation, but the old Full stop remains until the next synchronization.

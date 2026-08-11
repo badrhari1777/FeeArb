@@ -268,3 +268,9 @@ uses the 8% exchange-cap fallback. It neither repeats the write nor duplicates
 blocked events until exposure changes or position value grows more than 5%.
 Focused regression passed `124`; the complete suite passed `720` plus `8`
 subtests, with both production Pump state/event hashes unchanged.
+
+Deployment preserved the three owned positions, three nearest non-reduce
+ladders and six Full TP/SL orders. Explicit `ARM PUMP LIVE 3000` succeeded.
+Following monitor cycles stayed armed, next-gate admission stayed ready at
+about `+$887.89`, and no error or margin mutation occurred. TUT Grid and Manual
+execution state were unchanged.

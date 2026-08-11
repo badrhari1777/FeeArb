@@ -899,6 +899,14 @@ The operator-authorized `ARM PUMP LIVE 3000` succeeded with manager
 complete-path cash gate. The same-day next-gate refinement supersedes that
 decision while preserving the negative full-path value as a stress warning.
 
+Next-gate refinement deployment on 2026-08-11 completed with the same three
+owned positions, exactly three nearest non-reduce ladders and six Full TP/SL
+orders. `ARM PUMP LIVE 3000` succeeded; following monitor cycles remained
+armed with no error and no margin add. For the displayed equal five-leg
+candidate, hard required available was `$1382.50` against about `$2270.39`
+available (`+$887.89` headroom). Full-path stress remained `-$2062.11` and is
+shown as warning context rather than entry authority.
+
 The Pump page and `/api/positions/overview` expose `margin_manager`,
 `shared_pool`, next-gate headroom, full-path stress headroom and the effective
 per-position cap. Rollback
