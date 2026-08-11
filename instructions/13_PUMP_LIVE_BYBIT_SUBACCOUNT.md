@@ -1049,6 +1049,13 @@ Full TP/SL, and only then recreates that one order. No distant ladder is made
 live. Margin release uses the same 12% boundary, so surplus cannot be removed
 when it would reopen the fill-reaction window.
 
+If Bybit's isolated `position margin <= position value` ceiling temporarily
+cannot accept the required 12% prefund, the unsafe ladder remains cancelled and
+planned. The gate is retried from fresh exchange state, but an unchanged
+required/allowed shortfall writes only one `margin_prefund_blocked` event rather
+than one event per hot cycle. A higher mark increases position value and can
+make the same gate feasible well before the distant ladder price.
+
 The exact BMT three-leg regression starts from exchange-like state
 `qty=15117`, `liq=0.03155`, L2 `0.029772` and L3 `0.039696`. It requires about
 `$45` before L2 and `$315` before L3, verifies the still-active stop and the

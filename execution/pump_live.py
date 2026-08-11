@@ -4785,18 +4785,36 @@ class PumpLiveController:
             )
         if required > allowed + 1e-9:
             with self._lock:
+                repeated_block = bool(
+                    item.get("margin_prefund_status") == "reserve_insufficient"
+                    and math.isclose(
+                        _safe_float(item.get("margin_prefund_blocked_required_usd"), -1.0),
+                        required,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                    and math.isclose(
+                        _safe_float(item.get("margin_prefund_blocked_allowed_usd"), -1.0),
+                        allowed,
+                        rel_tol=1e-9,
+                        abs_tol=1e-9,
+                    )
+                )
                 item["margin_prefund_status"] = "reserve_insufficient"
+                item["margin_prefund_blocked_required_usd"] = required
+                item["margin_prefund_blocked_allowed_usd"] = allowed
                 item["updated_at_ms"] = _now_ms()
                 self._save_state_locked()
-            self._event(
-                "margin_prefund_blocked",
-                {
-                    "symbol": symbol,
-                    "required_usd": required,
-                    "allowed_usd": allowed,
-                    "available_usd": available,
-                },
-            )
+            if not repeated_block:
+                self._event(
+                    "margin_prefund_blocked",
+                    {
+                        "symbol": symbol,
+                        "required_usd": required,
+                        "allowed_usd": allowed,
+                        "available_usd": available,
+                    },
+                )
             raise RuntimeError("pump_live_margin_prefund_reserve_insufficient")
 
         previous_liq = liq

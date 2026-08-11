@@ -1361,6 +1361,7 @@ def test_next_ladder_is_deferred_when_margin_envelope_is_exhausted(
 
     status = controller.run_cycle()
     item = status["positions"][0]
+    second_status = controller.run_cycle()
 
     assert gateway.margin_adds == []
     assert gateway.canceled == ["l3"]
@@ -1368,6 +1369,10 @@ def test_next_ladder_is_deferred_when_margin_envelope_is_exhausted(
     assert item["ladder_gate_status"] == "blocked"
     assert status["blocked_reason"] == "next_ladder_margin_not_confirmed"
     assert status["last_error"] is None
+    assert sum(
+        event["event"] == "margin_prefund_blocked"
+        for event in second_status["recent_events"]
+    ) == 1
 
 
 def test_next_ladder_prefund_uses_guarded_main_transfer_only_for_cash_gap(

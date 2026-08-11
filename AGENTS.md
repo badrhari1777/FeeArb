@@ -120,7 +120,9 @@ Recent Changes
   clear that ladder by at least 12% with zero tolerance. The exact BMT three-leg
   model requires about `$45` before L2 and `$315` before L3 and retains more
   than 20% projected liquidation buffer after L3. Margin release uses the same
-  v4 boundary. Pump/API/lab regression passed (`211 passed`, `6 warnings`),
+  v4 boundary. Unchanged exchange-cap prefund shortfalls are event-deduped while
+  their unsafe ladder remains cancelled and planned. Pump/API/lab regression
+  passed (`211 passed`, `6 warnings`),
   and the complete suite passed (`743 passed`, `8` subtests, `13` pre-existing
   warnings). Canonical operation and rollout evidence are in
   `instructions/13_PUMP_LIVE_BYBIT_SUBACCOUNT.md`.
