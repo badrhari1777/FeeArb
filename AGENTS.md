@@ -109,6 +109,22 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live close recovery and accounting were decoupled on 2026-08-12 after
+  RATS held for over seven days, closed fully by Bybit Take Profit, and then
+  remained `position_absent_unconfirmed` because one full-window transaction
+  log request exceeded Bybit's seven-day limit. Close accounting now reads one
+  narrow exchange `Closed PnL` row plus optional metadata for its specific exit
+  order. The row supplies actual aggregate entry/exit, fees, funding-inclusive
+  net PnL, and return; its quantity is checked against the last tracked Pump
+  quantity. Confirmed flatness and remaining-position/order protection may
+  recover entries after their existing healthy-cycle gates even if financial
+  reporting is unavailable or partial. Operator disarm, restart, emergency,
+  unknown exchange state, and protection failure remain fail-closed. The live
+  RATS row independently verified TP `0.03738`, fill `0.03678`, funding
+  `+$0.79841842`, fees `$0.15157420`, and net `+$23.49104422`. Verified focused
+  (`117`), expanded (`149`, `6 warnings`), and full regression (`748`, `8`
+  subtests, `13` warnings). Deployment still needs a supervised restart and
+  explicit operator ARM.
 - Pump Live v4 next ladders became price-proximity gated on 2026-08-11 by
   explicit operator decision. Distance is `(next fill / Mark - 1) * 100`:
   `>55%` is dormant at the normal poll, `35..55%` is planned-only with the

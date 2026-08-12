@@ -419,16 +419,22 @@ therefore no longer waits for the remaining hundreds of symbols in the same
 scan. The normal ownership, slot, liquidity, risk, and duplicate-entry guards
 still decide whether the signal can become an order.
 
-After a live position is confirmed flat, Pump Live reads Bybit fills and the
-account transaction log for that position window. It persists exchange-derived
-entry/exit quantities and average prices, trading fees, funding, gross PnL, net
-PnL, and return in `live_state.json`. A one-shot startup backfill fills these
-fields for older closed Pump-owned positions that do not yet have close
-accounting. The exchange records are authoritative; ticker snapshots are not
-used as realized-PnL substitutes.
+After a live position is confirmed flat, Pump Live reads one compact Bybit
+`Closed PnL` record around the observed close time and, when available, the
+specific final order by its returned order ID. `Closed PnL` already contains
+the exchange-authoritative closed quantity, aggregate actual entry/exit values
+and prices, entry/exit fees, funding-inclusive net PnL, and return even when the
+position was held for longer than seven days. Pump derives the funding component
+as `exchange net - price gross + fees` and persists the result plus TP/SL exit
+metadata in `live_state.json`. It no longer downloads every fill and account
+transaction across the full holding period. A one-shot startup backfill fills
+these fields for older closed Pump-owned positions that do not yet have close
+accounting. Local planned ladder prices are used only to validate ownership and
+expected closed quantity; they never replace actual exchange execution.
 
-This adds no recurring private API polling. Private history is requested only
-when a close needs accounting or a missing historical close is backfilled.
+This adds no recurring private API polling. The narrow close record and its
+specific exit order are requested only when a close needs accounting or a
+missing historical close is backfilled.
 
 ## Four-slot cash guard correction (2026-08-09)
 
@@ -594,12 +600,14 @@ live position.
 Update 2026-08-10: a normal exchange-side TP/flat close no longer leaves new
 entries permanently blocked by `position_absent_unconfirmed`. Automatic
 re-arming is deliberately narrow: entries must have been armed before the
-first missing-position scan, the position must be flat for two scans, close
-accounting must be complete, no unknown position/order may exist, and every
-remaining Pump position must be open with confirmed TP/SL for two additional
-healthy scans. Operator disarm, emergency close, incomplete accounting, an
-unknown exchange object, or degraded protection is never overridden. A
-restart also clears the pending automatic recovery and still requires the
+first missing-position scan, the position must be flat for two scans, no
+unknown position/order may exist, and every remaining Pump position must be
+open with confirmed TP/SL for two additional healthy scans. From 2026-08-12,
+financial accounting is deliberately separate from this safety proof: an
+unavailable or incomplete PnL report stays visible and eligible for backfill,
+but cannot keep verified-safe new entries disabled. Operator disarm, emergency
+close, an unknown exchange object, or degraded protection is never overridden.
+A restart also clears the pending automatic recovery and still requires the
 normal explicit ARM/resume verification.
 
 Update 2026-08-10, `$3000` capital path: every legacy position is migrated to
@@ -1167,3 +1175,39 @@ no monitor error, blocked reason, transient recovery, or portfolio risk freeze.
 Exchange reconciliation showed exactly seven open orders: six reduce-only
 TP/SL orders plus the single non-reduce BMT L2. Implementation commit:
 `854e4d0`.
+
+## Compact close accounting and independent recovery (2026-08-12)
+
+RATS exposed an unnecessary coupling between trade reporting and entry safety.
+Its full-position Bybit Take Profit triggered at `0.03738` and filled all
+`1750` contracts at average `0.03678`, but the old accounting implementation
+requested one transaction-log interval from 2026-08-04 through 2026-08-12.
+Bybit rejected that interval because it exceeded seven days. Exchange flatness
+was already confirmed, yet `close_accounting_status=error` prevented the normal
+two-cycle entry recovery and left `position_absent_unconfirmed` active.
+
+The authoritative compact Bybit `Closed PnL` row for the same close returned
+entry `0.04983382`, exit `0.03678`, fees `$0.15157420`, funding `+$0.79841842`,
+and exact net PnL `+$23.49104422`; the specific close order confirmed
+`TakeProfit`, `Filled`, reduce-only and close-on-trigger. This exactly matched
+an independent, read-only reconstruction of all fills and funding settlements.
+
+Current policy therefore separates two concerns:
+
+1. Position safety is proven by two consecutive flat exchange reads, owned
+   order cancellation, no unknown exchange objects, and intact TP/SL on every
+   remaining Pump position. Two further healthy scans may restore entries if
+   they were armed before the normal close.
+2. Financial reporting uses the narrow `Closed PnL` record and validates its
+   quantity against the last locally tracked exchange quantity. A missing API
+   row, optional order-metadata failure, or quantity mismatch remains
+   `unavailable/error/partial` for later backfill but does not invalidate the
+   already confirmed flat state.
+
+Manual operator disarm, restart, emergency close, unknown exchange state, or
+missing protection still never auto-arm. The change performs no trading action
+and does not alter entry, ladder, margin, TP, or SL rules. Verified Python
+compilation, the focused Pump set (`117 passed`), the expanded Pump/API/account
+set (`149 passed`, `6 warnings`), and the complete project suite (`748 passed`,
+`8` subtests, `13` pre-existing warnings). Live activation still requires a
+separate supervised restart and explicit operator ARM.

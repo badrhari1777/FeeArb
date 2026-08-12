@@ -3536,6 +3536,87 @@ def test_flat_position_needs_two_cycles_then_cancels_ladder(tmp_path: Path) -> N
     )
 
 
+def test_flat_position_accounting_error_does_not_block_confirmed_close_recovery(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    monkeypatch.setattr(
+        gateway,
+        "fetch_closed_trade_summary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated accounting API failure")
+        ),
+    )
+    gateway.positions = []
+
+    first = controller.run_cycle()
+    second = controller.run_cycle()
+    recovered = controller.run_cycle()
+
+    assert first["blocked_reason"] == "position_absent_unconfirmed"
+    closed = next(
+        item for item in second["positions"] if item["status"] == "closed"
+    )
+    assert closed["close_accounting_status"] == "error"
+    assert "simulated accounting API failure" in closed["close_accounting_error"]
+    assert second["close_recovery_healthy_cycles"] == 1
+    assert recovered["entry_armed"] is True
+    assert recovered["blocked_reason"] is None
+    assert recovered["status"] == "armed"
+
+
+def test_flat_position_rejects_wrong_closed_pnl_quantity_but_recovers_entries(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    gateway = FakePumpGateway()
+    gateway.closed_trade_summary = {
+        "status": "complete",
+        "exit_qty": 999.0,
+        "net_pnl_usd": 12.0,
+    }
+    controller = PumpLiveController(
+        gateway=gateway,
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
+    controller.submit_decisions([ready_decision(armed_at + 1)])
+    controller.run_cycle()
+    expected_qty = gateway.positions[0]["qty"]
+    gateway.positions = []
+
+    controller.run_cycle()
+    closed_cycle = controller.run_cycle()
+    recovered = controller.run_cycle()
+
+    closed = next(
+        item for item in closed_cycle["positions"] if item["status"] == "closed"
+    )
+    assert closed["close_accounting_status"] == "partial"
+    assert closed["close_accounting"]["validation_error"] == (
+        "closed_pnl_qty_mismatch"
+    )
+    assert closed["close_accounting"]["expected_exit_qty"] == expected_qty
+    assert recovered["entry_armed"] is True
+
+
 def test_flat_position_does_not_override_prior_operator_disarm(tmp_path: Path) -> None:
     env_path = tmp_path / "pump_live.env"
     write_env(env_path)
@@ -3590,6 +3671,9 @@ def test_flat_position_persists_exact_exchange_accounting(tmp_path: Path) -> Non
     armed_at = int(controller.arm(ARM_CONFIRMATION)["armed_at_ms"])
     controller.submit_decisions([ready_decision(armed_at + 1)])
     controller.run_cycle()
+    actual_qty = gateway.positions[0]["qty"]
+    gateway.closed_trade_summary["entry_qty"] = actual_qty
+    gateway.closed_trade_summary["exit_qty"] = actual_qty
     gateway.positions = []
 
     controller.run_cycle()
@@ -4650,6 +4734,102 @@ def test_bybit_full_protection_treats_not_modified_as_success(
     )
 
     assert result == {"status": "already_set"}
+
+
+def test_bybit_close_accounting_uses_compact_closed_pnl_record(
+    monkeypatch: Any,
+) -> None:
+    class ClosedPnlClient:
+        closed_pnl_params: dict[str, Any] | None = None
+        order_history_params: dict[str, Any] | None = None
+
+        @classmethod
+        def private_get_v5_position_closed_pnl(
+            cls,
+            params: dict[str, Any],
+        ) -> dict[str, Any]:
+            cls.closed_pnl_params = dict(params)
+            return {
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "1000RATSUSDT",
+                            "orderId": "close-rats",
+                            "side": "Buy",
+                            "qty": "1750",
+                            "avgEntryPrice": "0.04983382",
+                            "avgExitPrice": "0.03678",
+                            "closedPnl": "23.49104422",
+                            "cumEntryValue": "87.2092",
+                            "cumExitValue": "64.365",
+                            "openFee": "0.0872092",
+                            "closeFee": "0.064365",
+                            "updatedTime": "1786483230000",
+                        }
+                    ],
+                    "nextPageCursor": "",
+                }
+            }
+
+        @classmethod
+        def private_get_v5_order_history(
+            cls,
+            params: dict[str, Any],
+        ) -> dict[str, Any]:
+            cls.order_history_params = dict(params)
+            return {
+                "result": {
+                    "list": [
+                        {
+                            "orderStatus": "Filled",
+                            "orderType": "Market",
+                            "stopOrderType": "TakeProfit",
+                            "triggerPrice": "0.03738",
+                            "reduceOnly": True,
+                            "closeOnTrigger": True,
+                        }
+                    ]
+                }
+            }
+
+    gateway = BybitPumpLiveGateway()
+    monkeypatch.setattr(gateway, "_ensure_client", lambda: ClosedPnlClient())
+    monkeypatch.setattr(
+        gateway,
+        "_market",
+        lambda symbol: {"id": symbol, "symbol": f"{symbol[:-4]}/USDT:USDT"},
+    )
+
+    summary = gateway.fetch_closed_trade_summary(
+        "1000RATSUSDT",
+        opened_at_ms=1785844917223,
+        closed_at_ms=1786483241323,
+    )
+
+    assert summary["status"] == "complete"
+    assert summary["source"] == "bybit_closed_pnl"
+    assert summary["entry_qty"] == 1750.0
+    assert summary["exit_qty"] == 1750.0
+    assert summary["avg_entry_price"] == 0.04983382
+    assert summary["avg_exit_price"] == 0.03678
+    assert summary["fees_usd"] == 0.1515742
+    assert summary["funding_pnl_usd"] == 0.79841842
+    assert summary["net_pnl_usd"] == 23.49104422
+    assert summary["exit_stop_order_type"] == "TakeProfit"
+    assert summary["exit_trigger_price"] == 0.03738
+    assert summary["exit_order_ids"] == ["close-rats"]
+    assert ClosedPnlClient.closed_pnl_params is not None
+    assert (
+        ClosedPnlClient.closed_pnl_params["endTime"]
+        - ClosedPnlClient.closed_pnl_params["startTime"]
+        < 7 * 24 * 60 * 60 * 1000
+    )
+    assert ClosedPnlClient.order_history_params == {
+        "category": "linear",
+        "symbol": "1000RATSUSDT",
+        "orderId": "close-rats",
+        "limit": 1,
+    }
 
 
 def test_bybit_balance_uses_exact_usdt_wallet_not_usd_conversion(

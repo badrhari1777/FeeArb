@@ -945,108 +945,147 @@ class BybitPumpLiveGateway:
         opened_at_ms: int,
         closed_at_ms: int,
     ) -> dict[str, Any]:
+        """Read the exchange-authoritative result of the final position close.
+
+        Bybit's Closed PnL row already aggregates the actual entry/exit values,
+        fees, funding and net PnL for the position closed by one reduce-only
+        order.  Reading that compact row around the observed flat timestamp is
+        both more authoritative and much cheaper than replaying every account
+        transaction over a potentially 30-day Pump holding period.
+        """
         with self._lock:
             client = self._ensure_client()
             market_id = str(self._market(symbol).get("id") or _normalize_symbol(symbol))
-            ccxt_symbol = self._ccxt_symbol(symbol)
-            start_ms = max(0, int(opened_at_ms) - 60_000)
-            end_ms = max(start_ms, int(closed_at_ms) + 60_000)
-            trades = self._private_request(
-                "fetch_closed_trade_summary_trades",
-                lambda: client.fetch_my_trades(
-                    ccxt_symbol,
-                    start_ms,
-                    200,
-                    {"category": "linear"},
-                ),
-            )
-            matching_trades = [
-                dict(item)
-                for item in trades or []
-                if start_ms <= _safe_int(item.get("timestamp"), 0) <= end_ms
-                and _normalize_symbol(item.get("symbol") or market_id) == _normalize_symbol(symbol)
-            ]
-            transactions: list[dict[str, Any]] = []
+            normalized_symbol = _normalize_symbol(symbol)
+            # A narrow close-time window is sufficient: each Closed PnL row
+            # contains the complete position entry aggregate even when the
+            # position itself was held for longer than Bybit's seven-day
+            # transaction-log request limit.
+            start_ms = max(0, int(closed_at_ms) - 24 * 60 * 60 * 1000)
+            end_ms = max(start_ms, int(closed_at_ms) + 5 * 60 * 1000)
+            rows: list[dict[str, Any]] = []
             cursor = ""
-            for _ in range(10):
+            for _ in range(5):
                 params: dict[str, Any] = {
-                    "accountType": "UNIFIED",
                     "category": "linear",
-                    "currency": "USDT",
+                    "symbol": market_id,
                     "startTime": start_ms,
                     "endTime": end_ms,
-                    "limit": 50,
+                    "limit": 100,
                 }
                 if cursor:
                     params["cursor"] = cursor
                 payload = self._private_request(
-                    "fetch_closed_trade_summary_transactions",
-                    lambda params=params: client.private_get_v5_account_transaction_log(params),
+                    "fetch_closed_trade_summary_closed_pnl",
+                    lambda params=params: client.private_get_v5_position_closed_pnl(params),
                 )
                 result = (payload or {}).get("result") or {}
-                rows = result.get("list") or []
-                transactions.extend(
-                    dict(item)
-                    for item in rows
-                    if _normalize_symbol(item.get("symbol")) == _normalize_symbol(symbol)
-                )
+                rows.extend(dict(item) for item in result.get("list") or [])
                 next_cursor = str(result.get("nextPageCursor") or "")
                 if not next_cursor or next_cursor == cursor:
                     break
                 cursor = next_cursor
 
-            sells = [item for item in matching_trades if str(item.get("side") or "").lower() == "sell"]
-            buys = [item for item in matching_trades if str(item.get("side") or "").lower() == "buy"]
-
-            def aggregate(items: list[dict[str, Any]]) -> tuple[float, float, float]:
-                qty = sum(_safe_float(item.get("amount"), 0.0) for item in items)
-                cost = sum(_safe_float(item.get("cost"), 0.0) for item in items)
-                fees = sum(
-                    _safe_float((item.get("fee") or {}).get("cost"), 0.0)
-                    for item in items
-                    if isinstance(item.get("fee"), Mapping)
-                )
-                return qty, cost, fees
-
-            entry_qty, entry_cost, entry_fees = aggregate(sells)
-            exit_qty, exit_cost, exit_fees = aggregate(buys)
-            funding_pnl = sum(
-                _safe_float(item.get("funding"), 0.0)
-                for item in transactions
-                if str(item.get("type") or "").upper() == "SETTLEMENT"
+            candidates = [
+                item
+                for item in rows
+                if _normalize_symbol(item.get("symbol")) == normalized_symbol
+                and str(item.get("side") or "").lower() == "buy"
+                and start_ms
+                <= _safe_int(item.get("updatedTime") or item.get("createdTime"), 0)
+                <= end_ms
+            ]
+            if not candidates:
+                return {
+                    "status": "unavailable",
+                    "source": "bybit_closed_pnl",
+                    "symbol": normalized_symbol,
+                    "opened_at_ms": opened_at_ms,
+                    "closed_at_ms": closed_at_ms,
+                }
+            row = min(
+                candidates,
+                key=lambda item: abs(
+                    _safe_int(item.get("updatedTime") or item.get("createdTime"), 0)
+                    - int(closed_at_ms)
+                ),
             )
-            transaction_net = sum(_safe_float(item.get("change"), 0.0) for item in transactions)
+            qty = _safe_float(row.get("qty"), 0.0)
+            entry_cost = _safe_float(row.get("cumEntryValue"), 0.0)
+            exit_cost = _safe_float(row.get("cumExitValue"), 0.0)
+            entry_fees = abs(_safe_float(row.get("openFee"), 0.0))
+            exit_fees = abs(_safe_float(row.get("closeFee"), 0.0))
+            fees = entry_fees + exit_fees
             gross_pnl = entry_cost - exit_cost
-            calculated_net = gross_pnl - entry_fees - exit_fees + funding_pnl
-            complete = entry_qty > 0 and exit_qty >= entry_qty - max(1e-8, entry_qty * 1e-8)
+            net_pnl = _safe_float(row.get("closedPnl"), 0.0)
+            # For the live short-only Pump strategy, the residual between
+            # exchange net PnL and price PnL after fees is funding.
+            funding_pnl = net_pnl - gross_pnl + fees
+            avg_entry = _safe_float(row.get("avgEntryPrice"), 0.0)
+            avg_exit = _safe_float(row.get("avgExitPrice"), 0.0)
+            close_order_id = str(row.get("orderId") or "")
+            exit_meta: dict[str, Any] = {}
+            if close_order_id:
+                try:
+                    order_payload = self._private_request(
+                        "fetch_closed_trade_summary_exit_order",
+                        lambda: client.private_get_v5_order_history(
+                            {
+                                "category": "linear",
+                                "symbol": market_id,
+                                "orderId": close_order_id,
+                                "limit": 1,
+                            }
+                        ),
+                    )
+                    order_rows = (
+                        ((order_payload or {}).get("result") or {}).get("list") or []
+                    )
+                    if order_rows:
+                        order = dict(order_rows[0])
+                        exit_meta = {
+                            "exit_order_status": order.get("orderStatus"),
+                            "exit_order_type": order.get("orderType"),
+                            "exit_stop_order_type": order.get("stopOrderType"),
+                            "exit_trigger_price": _optional_float(
+                                order.get("triggerPrice")
+                            ),
+                            "exit_reduce_only": bool(order.get("reduceOnly")),
+                            "exit_close_on_trigger": bool(
+                                order.get("closeOnTrigger")
+                            ),
+                        }
+                except Exception as exc:  # optional metadata must not discard exact PnL
+                    exit_meta = {"exit_order_lookup_error": _clean_error(exc)}
+            complete = bool(qty > 0 and entry_cost > 0 and avg_entry > 0 and avg_exit > 0)
             return {
                 "status": "complete" if complete else "partial",
-                "symbol": _normalize_symbol(symbol),
+                "source": "bybit_closed_pnl",
+                "symbol": normalized_symbol,
                 "opened_at_ms": opened_at_ms,
                 "closed_at_ms": closed_at_ms,
-                "entry_qty": round(entry_qty, 12),
-                "exit_qty": round(exit_qty, 12),
+                "entry_qty": round(qty, 12),
+                "exit_qty": round(qty, 12),
                 "entry_notional_usd": round(entry_cost, 12),
                 "exit_notional_usd": round(exit_cost, 12),
-                "avg_entry_price": round(entry_cost / entry_qty, 12) if entry_qty > 0 else None,
-                "avg_exit_price": round(exit_cost / exit_qty, 12) if exit_qty > 0 else None,
+                "avg_entry_price": round(avg_entry, 12) if avg_entry > 0 else None,
+                "avg_exit_price": round(avg_exit, 12) if avg_exit > 0 else None,
                 "entry_fees_usd": round(entry_fees, 12),
                 "exit_fees_usd": round(exit_fees, 12),
-                "fees_usd": round(entry_fees + exit_fees, 12),
+                "fees_usd": round(fees, 12),
                 "funding_pnl_usd": round(funding_pnl, 12),
                 "gross_pnl_usd": round(gross_pnl, 12),
-                "calculated_net_pnl_usd": round(calculated_net, 12),
-                "net_pnl_usd": round(transaction_net, 12),
+                "calculated_net_pnl_usd": round(net_pnl, 12),
+                "net_pnl_usd": round(net_pnl, 12),
                 "net_return_on_entry_notional_pct": (
-                    round(transaction_net / entry_cost * 100.0, 9)
+                    round(net_pnl / entry_cost * 100.0, 9)
                     if entry_cost > 0
                     else None
                 ),
-                "entry_fill_count": len(sells),
-                "exit_fill_count": len(buys),
-                "transaction_count": len(transactions),
-                "entry_order_ids": sorted({str(item.get("order") or "") for item in sells if item.get("order")}),
-                "exit_order_ids": sorted({str(item.get("order") or "") for item in buys if item.get("order")}),
+                "closed_pnl_record_count": 1,
+                "entry_order_ids": [],
+                "exit_order_ids": [close_order_id] if close_order_id else [],
+                **exit_meta,
             }
 
     def set_leverage(self, symbol: str, leverage: float) -> None:
@@ -5812,6 +5851,22 @@ class PumpLiveController:
                             )
                             or {}
                         )
+                        expected_qty = _safe_float(item.get("qty"), 0.0)
+                        accounted_qty = _safe_float(
+                            accounting.get("exit_qty"),
+                            0.0,
+                        )
+                        qty_tolerance = max(1e-8, expected_qty * 1e-6)
+                        if (
+                            accounting.get("status") == "complete"
+                            and expected_qty > 0
+                            and abs(accounted_qty - expected_qty) > qty_tolerance
+                        ):
+                            accounting["status"] = "partial"
+                            accounting["validation_error"] = (
+                                "closed_pnl_qty_mismatch"
+                            )
+                            accounting["expected_exit_qty"] = expected_qty
                     except Exception as exc:  # closure remains authoritative even if accounting is delayed
                         accounting_error = _clean_error(exc)
                         logger.warning(
@@ -5874,7 +5929,7 @@ class PumpLiveController:
             ),
             None,
         )
-        if not closed or closed.get("close_accounting_status") != "complete":
+        if not closed:
             return False
         if self._unknown_exchange_positions(exchange_positions):
             return False
@@ -5885,6 +5940,8 @@ class PumpLiveController:
             for item in exchange_positions
             if item.get("side") == "short" and _safe_float(item.get("qty"), 0.0) > 0
         }
+        if symbol in exchange_symbols:
+            return False
         remaining = self._open_positions(self._state)
         if any(
             item.get("status") != "open"
