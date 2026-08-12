@@ -855,3 +855,18 @@ commit -> bounded повторная длительная валидация -> 
   ещё `18 passed`; полный suite: `793 passed`, `8 subtests`, `15 warnings`.
   Профиль можно запускать скрытым локальным процессом, проверив bootstrap и
   ранние cycles. Любой monthly/shadow/trading переход остаётся отдельным gate.
+
+### 2026-08-13 — 24h QA запущен
+
+- Background run: `preflight-24h-20260812T215857Z`; start
+  `2026-08-12T21:59:17Z` (`00:59:17` МСК 13 августа), ожидаемый deadline
+  около `00:59` МСК 14 августа. Runtime/logs находятся только в ignored
+  `data/research/strategy_lab_observatory/preflight/`.
+- Bootstrap: profile `24h`, configured `86400s`, source union `60`, Registry и
+  runner согласованы `48/48` verified symbols, оба external sources fresh.
+- Early health: первый cycle завершён, `44/44` pairs (`100%`), `61` REST calls,
+  REST errors / invalid BBO / cycle failures — `0`, last error отсутствует.
+- Backend/Pump/ордера/переводы не менялись. Следующая сессия сначала читает
+  `run/status.json`, не запускает второй процесс и после completion проверяет
+  gzip/report/status, field coverage, rate errors, funding boundaries, RSS/disk.
+  Только по этому результату принимается решение о Phase O1.

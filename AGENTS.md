@@ -109,6 +109,15 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- The bounded Strategy Lab 24h QA is currently running as
+  `preflight-24h-20260812T215857Z`, started `2026-08-12T21:59:17Z` with an
+  expected deadline near `2026-08-13T21:59Z`. Bootstrap aligned 60 union
+  candidates with 48/48 source-aware Registry candidates, both sources were
+  fresh, and the first cycle covered 44/44 pairs with 61 REST calls and zero
+  REST, BBO, or cycle errors. Runtime artifacts and launcher output stay in the
+  ignored Observatory preflight tree. Do not start a second run or clear a live
+  lock; after completion, audit gzip/report/status, field/rate quality, funding
+  boundaries, RSS, and disk before deciding on Phase O1.
 - A distinct hard-capped Strategy Lab 24-hour QA profile was added on
   2026-08-13. The existing `1h` profile accepts only 1..3600 seconds and its own
   confirmation; `24h` requires the exact `RUN STRATEGY LAB PREFLIGHT 24H` and

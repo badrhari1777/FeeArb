@@ -1018,3 +1018,13 @@ runtime status и точный следующий шаг. Нельзя объя�
 - Профильные tests: `22 passed`; связанная Observatory regression: `18 passed`.
   Полный suite: `793 passed`, `8 subtests`, `15 warnings`. Следующий шаг —
   commit, background launch и early-health check.
+
+## Runtime 2026-08-13 — active 24h QA
+
+- Active run `preflight-24h-20260812T215857Z`, start `21:59:17Z`, deadline
+  примерно `21:59Z` 13 августа / `00:59` МСК 14 августа.
+- Bootstrap PASS: `60` union, `48/48` Registry-verified, profile `24h`,
+  `86400s`, fresh Coinglass + ArbitrageScanner.
+- First cycle PASS: `44/44` pairs, `61` REST requests, errors/BBO failures `0`.
+- Не перезапускать и не удалять lock, пока PID жив. После завершения провести
+  integrity/field/rate/resource audit и обновить этот документ до O1 decision.
