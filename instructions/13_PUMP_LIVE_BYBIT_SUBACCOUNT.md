@@ -1260,3 +1260,31 @@ latest result is `no_recent_pump / no_pump_trigger_in_recent_window`. With the
 current Bybit-only Pump Live route, the probability of a PROM entry is therefore
 zero while the contract remains closed. A future relisting would still require a
 new scan event and all normal strategy/live gates; no override was added.
+
+## Fixed-budget $600-$1200 research checkpoint (2026-08-12)
+
+The reproducible on-demand cash-flow replay is
+`scripts/pump_live_budget_sweep_research.py`; the human analysis is
+`docs/pump_live_budget_sweep_research_2026-08-12.md`. It preserves the exact
+current primary strategy, four-symbol cap, 50% ladders, v4 `35/45` proximity,
+`12%/12%` fill reaction protection, `20 -> 25%` warning restore, isolated
+positions and one shared cash pool. Only the complete per-symbol maximum varies
+from `$600` through `$1200` in `$50` increments. Unlimited main liquidity never
+blocks a research action, but principal and duration are reported separately.
+
+The declared archive boundary is 2024-01-01, but the 40 exact-current signals
+start only on 2025-09-08; the four-slot replay executes 35. The model reconstructs
+actual filled-leg allocation and on-demand margin from `1h` candles. It does not
+reserve the full ladder for the complete holding period. All 13 levels required
+zero borrowing in the observed chronology because retained wins precede the
+HUSDT tail. This result is order-dependent: with profits swept, peak loan rises
+from `$1120` at `$600` to `$5180` at `$1200`.
+
+The balanced research candidate is `$800`; `$850` is the hard upper candidate
+under both current `$5000` per-position top-up and `$2000` rescue scales. `$900`
+already exceeds the per-position cap in the HUSDT replay, and `$950+` also
+exceeds the rescue scale for a single reconstructed hour.
+The live policy remains `$600`. Any promotion must be an explicit later operator
+decision, apply only to new positions through immutable risk snapshots, and pass
+a separate live preflight/observation gate. The hourly replay assumes ideal
+in-candle response and cannot validate transfer latency or an unseen faster tail.

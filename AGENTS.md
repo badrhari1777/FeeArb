@@ -109,6 +109,21 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- A reproducible Pump Live fixed-budget sweep was added on 2026-08-12 without
+  changing live `$600` sizing or orders. It replays the exact current primary
+  strategy and four-position ownership from a `$3000` shared cash pool for
+  complete per-symbol budgets `$600..$1200`, reconstructing filled legs,
+  `35/45` ladder proximity, `12%/12%` prefund, `20 -> 25%` risk restores and
+  gradual release from archived `1h` candles. Although the source boundary is
+  2024-01-01, the 40 exact-current candidates begin 2025-09-08 and the portfolio
+  executes 35. All tested levels show zero chronological borrowing because
+  retained wins precede the HUSDT tail, but the no-profit counterfactual needs
+  `$1120..$5180`; hourly ideal reaction remains a hard limitation. `$800` is
+  the balanced research candidate; `$850` is the hard upper candidate under
+  both current `$5000` position-top-up and `$2000` rescue scales. `$900`
+  exceeds the former in the HUSDT replay, and `$950+` also exceeds the latter
+  within one reconstructed hour. Reproduction and conclusions:
+  `docs/pump_live_budget_sweep_research_2026-08-12.md`.
 - Pump Live was safely rearmed during the 2026-08-12 Strategy Lab deployment by
   explicit operator request. Manual and Auto-Arb were idle; ACE/BMT matched two
   exchange shorts and four reduce-only TP/SL orders. The first post-stop launcher
