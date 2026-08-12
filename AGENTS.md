@@ -109,6 +109,21 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab Observatory integrated Registry and bounded own feeds on
+  2026-08-12. Its manual sequence is now external refresh, Registry refresh,
+  then a 1..30 second / 1..10 symbol feed probe. The persisted snapshot keeps a
+  compact candidate-only Registry, source-specific verification, feed QA and
+  last-good evidence. A successful external refresh marks downstream Registry
+  and feed stale, and stale Registry cannot start a probe. The page exposes
+  source counts/modes/errors, connections, updates, per-venue coverage, missing
+  pairs, freshness and observed venues per candidate; every row remains
+  research-only with no scheduler or execution route. An end-to-end temporary
+  state smoke produced 30 candidates, 29 Registry-eligible symbols and 85% pair
+  coverage across all five venues in an 8-second feed (Gate 40%, the other four
+  100%, no invalid BBO). Focused tests passed (`23`); full regression passed
+  (`771`, plus `8` subtests, `15` warnings). Phase O0 implementation is ready;
+  stop for explicit operator approval before the 1h research preflight. That
+  approval must not be inferred for 24h, monthly collection, shadow or trading.
 - Strategy Lab bounded public feed v1 was added on 2026-08-12. A probe is hard
   capped at 10 symbols and 30 seconds, uses one public websocket per selected
   venue, has a global wall-clock deadline, and cannot emit a trading signal or

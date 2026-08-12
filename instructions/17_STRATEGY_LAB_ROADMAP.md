@@ -15,7 +15,7 @@
 артефакты, затем исправить roadmap в том же логическом коммите.
 
 Последнее обновление: `2026-08-12`.
-Текущий этап: `Phase O0 external intake, Instrument Registry и bounded multiplexed feed core готовы; Observatory integration pending`.
+Текущий этап: `Phase O0 bounded Observatory готов; ожидается operator verdict перед 1h preflight`.
 Текущий режим: `research_only_no_trading`.
 
 ## Цель
@@ -687,3 +687,29 @@ Shadow -> live:
 - Следующий safe block: встроить Registry refresh, bounded probe и собственную QA
   в отдельную Observatory page/API с last-good state. После её regression нужен
   отдельный operator verdict перед `1h` preflight.
+
+### 2026-08-12 — Observatory Registry/feed integration
+
+- На отдельной `/strategy-lab-observatory` появились последовательные ручные
+  действия: external refresh -> Instrument Registry refresh -> bounded own-feed
+  probe. API ограничивает probe `1..30s` и `1..10` symbols; scheduler, shadow
+  positions и execution routes отсутствуют.
+- Runtime snapshot хранит компактный Registry только для текущего candidate union,
+  source status, source-specific verification, eligible count, последний feed
+  report и QA verdict. Ошибка не затирает last-good.
+- Любой успешный новый external refresh помечает прежние Registry и feed stale;
+  feed нельзя запустить, пока Registry не обновлён. Это запрещает смешивать новый
+  candidate set со старой картой контрактов.
+- UI показывает по каждой бирже registry mode/count/error, feed connections,
+  updates, pair coverage, missing pairs/freshness и число фактически наблюдавшихся
+  venues по каждому кандидату. Все строки остаются `NO (research)`.
+- End-to-end live-smoke через `StrategyLabObservatory` во временном state занял
+  `21.5s`: ArbitrageScanner дал итоговые `30` кандидатов, Registry подтвердил
+  `29`; `8s` feed наблюдал `85%` pairs и все пять venues. Coverage:
+  Binance/Bybit/OKX/KuCoin `100%`, Gate `40%`; missing Gate pairs сохранены,
+  invalid BBO — `0`.
+- Профильная регрессия: `23 passed`; полный suite: `771 passed`, `8 subtests`,
+  `15 warnings`. Долгий collector не запускался.
+- Phase O0 implementation gate завершён. Следующее действие требует человека:
+  отдельное подтверждение на bounded `1h` preflight. Оно не разрешает `24h`,
+  месячный prospective-сбор, strategy shadow или торговлю.

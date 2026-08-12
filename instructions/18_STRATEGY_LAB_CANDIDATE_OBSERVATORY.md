@@ -823,11 +823,12 @@ collector, `1h/24h` preflight,
 
 ## Точный следующий безопасный шаг
 
-Следующий change block — только `Phase O0`:
+Phase O0 bounded implementation завершена. Следующий шаг требует отдельного
+операторского решения:
 
-- интеграция готовых Registry и bounded feed в Observatory page/API;
-- last-good Registry/feed state и явная own-feed verification external candidates;
-- без долгого запуска, shadow positions, orders, ARM и изменений live-модулей.
+- разрешить или не разрешить bounded `1h` preflight;
+- preflight остаётся research-only и не включает shadow positions/orders;
+- разрешение `1h` не является разрешением `24h` или месячного сбора.
 
 После тестов нужен отдельный операторский verdict перед `1h/24h` preflight, а после
 preflight — отдельное подтверждение перед месячным prospective-сбором.
@@ -896,3 +897,26 @@ runtime status и точный следующий шаг. Нельзя объя�
   bounded feed probe, persisted last-good snapshot, mapping/coverage/freshness
   verdict. Только после его тестов запрашивается operator approval на `1h`
   preflight; `24h` и месячный сбор остаются отдельными решениями.
+
+## Checkpoint 2026-08-12 — Observatory Registry/feed integration
+
+- Отдельная страница теперь проводит Phase O0 строго по цепочке: external source
+  refresh -> Registry refresh -> bounded feed probe. Endpoint probe валидирует
+  `duration_sec=1..30` и `max_symbols=1..10`; фонового запуска нет.
+- Persisted state содержит compact candidate-only Registry, verification каждого
+  external observation, eligible candidate count, feed quality и полный короткий
+  report. Last-good сохраняется при ошибке. Новый успешный source refresh
+  автоматически делает Registry/feed stale, а stale Registry блокирует probe.
+- Feed quality требует минимум две observations, одну монету на двух venues,
+  минимум две наблюдавшиеся биржи, отсутствие subscription errors и crossed BBO.
+  Coverage ниже 100% остаётся допустимой для bounded research и явно показывается,
+  а не маскируется.
+- UI выводит registry source count/mode/error, feed status/connections/updates,
+  per-venue coverage, missing pairs, freshness, Registry venues и число own-feed
+  venues для каждой монеты. Торговых controls нет; signal везде `NO (research)`.
+- End-to-end temporary-state smoke: `30` candidate union, `29` Registry-eligible,
+  `8s` own feed `85%` pairs, все пять venues; Binance/Bybit/OKX/KuCoin `100%`,
+  Gate `40%`, invalid BBO `0`. Меняющиеся числа — диагностический snapshot.
+- Focused tests `23 passed`; полный regression `771 passed`, `8 subtests`,
+  `15 warnings`. Следующий шаг — только отдельный operator verdict перед `1h`
+  preflight. `24h`, месяц, shadow strategies и trading остаются запрещены.

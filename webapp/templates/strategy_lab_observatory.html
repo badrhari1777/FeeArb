@@ -23,6 +23,7 @@
       <dl>
         <div><dt>Режим</dt><dd id="sl-mode">research_only_no_trading</dd></div>
         <div><dt>Состояние</dt><dd><span id="sl-status" class="status-pill status-pill--idle">idle</span></dd></div>
+        <div><dt>Операция</dt><dd id="sl-operation">-</dd></div>
         <div><dt>Кандидатов</dt><dd id="sl-candidate-count">0</dd></div>
         <div><dt>Обновлено</dt><dd id="sl-updated-at">-</dd></div>
       </dl>
@@ -59,13 +60,51 @@
     </section>
 
     <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <h2>Instrument Registry</h2>
+          <p class="muted">Точные исполнимые symbols пяти бирж. Refresh доступен после external candidate union.</p>
+        </div>
+        <div class="panel-actions">
+          <button type="button" class="button" id="sl-registry-refresh">Обновить Registry</button>
+        </div>
+      </div>
+      <p id="sl-registry-summary" class="muted">Registry ещё не запускался.</p>
+      <table class="data-table">
+        <thead><tr><th>Биржа</th><th>Статус</th><th>Контрактов</th><th>Режим</th><th>Ошибка</th></tr></thead>
+        <tbody id="sl-registry-body"></tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <h2>Bounded own-feed probe</h2>
+          <p class="muted">Только market observations, без scheduler, shadow-позиций и заявок.</p>
+        </div>
+        <div class="panel-actions">
+          <label>Секунд <input id="sl-feed-duration" type="number" min="1" max="30" value="12" /></label>
+          <label>Монет <input id="sl-feed-symbols" type="number" min="1" max="10" value="5" /></label>
+          <button type="button" class="button" id="sl-feed-probe">Запустить probe</button>
+        </div>
+      </div>
+      <p id="sl-feed-summary" class="muted">Feed probe ещё не запускался.</p>
+      <table class="data-table">
+        <thead><tr><th>Биржа</th><th>Статус</th><th>Пары</th><th>Coverage</th><th>Connections</th><th>Updates</th><th>Ошибки</th></tr></thead>
+        <tbody id="sl-feed-body"></tbody>
+      </table>
+      <p class="muted">Missing pairs: <span id="sl-feed-missing">-</span></p>
+    </section>
+
+    <section class="panel">
       <h2>External candidate union (максимум 30)</h2>
       <p class="muted">Приоритет определяет глубину наблюдения, но не является торговым сигналом.</p>
       <table class="data-table data-table--wide">
         <thead>
           <tr>
             <th>#</th><th>Symbol</th><th>Priority</th><th>Sources</th><th>Overlap</th>
-            <th>Coinglass rank</th><th>Funding dispersion</th><th>Long</th><th>Short</th><th>Signal</th>
+            <th>Coinglass rank</th><th>Funding dispersion</th><th>Long</th><th>Short</th>
+            <th>Registry venues</th><th>Own feed</th><th>Signal</th>
           </tr>
         </thead>
         <tbody id="sl-candidate-body"></tbody>

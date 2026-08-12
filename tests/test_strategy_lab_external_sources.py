@@ -6,6 +6,7 @@ from pathlib import Path
 from strategy_lab.arbitragescanner_source import parse_arbitragescanner_payload
 from strategy_lab.coinglass_source import parse_coinglass_dom_rows
 from strategy_lab.external_contract import ExternalLeg, ExternalObservation, merge_external_candidates
+from strategy_lab.instrument_registry import InstrumentContract, build_registry_payload
 from strategy_lab.observatory import StrategyLabObservatory
 
 
@@ -159,3 +160,133 @@ def test_observatory_preserves_last_good_on_empty_refresh(tmp_path: Path) -> Non
     assert second["sources"]["arbitragescanner"]["status"] == "stale"
     assert second["sources"]["arbitragescanner"]["last_good_used"] is True
     assert (tmp_path / "latest.json").exists()
+
+
+def _registry_fixture() -> dict[str, object]:
+    rows = {
+        "binance": [InstrumentContract("binance", "ACE", "ACEUSDT", "ACE", "USDT", "USDT", "TRADING", True)],
+        "bybit": [InstrumentContract("bybit", "ACE", "ACEUSDT", "ACE", "USDT", "USDT", "Trading", True)],
+        "okx": [],
+        "kucoin": [],
+        "gate": [],
+    }
+    source_status = {
+        exchange: {"status": "fresh", "count": len(items), "error": None}
+        for exchange, items in rows.items()
+    }
+    return build_registry_payload(rows, source_status=source_status)
+
+
+def _feed_report_fixture() -> dict[str, object]:
+    return {
+        "mode": "bounded_research_only_no_trading",
+        "scheduler_enabled": False,
+        "observation_count": 2,
+        "pair_coverage_pct": 100.0,
+        "symbols_with_two_venues": 1,
+        "invalid_bbo": [],
+        "venue_status": {
+            "binance": {"subscription_errors": 0},
+            "bybit": {"subscription_errors": 0},
+        },
+        "venue_coverage": {
+            "binance": {"expected": 1, "observed": 1, "coverage_pct": 100.0},
+            "bybit": {"expected": 1, "observed": 1, "coverage_pct": 100.0},
+        },
+        "missing_pairs": [],
+        "freshness_ms": {"max": 10, "median": 5},
+        "field_availability": {},
+        "observations": [],
+        "trade_signal": False,
+        "research_only": True,
+    }
+
+
+def test_observatory_registry_and_feed_are_bounded_and_preserve_last_good(tmp_path: Path) -> None:
+    observatory = StrategyLabObservatory(state_dir=tmp_path)
+    good = _observation("arbitragescanner", "ACE")
+
+    async def source_fetch() -> dict[str, object]:
+        return {"observed_at": good.observed_at, "raw_count": 1, "observations": [good], "quarantined": []}
+
+    async def registry_fetch(observations) -> dict[str, object]:
+        assert [item.canonical_symbol for item in observations] == ["ACE"]
+        return _registry_fixture()
+
+    async def feed_runner(registry, symbols, *, duration_sec, max_symbols) -> dict[str, object]:
+        assert set(registry["vectors"]["ACE"]) == {"binance", "bybit"}
+        assert symbols == ["ACE"]
+        assert duration_sec == 7
+        assert max_symbols == 1
+        return _feed_report_fixture()
+
+    asyncio.run(observatory.refresh(sources=["arbitragescanner"], fetchers={"arbitragescanner": source_fetch}))
+    registry_state = asyncio.run(observatory.refresh_registry(registry_fetcher=registry_fetch))
+    feed_state = asyncio.run(
+        observatory.run_feed_probe(duration_sec=7, max_symbols=1, feed_runner=feed_runner)
+    )
+
+    assert registry_state["registry"]["status"] == "fresh"
+    assert registry_state["registry"]["eligible_candidate_count"] == 1
+    assert set(registry_state["registry"]["snapshot"]["vectors"]) == {"ACE"}
+    assert feed_state["feed_probe"]["status"] == "fresh"
+    assert feed_state["feed_probe"]["quality"]["ready_for_bounded_research"] is True
+    assert feed_state["feed_probe"]["report"]["trade_signal"] is False
+
+    async def registry_failure(_observations):
+        raise RuntimeError("registry unavailable")
+
+    async def feed_failure(*_args, **_kwargs):
+        raise RuntimeError("feed unavailable")
+
+    stale_feed = asyncio.run(observatory.run_feed_probe(feed_runner=feed_failure))
+    stale_registry = asyncio.run(observatory.refresh_registry(registry_fetcher=registry_failure))
+
+    assert stale_registry["registry"]["status"] == "stale"
+    assert stale_registry["registry"]["last_good_used"] is True
+    assert stale_registry["registry"]["snapshot"]["vectors"]["ACE"]["bybit"]["active"] is True
+    assert stale_feed["feed_probe"]["status"] == "stale"
+    assert stale_feed["feed_probe"]["last_good_used"] is True
+    assert stale_feed["feed_probe"]["report"]["pair_coverage_pct"] == 100.0
+
+    restored = StrategyLabObservatory(state_dir=tmp_path).status()
+    assert restored["registry"]["status"] == "stale"
+    assert restored["feed_probe"]["status"] == "stale"
+    assert restored["scheduler_enabled"] is False
+
+
+def test_external_refresh_marks_registry_and_feed_stale(tmp_path: Path) -> None:
+    observatory = StrategyLabObservatory(state_dir=tmp_path)
+    first_observation = _observation("arbitragescanner", "ACE")
+
+    async def source_fetch() -> dict[str, object]:
+        return {
+            "observed_at": first_observation.observed_at,
+            "raw_count": 1,
+            "observations": [first_observation],
+            "quarantined": [],
+        }
+
+    async def registry_fetch(_observations) -> dict[str, object]:
+        return _registry_fixture()
+
+    async def feed_runner(*_args, **_kwargs) -> dict[str, object]:
+        return _feed_report_fixture()
+
+    asyncio.run(observatory.refresh(sources=["arbitragescanner"], fetchers={"arbitragescanner": source_fetch}))
+    asyncio.run(observatory.refresh_registry(registry_fetcher=registry_fetch))
+    asyncio.run(observatory.run_feed_probe(feed_runner=feed_runner))
+    refreshed = asyncio.run(
+        observatory.refresh(sources=["arbitragescanner"], fetchers={"arbitragescanner": source_fetch})
+    )
+
+    assert refreshed["registry"]["status"] == "stale"
+    assert refreshed["registry"]["last_good_used"] is True
+    assert refreshed["feed_probe"]["status"] == "stale"
+    assert refreshed["feed_probe"]["last_good_used"] is True
+    try:
+        asyncio.run(observatory.run_feed_probe(feed_runner=feed_runner))
+    except ValueError as exc:
+        assert "Registry is stale" in str(exc)
+    else:  # pragma: no cover - assertion branch
+        raise AssertionError("feed probe accepted stale Instrument Registry")

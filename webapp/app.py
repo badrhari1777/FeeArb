@@ -54,7 +54,7 @@ from strategy_lab import StrategyLabObservatory
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-08-12-strategy-lab-observatory-v1"
+STATIC_VERSION = "v2026-08-12-strategy-lab-observatory-v2"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -124,6 +124,11 @@ class SettingsPayload(BaseModel):
 
 class StrategyLabRefreshPayload(BaseModel):
     sources: Optional[list[str]] = None
+
+
+class StrategyLabFeedProbePayload(BaseModel):
+    duration_sec: float = Field(default=12.0, ge=1.0, le=30.0)
+    max_symbols: int = Field(default=5, ge=1, le=10)
 
 
 class ManualBasePayload(BaseModel):
@@ -701,6 +706,29 @@ async def strategy_lab_observatory_refresh_api(
 ) -> JSONResponse:
     try:
         result = await strategy_lab_observatory.refresh(sources=payload.sources)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/strategy-lab/observatory/registry/refresh")
+async def strategy_lab_observatory_registry_refresh_api() -> JSONResponse:
+    try:
+        result = await strategy_lab_observatory.refresh_registry()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
+
+
+@app.post("/api/strategy-lab/observatory/feed/probe")
+async def strategy_lab_observatory_feed_probe_api(
+    payload: StrategyLabFeedProbePayload,
+) -> JSONResponse:
+    try:
+        result = await strategy_lab_observatory.run_feed_probe(
+            duration_sec=payload.duration_sec,
+            max_symbols=payload.max_symbols,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JSONResponse(jsonable_encoder(result))
