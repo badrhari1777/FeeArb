@@ -643,3 +643,18 @@ Shadow -> live:
   на main page. Полная регрессия: `757 passed`, `8 subtests`, `15 warnings`.
 - Следующий safe block: Instrument Registry пяти бирж и bounded multiplexed public
   feed prototype. Затем отдельное операторское решение перед `1h` preflight.
+
+### 2026-08-12 — Instrument Registry v1
+
+- Реализован общий пятибиржевой Registry точных USDT perpetual contracts:
+  Binance/Bybit/OKX/KuCoin bulk, Gate candidate-scoped exact-contract с bounded
+  concurrency. Gate bulk исключён из hot path после фактических `~15 KB / 1.17 MB`
+  за `30s`.
+- Registry, а не внешний screener, теперь является источником executable venue
+  symbols. Общий `SYMBOLUSDT` от ArbitrageScanner для OKX/KuCoin/Gate сохраняется
+  как format disagreement; реальное расхождение asset identity блокируется.
+- Live-smoke на 10 seeds занял `4.8s`: Gate `9/10`, `9` candidates проверены на
+  двух и более venues; REDSTONE ожидаемо veto. Полная регрессия:
+  `762 passed`, `8 subtests`, `15 warnings`.
+- Следующий safe block: bounded multiplexed public feed и own-feed QA; long run,
+  shadow/paper/live и ARM по-прежнему не разрешены.

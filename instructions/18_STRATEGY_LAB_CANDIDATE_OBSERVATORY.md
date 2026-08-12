@@ -773,8 +773,8 @@ Phase O0 частично реализован и доступен на отде
 ArbitrageScanner `789 raw / 497 eligible`, итог `30`, overlap `16`. Числа являются
 снимком меняющихся внешних таблиц, а не фиксированной нормой.
 
-Не реализованы и не считаются разрешёнными этим checkpoint: общий пятибиржевой
-Instrument Registry, own-feed verification, multiplexed feeds, `1h/24h` preflight,
+Не реализованы и не считаются разрешёнными этим checkpoint: own-feed verification,
+multiplexed feeds, `1h/24h` preflight,
 месячный collector, strategy shadow и любые заявки.
 
 ### Phase O0 — data contract and bounded preflight
@@ -783,7 +783,7 @@ Instrument Registry, own-feed verification, multiplexed feeds, `1h/24h` prefligh
    общий `source_observation` contract для own/Coinglass/ArbitrageScanner.
 2. **Готово для external intake:** добавить replay fixtures и контрактные тесты для exact exchange aliases,
    long=min funding / short=max funding и потери/stale внешнего источника.
-3. Реализовать общий Instrument Registry для пяти бирж.
+3. **Готово:** реализовать общий Instrument Registry для пяти бирж.
 4. **Готово для бесплатных источников:** реализовать source adapters в выключенном по умолчанию research-контуре:
    ArbitrageScanner exact-five; Coinglass official API при наличии ключа; web
    parser только как slow fallback.
@@ -825,7 +825,6 @@ Instrument Registry, own-feed verification, multiplexed feeds, `1h/24h` prefligh
 
 Следующий change block — только `Phase O0`:
 
-- пятибиржевой Instrument Registry;
 - bounded multiplexed feed prototype;
 - own-feed verification и coverage/freshness QA external candidates;
 - без долгого запуска, shadow positions, orders, ARM и изменений live-модулей.
@@ -839,3 +838,32 @@ preflight — отдельное подтверждение перед меся�
 коммите: что реализовано, coverage/QA, фактические caps, тесты, ограничения,
 runtime status и точный следующий шаг. Нельзя объявлять проектный cap фактической
 пропускной способностью до bounded preflight.
+
+## Checkpoint 2026-08-12 — Instrument Registry v1
+
+- Добавлен `strategy_lab_instrument_registry_v1`. Он хранит реальный
+  `exchange_symbol`, canonical/base/quote/settle, active/status, linear/perpetual,
+  contract size, tick/step/minimum и funding cadence там, где она опубликована.
+- Binance, Bybit, OKX и KuCoin читаются параллельными public bulk endpoints. Gate
+  намеренно работает в `candidate_scoped_exact_contract`: bulk endpoint передал
+  лишь около `15 KB` из `1.17 MB` за `30s`, а отдельный контракт отвечает за
+  `1–2s`; запросы ограничены текущими candidate seeds и concurrency `5`.
+- `XBT` нормализуется в asset identity `BTC`, но token multipliers (`1000...`)
+  не схлопываются. Несколько active-контрактов одного canonical symbol на одной
+  бирже дают quarantine `multiple_active_contracts`.
+- ArbitrageScanner часто возвращает общий `SYMBOLUSDT` даже для OKX/KuCoin/Gate.
+  Это больше не считается исполнимым symbol ID: точный ID берётся только из
+  Registry, форматное различие записывается как QA feature. Если provider-symbol
+  указывает уже на другой asset, остаётся fail-closed veto
+  `external_symbol_asset_mismatch`.
+- Bounded live-smoke на десяти текущих ArbitrageScanner seeds завершился за
+  `4.8s`: active registry `527 Binance / 702 Bybit / 431 OKX / 659 KuCoin / 9 Gate`;
+  Gate подтвердил `9/10`, а отсутствующий `REDSTONE_USDT` получил ожидаемый
+  `fewer_than_two_verified_venues`. Девять seeds имели минимум две проверенные
+  площадки. Эти цифры являются изменяемым снимком, не capacity promise.
+- Fixture/contract tests: `10 passed`; полный regression: `762 passed`,
+  `8 subtests`, `15 warnings`. Trading, ARM, orders, transfers и margin не
+  затрагивались.
+- Точный следующий блок: bounded multiplexed BBO/ticker feed prototype поверх
+  Registry, normalized own-observation contract и coverage/freshness QA. После
+  него требуется отдельный operator verdict перед `1h` preflight.

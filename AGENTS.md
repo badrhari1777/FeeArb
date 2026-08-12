@@ -109,6 +109,19 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab Instrument Registry v1 was added on 2026-08-12 after the external
+  intake isolation. Binance, Bybit, OKX and KuCoin use parallel public bulk
+  catalogs; Gate deliberately resolves only the bounded candidate set through
+  exact-contract calls because its 1.17 MB bulk endpoint delivered only about
+  15 KB in 30 seconds. Registry venue symbols are authoritative; generic
+  ArbitrageScanner `SYMBOLUSDT` values for OKX/KuCoin/Gate are recorded as format
+  disagreement, while a true asset mismatch remains fail-closed. A ten-seed
+  live smoke completed in 4.8 seconds, verified nine candidates on at least two
+  venues and vetoed unavailable REDSTONE. Contract tests passed (`10`); full
+  regression passed (`762`, plus `8` subtests, `15` warnings). This is
+  research-only: no scheduler, long run, ARM, orders, transfers or margin action.
+  Next is the bounded multiplexed own-feed prototype, followed by separate
+  operator approval before a 1h preflight.
 - Strategy Lab external candidate intake was isolated and implemented on
   2026-08-12. The legacy main-dashboard Coinglass/ArbitrageScanner scheduler and
   startup bootstrap no longer run; their settings, parser intervals, Data
