@@ -14,6 +14,7 @@ from strategy_lab.preflight import (
     eligible_registry_symbols,
     exclusive_preflight_lock,
     run_capacity_preflight,
+    verified_observation_symbols,
 )
 
 
@@ -89,6 +90,19 @@ def test_eligible_symbols_require_two_venues_and_preserve_candidate_order():
     assert eligible_registry_symbols(
         registry, ["BBBUSDT", "ONEUSDT", "AAAUSDT", "BBBUSDT", "MISSING"]
     ) == ["BBBUSDT", "AAAUSDT"]
+
+
+def test_verified_symbols_preserve_union_order_and_exclude_registry_vetoes():
+    verification = [
+        {"canonical_symbol": "AAAUSDT", "eligible_for_observation": True},
+        {"canonical_symbol": "BBBUSDT", "eligible_for_observation": False},
+        {"canonical_symbol": "CCCUSDT", "eligible_for_observation": True},
+        # A second provider may independently verify the same canonical asset.
+        {"canonical_symbol": "BBBUSDT", "eligible_for_observation": True},
+    ]
+    assert verified_observation_symbols(
+        ["CCCUSDT", "BBBUSDT", "AAAUSDT", "CCCUSDT", "VETOUSDT"], verification
+    ) == ["CCCUSDT", "BBBUSDT", "AAAUSDT"]
 
 
 def test_process_memory_probe_is_available_on_windows():

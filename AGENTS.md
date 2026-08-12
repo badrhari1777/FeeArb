@@ -109,6 +109,15 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab preflight eligibility was aligned with the source-aware
+  Instrument Registry verdict on 2026-08-12. The first one-hour attempt was
+  stopped after one cycle when bootstrap showed 47 Registry-eligible candidates
+  but the runner selected 54 using only a second `>=2 venues` check. That
+  partial artifact is excluded from capacity results. The CLI now preserves
+  union rank while requiring `eligible_for_observation=true` and fails before
+  feed if its selected count differs from `eligible_candidate_count`. Focused
+  tests passed (`31`), and the full suite passed (`784`, `8 subtests`,
+  `15 warnings`) before a clean retry.
 - A bounded Strategy Lab capacity-preflight runner was added on 2026-08-12 for
   the separately approved one-hour research check. It refreshes the two
   external candidate sources and the five-venue Instrument Registry, then

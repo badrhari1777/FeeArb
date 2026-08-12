@@ -157,6 +157,25 @@ def eligible_registry_symbols(
     return result
 
 
+def verified_observation_symbols(
+    candidates: Iterable[str], verification: Iterable[dict[str, Any]]
+) -> list[str]:
+    """Keep candidate order but honor Observatory's source-aware Registry verdict."""
+    verified = {
+        str(row.get("canonical_symbol") or "").upper()
+        for row in verification
+        if row.get("eligible_for_observation")
+    }
+    result: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        symbol = str(candidate or "").upper()
+        if symbol in verified and symbol not in seen:
+            result.append(symbol)
+            seen.add(symbol)
+    return result
+
+
 def _rotation_window(symbols: list[str], cycle_index: int, max_symbols: int) -> list[str]:
     if len(symbols) <= max_symbols:
         return list(symbols)

@@ -755,3 +755,17 @@ Shadow -> live:
 research-only несостыковки и продолжать обоснованные этапы roadmap; любое
 человеческое действие и любой trading/shadow-position boundary остаются
 отдельным stop gate.
+
+### 2026-08-12 — preflight eligibility alignment
+
+- Первый часовой запуск был остановлен после первого цикла: bootstrap честно
+  показал `47` source-aware Registry-eligible кандидатов, но feed runner
+  подготовил `54`, повторно применив только упрощённое правило `>=2 venues`.
+  Полученные `36` observations не считаются результатом preflight.
+- Runner теперь сохраняет порядок candidate union, но допускает символ только
+  при наличии `verification.eligible_for_observation=true`; число выбранных
+  символов обязано точно совпасть с `registry.eligible_candidate_count`, иначе
+  запуск завершается до feed. Это сохраняет veto по mismatch/quarantine, а не
+  превращает наличие контрактов в достаточное условие.
+- После исправления профильная регрессия: `31 passed`; полный suite:
+  `784 passed`, `8 subtests`, `15 warnings`. Следующий шаг — новый чистый `1h`.

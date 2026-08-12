@@ -21,6 +21,7 @@ from strategy_lab.preflight import (  # noqa: E402
     MAX_PREFLIGHT_DURATION_SEC,
     exclusive_preflight_lock,
     run_capacity_preflight,
+    verified_observation_symbols,
 )
 
 
@@ -66,14 +67,24 @@ async def main_async(args: argparse.Namespace) -> dict[str, object]:
     registry_state = registry_result.get("registry") or {}
     if registry_state.get("status") != "fresh" or not registry_state.get("snapshot"):
         raise RuntimeError(f"registry_preflight_failed:{registry_state.get('error')}")
-    candidates = [
+    candidate_order = [
         str(row.get("canonical_symbol") or "").upper()
         for row in registry_result.get("candidates") or []
     ]
+    candidates = verified_observation_symbols(
+        candidate_order,
+        registry_state.get("verification") or [],
+    )
+    if len(candidates) != int(registry_state.get("eligible_candidate_count") or 0):
+        raise RuntimeError(
+            "registry_eligible_count_mismatch:"
+            f"selected={len(candidates)},reported={registry_state.get('eligible_candidate_count')}"
+        )
     bootstrap_summary = {
         "mode": "research_only_no_trading",
         "trade_signal": False,
-        "candidate_count": len(candidates),
+        "candidate_union_count": len(candidate_order),
+        "verified_candidate_count": len(candidates),
         "source_status": {
             name: {
                 "status": row.get("status"),

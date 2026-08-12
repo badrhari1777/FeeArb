@@ -949,3 +949,16 @@ runtime status и точный следующий шаг. Нельзя объя�
 
 Точный следующий шаг: полный regression + commit, затем один bounded `1h` run,
 разбор реального coverage/load/disk и запись результата сюда до решения о `24h`.
+
+## Checkpoint 2026-08-12 — source-aware eligibility fix
+
+- Первый `1h` был прерван после одного цикла и не является capacity result:
+  Registry сообщил `47` eligible candidates, тогда как повторная локальная
+  проверка только по `>=2 venues` выбрала `54` и могла вернуть source-vetoed
+  symbols.
+- CLI теперь формирует feed universe строго из persisted Registry verification
+  с `eligible_for_observation=true`, сохраняя rank candidate union, и fail-fast
+  сравнивает итог с `eligible_candidate_count`. Профильные тесты: `31 passed`;
+  полный suite: `784 passed`, `8 subtests`, `15 warnings`.
+- Точный следующий шаг: чистый bounded `1h`; прерванный каталог остаётся только
+  runtime evidence раннего fail-closed контроля и в анализ не включается.
