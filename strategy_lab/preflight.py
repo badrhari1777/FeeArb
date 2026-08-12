@@ -194,6 +194,9 @@ def _initial_totals(symbols: list[str]) -> dict[str, Any]:
         "subscription_errors": 0,
         "parse_errors": 0,
         "rest_errors": 0,
+        "rest_requests": 0,
+        "rest_updates": 0,
+        "rest_bytes": 0,
         "connections": 0,
         "messages": 0,
         "updates": 0,
@@ -206,7 +209,8 @@ def _initial_totals(symbols: list[str]) -> dict[str, Any]:
         "venues": {
             venue: {"expected": 0, "observed": 0, "connections": 0, "messages": 0,
                     "updates": 0, "parse_errors": 0, "subscription_errors": 0,
-                    "rest_errors": 0, "cycles_with_error": 0}
+                    "rest_errors": 0, "rest_requests": 0, "rest_updates": 0,
+                    "rest_bytes": 0, "cycles_with_error": 0}
             for venue in TARGET_EXCHANGES
         },
         "fields": {field: {venue: 0 for venue in TARGET_EXCHANGES} for field in FIELD_NAMES},
@@ -231,7 +235,10 @@ def _accumulate_report(totals: dict[str, Any], report: dict[str, Any]) -> None:
         venue_total = totals["venues"][venue]
         venue_total["expected"] += int(coverage.get("expected") or 0)
         venue_total["observed"] += int(coverage.get("observed") or 0)
-        for key in ("connections", "messages", "updates", "parse_errors", "subscription_errors", "rest_errors"):
+        for key in (
+            "connections", "messages", "updates", "parse_errors", "subscription_errors",
+            "rest_errors", "rest_requests", "rest_updates", "rest_bytes",
+        ):
             value = int(status.get(key) or 0)
             venue_total[key] += value
             totals[key] += value
@@ -271,6 +278,16 @@ def _finalize_report(
             **row,
             "coverage_pct": _percent(row["observed"], row["expected"]),
         }
+    field_metrics: dict[str, dict[str, Any]] = {}
+    for field, venue_counts in totals["fields"].items():
+        field_metrics[field] = {}
+        for venue, available in venue_counts.items():
+            observed = int(venue_metrics[venue]["observed"])
+            field_metrics[field][venue] = {
+                "available": int(available),
+                "observed": observed,
+                "coverage_pct": _percent(int(available), observed),
+            }
     observations = int(totals["observations"])
     raw_bytes = int(totals["raw_observation_bytes"])
     duration_for_rate = max(actual_duration_sec, 0.001)
@@ -292,6 +309,8 @@ def _finalize_report(
         failures.append("invalid_bbo")
     if int(totals["subscription_errors"]) > 0:
         failures.append("subscription_errors")
+    if int(totals["rest_errors"]) > 0:
+        warnings.append("rest_snapshot_errors")
     for venue in ("binance", "bybit", "okx", "kucoin"):
         coverage = venue_metrics[venue]["coverage_pct"]
         if coverage is None or coverage < 80.0:
@@ -299,6 +318,19 @@ def _finalize_report(
     gate_coverage = venue_metrics["gate"]["coverage_pct"]
     if gate_coverage is None or gate_coverage < 50.0:
         warnings.append("gate_coverage_below_50pct")
+    required_fields = (
+        "best_bid", "best_ask", "mark_price", "funding_rate", "open_interest",
+        "volume_24h_quote",
+    )
+    for venue in ("binance", "bybit", "okx", "kucoin"):
+        for field in required_fields:
+            coverage = field_metrics[field][venue]["coverage_pct"]
+            if coverage is None or coverage < 80.0:
+                failures.append(f"{venue}_{field}_coverage_below_80pct")
+    for field in required_fields:
+        coverage = field_metrics[field]["gate"]["coverage_pct"]
+        if coverage is not None and coverage < 50.0:
+            warnings.append(f"gate_{field}_coverage_below_50pct")
     eligible = set(totals["eligible_symbols"])
     sampled = set(totals["sampled_symbols"])
     observed = set(totals["observed_symbols"])
@@ -347,8 +379,12 @@ def _finalize_report(
             "connections": int(totals["connections"]),
             "messages": int(totals["messages"]),
             "updates": int(totals["updates"]),
+            "rest_requests": int(totals["rest_requests"]),
+            "rest_updates": int(totals["rest_updates"]),
+            "rest_bytes": int(totals["rest_bytes"]),
             "venues": venue_metrics,
             "field_observations": totals["fields"],
+            "field_coverage": field_metrics,
         },
         "resources": {
             "cpu_seconds": round(cpu_seconds, 3),

@@ -109,6 +109,18 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab public observations were made field-complete on 2026-08-12 with
+  candidate-scoped REST seeding, without bulk-universe polling or credentials.
+  Each rotating window fetches Binance ticker+OI, OKX ticker+OI, KuCoin contract
+  plus level-1 ticker, and Gate ticker; Bybit remains WS-only. WS continues to
+  provide/update BBO. Preflight QA now requires at least 80% bid/ask/mark/
+  funding/OI/quote-volume coverage on the four core venues and records REST
+  calls, bytes, updates, and errors. The final 20-second real smoke
+  `preflight-20260812T205128Z` passed 43/43 pairs and 100% required fields on all
+  five venues with 60 calls, 34,110 response bytes, and zero feed/REST errors.
+  The full suite passed (`790`, `8 subtests`, `15 warnings`). Longer stability
+  validation is still required before prospective collection; no trading or
+  shadow positions were enabled.
 - The clean Strategy Lab one-hour capacity preflight completed on 2026-08-12
   as `preflight-20260812T194321Z`: 60/60 cycles, 1,910 gzip observations,
   all 47 verified candidates, 91.563% aggregate pair coverage, and zero cycle,

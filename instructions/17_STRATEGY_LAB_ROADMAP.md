@@ -794,3 +794,30 @@ research-only несостыковки и продолжать обоснова�
 добавить bounded public REST seed для недостающих OI/volume/last/mark полей и
 тихих Gate pairs, сохранить websocket BBO основным источником, ввести field-level
 QA и повторить короткую/часовую валидацию. Торговые режимы не включать.
+
+### 2026-08-12 — candidate-scoped field enrichment v2
+
+- Добавлен `strategy_lab/public_snapshot.py`: только для текущего окна `<=10`
+  exact contracts, без bulk universe. Binance получает exact 24h ticker + OI,
+  OKX exact ticker + OI, KuCoin exact contract + level-1 ticker, Gate exact
+  ticker; Bybit остаётся WS-only, поскольку его ticker уже полный.
+- REST дополняет last/mark/index/funding/predicted/settlement/OI/volume, а для
+  тихих KuCoin/Gate ещё и BBO. Websocket BBO продолжает обновлять snapshot в
+  течение окна и остаётся основным live-price источником. Контур публичный,
+  research-only и не использует credentials/execution.
+- В отчёт добавлены REST requests/updates/bytes и field-level coverage. Core QA
+  теперь требует `>=80%` для bid/ask/mark/funding/OI/quote-volume на Binance,
+  Bybit, OKX, KuCoin; REST errors видимы как warning. Gate остаётся отдельно
+  видимым и получает warning ниже `50%` по паре/обязательному полю.
+- Первый `20s` smoke правильно завершился `FAIL`: OI/volume/Gate уже были полны,
+  но KuCoin WS BBO не успевал в `8s`. После exact KuCoin level-1 snapshot run
+  `preflight-20260812T205128Z` дал `PASS`: `2/2` cycles, `43/43` pairs и `100%`
+  всех обязательных полей на пяти venues, `60` REST calls / `34,110 bytes`,
+  errors `0`.
+- Профильная regression: `36 passed` до финального KuCoin fix и `19 passed`
+  snapshot/feed/preflight после него; полный suite: `790 passed`, `8 subtests`,
+  `15 warnings`.
+
+Технически data-contract готов к более длинной проверке, но короткий smoke не
+доказывает суточную устойчивость REST rate/error/missingness. Следующий safe gate:
+commit -> bounded повторная длительная валидация -> только затем prospective O1.

@@ -980,3 +980,19 @@ runtime status и точный следующий шаг. Нельзя объя�
 - Следующий блок: exact public REST snapshots только для ротируемых `<=10`
   symbols (не весь universe), field-level coverage QA и повторный bounded test.
   WS остаётся источником BBO; REST не используется как торговый сигнал.
+
+## Checkpoint 2026-08-12 — field-complete v2 smoke
+
+- Candidate-scoped REST seed добавлен поверх WS: Binance ticker+OI, OKX
+  ticker+OI, KuCoin contract+level1, Gate ticker; Bybit не делает лишний REST.
+  Запросы идут только по Registry exchange symbols текущего окна, concurrency
+  `5`, timeout `12s`; одна ошибка не останавливает WS, но попадает в QA.
+- Field QA требует core coverage bid/ask/mark/funding/OI/quote-volume `>=80%`.
+  Отчёт отдельно считает REST requests, updates, bytes и errors.
+- Valid smoke `preflight-20260812T205128Z`: `PASS`, `43/43` pairs, обязательные
+  поля `100%` на всех пяти venues, `60` REST requests, `34,110` response bytes,
+  `0` REST/subscription/parse/BBO errors. Тихие Gate и KuCoin теперь имеют
+  snapshot, но WS продолжает обновлять BBO при наличии событий.
+- Full regression: `790 passed`, `8 subtests`, `15 warnings`. Точный следующий
+  шаг — зафиксировать код и проверить длительную rate/error/field стабильность;
+  месячный O1 и strategy shadow ещё не включены.

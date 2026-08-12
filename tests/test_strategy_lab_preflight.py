@@ -44,7 +44,10 @@ async def _successful_feed(_registry, symbols, *, duration_sec, max_symbols):
             "received_at_ms": 1,
             "best_bid": 100.0,
             "best_ask": 101.0,
+            "mark_price": 100.5,
             "funding_rate": 0.001,
+            "open_interest": 1000.0,
+            "volume_24h_quote": 50000.0,
         }
         for symbol in symbols
         for venue in venues
@@ -74,7 +77,15 @@ async def _successful_feed(_registry, symbols, *, duration_sec, max_symbols):
             for venue in venues
         },
         "field_availability": {
-            field: {venue: len(symbols) if field in {"best_bid", "best_ask", "funding_rate"} else 0 for venue in venues}
+            field: {
+                venue: len(symbols)
+                if field in {
+                    "best_bid", "best_ask", "mark_price", "funding_rate",
+                    "open_interest", "volume_24h_quote",
+                }
+                else 0
+                for venue in venues
+            }
             for field in (
                 "best_bid", "best_ask", "last_price", "mark_price", "index_price",
                 "funding_rate", "predicted_funding_rate", "next_funding_time_ms",
@@ -137,6 +148,7 @@ def test_capacity_preflight_rotates_symbols_and_writes_auditable_artifacts(tmp_p
     assert report["sampled_symbol_count"] == 3
     assert report["feed"]["pair_coverage_pct"] == 100.0
     assert report["feed"]["connections"] == 10
+    assert report["feed"]["field_coverage"]["open_interest"]["okx"]["coverage_pct"] == 100.0
     assert report["qa"] == {"verdict": "PASS", "failures": [], "warnings": []}
     assert report["resources"]["compressed_bytes_per_row"] > 0
 

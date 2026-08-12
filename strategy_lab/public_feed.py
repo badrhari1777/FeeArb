@@ -13,6 +13,7 @@ import aiohttp
 import websockets
 
 from .external_contract import TARGET_EXCHANGES, utc_now_iso
+from .public_snapshot import seed_public_snapshots
 
 
 OWN_OBSERVATION_VERSION = "strategy_lab_own_observation_v1"
@@ -406,6 +407,7 @@ async def _binance_runner(symbols: list[str], deadline: float, emit: Emit, stats
         except Exception as exc:  # pylint: disable=broad-except
             stats["rest_errors"] = int(stats.get("rest_errors") or 0) + 1
             stats["last_rest_error"] = f"{type(exc).__name__}: {exc}"
+        await seed_public_snapshots("binance", symbols, emit, stats)
         await _receive_loop(ws, deadline, parse_binance_message, emit, stats)
 
 
@@ -417,6 +419,7 @@ async def _bybit_runner(symbols: list[str], deadline: float, emit: Emit, stats: 
 
 
 async def _okx_runner(symbols: list[str], deadline: float, emit: Emit, stats: dict[str, Any]) -> None:
+    await seed_public_snapshots("okx", symbols, emit, stats)
     args = [
         {"channel": channel, "instId": symbol}
         for symbol in symbols
@@ -429,6 +432,7 @@ async def _okx_runner(symbols: list[str], deadline: float, emit: Emit, stats: di
 
 
 async def _gate_runner(symbols: list[str], deadline: float, emit: Emit, stats: dict[str, Any]) -> None:
+    await seed_public_snapshots("gate", symbols, emit, stats)
     async with websockets.connect(GATE_WS_URL, open_timeout=15, close_timeout=1, ping_interval=20, ping_timeout=20) as ws:
         stats["connections"] += 1
         for channel in ("futures.tickers", "futures.book_ticker"):
@@ -439,6 +443,7 @@ async def _gate_runner(symbols: list[str], deadline: float, emit: Emit, stats: d
 
 
 async def _kucoin_runner(symbols: list[str], deadline: float, emit: Emit, stats: dict[str, Any]) -> None:
+    await seed_public_snapshots("kucoin", symbols, emit, stats)
     async with aiohttp.ClientSession() as session:
         async with session.post(KUCOIN_TOKEN_URL, timeout=aiohttp.ClientTimeout(total=15)) as response:
             payload = await response.json()
