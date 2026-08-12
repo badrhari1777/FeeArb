@@ -209,7 +209,7 @@ def test_preflight_lock_rejects_live_owner_and_recovers_stale_pid(tmp_path: Path
     assert not lock_path.exists()
 
 
-@pytest.mark.parametrize("duration", [0, 3601])
+@pytest.mark.parametrize("duration", [0, 86401])
 def test_capacity_preflight_rejects_out_of_bounds_duration(tmp_path: Path, duration: float):
     with pytest.raises(ValueError, match="duration_sec"):
         asyncio.run(run_capacity_preflight(

@@ -109,6 +109,15 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- A distinct hard-capped Strategy Lab 24-hour QA profile was added on
+  2026-08-13. The existing `1h` profile accepts only 1..3600 seconds and its own
+  confirmation; `24h` requires the exact `RUN STRATEGY LAB PREFLIGHT 24H` and
+  exactly 86,400 seconds. Validation happens before disk/network I/O, and both
+  profiles share one exclusive lock. This 24h run keeps the initial verified
+  candidate set fixed to assess rates, funding boundaries, field completeness,
+  cadence, RSS, and disk; it is not monthly O1 discovery or strategy shadow.
+  Profile tests passed (`22`) plus related Observatory regression (`18`); the
+  full suite passed (`793`, `8 subtests`, `15 warnings`).
 - The field-complete Strategy Lab v2 one-hour run passed on 2026-08-13 as
   `preflight-20260812T205407Z`: 60/60 cycles, 2,115 rows, all 49 symbols, 100%
   pairs, and 100% bid/ask/mark/funding/OI/quote-volume coverage on all five

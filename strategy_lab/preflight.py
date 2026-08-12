@@ -18,7 +18,8 @@ from .public_feed import run_bounded_public_feed
 
 
 PREFLIGHT_VERSION = "strategy_lab_capacity_preflight_v1"
-MAX_PREFLIGHT_DURATION_SEC = 3600.0
+DEFAULT_PREFLIGHT_DURATION_SEC = 3600.0
+MAX_PREFLIGHT_DURATION_SEC = 86400.0
 DEFAULT_CYCLE_INTERVAL_SEC = 60.0
 DEFAULT_CYCLE_DURATION_SEC = 30.0
 DEFAULT_MAX_SYMBOLS_PER_CYCLE = 10
@@ -411,7 +412,7 @@ async def run_capacity_preflight(
     candidates: Iterable[str],
     *,
     output_dir: Path,
-    duration_sec: float = MAX_PREFLIGHT_DURATION_SEC,
+    duration_sec: float = DEFAULT_PREFLIGHT_DURATION_SEC,
     cycle_interval_sec: float = DEFAULT_CYCLE_INTERVAL_SEC,
     cycle_duration_sec: float = DEFAULT_CYCLE_DURATION_SEC,
     max_symbols_per_cycle: int = DEFAULT_MAX_SYMBOLS_PER_CYCLE,

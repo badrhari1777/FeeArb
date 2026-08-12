@@ -1006,3 +1006,15 @@ runtime status и точный следующий шаг. Нельзя объя�
 - CPU `1.45%` core, peak RSS `101.8 MB`, delay `0.016s`, disk forecast
   `6.93 MB/day`. Следующий safe step — отдельный bounded `24h` QA profile;
   prospective month/shadow/trading пока не разрешены этим результатом.
+
+## Checkpoint 2026-08-13 — 24h QA profile
+
+- Добавлен отдельный CLI `--profile 24h`. Он требует точную confirmation
+  `RUN STRATEGY LAB PREFLIGHT 24H` и ровно `86400s`; `1h` ограничен `<=3600s`.
+  Проверки выполняются до I/O, оба профиля используют один exclusive lock.
+- Это long QA текущего фиксированного verified candidate set: он проверяет
+  rate/timeouts, funding boundaries, field completeness, cadence, RSS/disk.
+  Он не обновляет candidate universe внутри суток и не является O1 collector.
+- Профильные tests: `22 passed`; связанная Observatory regression: `18 passed`.
+  Полный suite: `793 passed`, `8 subtests`, `15 warnings`. Следующий шаг —
+  commit, background launch и early-health check.

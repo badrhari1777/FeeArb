@@ -840,3 +840,18 @@ commit -> bounded повторная длительная валидация -> 
 Решение: v2 готов к отдельному bounded `24h` QA. Он проверяет funding boundaries,
 редкие rate/timeouts, длительную field completeness и disk/RSS, но ещё не
 является O1 monthly collector, shadow positions или стратегией.
+
+### 2026-08-13 — separate bounded 24h profile
+
+- CLI теперь имеет два независимых профиля. `1h` допускает только `1..3600s` и
+  прежнюю фразу `RUN STRATEGY LAB PREFLIGHT 1H`; он физически не может быть
+  растянут до суток. `24h` требует отдельную фразу
+  `RUN STRATEGY LAB PREFLIGHT 24H` и ровно `86400s`; сократить/увеличить его
+  через аргументы нельзя.
+- Общий research runner получил hard maximum `86400s`, но выбор профиля и exact
+  confirmation проверяются до disk/network I/O. Lock остаётся общим: `1h` и
+  `24h` не могут работать параллельно.
+- Профильные tests контракта/caps: `22 passed`; полная Observatory-интеграция:
+  ещё `18 passed`; полный suite: `793 passed`, `8 subtests`, `15 warnings`.
+  Профиль можно запускать скрытым локальным процессом, проверив bootstrap и
+  ранние cycles. Любой monthly/shadow/trading переход остаётся отдельным gate.
