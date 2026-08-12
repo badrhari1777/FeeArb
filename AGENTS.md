@@ -109,6 +109,18 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- The clean Strategy Lab one-hour capacity preflight completed on 2026-08-12
+  as `preflight-20260812T194321Z`: 60/60 cycles, 1,910 gzip observations,
+  all 47 verified candidates, 91.563% aggregate pair coverage, and zero cycle,
+  subscription, parse, REST, or invalid-BBO errors. Binance, Bybit, OKX, and
+  KuCoin each covered 100%; Gate covered 38.462% with healthy connections but
+  no event for many quiet contracts. CPU was 1.045% of one core, peak RSS
+  112.7 MB, max schedule delay 0.015s, and disk forecast 5.04 MB/day. Capacity
+  passed with a Gate warning, but 24h collection is held: OI and quote-volume
+  were complete only on Bybit and partial on Gate, so the current contract is
+  insufficient for OI-volume-price research. The next research-only block is
+  candidate-scoped public REST seeding plus field-level QA; no trading or
+  shadow positions are authorized.
 - Strategy Lab preflight eligibility was aligned with the source-aware
   Instrument Registry verdict on 2026-08-12. The first one-hour attempt was
   stopped after one cycle when bootstrap showed 47 Registry-eligible candidates

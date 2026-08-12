@@ -962,3 +962,21 @@ runtime status и точный следующий шаг. Нельзя объя�
   полный suite: `784 passed`, `8 subtests`, `15 warnings`.
 - Точный следующий шаг: чистый bounded `1h`; прерванный каталог остаётся только
   runtime evidence раннего fail-closed контроля и в анализ не включается.
+
+## Checkpoint 2026-08-12 — clean 1h result
+
+- Valid run: `preflight-20260812T194321Z`, `60/60` cycles, `1910` gzip rows,
+  `47/47` symbols, `91.563%` pairs, no cycle/feed/BBO errors. Integrity checks
+  подтвердили одинаковые row counts в gzip/report/status и закрытый lock.
+- Binance/Bybit/OKX/KuCoin дали `100%`; Gate дал `38.462%` без connection errors.
+  Это event-driven snapshot gap: многие тихие Gate contracts не присылают ticker
+  за `30s`, хотя подписка исправна.
+- Capacity PASS: CPU `1.045%` core, peak RSS `112.7 MB`, max delay `0.015s`,
+  disk `209.9 KB/hour` / `5.04 MB/day`. Уменьшать число кандидатов из-за
+  локальной нагрузки не требуется.
+- Data completeness пока FAIL для главной цели: OI/quote volume стабильно есть
+  у Bybit, но отсутствует в собственных rows Binance/OKX/KuCoin и частично
+  появляется у Gate. Поэтому `24h` на v1 не запускается.
+- Следующий блок: exact public REST snapshots только для ротируемых `<=10`
+  symbols (не весь universe), field-level coverage QA и повторный bounded test.
+  WS остаётся источником BBO; REST не используется как торговый сигнал.

@@ -769,3 +769,28 @@ research-only несостыковки и продолжать обоснова�
   превращает наличие контрактов в достаточное условие.
 - После исправления профильная регрессия: `31 passed`; полный suite:
   `784 passed`, `8 subtests`, `15 warnings`. Следующий шаг — новый чистый `1h`.
+
+### 2026-08-12 — bounded 1h capacity result
+
+- Чистый run `preflight-20260812T194321Z` завершил ровно `60/60` циклов за
+  `3600s`: `1910` normalized observations, `47/47` verified symbols,
+  aggregate pair coverage `91.563%`, failed cycles / parse / subscription /
+  REST errors / invalid BBO — `0`. Gzip, report и status сверены построчно.
+- Venue coverage: Binance `561/561`, Bybit `536/536`, OKX `192/192`, KuCoin
+  `511/511` — по `100%`; Gate `110/286 = 38.462%`. Gate имел соединения и
+  updates без errors, то есть проблема — отсутствие события по тихому контракту,
+  а не capacity/reconnect. Verdict: `PASS_WITH_WARNINGS` только из-за Gate.
+- Реальная нагрузка: CPU `37.625s` (`1.045%` одного ядра), RSS start/end/peak
+  `65.0/109.7/112.7 MB`, max schedule delay `0.015s`; storage `209,906 bytes`
+  за час, forecast около `5.04 MB/day`. Candidate union `60` и текущие `47`
+  eligible symbols система тянет с большим запасом.
+- Field audit запретил немедленный `24h`: funding имеется на всех наблюдаемых
+  rows четырёх core venues, но OI и quote-volume в текущем feed стабильны только
+  у Bybit. Binance/OKX/KuCoin дают эти признаки `0%` rows, Gate около `21.8%`
+  своих observed rows. Такой суточный датасет был бы пригоден для spread/funding,
+  но недостаточен для заявленного OI-volume-price hypothesis search.
+
+Решение: capacity phase пройден, но data-contract phase ещё нет. Перед `24h`
+добавить bounded public REST seed для недостающих OI/volume/last/mark полей и
+тихих Gate pairs, сохранить websocket BBO основным источником, ввести field-level
+QA и повторить короткую/часовую валидацию. Торговые режимы не включать.
