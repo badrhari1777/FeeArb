@@ -109,6 +109,22 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab bounded public feed v1 was added on 2026-08-12. A probe is hard
+  capped at 10 symbols and 30 seconds, uses one public websocket per selected
+  venue, has a global wall-clock deadline, and cannot emit a trading signal or
+  enable a scheduler. Exact venue symbols come only from Instrument Registry.
+  Own observations normalize BBO, last/mark/index, funding and next settlement,
+  predicted funding, OI and volume while preserving missing fields. Binance BBO
+  stays websocket-native; because its acknowledged mark-price stream emitted no
+  updates in bounded live probes, one bulk public premium-index REST snapshot
+  seeds mark/index/funding for all selected Binance symbols without per-symbol
+  fan-out. QA reports pair/per-venue coverage, missing pairs, freshness, field
+  availability, invalid BBO and parser/subscription errors. An 8-second five-seed
+  smoke observed 16/20 pairs (Binance/Bybit/OKX 100%, KuCoin 75%, Gate 40%) with
+  one connection each and no parse/subscription error; this is not yet a capacity
+  proof. Focused tests passed (`15`), full regression passed (`767`, plus `8`
+  subtests, `15` warnings). Next is Observatory UI/API integration and last-good
+  state, then explicit operator approval before a 1h preflight.
 - Strategy Lab Instrument Registry v1 was added on 2026-08-12 after the external
   intake isolation. Binance, Bybit, OKX and KuCoin use parallel public bulk
   catalogs; Gate deliberately resolves only the bounded candidate set through

@@ -773,8 +773,8 @@ Phase O0 частично реализован и доступен на отде
 ArbitrageScanner `789 raw / 497 eligible`, итог `30`, overlap `16`. Числа являются
 снимком меняющихся внешних таблиц, а не фиксированной нормой.
 
-Не реализованы и не считаются разрешёнными этим checkpoint: own-feed verification,
-multiplexed feeds, `1h/24h` preflight,
+Не реализованы и не считаются разрешёнными этим checkpoint: постоянный own-feed
+collector, `1h/24h` preflight,
 месячный collector, strategy shadow и любые заявки.
 
 ### Phase O0 — data contract and bounded preflight
@@ -825,8 +825,8 @@ multiplexed feeds, `1h/24h` preflight,
 
 Следующий change block — только `Phase O0`:
 
-- bounded multiplexed feed prototype;
-- own-feed verification и coverage/freshness QA external candidates;
+- интеграция готовых Registry и bounded feed в Observatory page/API;
+- last-good Registry/feed state и явная own-feed verification external candidates;
 - без долгого запуска, shadow positions, orders, ARM и изменений live-модулей.
 
 После тестов нужен отдельный операторский verdict перед `1h/24h` preflight, а после
@@ -867,3 +867,32 @@ runtime status и точный следующий шаг. Нельзя объя�
 - Точный следующий блок: bounded multiplexed BBO/ticker feed prototype поверх
   Registry, normalized own-observation contract и coverage/freshness QA. После
   него требуется отдельный operator verdict перед `1h` preflight.
+
+## Checkpoint 2026-08-12 — bounded multiplexed public feed v1
+
+- Добавлены `strategy_lab_bounded_public_feed_v1` и
+  `strategy_lab_own_observation_v1`. Probe жёстко ограничен `10` symbols / `30s`,
+  не имеет scheduler или execution API и открывает максимум один public WS на
+  каждую из `Binance/Bybit/OKX/KuCoin/Gate`.
+- Venue symbols берутся только из Instrument Registry. Нормализуются BBO,
+  last/mark/index, funding, predicted funding, next settlement, OI и volume;
+  отсутствующее поле остаётся отсутствующим и попадает в field-availability QA.
+- Binance BBO остаётся websocket-native. В двух bounded проверках Binance
+  `markPrice@1s` подтверждал подписку, но не присылал update; поэтому mark/index/
+  funding/next funding seed берётся одним public bulk REST snapshot. Это один
+  запрос на всю выбранную группу, не per-symbol loop.
+- QA отчёт содержит pair и per-venue coverage, missing pairs, freshness,
+  field availability, invalid BBO, connections, messages/updates и parse/
+  subscription/REST errors. Общий deadline не может растянуть probe более чем
+  примерно на `3s` сверх заданного market window.
+- Live-smoke `8s` на пяти текущих seeds дал `16/20` observations: Binance `100%`,
+  Bybit `100%`, OKX `100%`, KuCoin `75%`, Gate `40%`; у всех venues было одно
+  соединение, без parse/subscription errors и crossed BBO. Это ожидаемо выявило,
+  что event-driven KuCoin/Gate может не дать update по тихому контракту в столь
+  коротком окне; missing pairs не скрываются.
+- Tests: профильные `15 passed`; полный regression `767 passed`, `8 subtests`,
+  `15 warnings`. Long run и стратегии не запускались.
+- Точный следующий блок: Observatory integration — кнопки Registry refresh и
+  bounded feed probe, persisted last-good snapshot, mapping/coverage/freshness
+  verdict. Только после его тестов запрашивается operator approval на `1h`
+  preflight; `24h` и месячный сбор остаются отдельными решениями.

@@ -15,7 +15,7 @@
 артефакты, затем исправить roadmap в том же логическом коммите.
 
 Последнее обновление: `2026-08-12`.
-Текущий этап: `Phase O0 external intake готов; Instrument Registry и bounded multiplexed feed prototype pending`.
+Текущий этап: `Phase O0 external intake, Instrument Registry и bounded multiplexed feed core готовы; Observatory integration pending`.
 Текущий режим: `research_only_no_trading`.
 
 ## Цель
@@ -658,3 +658,32 @@ Shadow -> live:
   `762 passed`, `8 subtests`, `15 warnings`.
 - Следующий safe block: bounded multiplexed public feed и own-feed QA; long run,
   shadow/paper/live и ARM по-прежнему не разрешены.
+
+### 2026-08-12 — bounded multiplexed public feed v1
+
+- Реализован `strategy_lab_bounded_public_feed_v1`: максимум `10` symbols и
+  `30s`, один public WebSocket на каждую из пяти бирж, общий wall-clock deadline
+  и обязательные `research_only=true / trade_signal=false / scheduler=false`.
+- Наблюдение `strategy_lab_own_observation_v1` нормализует BBO, last/mark/index,
+  funding/predicted funding/next settlement, OI и volume, сохраняя точный
+  Registry symbol и фактические source channels. Поля не подменяются нулями:
+  отсутствие данных остаётся измеримой missingness.
+- Binance BBO идёт через multiplexed WS. Поскольку подтверждённая mark-price
+  подписка в bounded live-smoke не дала сообщений, mark/index/funding/next time
+  безопасно и дёшево инициализируются одним public bulk `premiumIndex` REST
+  snapshot, без per-symbol fan-out.
+- QA считает expected/observed pairs и coverage каждой биржи, missing pairs,
+  freshness, field availability, invalid BBO, parse/subscription/REST errors и
+  число соединений. Полезный поток, завершённый общим deadline, отличается от
+  источника без единого update.
+- Финальный `8s` live-smoke на `ONE/COTI/B3/KAITO/RVN` дал `16/20` pairs:
+  Binance `4/4`, Bybit `4/4`, OKX `3/3`, KuCoin `3/4`, Gate `2/5`; все пять
+  использовали ровно по одному WS, parse/subscription errors и invalid BBO — `0`.
+  Короткое окно не является capacity proof: неактивные KuCoin/Gate contracts
+  могут не прислать тик до deadline.
+- Контрактная регрессия feed/Registry/external intake: `15 passed`; полный suite:
+  `767 passed`, `8 subtests`, `15 warnings`. Постоянный collector, shadow/paper,
+  торговый signal и заявки не включались.
+- Следующий safe block: встроить Registry refresh, bounded probe и собственную QA
+  в отдельную Observatory page/API с last-good state. После её regression нужен
+  отдельный operator verdict перед `1h` preflight.
