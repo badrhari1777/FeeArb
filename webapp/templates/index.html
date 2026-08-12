@@ -6,20 +6,11 @@
   {% set rp = request.scope.get('root_path', '') %}
   <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
   <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
-  {% set raw_snapshot = state.get('snapshot') %}
-  {% set snapshot = raw_snapshot or {} %}
-  {% set has_snapshot = raw_snapshot is not none %}
-  {% set screener_rows = snapshot.get('screener_rows', []) %}
-  {% set coinglass_rows = snapshot.get('coinglass_rows', []) %}
-  {% set universe_rows = snapshot.get('universe', []) %}
-  {% set opportunity_rows = snapshot.get('opportunities', []) %}
-  {% set messages = snapshot.get('messages', []) %}
+  {% set snapshot = {} %}
   {% set status = state.get('status', 'idle') %}
   {% set status_class = status|lower|replace(' ', '-') %}
   {% set settings = state.get('settings', {}) %}
 {% set refresh_interval = settings.get('table_refresh_seconds', state.get('refresh_interval', 300)) %}
-{% set parser_interval = settings.get('parser_refresh_seconds', state.get('parser_refresh_interval', refresh_interval)) %}
-{% set exchange_interval = settings.get('exchange_refresh_seconds', state.get('exchange_refresh_interval', parser_interval)) %}
 {% set account_interval = settings.get('account_refresh_seconds', state.get('account_refresh_interval', 90)) %}
 {% set positions_market_interval = settings.get('positions_market_refresh_seconds', state.get('positions_market_refresh_interval', 30)) %}
   {% set exchange_status_rows = state.get('exchange_status', []) %}
@@ -46,7 +37,7 @@
   <header class="masthead">
     <div>
       <h1>Funding Arbitrage Monitor</h1>
-      <p class="subtitle">Live view of cross-exchange funding opportunities</p>
+      <p class="subtitle">Positions, balances, protection and execution controls</p>
     </div>
     <div class="status-block">
       <dl>
@@ -57,40 +48,8 @@
           </dd>
         </div>
         <div>
-          <dt>Generated (UTC)</dt>
-          <dd id="generated-at">{{ snapshot.get('generated_at') or "-" }}</dd>
-        </div>
-        <div>
           <dt>Last Updated</dt>
-          <dd id="last-updated">{{ state.get('last_updated') or "-" }}</dd>
-        </div>
-        <div>
-          <dt>Screener source</dt>
-          <dd id="screener-source">
-            {% if snapshot.get('screener_from_cache') is none %}
-              -
-            {% elif snapshot.get('screener_from_cache') %}
-              cache
-            {% else %}
-              fresh
-            {% endif %}
-          </dd>
-        </div>
-        <div>
-          <dt>Coinglass source</dt>
-          <dd id="coinglass-source">
-            {% if snapshot.get('coinglass_from_cache') is none %}
-              -
-            {% elif snapshot.get('coinglass_from_cache') %}
-              cache
-            {% else %}
-              fresh
-            {% endif %}
-          </dd>
-        </div>
-        <div>
-          <dt>Opportunities</dt>
-          <dd id="opportunity-count">{{ opportunity_rows | length }}</dd>
+          <dd id="last-updated">{{ account_last_checked or state.get('last_updated') or "-" }}</dd>
         </div>
         <div>
           <dt>Last error</dt>
@@ -118,13 +77,13 @@
           </dd>
         </div>
       </dl>
-      <button id="refresh-button" class="button" type="button">Manual refresh</button>
       <a class="button" href="/manual">Manual trading</a>
       <a class="button" href="/positions">Positions</a>
       <a class="button" href="/strategies">Strategies</a>
       <a class="button" href="/funding-history">Funding history</a>
       <a class="button" href="/pump-short-lab">Pump Short Lab</a>
-      <p class="hint">UI refresh: {{ refresh_interval }} s | Parser: {{ parser_interval }} s | Exchange poll: {{ exchange_interval }} s | Account refresh: {{ account_interval }} s | Positions market: {{ positions_market_interval }} s</p>
+      <a class="button" href="/strategy-lab-observatory">Strategy Lab</a>
+      <p class="hint">UI refresh: {{ refresh_interval }} s | Account refresh: {{ account_interval }} s | Positions market: {{ positions_market_interval }} s</p>
     </div>
   </header>
 
@@ -153,29 +112,8 @@
       <h2>Configuration</h2>
       <form id="settings-form">
         <fieldset class="settings-fieldset">
-          <legend>Data sources</legend>
-          <label class="settings-checkbox">
-            <input type="checkbox" name="sources" value="arbitragescanner"{% if settings.get('sources', {}).get('arbitragescanner', True) %} checked{% endif %} />
-            ArbitrageScanner
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" name="sources" value="coinglass"{% if settings.get('sources', {}).get('coinglass', True) %} checked{% endif %} />
-            Coinglass
-          </label>
-        </fieldset>
-        <fieldset class="settings-fieldset">
-          <legend>Exchanges (opportunities)</legend>
-          {% set exchanges_settings = settings.get('exchanges', {}) %}
-          {% for name, enabled in exchanges_settings.items() %}
-          <label class="settings-checkbox">
-            <input type="checkbox" name="exchanges" value="{{ name }}"{% if enabled %} checked{% endif %} />
-            {{ name|upper }}
-          </label>
-          {% endfor %}
-        </fieldset>
-        <fieldset class="settings-fieldset">
           <legend>Exchanges (analysis)</legend>
-          {% set analysis_exchanges = settings.get('analysis_exchanges', exchanges_settings) %}
+          {% set analysis_exchanges = settings.get('analysis_exchanges', {}) %}
           {% for name, enabled in analysis_exchanges.items() %}
           <label class="settings-checkbox">
             <input type="checkbox" name="analysis_exchanges" value="{{ name }}"{% if enabled %} checked{% endif %} />
@@ -184,14 +122,6 @@
           {% endfor %}
         </fieldset>
         <div class="settings-intervals">
-          <label>
-            Parser refresh (seconds)
-            <input type="number" id="parser-interval" min="30" max="86400" step="1" value="{{ parser_interval }}" />
-          </label>
-          <label>
-            Exchange poll (seconds)
-            <input type="number" id="exchange-interval" min="30" max="86400" step="1" value="{{ exchange_interval }}" />
-          </label>
           <label>
             UI refresh (seconds)
             <input type="number" id="table-interval" min="30" max="86400" step="1" value="{{ refresh_interval }}" />
@@ -205,7 +135,7 @@
             <input type="number" id="positions-market-interval" min="30" max="86400" step="1" value="{{ positions_market_interval }}" />
           </label>
         </div>
-        <p class="settings-note muted">Keep at least one source and one exchange enabled.</p>
+        <p class="settings-note muted">Candidate discovery moved to the research-only Strategy Lab Observatory.</p>
         <fieldset class="settings-fieldset">
           <legend>Protective orders</legend>
           <div class="settings-intervals">
@@ -482,203 +412,10 @@
         </div>
       </form>
     </section>
-    <section class="panel panel--muted" id="empty-state"{% if has_snapshot %} style="display: none;"{% endif %}>
-        <h2>Preparing snapshot</h2>
-        <p class="muted">
-          We are collecting the latest market data. Tables will populate automatically once the snapshot is ready.
-        </p>
-      </section>
-
-      <section class="panel panel--alert" id="messages"{% if not messages %} style="display: none;"{% endif %}>
-        <h2>Status Messages</h2>
-        <ul id="messages-list">
-          {% for message in messages %}
-            <li>{{ message }}</li>
-          {% endfor %}
-        </ul>
-      </section>
-
-    <section class="panel" id="exchange-status">
-      <h2>Exchange Responses</h2>
-      <table class="data-table" id="exchange-status-table">
-        <thead>
-          <tr>
-            <th>Exchange</th>
-            <th>Status</th>
-            <th>Snapshots</th>
-            <th>Message</th>
-          </tr>
-        </thead>
-        <tbody id="exchange-status-body">
-          {% for row in exchange_status_rows %}
-            {% set status_slug = (row.status or 'unknown') | lower | replace(' ', '-') %}
-            <tr>
-              <td>{{ row.exchange }}</td>
-              <td>
-                <span class="status-chip status-chip--{{ status_slug }}">{{ row.status or "unknown" }}</span>
-              </td>
-              <td>{{ row.count if row.count is not none else "-" }}</td>
-              <td>{{ row.message or row.error or "-" }}</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+    <section class="panel panel--alert" id="messages" style="display: none;">
+      <h2>Operational messages</h2>
+      <ul id="messages-list"></ul>
     </section>
-
-    <section class="panel panel--compact" id="activity-log">
-      <h2>Activity</h2>
-      <ul class="event-log" id="event-log">
-        {% for event in events %}
-          <li class="event-log__item">
-            <span class="event-log__time">{{ event.timestamp }}</span>
-            <span class="event-log__message">
-              {{ event.payload.message or event.event }}
-            </span>
-          </li>
-        {% endfor %}
-      </ul>
-      <p class="muted" id="event-empty"{% if events %} style="display: none;"{% endif %}>
-        Progress updates will appear here as the refresh runs.
-      </p>
-    </section>
-
-    <section class="panel" id="overview">
-      <h2>Data Overview</h2>
-      <div class="overview-grid">
-        <div>
-          <h3>ArbitrageScanner Top Entries</h3>
-          <table class="data-table" id="screener-table">
-            <thead>
-              <tr>
-                <th>Symbol</th>
-                <th>Spread %</th>
-                <th>Long</th>
-                <th>Long Fee %</th>
-                <th>Short</th>
-                <th>Short Fee %</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for row in screener_rows %}
-                <tr>
-                  <td>{{ row.symbol }}</td>
-                  <td>{{ ((row.spread or 0) * 100) | round(4) }}</td>
-                  <td>{{ row.long_exchange }}</td>
-                  <td>{{ ((row.long_fee or 0) * 100) | round(4) }}</td>
-                  <td>{{ row.short_exchange }}</td>
-                  <td>{{ ((row.short_fee or 0) * 100) | round(4) }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-        <div>
-          <h3>Coinglass Top Entries</h3>
-          <table class="data-table" id="coinglass-table">
-            <thead>
-              <tr>
-                <th>Rank</th>
-                <th>Symbol</th>
-                <th>Pair</th>
-                <th>Long</th>
-                <th>Short</th>
-                <th>Net %</th>
-                <th>APR %</th>
-                <th>Spread %</th>
-              </tr>
-            </thead>
-            <tbody>
-              {% for row in coinglass_rows %}
-                <tr>
-                  <td>{{ row.ranking }}</td>
-                  <td>{{ row.symbol }}</td>
-                  <td>{{ row.pair }}</td>
-                  <td>{{ row.long_exchange }}</td>
-                  <td>{{ row.short_exchange }}</td>
-                  <td>{{ (row.net_funding_rate_percent or 0) | round(3) }}</td>
-                  <td>{{ (row.apr_percent or 0) | round(2) }}</td>
-                  <td>{{ (row.spread_rate_percent or 0) | round(3) }}</td>
-                </tr>
-              {% endfor %}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel" id="symbol-universe">
-      <h2>Monitored Symbols</h2>
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Sources</th>
-          </tr>
-        </thead>
-        <tbody id="universe-table-body">
-          {% for row in universe_rows %}
-            <tr>
-              <td>{{ row.symbol }}</td>
-              <td>{{ row.sources }}</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </section>
-
-    <section class="panel" id="opportunities">
-      <h2>Funding Opportunities</h2>
-      <table class="data-table data-table--wide">
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Long<br>Exchange</th>
-            <th>Long<br>Rate&nbsp;%</th>
-            <th>Long<br>Ask</th>
-            <th>Long Liquidity<br>(USDT)</th>
-            <th>Next Funding<br>(Long)</th>
-            <th>Funding Interval<br>(Long, h)</th>
-            <th>Short<br>Exchange</th>
-            <th>Short<br>Rate&nbsp;%</th>
-            <th>Short<br>Bid</th>
-            <th>Short Liquidity<br>(USDT)</th>
-            <th>Next Funding<br>(Short)</th>
-            <th>Funding Interval<br>(Short, h)</th>
-            <th>Spread&nbsp;%</th>
-            <th>Price Gap&nbsp;%</th>
-            <th>Effective<br>Spread&nbsp;%</th>
-            <th>Participants</th>
-          </tr>
-        </thead>
-        <tbody id="opportunity-table-body">
-          {% for row in opportunity_rows %}
-            <tr>
-              <td>{{ row.symbol }}</td>
-              <td>{{ row.long_exchange }}</td>
-              <td>{{ ((row.long_rate or 0) * 100) | round(3) }}</td>
-              <td>{{ row.long_ask if row.long_ask is not none else "-" }}</td>
-              <td>{{ row.long_liquidity_usd if row.long_liquidity_usd is not none else "-" }}</td>
-              <td>{{ row.long_next_funding or "-" }}</td>
-              <td>{{ row.long_funding_interval_hours if row.long_funding_interval_hours is not none else "-" }}</td>
-              <td>{{ row.short_exchange }}</td>
-              <td>{{ ((row.short_rate or 0) * 100) | round(3) }}</td>
-              <td>{{ row.short_bid if row.short_bid is not none else "-" }}</td>
-              <td>{{ row.short_liquidity_usd if row.short_liquidity_usd is not none else "-" }}</td>
-              <td>{{ row.short_next_funding or "-" }}</td>
-              <td>{{ row.short_funding_interval_hours if row.short_funding_interval_hours is not none else "-" }}</td>
-              <td>{{ ((row.spread or 0) * 100) | round(3) }}</td>
-              <td>{{ ((row.price_diff_pct or 0) * 100) | round(3) }}</td>
-              <td>{{ ((row.effective_spread or 0) * 100) | round(3) }}</td>
-              <td>{{ row.participants }}</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-      {% if opportunity_rows | length == 0 %}
-        <p class="muted">No opportunities detected for the current snapshot.</p>
-      {% endif %}
-    </section>
-
     <section class="panel" id="account-status-panel">
       <h2>Exchange API Status</h2>
       <p class="muted">Last check: <span id="account-last-updated">{{ account_last_checked or "-" }}</span></p>

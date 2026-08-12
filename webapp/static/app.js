@@ -77,7 +77,7 @@
   };
 
   var defaultSettings = {
-    sources: { arbitragescanner: true, coinglass: true },
+    sources: { arbitragescanner: false, coinglass: false },
     exchanges: { binance: true, okx: true },
     analysis_exchanges: { binance: true, bybit: true, bingx: true, bitget: true, okx: true, gate: true, mexc: true, kucoin: true },
     parser_refresh_seconds: 1200,
@@ -764,7 +764,8 @@
   function updateMetadata(state) {
     var snapshot = state.snapshot || null;
     setText(elements.generatedAt, formatDate(snapshot && snapshot.generated_at));
-    var lastUpdated = state.last_updated ? formatDate(state.last_updated) : '-';
+    var accountUpdated = state.accounts && state.accounts.last_updated ? state.accounts.last_updated : null;
+    var lastUpdated = accountUpdated ? formatDate(accountUpdated) : (state.last_updated ? formatDate(state.last_updated) : '-');
     setText(elements.lastUpdated, lastUpdated);
     setText(elements.opportunityCount, snapshot && snapshot.opportunities ? String(snapshot.opportunities.length) : '0');
     setText(elements.lastError, state.last_error || 'None');
@@ -2607,17 +2608,8 @@
 
   function collectMessages(state) {
     var messages = [];
-    if (!state.snapshot && state.status === 'pending') {
-      messages.push('Initial data is being collected. This may take a couple of minutes.');
-    }
     if (state.last_error) {
-      messages.push('Last refresh error: ' + state.last_error);
-    }
-    if (state.snapshot && state.snapshot.messages && state.snapshot.messages.length) {
-      var i;
-      for (i = 0; i < state.snapshot.messages.length; i += 1) {
-        messages.push(state.snapshot.messages[i]);
-      }
+      messages.push('Last service error: ' + state.last_error);
     }
     return messages;
   }
@@ -2647,18 +2639,14 @@
       return;
     }
     var tableSeconds = getRefreshInterval(state);
-    var parserSeconds = getParserInterval(state);
-    var exchangeSeconds = getExchangeInterval(state);
     var accountSeconds = getAccountInterval(state);
     var positionsSeconds = getPositionsMarketInterval(state);
-    elements.hint.textContent = 'UI refresh: ' + tableSeconds + ' s | Parser: ' + parserSeconds + ' s | Exchange poll: ' + exchangeSeconds + ' s | Account refresh: ' + accountSeconds + ' s | Positions market: ' + positionsSeconds + ' s';
+    elements.hint.textContent = 'UI refresh: ' + tableSeconds + ' s | Account refresh: ' + accountSeconds + ' s | Positions market: ' + positionsSeconds + ' s';
   }
 
   function renderAll() {
     updateStatusPill(globalState.status);
     updateMetadata(globalState);
-    renderSnapshotData(globalState.snapshot);
-    renderEvents(globalState.events || []);
     renderExecution(globalState.execution);
     renderAccounts(globalState.accounts);
     renderGridStrategies(globalState.auto_arb || {});
@@ -2669,9 +2657,7 @@
     syncAutoExitExecId(globalState.auto_exit || {}, globalState.auto_strategies || {});
     renderAutoExitAgent();
     renderMessages(collectMessages(globalState));
-    toggleEmptyState(!globalState.snapshot);
     updateHint(globalState);
-    updateRefreshButton();
     syncAutoExitDefaults(globalState.auto_exit);
   }
 
@@ -2903,8 +2889,8 @@
 
   function collectSettingsFromForm() {
     var result = {
-      sources: {},
-      exchanges: {},
+      sources: clone((globalState.settings && globalState.settings.sources) || defaultSettings.sources),
+      exchanges: clone((globalState.settings && globalState.settings.exchanges) || defaultSettings.exchanges),
       parser_refresh_seconds: defaultSettings.parser_refresh_seconds,
       exchange_refresh_seconds: defaultSettings.exchange_refresh_seconds,
       table_refresh_seconds: defaultSettings.table_refresh_seconds,
@@ -2918,14 +2904,6 @@
     }
     var i;
     var inputs;
-    inputs = elements.settingsForm.querySelectorAll('input[name="sources"]');
-    for (i = 0; i < inputs.length; i += 1) {
-      result.sources[inputs[i].value] = !!inputs[i].checked;
-    }
-    inputs = elements.settingsForm.querySelectorAll('input[name="exchanges"]');
-    for (i = 0; i < inputs.length; i += 1) {
-      result.exchanges[inputs[i].value] = !!inputs[i].checked;
-    }
     inputs = elements.settingsForm.querySelectorAll('input[name="analysis_exchanges"]');
     result.analysis_exchanges = {};
     for (i = 0; i < inputs.length; i += 1) {
@@ -3144,16 +3122,6 @@
     var exchanges = settings.exchanges || {};
     var inputs;
     var i;
-    inputs = elements.settingsForm.querySelectorAll('input[name="sources"]');
-    for (i = 0; i < inputs.length; i += 1) {
-      var name = inputs[i].value;
-      inputs[i].checked = sources.hasOwnProperty(name) ? !!sources[name] : !!defaultSettings.sources[name];
-    }
-    inputs = elements.settingsForm.querySelectorAll('input[name="exchanges"]');
-    for (i = 0; i < inputs.length; i += 1) {
-      var exchange = inputs[i].value;
-      inputs[i].checked = exchanges.hasOwnProperty(exchange) ? !!exchanges[exchange] : !!defaultSettings.exchanges[exchange];
-    }
     var analysis = settings.analysis_exchanges || exchanges || {};
     inputs = elements.settingsForm.querySelectorAll('input[name="analysis_exchanges"]');
     for (i = 0; i < inputs.length; i += 1) {

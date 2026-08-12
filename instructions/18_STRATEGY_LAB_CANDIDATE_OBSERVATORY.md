@@ -755,14 +755,36 @@ funding interval, premium/oracle spread, OI, volume, fees и фактическ�
 
 ## Пошаговый план реализации
 
+## Реализованный checkpoint 2026-08-12
+
+Phase O0 частично реализован и доступен на отдельной странице
+`/strategy-lab-observatory`:
+
+- external contract: `strategy_lab_external_candidate_v1`;
+- exact-five ArbitrageScanner adapter с правильными aliases, scale и sign;
+- Coinglass web fallback с реальными checkbox-click, проверкой выбранного набора,
+  postcondition таблицы и last-good;
+- bounded union максимум `30`, где overlap получает P1, но каждое наблюдение явно
+  имеет `trade_signal=false`;
+- one-shot GET/POST API без scheduler и без связи с execution;
+- старый intake и его настройки убраны с главной страницы и не стартуют с backend.
+
+Свежий combined smoke в отдельном временном каталоге: Coinglass `20/20`,
+ArbitrageScanner `789 raw / 497 eligible`, итог `30`, overlap `16`. Числа являются
+снимком меняющихся внешних таблиц, а не фиксированной нормой.
+
+Не реализованы и не считаются разрешёнными этим checkpoint: общий пятибиржевой
+Instrument Registry, own-feed verification, multiplexed feeds, `1h/24h` preflight,
+месячный collector, strategy shadow и любые заявки.
+
 ### Phase O0 — data contract and bounded preflight
 
-1. Зафиксировать schema/version, sign convention, candidate/event identity и
+1. **Готово:** зафиксировать schema/version, sign convention, candidate/event identity и
    общий `source_observation` contract для own/Coinglass/ArbitrageScanner.
-2. Добавить replay fixtures и контрактные тесты для exact exchange aliases,
+2. **Готово для external intake:** добавить replay fixtures и контрактные тесты для exact exchange aliases,
    long=min funding / short=max funding и потери/stale внешнего источника.
 3. Реализовать общий Instrument Registry для пяти бирж.
-4. Реализовать source adapters в выключенном по умолчанию research-контуре:
+4. **Готово для бесплатных источников:** реализовать source adapters в выключенном по умолчанию research-контуре:
    ArbitrageScanner exact-five; Coinglass official API при наличии ключа; web
    parser только как slow fallback.
 5. Сделать multiplexed public feed prototype без постоянного long run.
@@ -803,11 +825,9 @@ funding interval, premium/oracle spread, OI, volume, fees и фактическ�
 
 Следующий change block — только `Phase O0`:
 
-- versioned source/candidate schema, replay fixtures и tests;
-- исправление ArbitrageScanner aliases/sign в новом research adapter без
-  автоматического включения старого runtime source;
 - пятибиржевой Instrument Registry;
 - bounded multiplexed feed prototype;
+- own-feed verification и coverage/freshness QA external candidates;
 - без долгого запуска, shadow positions, orders, ARM и изменений live-модулей.
 
 После тестов нужен отдельный операторский verdict перед `1h/24h` preflight, а после

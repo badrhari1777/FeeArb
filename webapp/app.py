@@ -49,11 +49,12 @@ from .bybit_pump_short_lab import (
     normalize_shadow_schedule_config,
 )
 from execution.pump_live import PumpLiveController
+from strategy_lab import StrategyLabObservatory
 
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-08-11-pump-ladder-proximity-v1"
+STATIC_VERSION = "v2026-08-12-strategy-lab-observatory-v1"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -75,11 +76,15 @@ if os.getenv("FEEARB_TESTING") == "1":
         notifier=service.notification_router,
         main_portfolio_provider=service.mobile_positions_payload,
     )
+    strategy_lab_observatory = StrategyLabObservatory(
+        state_dir=Path(tempfile.mkdtemp(prefix="feearb-strategy-lab-test-")),
+    )
 else:
     bybit_pump_short_lab = BybitPumpShortLab(
         notifier=service.notification_router,
         main_portfolio_provider=service.mobile_positions_payload,
     )
+    strategy_lab_observatory = StrategyLabObservatory()
 logger = logging.getLogger(__name__)
 
 
@@ -115,6 +120,10 @@ class SettingsPayload(BaseModel):
     )
     protective: Optional[Dict[str, object]] = None
     manual: Optional[Dict[str, object]] = None
+
+
+class StrategyLabRefreshPayload(BaseModel):
+    sources: Optional[list[str]] = None
 
 
 class ManualBasePayload(BaseModel):
@@ -494,6 +503,18 @@ async def positions_page(request: Request) -> HTMLResponse:
     )
 
 
+@app.get("/strategy-lab-observatory", response_class=HTMLResponse)
+async def strategy_lab_observatory_page(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(
+        "strategy_lab_observatory.html",
+        {
+            "request": request,
+            "initial": strategy_lab_observatory.status(),
+            "static_version": STATIC_VERSION,
+        },
+    )
+
+
 @app.get("/coin/{symbol}", response_class=HTMLResponse)
 async def coin_analysis_page(
     request: Request,
@@ -667,6 +688,22 @@ async def spread_monitor_page(request: Request) -> HTMLResponse:
 @app.get("/api/snapshot")
 async def snapshot_api() -> JSONResponse:
     return JSONResponse(jsonable_encoder(_ui_state_payload()))
+
+
+@app.get("/api/strategy-lab/observatory")
+async def strategy_lab_observatory_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(strategy_lab_observatory.status()))
+
+
+@app.post("/api/strategy-lab/observatory/refresh")
+async def strategy_lab_observatory_refresh_api(
+    payload: StrategyLabRefreshPayload,
+) -> JSONResponse:
+    try:
+        result = await strategy_lab_observatory.refresh(sources=payload.sources)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return JSONResponse(jsonable_encoder(result))
 
 
 @app.get("/api/positions/overview")

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <title>Strategy Lab Observatory | FeeArb</title>
+  {% set rp = request.scope.get('root_path', '') %}
+  <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
+  <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
+  <script>
+    window.__ROOT_PATH__ = "{{ rp }}";
+    window.__STRATEGY_LAB_OBSERVATORY__ = {{ initial | tojson | safe }};
+  </script>
+  <script defer src="{{ rp }}/static/strategy_lab_observatory.js?v={{ static_version }}"></script>
+</head>
+<body class="page">
+  <header class="masthead">
+    <div>
+      <p class="back-link"><a href="/">Назад на главную</a></p>
+      <h1>Strategy Lab Candidate Observatory</h1>
+      <p class="subtitle">Изолированный research-only отбор кандидатов. Сделки, ARM и маржа недоступны.</p>
+    </div>
+    <div class="status-block">
+      <dl>
+        <div><dt>Режим</dt><dd id="sl-mode">research_only_no_trading</dd></div>
+        <div><dt>Состояние</dt><dd><span id="sl-status" class="status-pill status-pill--idle">idle</span></dd></div>
+        <div><dt>Кандидатов</dt><dd id="sl-candidate-count">0</dd></div>
+        <div><dt>Обновлено</dt><dd id="sl-updated-at">-</dd></div>
+      </dl>
+      <p class="hint">Фоновый scheduler выключен. Каждый сбор запускается только кнопкой и сохраняет last-good.</p>
+    </div>
+  </header>
+
+  <main class="content">
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Одноразовый bounded refresh</h2>
+        <div class="panel-actions">
+          <button type="button" class="button" id="sl-refresh-all">Coinglass + ArbitrageScanner</button>
+          <button type="button" class="button button--ghost" id="sl-refresh-coinglass">Только Coinglass</button>
+          <button type="button" class="button button--ghost" id="sl-refresh-arbitragescanner">Только ArbitrageScanner</button>
+          <button type="button" class="button button--ghost" id="sl-status-refresh">Обновить экран</button>
+        </div>
+      </div>
+      <p id="sl-action-status" class="settings-status" aria-live="polite"></p>
+      <p class="muted">Точные биржи: Binance, Bybit, OKX, KuCoin, Gate. При пустом/ошибочном ответе успешный предыдущий snapshot не затирается.</p>
+    </section>
+
+    <section class="panel">
+      <h2>Источники</h2>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Источник</th><th>Статус</th><th>Raw</th><th>Подходят</th><th>Карантин</th>
+            <th>Последний успех</th><th>Last-good</th><th>Ошибка</th>
+          </tr>
+        </thead>
+        <tbody id="sl-source-body"></tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>External candidate union (максимум 30)</h2>
+      <p class="muted">Приоритет определяет глубину наблюдения, но не является торговым сигналом.</p>
+      <table class="data-table data-table--wide">
+        <thead>
+          <tr>
+            <th>#</th><th>Symbol</th><th>Priority</th><th>Sources</th><th>Overlap</th>
+            <th>Coinglass rank</th><th>Funding dispersion</th><th>Long</th><th>Short</th><th>Signal</th>
+          </tr>
+        </thead>
+        <tbody id="sl-candidate-body"></tbody>
+      </table>
+      <p class="muted" id="sl-candidate-empty">Данных пока нет. Запустите bounded refresh.</p>
+    </section>
+  </main>
+</body>
+</html>

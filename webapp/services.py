@@ -17,9 +17,6 @@ from urllib.request import Request, urlopen
 
 from pipeline import (
     DataSnapshot,
-    SourceSnapshot,
-    build_snapshot_from_sources,
-    collect_sources_async,
 )
 from orchestrator.models import MarketSnapshot
 from project_settings import SettingsManager
@@ -3337,23 +3334,15 @@ class DataService:
         self._positions_market_interval = self._settings_manager.current.positions_market_refresh_seconds
         self._summary_interval = self._settings_manager.current.summary_refresh_seconds
         self._snapshot: Optional[DataSnapshot] = None
-        self._cached_sources: Optional[SourceSnapshot] = None
         self._lock = asyncio.Lock()
-        self._task: Optional[asyncio.Task] = None
-        self._bootstrap_task: Optional[asyncio.Task] = None
         self._status: str = "idle"
         self._last_error: Optional[str] = None
         self._last_refreshed: Optional[datetime] = None
-        self._last_source_refresh: Optional[datetime] = None
         self._in_progress: bool = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._events: List[dict[str, Any]] = []
         self._exchange_status: Dict[str, dict[str, Any]] = {}
         self._funding_cache: dict[tuple[str, str], tuple[float | None, str | None, float | None, float]] = {}
-        self._last_snapshot_sources_at: Optional[datetime] = None
-        self._last_snapshot_universe_key: tuple[str, ...] | None = None
-        self._last_snapshot_exchanges_key: tuple[str, ...] | None = None
-        self._last_source_flags_key: tuple[tuple[str, bool], ...] | None = None
         self._exec_settings_manager = ExecutionSettingsManager()
         self._execution_settings: ExecutionSettings = self._exec_settings_manager.current
         self._wallet = WalletService(self._execution_settings.balance.initial_balances)
@@ -6517,10 +6506,11 @@ class DataService:
         await self._accounts.refresh_now(force_env=True)
         await self._refresh_positions_market_snapshots(force=True)
         await self._maybe_sync_protective_orders()
-        if self._task is None:
-            await self._restart_scheduler()
-        if self._bootstrap_task is None or self._bootstrap_task.done():
-            self._bootstrap_task = asyncio.create_task(self.refresh_markets())
+        # The legacy main-dashboard candidate collectors are retired. External
+        # discovery now belongs to the isolated Strategy Lab Observatory and
+        # must never start as a side effect of the trading dashboard startup.
+        async with self._lock:
+            self._status = "ready"
         if self._positions_market_task is None:
             self._positions_market_task = asyncio.create_task(self._positions_market_scheduler())
         if self._protective_task is None:
@@ -6545,20 +6535,6 @@ class DataService:
         await self._telemetry.start()
 
     async def shutdown(self) -> None:
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
-        if self._bootstrap_task:
-            self._bootstrap_task.cancel()
-            try:
-                await self._bootstrap_task
-            except asyncio.CancelledError:
-                pass
-            self._bootstrap_task = None
         if self._positions_market_task:
             self._positions_market_task.cancel()
             try:
@@ -6634,33 +6610,6 @@ class DataService:
         await self._accounts.stop()
         await self._manual.close()
         await self._protective_manager.close()
-
-    async def _scheduler(self) -> None:
-        try:
-            while True:
-                interval = max(self._exchange_interval, 1)
-                await asyncio.sleep(interval)
-                result = await self.refresh_markets(
-                    force_sources=self._sources_due(),
-                )
-                if result == "failed":
-                    logger.warning(
-                        "Scheduled snapshot refresh failed; will retry after interval."
-                    )
-        except asyncio.CancelledError:
-            raise
-
-    async def _restart_scheduler(self) -> None:
-        if self._loop is None or self._loop.is_closed():
-            return
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
-        self._task = asyncio.create_task(self._scheduler())
 
     async def _protective_scheduler(self) -> None:
         """Independent loop for balance/position driven protective upkeep."""
@@ -6971,162 +6920,19 @@ class DataService:
         self._record_coin_outcomes_cycle(cycle)
         return cycle
 
-    def _sources_due(self) -> bool:
-        if self._cached_sources is None or self._last_source_refresh is None:
-            return True
-        age = datetime.now(timezone.utc) - self._last_source_refresh
-        return age.total_seconds() >= max(self._parser_interval, 1)
-
     async def refresh_markets(self, *, force_sources: bool = True) -> RefreshResult:
-        async with self._lock:
-            if self._in_progress:
-                return "in_progress"
-            prev_exchange_status = dict(self._exchange_status)
-            prev_snapshot = self._snapshot
-            prev_last_refreshed = self._last_refreshed
-            self._in_progress = True
-            self._status = "pending"
-            self._last_error = None
-            self._events = []
-            self._exchange_status = {}
+        del force_sources
         self._record_event(
-            "refresh:start",
-            {"message": "Snapshot refresh started"},
+            "legacy_discovery:disabled",
+            {
+                "message": "Legacy main-dashboard discovery is disabled; use Strategy Lab Observatory",
+            },
         )
-
-        outcome: RefreshResult = "completed"
-        loop = self._loop or asyncio.get_running_loop()
-        progress_cb = self._make_progress_callback(loop)
-        current_settings = self._settings_manager.current
-        source_flags = dict(current_settings.sources)
-        exchange_flags = dict(current_settings.exchanges)
-        sources: Optional[SourceSnapshot] = self._cached_sources
-        source_flags_key = tuple(sorted((name, bool(enabled)) for name, enabled in source_flags.items()))
-        source_flags_changed = (
-            self._last_source_flags_key is not None and source_flags_key != self._last_source_flags_key
-        )
-
-        need_sources = (
-            force_sources
-            or sources is None
-            or self._sources_due()
-            or source_flags_changed
-        )
-        if need_sources:
-            try:
-                sources = await collect_sources_async(
-                    progress_cb,
-                    source_settings=source_flags,
-                    exchange_settings=exchange_flags,
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.exception("Source refresh raised an error")
-                self._record_event(
-                    "sources:failed",
-                    {"message": "Source refresh failed", "error": str(exc)},
-                )
-                if self._cached_sources is None:
-                    outcome = "failed"
-                    self._record_event(
-                        "refresh:failed",
-                        {
-                            "message": "Snapshot refresh failed (no cached sources)",
-                            "error": str(exc),
-                        },
-                    )
-                    async with self._lock:
-                        self._last_error = str(exc)
-                        self._status = "error"
-                        self._in_progress = False
-                    return outcome
-                sources = self._cached_sources
-                # attach warning for downstream reporting
-                warning_message = "Source refresh failed; using cached data."
-                if warning_message not in sources.messages:
-                    sources.messages.append(warning_message)
-            else:
-                self._cached_sources = sources
-                self._last_source_refresh = sources.generated_at
-                self._last_source_flags_key = source_flags_key
-        if sources is None:
-            async with self._lock:
-                self._last_error = "sources_unavailable"
-                self._status = "error"
-            return "failed"
-
-        symbols = [str(entry.get("symbol") or "") for entry in sources.universe if entry.get("symbol")]
-        universe_key = tuple(sorted(symbols))
-        exchanges_key = tuple(sorted(name for name, enabled in exchange_flags.items() if enabled))
-        skip_exchange_refresh = (
-            not need_sources
-            and self._snapshot is not None
-            and self._last_snapshot_sources_at is not None
-            and sources.generated_at == self._last_snapshot_sources_at
-            and universe_key == (self._last_snapshot_universe_key or ())
-            and exchanges_key == (self._last_snapshot_exchanges_key or ())
-        )
-        if skip_exchange_refresh:
-            self._record_event(
-                "refresh:skipped",
-                {
-                    "message": "Snapshot refresh skipped (sources unchanged)",
-                    "reason": "sources_unchanged",
-                    "generated_at": sources.generated_at.isoformat(),
-                },
-            )
-            async with self._lock:
-                self._snapshot = prev_snapshot
-                self._status = "ready" if prev_snapshot else "idle"
-                self._last_error = None
-                self._last_refreshed = prev_last_refreshed
-                self._exchange_status = prev_exchange_status
-            async with self._lock:
-                self._in_progress = False
-            return "completed"
-
-        try:
-            snapshot = await build_snapshot_from_sources(
-                sources,
-                progress_cb=progress_cb,
-                exchange_settings=exchange_flags,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.exception("Snapshot refresh raised an error")
-            outcome = "failed"
-            self._record_event(
-                "refresh:failed",
-                {"message": "Snapshot refresh failed", "error": str(exc)},
-            )
-            async with self._lock:
-                self._last_error = str(exc)
-                self._status = "error"
-        else:
-            self._record_event(
-                "refresh:completed",
-                {
-                    "message": "Snapshot refresh completed successfully",
-                    "opportunity_count": len(snapshot.opportunities),
-                },
-            )
-            async with self._lock:
-                self._snapshot = snapshot
-                self._status = "ready"
-                self._last_error = None
-                self._last_refreshed = datetime.now(timezone.utc)
-                self._parser_interval = current_settings.parser_refresh_seconds
-                self._exchange_interval = current_settings.exchange_refresh_seconds
-                self._exchange_status = {
-                    entry.get("exchange", f"exchange-{idx}"): entry
-                    for idx, entry in enumerate(snapshot.exchange_status)
-                }
-                self._last_snapshot_sources_at = sources.generated_at
-                self._last_snapshot_universe_key = universe_key
-                self._last_snapshot_exchanges_key = exchanges_key
-        finally:
-            async with self._lock:
-                self._in_progress = False
-
-        return outcome
+        async with self._lock:
+            self._status = "ready"
+            self._last_error = None
+            self._in_progress = False
+        return "completed"
 
     async def on_settings_updated(self) -> None:
         async with self._lock:
@@ -7140,7 +6946,7 @@ class DataService:
             self._protective_manager.update_config(self._risk_config)
             self._protective_interval = getattr(self._risk_config, "position_check_interval_sec", self._protective_interval)
             self._apply_alert_settings()
-        await self._restart_scheduler()
+        # Legacy market-discovery scheduling intentionally stays disabled.
         await self._restart_protective_scheduler()
         await self._restart_positions_market_scheduler()
         await self._restart_derisk_scheduler()

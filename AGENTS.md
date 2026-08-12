@@ -109,6 +109,25 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Strategy Lab external candidate intake was isolated and implemented on
+  2026-08-12. The legacy main-dashboard Coinglass/ArbitrageScanner scheduler and
+  startup bootstrap no longer run; their settings, parser intervals, Data
+  Overview, universe and Funding Opportunities were removed from `/`. The
+  compatibility refresh endpoint is a no-op, while account, positions,
+  protection, auto-exit, coin-analysis and Pump loops are unchanged. New
+  research-only `/strategy-lab-observatory` has no scheduler or trading
+  controls. `strategy_lab_external_candidate_v1` preserves provider asset ID
+  and exact per-venue symbols; ArbitrageScanner now maps exact five aliases
+  including OKX, uses provider percentage-point scale and `long=min / short=max`.
+  Coinglass physically applies the five UI checkboxes, verifies checkbox and
+  stabilized table postconditions, and preserves last-good on failure. Bounded
+  live smoke returned Coinglass `20/20`, ArbitrageScanner `789/497`, and a
+  30-symbol union with 16 overlaps; changing public counts are evidence only,
+  never trade signals. No long run, ARM, order or live setting changed. Next:
+  five-venue Instrument Registry and bounded multiplexed feed prototype before
+  a separately approved 1h preflight. Full regression passed (`757`, plus `8`
+  subtests, `15` warnings). Canonical state:
+  `instructions/18_STRATEGY_LAB_CANDIDATE_OBSERVATORY.md`.
 - Pump Live close recovery and accounting were decoupled on 2026-08-12 after
   RATS held for over seven days, closed fully by Bybit Take Profit, and then
   remained `position_absent_unconfirmed` because one full-window transaction

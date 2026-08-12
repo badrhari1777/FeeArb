@@ -14,8 +14,8 @@
 Если реализация и этот документ расходятся, сначала проверить код и свежие
 артефакты, затем исправить roadmap в том же логическом коммите.
 
-Последнее обновление: `2026-08-10`.
-Текущий этап: `Candidate Observatory design зафиксирован; Phase O0 data contract / Instrument Registry / bounded feed prototype pending`.
+Последнее обновление: `2026-08-12`.
+Текущий этап: `Phase O0 external intake готов; Instrument Registry и bounded multiplexed feed prototype pending`.
 Текущий режим: `research_only_no_trading`.
 
 ## Цель
@@ -610,3 +610,36 @@ Shadow -> live:
   market-cap/volume filtered context, не источник отдельной perpetual-квоты.
 - Это уточнение design-only: collector, long run, shadow/paper, ARM, заявки и
   live-модули не запускались и не менялись. Следующий safe block остаётся Phase O0.
+
+### 2026-08-12 — отдельная Observatory page и исправленный external intake
+
+- Устаревший main-dashboard intake выведен из runtime: startup больше не создаёт
+  legacy market scheduler/bootstrap, settings update не может снова включить
+  `coinglass/arbitragescanner`, а совместимый `/api/refresh` является no-op.
+  Accounts, positions-market, protective, auto-exit, coin-analysis и Pump loops
+  не менялись.
+- С главной страницы удалены source/exchange-opportunity настройки, parser poll,
+  Data Overview, общий symbol universe и Funding Opportunities. Создана отдельная
+  `/strategy-lab-observatory` без торговых controls.
+- Введён `strategy_lab_external_candidate_v1`: source asset ID, canonical symbol,
+  exact exchange symbol каждой ноги, source timestamp, mapping status, raw
+  identity и явный `research_only/trade_signal=false`.
+- Новый ArbitrageScanner adapter использует exact aliases пяти бирж, включая
+  `okex_futures -> okx`, переводит provider percentage points в decimal и задаёт
+  экономическое направление `long=min funding`, `short=max funding`. Live-smoke
+  менялся вместе с публичной таблицей: `772..789` raw rows, стабильно `497`
+  eligible exact-five symbols.
+- Новый Coinglass fallback физически открывает `Exchanges`, кликает только
+  `Binance/Bybit/OKX/KuCoin/Gate`, повторно читает checkbox state и ждёт, пока
+  React-таблица два чтения подряд содержит только exact-five пары. Пустой,
+  частичный, stale или anti-bot результат не затирает last-good. Live-smoke:
+  `20/20` valid exact-five rows примерно за `9.4s`.
+- Bounded combined smoke в отдельном временном state дал `30` external candidates,
+  из них `16` подтверждены обоими источниками. Это monitoring priority, не alpha
+  и не разрешение сделки. Scheduler Observatory остаётся выключен; долгий сбор
+  не запускался.
+- Контрактные/web tests покрывают aliases/sign, exact-five, mapping preservation,
+  collision quarantine, overlap ranking, last-good и отсутствие legacy-блоков
+  на main page. Полная регрессия: `757 passed`, `8 subtests`, `15 warnings`.
+- Следующий safe block: Instrument Registry пяти бирж и bounded multiplexed public
+  feed prototype. Затем отдельное операторское решение перед `1h` preflight.

@@ -18,8 +18,10 @@ from config import BASE_DIR, SUPPORTED_EXCHANGES
 _DEFAULT_SETTINGS_PATH: Final[Path] = BASE_DIR / "data" / "settings.json"
 
 DEFAULT_SOURCES: Final[Dict[str, bool]] = {
-    "arbitragescanner": True,
-    "coinglass": True,
+    # Legacy main-dashboard discovery is retired. Strategy Lab owns external
+    # candidate intake and has an independent, research-only configuration.
+    "arbitragescanner": False,
+    "coinglass": False,
 }
 
 DEFAULT_EXCHANGES: Final[Dict[str, bool]] = {
@@ -284,7 +286,9 @@ class AppSettings:
 
     def normalised(self) -> "AppSettings":
         """Ensure the settings align with the latest defaults."""
-        self.sources = _normalise_bool_map(DEFAULT_SOURCES, self.sources)
+        # Do not allow an old settings.json or the compatibility API to revive
+        # the retired main-dashboard collectors.
+        self.sources = dict(DEFAULT_SOURCES)
         self.exchanges = _normalise_bool_map(
             _default_exchanges(), self.exchanges
         )
@@ -438,8 +442,6 @@ class AppSettings:
 
     def validate(self) -> None:
         """Validate invariants, raising ValueError if anything is invalid."""
-        if not any(self.sources.values()):
-            raise ValueError("At least one data source must remain enabled.")
         if not any(self.exchanges.values()):
             raise ValueError("At least one exchange must remain enabled.")
         if not any(self.analysis_exchanges.values()):
