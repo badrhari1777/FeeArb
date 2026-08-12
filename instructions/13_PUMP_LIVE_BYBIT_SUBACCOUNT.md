@@ -1229,3 +1229,34 @@ reduce-only orders; ACE/BMT L2 remained `planned/dormant` at roughly
 `72.7%/68.5%` distance and therefore correctly had no physical ladder orders.
 The observed wallet/available balances were `$3075.42/$2869.63`; the shared
 pool was ready with about `$2674.63` new-entry headroom.
+
+## Strategy Lab deployment, re-ARM and PROM candidate audit (2026-08-12)
+
+The operator explicitly requested `ARM PUMP LIVE 3000` while the bounded
+Strategy Lab work continued. Before deployment, Manual had no running execution,
+Auto-Arb had no rule/transition, Pump had two matching exchange positions
+(`ACEUSDT`, `BMTUSDT`), four reduce-only TP/SL orders, a healthy monitor and no
+freeze/error. ARM first succeeded in `tracked_positions_verified` resume mode.
+
+The final Observatory deployment again disarmed new entries before stopping the
+backend. The first launcher attempt did not become healthy within 45 seconds and
+left no uvicorn listener; entries stayed disarmed and all four exchange-side
+protective orders remained in place. A second canonical launcher invocation
+started FeeArb normally. The new page/API returned HTTP 200 and Pump recovered
+the same two positions and four orders before re-ARM.
+
+Using the same explicit operator authorization, `ARM PUMP LIVE 3000` then passed
+the ownership/protection-aware resume. Later cycles remained `armed`, monitor
+alive, with no blocked reason, last error, transient recovery or portfolio risk
+freeze. Exchange state stayed at two positions and four protective orders;
+available Pump USDT was about `$2869.32`. The combined positions overview showed
+zero protection issues across Main and Pump.
+
+The requested `PROM` check is unambiguous. Bybit's exact public instrument query
+returns `PROMUSDT` as `LinearPerpetual` but `status=Closed`; consequently it is
+correctly absent from the active bulk instrument universe and from Pump scan
+candidates. The current scan contains the different asset `PROMPTUSDT`, whose
+latest result is `no_recent_pump / no_pump_trigger_in_recent_window`. With the
+current Bybit-only Pump Live route, the probability of a PROM entry is therefore
+zero while the contract remains closed. A future relisting would still require a
+new scan event and all normal strategy/live gates; no override was added.

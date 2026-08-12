@@ -109,6 +109,18 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- Pump Live was safely rearmed during the 2026-08-12 Strategy Lab deployment by
+  explicit operator request. Manual and Auto-Arb were idle; ACE/BMT matched two
+  exchange shorts and four reduce-only TP/SL orders. The first post-stop launcher
+  attempt produced no healthy listener, so the process remained disarmed while
+  exchange protection stayed intact; the second canonical launch succeeded.
+  Ownership-aware `ARM PUMP LIVE 3000` then passed in
+  `tracked_positions_verified` mode. Later cycles remained armed and healthy,
+  with two positions, four protective orders, no error/transient/freeze, and
+  about `$2869.32` available. A named PROM audit found no Pump candidate:
+  Bybit reports `PROMUSDT` as a closed LinearPerpetual, so it is absent from the
+  active universe and cannot enter through the current Bybit-only live route.
+  `PROMPTUSDT` is a different asset and its latest scan was `no_recent_pump`.
 - Strategy Lab Observatory integrated Registry and bounded own feeds on
   2026-08-12. Its manual sequence is now external refresh, Registry refresh,
   then a 1..30 second / 1..10 symbol feed probe. The persisted snapshot keeps a
