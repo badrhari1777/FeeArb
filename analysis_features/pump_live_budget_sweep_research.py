@@ -384,7 +384,14 @@ def _compress_timeline(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = [points[0]]
     for point in points[1:]:
         previous = result[-1]
-        keys = ("own_equity_usd", "base_margin_usd", "topup_usd", "borrowed_usd", "active_positions")
+        keys = (
+            "working_capital_usd",
+            "withdrawn_profit_usd",
+            "base_margin_usd",
+            "topup_usd",
+            "borrowed_usd",
+            "active_positions",
+        )
         if all(abs(_number(point.get(key)) - _number(previous.get(key))) < 1e-9 for key in keys):
             previous["ts_end"] = point["ts"]
             continue
@@ -398,7 +405,13 @@ def replay_budget(
     *,
     budget_usd: float,
     config: ReplayConfig,
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     events: dict[int, list[dict[str, Any]]] = defaultdict(list)
     details: list[dict[str, Any]] = []
     for trade_index, source in enumerate(trades):
@@ -412,11 +425,11 @@ def replay_budget(
         trade_id = f"{trade_index}:{source.get('case_id')}"
         for action in actions:
             events[_integer(action.get("ts"))].append(
-                {"kind": "cash", "trade_id": trade_id, **action}
+                {"kind": "cash", "trade_id": trade_id, "symbol": symbol, **action}
             )
         pnl = budget_usd * LEVERAGE * _number(source.get("net_pct")) / 100.0
         events[_integer(source.get("exit_ts"))].append(
-            {"kind": "pnl", "trade_id": trade_id, "pnl_usd": pnl}
+            {"kind": "pnl", "trade_id": trade_id, "symbol": symbol, "pnl_usd": pnl}
         )
         details.append(
             {
@@ -436,11 +449,15 @@ def replay_budget(
             }
         )
 
-    states: dict[str, dict[str, float]] = {}
-    own_equity = config.own_capital_usd
-    peak_equity = own_equity
+    states: dict[str, dict[str, Any]] = {}
+    working_capital = config.own_capital_usd
+    withdrawn_profit = 0.0
+    cumulative_strategy_pnl = 0.0
+    peak_strategy_wealth = config.own_capital_usd
     max_drawdown = 0.0
     timeline: list[dict[str, Any]] = []
+    loan_events: list[dict[str, Any]] = []
+    loan_episodes: list[dict[str, Any]] = []
     borrowed_usd_hours = 0.0
     borrowed_hours = 0.0
     previous_ts: int | None = None
@@ -450,14 +467,14 @@ def replay_budget(
     peak_base = 0.0
     peak_topup = 0.0
     peak_committed_at_ts: int | None = None
-    minimum_starting_capital = 0.0
-    peak_borrow_if_profits_swept = 0.0
     minimum_own_free = float("inf")
     minimum_own_free_at_ts: int | None = None
-    loan_episode_count = 0
-    loan_episode_start: int | None = None
-    max_loan_episode_h = 0.0
+    minimum_working_capital = working_capital
+    current_episode: dict[str, Any] | None = None
     active_hours = Counter()
+    peak_committed_by_concurrency: Counter[int] = Counter()
+    peak_borrowed_by_concurrency: Counter[int] = Counter()
+    minimum_free_by_concurrency: dict[int, float] = {}
 
     for ts in sorted(events):
         if previous_ts is not None and ts > previous_ts:
@@ -466,45 +483,132 @@ def replay_budget(
             if previous_borrow > 0:
                 borrowed_hours += hours
             active_hours[len(states)] += hours
+        timestamp_events = sorted(
+            events[ts],
+            key=lambda row: 0 if row["kind"] == "cash" else 1,
+        )
+        action_labels: list[str] = []
+        draw_causes: list[str] = []
+        repay_causes: list[str] = []
         # Cash state is applied before PnL at an identical exit timestamp.
-        for event in sorted(events[ts], key=lambda row: 0 if row["kind"] == "cash" else 1):
+        for event in timestamp_events:
             if event["kind"] == "cash":
                 trade_id = str(event["trade_id"])
                 base = _number(event.get("base_margin_usd"))
                 topup = _number(event.get("topup_usd"))
+                symbol = str(event.get("symbol") or "")
+                action_name = str(event.get("action") or "")
+                label = f"{symbol}:{action_name}"
+                action_labels.append(label)
+                delta_topup = _number(event.get("delta_topup_usd"))
+                if action_name == "entry_l1" or action_name.startswith("fill_l") or delta_topup > 0:
+                    draw_causes.append(label)
+                if action_name == "exit_release" or delta_topup < 0:
+                    repay_causes.append(label)
                 if base <= 0 and topup <= 0:
                     states.pop(trade_id, None)
                 else:
-                    states[trade_id] = {"base": base, "topup": topup}
+                    states[trade_id] = {
+                        "base": base,
+                        "topup": topup,
+                        "symbol": symbol,
+                    }
             else:
-                own_equity += _number(event.get("pnl_usd"))
-                peak_equity = max(peak_equity, own_equity)
-                max_drawdown = max(max_drawdown, peak_equity - own_equity)
+                pnl_delta = _number(event.get("pnl_usd"))
+                cumulative_strategy_pnl += pnl_delta
+                gross_working = working_capital + pnl_delta
+                if gross_working > config.own_capital_usd:
+                    withdrawn_profit += gross_working - config.own_capital_usd
+                    working_capital = config.own_capital_usd
+                else:
+                    working_capital = gross_working
+                minimum_working_capital = min(minimum_working_capital, working_capital)
+                action_labels.append(
+                    f"{event.get('symbol')}:pnl_{'profit' if pnl_delta >= 0 else 'loss'}"
+                )
+                if pnl_delta >= 0:
+                    repay_causes.append(f"{event.get('symbol')}:pnl_profit")
+                else:
+                    draw_causes.append(f"{event.get('symbol')}:pnl_loss")
+                strategy_wealth = working_capital + withdrawn_profit
+                peak_strategy_wealth = max(peak_strategy_wealth, strategy_wealth)
+                max_drawdown = max(
+                    max_drawdown,
+                    peak_strategy_wealth - strategy_wealth,
+                )
         base_total = sum(item["base"] for item in states.values())
         topup_total = sum(item["topup"] for item in states.values())
         committed = base_total + topup_total + config.operating_floor_usd
-        borrowed = max(0.0, committed - own_equity)
-        own_free = max(0.0, own_equity - committed)
+        borrowed = max(0.0, committed - working_capital)
+        own_free = max(0.0, working_capital - committed)
+        active_symbols = sorted(str(item["symbol"]) for item in states.values())
+        loan_delta = borrowed - previous_borrow
+        if abs(loan_delta) > 1e-9:
+            loan_events.append(
+                {
+                    "budget_usd": budget_usd,
+                    "ts": ts,
+                    "iso": ms_to_iso(ts),
+                    "event": "borrow" if loan_delta > 0 else "repay",
+                    "amount_usd": round(abs(loan_delta), 6),
+                    "borrowed_after_usd": round(borrowed, 6),
+                    "working_capital_usd": round(working_capital, 6),
+                    "base_margin_usd": round(base_total, 6),
+                    "topup_usd": round(topup_total, 6),
+                    "committed_plus_floor_usd": round(committed, 6),
+                    "active_positions": len(states),
+                    "active_symbols": "|".join(active_symbols),
+                    "causes": "|".join(draw_causes if loan_delta > 0 else repay_causes),
+                    "all_actions": "|".join(action_labels),
+                }
+            )
         if borrowed > 0 and previous_borrow <= 0:
-            loan_episode_count += 1
-            loan_episode_start = ts
-        if borrowed <= 0 and previous_borrow > 0 and loan_episode_start is not None:
-            max_loan_episode_h = max(max_loan_episode_h, (ts - loan_episode_start) / 3_600_000.0)
-            loan_episode_start = None
+            current_episode = {
+                "budget_usd": budget_usd,
+                "start_ts": ts,
+                "start_iso": ms_to_iso(ts),
+                "end_ts": None,
+                "end_iso": None,
+                "duration_h": None,
+                "peak_borrowed_usd": borrowed,
+                "peak_ts": ts,
+                "peak_iso": ms_to_iso(ts),
+                "start_active_positions": len(states),
+                "start_active_symbols": "|".join(active_symbols),
+                "start_causes": "|".join(draw_causes),
+            }
+        if current_episode is not None and borrowed > _number(current_episode.get("peak_borrowed_usd")):
+            current_episode["peak_borrowed_usd"] = borrowed
+            current_episode["peak_ts"] = ts
+            current_episode["peak_iso"] = ms_to_iso(ts)
+        if borrowed <= 0 and previous_borrow > 0 and current_episode is not None:
+            current_episode["end_ts"] = ts
+            current_episode["end_iso"] = ms_to_iso(ts)
+            current_episode["duration_h"] = round(
+                (ts - _integer(current_episode.get("start_ts"))) / 3_600_000.0,
+                6,
+            )
+            current_episode["end_causes"] = "|".join(repay_causes)
+            loan_episodes.append(current_episode)
+            current_episode = None
         peak_borrow = max(peak_borrow, borrowed)
         if committed > peak_committed:
             peak_committed = committed
             peak_committed_at_ts = ts
         peak_base = max(peak_base, base_total)
         peak_topup = max(peak_topup, topup_total)
-        cumulative_realized_pnl = own_equity - config.own_capital_usd
-        minimum_starting_capital = max(
-            minimum_starting_capital,
-            committed - cumulative_realized_pnl,
+        concurrency = len(states)
+        peak_committed_by_concurrency[concurrency] = max(
+            peak_committed_by_concurrency[concurrency],
+            committed,
         )
-        peak_borrow_if_profits_swept = max(
-            peak_borrow_if_profits_swept,
-            committed - config.own_capital_usd,
+        peak_borrowed_by_concurrency[concurrency] = max(
+            peak_borrowed_by_concurrency[concurrency],
+            borrowed,
+        )
+        minimum_free_by_concurrency[concurrency] = min(
+            minimum_free_by_concurrency.get(concurrency, float("inf")),
+            own_free,
         )
         if own_free < minimum_own_free:
             minimum_own_free = own_free
@@ -514,7 +618,10 @@ def replay_budget(
                 "budget_usd": budget_usd,
                 "ts": ts,
                 "iso": ms_to_iso(ts),
-                "own_equity_usd": round(own_equity, 6),
+                "working_capital_usd": round(working_capital, 6),
+                "withdrawn_profit_usd": round(withdrawn_profit, 6),
+                "cumulative_strategy_pnl_usd": round(cumulative_strategy_pnl, 6),
+                "strategy_wealth_usd": round(working_capital + withdrawn_profit, 6),
                 "base_margin_usd": round(base_total, 6),
                 "topup_usd": round(topup_total, 6),
                 "committed_plus_floor_usd": round(committed, 6),
@@ -526,9 +633,16 @@ def replay_budget(
         previous_ts = ts
         previous_borrow = borrowed
 
-    if loan_episode_start is not None and previous_ts is not None:
-        max_loan_episode_h = max(max_loan_episode_h, (previous_ts - loan_episode_start) / 3_600_000.0)
-    pnl = own_equity - config.own_capital_usd
+    if current_episode is not None and previous_ts is not None:
+        current_episode["end_ts"] = previous_ts
+        current_episode["end_iso"] = ms_to_iso(previous_ts)
+        current_episode["duration_h"] = round(
+            (previous_ts - _integer(current_episode.get("start_ts"))) / 3_600_000.0,
+            6,
+        )
+        current_episode["end_causes"] = "research_window_end"
+        loan_episodes.append(current_episode)
+    pnl = cumulative_strategy_pnl
     financing_cost = borrowed_usd_hours * (config.financing_apr_pct / 100.0) / (365.25 * 24.0)
     wins = sum(1 for row in details if _number(row.get("pnl_usd")) > 0)
     losses = len(details) - wins
@@ -542,7 +656,10 @@ def replay_budget(
         "wins": wins,
         "losses": losses,
         "win_rate_pct": round(wins / len(details) * 100.0, 6) if details else 0.0,
-        "final_own_equity_usd": round(own_equity, 6),
+        "final_working_capital_usd": round(working_capital, 6),
+        "minimum_working_capital_usd": round(minimum_working_capital, 6),
+        "withdrawn_profit_usd": round(withdrawn_profit, 6),
+        "final_strategy_wealth_usd": round(working_capital + withdrawn_profit, 6),
         "pnl_usd": round(pnl, 6),
         "roi_on_initial_3000_pct": round(pnl / config.own_capital_usd * 100.0, 6),
         "max_realized_drawdown_usd": round(max_drawdown, 6),
@@ -554,8 +671,11 @@ def replay_budget(
         "peak_borrowed_usd": round(peak_borrow, 6),
         "borrowed_hours": round(borrowed_hours, 6),
         "borrowed_usd_hours": round(borrowed_usd_hours, 6),
-        "loan_episode_count": loan_episode_count,
-        "max_loan_episode_h": round(max_loan_episode_h, 6),
+        "loan_episode_count": len(loan_episodes),
+        "max_loan_episode_h": round(
+            max((_number(row.get("duration_h")) for row in loan_episodes), default=0.0),
+            6,
+        ),
         "mean_loan_when_sampled_usd": round(statistics.mean([v for v in loan_values if v > 0]), 6) if any(v > 0 for v in loan_values) else 0.0,
         "p95_sampled_loan_usd": round(_percentile(loan_values, 0.95), 6),
         "financing_apr_pct": config.financing_apr_pct,
@@ -566,8 +686,6 @@ def replay_budget(
             pnl / max(config.own_capital_usd, peak_committed) * 100.0,
             6,
         ),
-        "minimum_initial_capital_for_observed_sequence_usd": round(max(0.0, minimum_starting_capital), 6),
-        "peak_borrow_if_realized_profits_swept_usd": round(max(0.0, peak_borrow_if_profits_swept), 6),
         "minimum_own_free_usd": round(0.0 if minimum_own_free == float("inf") else minimum_own_free, 6),
         "minimum_own_free_pct_of_initial": round(
             (0.0 if minimum_own_free == float("inf") else minimum_own_free)
@@ -585,7 +703,13 @@ def replay_budget(
         "legs_reconstruction_total": len(details),
         "max_concurrent_positions": max(active_hours, default=0),
         "hours_by_concurrency": json.dumps({str(key): round(value, 3) for key, value in sorted(active_hours.items())}),
-    }, details, _compress_timeline(timeline)
+        "peak_committed_at_four_positions_usd": round(peak_committed_by_concurrency[4], 6),
+        "peak_borrowed_at_four_positions_usd": round(peak_borrowed_by_concurrency[4], 6),
+        "minimum_free_at_four_positions_usd": round(
+            minimum_free_by_concurrency.get(4, 0.0),
+            6,
+        ),
+    }, details, _compress_timeline(timeline), loan_events, loan_episodes
 
 
 def _write_csv(path: Path, rows: list[Mapping[str, Any]]) -> None:
@@ -640,6 +764,7 @@ def _sparkline(
 def _render_html(
     summaries: list[Mapping[str, Any]],
     timelines: Mapping[float, list[Mapping[str, Any]]],
+    loan_episodes: Mapping[float, list[Mapping[str, Any]]],
     *,
     config: ReplayConfig,
     metadata: Mapping[str, Any],
@@ -653,10 +778,12 @@ def _render_html(
                 f"${_number(row.get('pnl_usd')):,.0f}",
                 f"{_number(row.get('roi_on_initial_3000_pct')):.1f}%",
                 f"{_number(row.get('max_realized_drawdown_pct')):.1f}%",
+                f"${_number(row.get('withdrawn_profit_usd')):,.0f}",
+                f"${_number(row.get('final_working_capital_usd')):,.0f}",
                 f"${_number(row.get('peak_borrowed_usd')):,.0f}",
                 f"{_number(row.get('borrowed_hours')):,.0f}",
-                f"${_number(row.get('minimum_own_free_usd')):,.0f}",
-                f"${_number(row.get('peak_borrow_if_realized_profits_swept_usd')):,.0f}",
+                f"{_integer(row.get('loan_episode_count'))}",
+                f"{_number(row.get('max_loan_episode_h')):,.0f}",
                 f"${_number(row.get('financing_cost_at_apr_usd')):,.2f}",
                 f"{_number(row.get('roi_on_peak_capital_employed_pct')):.1f}%",
             )
@@ -666,6 +793,22 @@ def _render_html(
     for row in summaries:
         budget = _number(row.get("budget_usd"))
         points = list(timelines[budget])
+        episodes = list(loan_episodes.get(budget) or [])
+        episode_rows = "".join(
+            "<tr>" + "".join(
+                f"<td>{html.escape(str(value))}</td>"
+                for value in (
+                    str(episode.get("start_iso") or "")[:16],
+                    str(episode.get("end_iso") or "")[:16],
+                    f"{_number(episode.get('duration_h')):,.1f}",
+                    f"${_number(episode.get('peak_borrowed_usd')):,.0f}",
+                    episode.get("start_active_positions"),
+                    episode.get("start_active_symbols"),
+                    episode.get("start_causes"),
+                )
+            ) + "</tr>"
+            for episode in episodes
+        ) or '<tr><td colspan="7">Заем не потребовался</td></tr>'
         sections.append(f"""
         <section class="level">
           <h2>${budget:,.0f} на одну монету</h2>
@@ -674,13 +817,21 @@ def _render_html(
             <span>ROI на собственные $3000: {_number(row.get('roi_on_initial_3000_pct')):.1f}%</span>
             <span>Пиковый заем: ${_number(row.get('peak_borrowed_usd')):,.0f}</span>
             <span>Часов с займом: {_number(row.get('borrowed_hours')):,.0f}</span>
+            <span>Эпизодов займа: {_integer(row.get('loan_episode_count'))}</span>
+            <span>Прибыль выведена: ${_number(row.get('withdrawn_profit_usd')):,.0f}</span>
+            <span>Рабочий капитал в конце: ${_number(row.get('final_working_capital_usd')):,.0f}</span>
+            <span>Пик занято при 4 монетах: ${_number(row.get('peak_committed_at_four_positions_usd')):,.0f}</span>
+            <span>Заем при 4 монетах: ${_number(row.get('peak_borrowed_at_four_positions_usd')):,.0f}</span>
             <span>Пиковый top-up одной монеты: ${_number(row.get('peak_single_trade_topup_usd')):,.0f}</span>
             <span>Макс. довнесение за час: ${_number(row.get('peak_single_hour_margin_add_usd')):,.0f}</span>
           </div>
-          {_sparkline(points, 'own_equity_usd', color='#2dd4bf', label='Собственный капитал после закрытых сделок')}
+          {_sparkline(points, 'working_capital_usd', color='#2dd4bf', label='Рабочий капитал Pump, ограничен $3000')}
+          {_sparkline(points, 'withdrawn_profit_usd', color='#a78bfa', label='Накопленная выведенная прибыль')}
           {_sparkline(points, 'borrowed_usd', color='#fb7185', label='Временно занято с main')}
           {_sparkline(points, 'committed_plus_floor_usd', color='#60a5fa', label='Занято в позициях + защитная маржа + $75 floor')}
           {_sparkline(points, 'active_positions', color='#fbbf24', label='Одновременно открытых монет', prefix='')}
+          <h3>Когда занимали и возвращали</h3>
+          <table><thead><tr><th>Начало</th><th>Возврат</th><th>Часы</th><th>Пик</th><th>Позиций</th><th>Монеты</th><th>Причина старта</th></tr></thead><tbody>{episode_rows}</tbody></table>
         </section>""")
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Pump Live budget sweep</title>
     <style>
@@ -692,11 +843,11 @@ def _render_html(
       .warn{{color:#fbbf24}}code{{color:#93c5fd}}
     </style></head><body><main>
     <h1>Pump Live: $600–$1200 на одну монету</h1>
-    <div class="note"><b>Что считается.</b> $600/$650/…/$1200 — это полный максимальный бюджет одной позиции, а не размер каждой ступени. Он делится по действующей лестнице 5×равно, 3×(1:2:3) или 2×(1:2). Стартовый собственный капитал — $3000, максимум 4 монеты, внешний заем не ограничивает действия и учитывается отдельно.</div>
+    <div class="note"><b>Что считается.</b> $600/$650/…/$1200 — это полный максимальный бюджет одной позиции, а не размер каждой ступени. Он делится по действующей лестнице 5×равно, 3×(1:2:3) или 2×(1:2). Рабочий Pump-капитал начинается с $3000 и никогда не растет выше $3000: прибыль сверх лимита сразу считается выведенной, убыток уменьшает рабочий капитал, следующая прибыль сначала восстанавливает его до $3000. Максимум 4 монеты, внешний заем не ограничивает действия и учитывается отдельно до полного возврата.</div>
     <div class="note"><b>Покрытие.</b> Исследовательская граница: {metadata['research_start_iso']}; первые/последние сигналы текущей стратегии: {metadata['actual_candidate_min_iso']} — {metadata['actual_candidate_max_iso']}. Кандидатов: {metadata['candidate_count']}, исполнено при лимите 4: {metadata['selected_trade_count']}.</div>
     <div class="note warn"><b>Ограничение.</b> Сигналы, funding/fees и исходы — из существующего часового Pump replay. Маржинальные действия восстановлены по 1h high/close с идеальной реакцией контроллера внутри свечи. Это годится для выбора размера капитала и оценки потребности в займе, но не доказывает переживание внутриминутного гэпа или latency перевода.</div>
     <div class="note"><b>Текущий live-контур для сопоставления:</b> максимум top-up одной позиции $5000, shared rescue facility $2000. В тесте эти лимиты не блокируют действия; превышения показывают, какие уровни нельзя переносить в live без отдельного изменения риск-политики.</div>
-    <h2>Сводное сравнение</h2><table><thead><tr><th>Бюджет</th><th>PnL</th><th>ROI/$3000</th><th>DD</th><th>Пик займа</th><th>Часы займа</th><th>Мин. свободно</th><th>Заем без прибыли</th><th>Цена займа {config.financing_apr_pct:.0f}% APR</th><th>ROI/пик занято</th></tr></thead><tbody>{rows}</tbody></table>
+    <h2>Сводное сравнение</h2><table><thead><tr><th>Бюджет</th><th>PnL</th><th>ROI/$3000</th><th>DD</th><th>Выведено</th><th>Рабочий капитал</th><th>Пик займа</th><th>Часы займа</th><th>Эпизоды</th><th>Макс. эпизод, ч</th><th>Цена займа {config.financing_apr_pct:.0f}% APR</th><th>ROI/пик занято</th></tr></thead><tbody>{rows}</tbody></table>
     <div class="note">Максимальная отдача на пиковый экономический капитал в этой выборке: <b>${_number(best_economic.get('budget_usd')):,.0f}</b>. Минимальная потребность в займе: <b>${_number(low_loan.get('budget_usd')):,.0f}</b>. Итоговый выбор должен учитывать не только линейно растущий PnL, но и пиковый заем, длительность долга и часовую гранулярность исходных свечей.</div>
     {''.join(sections)}
     </main></body></html>"""
@@ -728,9 +879,12 @@ def run_budget_sweep(
     summaries: list[dict[str, Any]] = []
     all_details: list[dict[str, Any]] = []
     all_timelines: list[dict[str, Any]] = []
+    all_loan_events: list[dict[str, Any]] = []
+    all_loan_episodes: list[dict[str, Any]] = []
     timelines_by_budget: dict[float, list[dict[str, Any]]] = {}
+    loan_episodes_by_budget: dict[float, list[dict[str, Any]]] = {}
     for value in budget_values:
-        summary, details, timeline = replay_budget(
+        summary, details, timeline, loan_events, loan_episodes = replay_budget(
             selected,
             series_by_symbol,
             budget_usd=value,
@@ -744,10 +898,13 @@ def run_budget_sweep(
             )
         all_details.extend(details)
         all_timelines.extend(timeline)
+        all_loan_events.extend(loan_events)
+        all_loan_episodes.extend(loan_episodes)
         timelines_by_budget[value] = timeline
+        loan_episodes_by_budget[value] = loan_episodes
 
     metadata = {
-        "schema": "pump_live_budget_sweep_research_v1",
+        "schema": "pump_live_budget_sweep_research_v2_capped_pool",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "research_start_iso": ms_to_iso(1_704_067_200_000),
         "actual_candidate_min_iso": min((str(row.get("entry_iso")) for row in candidates), default=""),
@@ -766,14 +923,23 @@ def run_budget_sweep(
             "hourly reconstructed entries, fills, margin actions, and exits",
             "ideal controller response inside each hourly candle",
             "unlimited and instant main-account liquidity",
+            "working Pump capital capped at $3000 and excess profit swept",
             "no transfer latency or intra-hour gap ordering",
         ],
     }
     _write_csv(output_dir / "budget_summary.csv", summaries)
     _write_csv(output_dir / "trade_details.csv", all_details)
     _write_csv(output_dir / "portfolio_timeline.csv", all_timelines)
+    _write_csv(output_dir / "loan_events.csv", all_loan_events)
+    _write_csv(output_dir / "loan_episodes.csv", all_loan_episodes)
     (output_dir / "report.html").write_text(
-        _render_html(summaries, timelines_by_budget, config=config, metadata=metadata),
+        _render_html(
+            summaries,
+            timelines_by_budget,
+            loan_episodes_by_budget,
+            config=config,
+            metadata=metadata,
+        ),
         encoding="utf-8",
     )
     (output_dir / "metadata.json").write_text(

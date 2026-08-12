@@ -1275,15 +1275,24 @@ blocks a research action, but principal and duration are reported separately.
 The declared archive boundary is 2024-01-01, but the 40 exact-current signals
 start only on 2025-09-08; the four-slot replay executes 35. The model reconstructs
 actual filled-leg allocation and on-demand margin from `1h` candles. It does not
-reserve the full ladder for the complete holding period. All 13 levels required
-zero borrowing in the observed chronology because retained wins precede the
-HUSDT tail. This result is order-dependent: with profits swept, peak loan rises
-from `$1120` at `$600` to `$5180` at `$1200`.
+reserve the full ladder for the complete holding period. The canonical v2 report
+caps working Pump capital at `$3000`: losses reduce it, later profit first
+restores it, and every excess dollar is counted as withdrawn to another account.
+Withdrawn profit never finances a later position.
 
-The balanced research candidate is `$800`; `$850` is the hard upper candidate
-under both current `$5000` per-position top-up and `$2000` rescue scales. `$900`
-already exceeds the per-position cap in the HUSDT replay, and `$950+` also
-exceeds the rescue scale for a single reconstructed hour.
+With that model, peak temporary loan rises from `$1120`/42 hours at `$600` to
+`$5180`/67 hours at `$1200`. Four simultaneous symbols never cause borrowing:
+even `$1200` peaks at only `$2030` committed with four open symbols. The binding
+events are actual adverse ladders/top-ups: HUSDT + COAI and then HUSDT alone;
+at `$1000+`, an earlier SOON + HUSDT episode also appears. Generated
+`loan_events.csv` records every draw/repayment and `loan_episodes.csv` groups
+their start, end, duration, peak, symbols and trigger.
+
+The balanced research candidate under unchanged current limits is now `$700`:
+peak loan `$1795` fits the `$2000` rescue facility and peak position top-up
+`$4020` fits the `$5000` cap. `$750` already needs `$2135` temporary loan;
+`$900` exceeds the position cap in the HUSDT replay, and `$950+` also exceeds
+the rescue scale for a single reconstructed hour.
 The live policy remains `$600`. Any promotion must be an explicit later operator
 decision, apply only to new positions through immutable risk snapshots, and pass
 a separate live preflight/observation gate. The hourly replay assumes ideal

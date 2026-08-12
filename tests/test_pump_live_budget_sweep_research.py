@@ -98,7 +98,7 @@ def test_budget_replay_scales_profit_and_tracks_unlimited_borrowing() -> None:
         closes=[1.0, 1.15, 1.5, 2.0, 1.1],
     )
     config = ReplayConfig(own_capital_usd=100.0, operating_floor_usd=25.0)
-    summary, details, timeline = replay_budget(
+    summary, details, timeline, loan_events, loan_episodes = replay_budget(
         [_candidate()],
         {"TESTUSDT": series},
         budget_usd=600.0,
@@ -107,6 +107,31 @@ def test_budget_replay_scales_profit_and_tracks_unlimited_borrowing() -> None:
     assert summary["pnl_usd"] == 180.0
     assert summary["peak_borrowed_usd"] > 0
     assert summary["borrowed_hours"] > 0
+    assert summary["final_working_capital_usd"] == 100.0
+    assert summary["withdrawn_profit_usd"] == 180.0
     assert details[0]["peak_topup_usd"] > 0
-    assert timeline[-1]["own_equity_usd"] == 280.0
+    assert timeline[-1]["working_capital_usd"] == 100.0
+    assert timeline[-1]["withdrawn_profit_usd"] == 180.0
     assert timeline[-1]["active_positions"] == 0
+    assert any(row["event"] == "borrow" for row in loan_events)
+    assert any(row["event"] == "repay" for row in loan_events)
+    assert loan_episodes
+
+
+def test_withdrawn_profit_never_increases_later_working_capital() -> None:
+    quiet = _series(
+        highs=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        closes=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    )
+    winner = _candidate(entry=0, exit_=2 * HOUR, net_pct=10.0)
+    loser = _candidate(entry=3 * HOUR, exit_=6 * HOUR, net_pct=-5.0)
+    summary, _details, timeline, _events, _episodes = replay_budget(
+        [winner, loser],
+        {"TESTUSDT": quiet},
+        budget_usd=600.0,
+        config=ReplayConfig(own_capital_usd=3_000.0),
+    )
+    assert summary["pnl_usd"] == 90.0
+    assert summary["withdrawn_profit_usd"] == 180.0
+    assert summary["final_working_capital_usd"] == 2_910.0
+    assert max(row["working_capital_usd"] for row in timeline) == 3_000.0

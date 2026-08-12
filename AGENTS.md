@@ -116,13 +116,14 @@ Recent Changes
   `35/45` ladder proximity, `12%/12%` prefund, `20 -> 25%` risk restores and
   gradual release from archived `1h` candles. Although the source boundary is
   2024-01-01, the 40 exact-current candidates begin 2025-09-08 and the portfolio
-  executes 35. All tested levels show zero chronological borrowing because
-  retained wins precede the HUSDT tail, but the no-profit counterfactual needs
-  `$1120..$5180`; hourly ideal reaction remains a hard limitation. `$800` is
-  the balanced research candidate; `$850` is the hard upper candidate under
-  both current `$5000` position-top-up and `$2000` rescue scales. `$900`
-  exceeds the former in the HUSDT replay, and `$950+` also exceeds the latter
-  within one reconstructed hour. Reproduction and conclusions:
+  executes 35. Working capital is capped at `$3000`; excess profit is withdrawn
+  and cannot finance later trades. Peak temporary loan is `$1120..$5180` for
+  `$600..$1200`. Four simultaneous symbols never borrow (only `$1055..$2030`
+  committed); HUSDT/COAI adverse top-ups are the binding events, with an
+  additional SOON/HUSDT episode at `$1000+`. `$700` is the balanced candidate
+  under unchanged `$2000` rescue and `$5000` position-top-up limits; `$750`
+  already needs `$2135` loan. Hourly ideal reaction remains a hard limitation.
+  Reproduction and conclusions:
   `docs/pump_live_budget_sweep_research_2026-08-12.md`.
 - Pump Live was safely rearmed during the 2026-08-12 Strategy Lab deployment by
   explicit operator request. Manual and Auto-Arb were idle; ACE/BMT matched two
