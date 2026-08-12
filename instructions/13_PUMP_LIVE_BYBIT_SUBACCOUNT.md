@@ -1209,5 +1209,23 @@ missing protection still never auto-arm. The change performs no trading action
 and does not alter entry, ladder, margin, TP, or SL rules. Verified Python
 compilation, the focused Pump set (`117 passed`), the expanded Pump/API/account
 set (`149 passed`, `6 warnings`), and the complete project suite (`748 passed`,
-`8` subtests, `13` pre-existing warnings). Live activation still requires a
-separate supervised restart and explicit operator ARM.
+`8` subtests, `13` pre-existing warnings).
+
+Live rollout completed after explicit operator approval on 2026-08-12. The
+pre-restart gate had no running Manual execution or active/pending Grid/Auto-Arb
+transition; ACE and BMT matched two exchange shorts and four reduce-only TP/SL
+orders. The unrelated final old-version block was a transient Bybit open-order
+read failure while entries were already disarmed; fresh reads were healthy.
+The canonical supervised restart loaded commit `961f7e5` disarmed and the
+one-shot backfill immediately changed RATS from accounting `error` to
+`complete` using `source=bybit_closed_pnl`, retaining exact net
+`+$23.49104422` and confirmed `TakeProfit/Filled` metadata.
+
+Verified resume synchronized Full TP/SL for both remaining positions and
+accepted explicit `ARM PUMP LIVE 3000`. Multiple later normal monitor cycles
+remained armed with no blocked reason, last error, transient recovery, or
+portfolio risk freeze. Exchange reconciliation stayed at exactly four
+reduce-only orders; ACE/BMT L2 remained `planned/dormant` at roughly
+`72.7%/68.5%` distance and therefore correctly had no physical ladder orders.
+The observed wallet/available balances were `$3075.42/$2869.63`; the shared
+pool was ready with about `$2674.63` new-entry headroom.

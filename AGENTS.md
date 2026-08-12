@@ -123,8 +123,12 @@ Recent Changes
   RATS row independently verified TP `0.03738`, fill `0.03678`, funding
   `+$0.79841842`, fees `$0.15157420`, and net `+$23.49104422`. Verified focused
   (`117`), expanded (`149`, `6 warnings`), and full regression (`748`, `8`
-  subtests, `13` warnings). Deployment still needs a supervised restart and
-  explicit operator ARM.
+  subtests, `13` warnings). Live rollout completed after an explicitly approved
+  supervised restart: RATS backfilled to `complete`, both remaining Full TP/SL
+  pairs reconciled, and `ARM PUMP LIVE 3000` resumed. Later cycles stayed armed
+  without error/block/freeze; ACE/BMT were correctly dormant with no physical
+  L2, four reduce-only protections remained, and shared entry headroom was
+  about `$2674.63`. Implementation commit: `961f7e5`.
 - Pump Live v4 next ladders became price-proximity gated on 2026-08-11 by
   explicit operator decision. Distance is `(next fill / Mark - 1) * 100`:
   `>55%` is dormant at the normal poll, `35..55%` is planned-only with the
