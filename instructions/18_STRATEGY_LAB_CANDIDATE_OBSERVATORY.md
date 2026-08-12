@@ -920,3 +920,32 @@ runtime status и точный следующий шаг. Нельзя объя�
 - Focused tests `23 passed`; полный regression `771 passed`, `8 subtests`,
   `15 warnings`. Следующий шаг — только отдельный operator verdict перед `1h`
   preflight. `24h`, месяц, shadow strategies и trading остаются запрещены.
+
+## Checkpoint 2026-08-12 — 1h capacity-preflight runner
+
+- `strategy_lab/preflight.py` запускает только bounded rotating public probes:
+  максимум `3600s`, окно `10` символов, market-window до `30s`, период `60s`.
+  Candidate list и точные exchange symbols берутся из только что обновлённых
+  external sources + Instrument Registry; догадки по тикерам запрещены.
+- Runtime artifacts находятся только в игнорируемом
+  `data/research/strategy_lab_observatory/preflight/<run>/`: bootstrap snapshot,
+  `observations.jsonl.gz`, `cycles.jsonl`, `status.json`, `report.json`.
+  Это диагностический датасет capacity/quality, не стратегия и не сигнал.
+- Ротация позволяет проверить до `60` текущих кандидатов без одновременной
+  подписки на весь universe. Метрики отдельно сохраняют пять venues, поэтому
+  слабый Gate не маскируется общим процентом. Core gate для Binance/Bybit/OKX/
+  KuCoin — `80%`; Gate пока warning ниже `50%` до получения часовой выборки.
+- Процесс имеет exact-confirmation, проверку диска, single-run lock, продолжает
+  следующий цикл после локальной ошибки, но отражает её в fail-closed QA.
+  Профильная интеграционная регрессия: `30 passed`; полный suite: `783 passed`,
+  `8 subtests`, `15 warnings`. `16s` real CLI smoke охватил `10/10` symbols и
+  завершил `2/2` cycles; core coverage был `100/100/100/50%`, Gate `60%`.
+  Строгий `FAIL` короткого окна сохранён из-за KuCoin, а Windows RSS после
+  исправления подтверждён (`64.9 -> 71.4 MB`, peak `74.9 MB`).
+- Оператор разрешил `1h` и последующее автономное исправление research-only
+  проблем. `24h` допускается только как обоснованное продолжение после анализа
+  часа; месячный prospective collector, strategy shadow/paper/live, ордера и
+  переводы этим не включены.
+
+Точный следующий шаг: полный regression + commit, затем один bounded `1h` run,
+разбор реального coverage/load/disk и запись результата сюда до решения о `24h`.

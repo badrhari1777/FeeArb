@@ -109,6 +109,21 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- A bounded Strategy Lab capacity-preflight runner was added on 2026-08-12 for
+  the separately approved one-hour research check. It refreshes the two
+  external candidate sources and the five-venue Instrument Registry, then
+  rotates windows of at most ten symbols through the existing 30-second public
+  feed once per minute. It is capped at 3600 seconds, requires an exact CLI
+  confirmation, 1 GiB free disk, and a single-process lock. Compressed raw
+  observations, per-cycle summaries, atomic status, venue/field coverage,
+  feed errors, CPU/RSS, cadence, and disk forecasts are written only under the
+  ignored research data tree. QA fails on core-venue coverage below 80%, low
+  cycle success, invalid BBO, subscription errors, or incomplete symbol
+  rotation; Gate below 50% is isolated as a warning pending real one-hour
+  evidence. This remains research-only and has no shadow positions, execution,
+  orders, transfers, or trading-module mutation. The focused Observatory suite
+  passed (`30`), and the complete project suite passed (`783`, `8 subtests`,
+  `15 warnings`) before the long run.
 - A reproducible Pump Live fixed-budget sweep was added on 2026-08-12 without
   changing live `$600` sizing or orders. It replays the exact current primary
   strategy and four-position ownership from a `$3000` shared cash pool for

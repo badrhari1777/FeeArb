@@ -713,3 +713,45 @@ Shadow -> live:
 - Phase O0 implementation gate завершён. Следующее действие требует человека:
   отдельное подтверждение на bounded `1h` preflight. Оно не разрешает `24h`,
   месячный prospective-сбор, strategy shadow или торговлю.
+
+### 2026-08-12 — bounded 1h capacity preflight реализован
+
+- Добавлены `strategy_lab_capacity_preflight_v1` и отдельный CLI
+  `scripts/strategy_lab_preflight.py`. Контур жёстко помечен
+  `research_only_no_trading`, не имеет execution API, не создаёт виртуальные
+  позиции и ограничивает один запуск максимумом `3600s`.
+- Перед сбором CLI заново получает внешний candidate union (до `60` монет),
+  строит Instrument Registry только по пяти утверждённым биржам и не начинает
+  feed, если Registry не `fresh`. Точный запуск дополнительно требует фразу
+  `RUN STRATEGY LAB PREFLIGHT 1H`, минимум `1 GiB` свободного диска и
+  эксклюзивный lock, поэтому два сбора не умножат соединения.
+- Capacity-профиль: одно окно до `10` монет каждые `60s`, собственный public
+  feed работает до `30s`, окна циклически ротируются. Для `60` eligible
+  кандидатов каждая монета должна попасть примерно в одно окно за `6 минут`;
+  в каждом цикле открывается максимум одно соединение на каждую из
+  Binance/Bybit/OKX/KuCoin/Gate.
+- Сохраняются сжатые normalized observations, компактные cycle summaries,
+  атомарный runtime status и финальный QA. Отчёт измеряет фактическое покрытие
+  пар и бирж, поля BBO/price/mark/index/funding/predicted/settlement/OI/volume,
+  errors/reconnects, crossed BBO, cadence gaps, CPU/RSS, raw/compressed
+  bytes/row и прогноз диска на час/сутки.
+- QA fail-closed: нулевые данные, менее `90%` успешных циклов, subscription
+  error, crossed BBO, отсутствие ротации всех eligible symbols или менее
+  `80%` покрытия каждой из четырёх core venues дают `FAIL`. Gate ниже `50%`
+  пока даёт отдельный warning, потому что короткие event-driven окна уже
+  показали его структурно худшее покрытие; это решение должно быть пересмотрено
+  по факту часа.
+- Профильная интеграционная регрессия до длинного запуска: `30 passed`; полный
+  suite: `783 passed`, `8 subtests`, `15 warnings`. Повторный `16s` CLI smoke
+  ротировал все `10/10` symbols и завершил `2/2` cycles без feed errors;
+  Binance/Bybit/OKX дали `100%`, KuCoin `50%`, Gate `60%`, поэтому строгий QA
+  ожидаемо оставил короткий smoke в `FAIL`. RSS-метрика после исправления:
+  `64.9 -> 71.4 MB`, peak `74.9 MB`; первичный disk forecast `1.27 MB/hour`.
+  Разрешение оператора на bounded `1h` получено. Оно не разрешает shadow/paper,
+  live, заявки, переводы или изменение работающих торговых модулей.
+
+Следующий регрессионный порядок: полный suite и commit реализации -> фактический
+`1h` -> разбор QA. После результата разрешено самостоятельно исправлять
+research-only несостыковки и продолжать обоснованные этапы roadmap; любое
+человеческое действие и любой trading/shadow-position boundary остаются
+отдельным stop gate.
