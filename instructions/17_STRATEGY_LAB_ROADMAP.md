@@ -821,3 +821,22 @@ QA и повторить короткую/часовую валидацию. Т�
 Технически data-contract готов к более длинной проверке, но короткий smoke не
 доказывает суточную устойчивость REST rate/error/missingness. Следующий safe gate:
 commit -> bounded повторная длительная валидация -> только затем prospective O1.
+
+### 2026-08-13 — field-complete v2 one-hour PASS
+
+- Run `preflight-20260812T205407Z` завершил `60/60` cycles, `2115` rows,
+  `49/49` verified symbols и `100%` pair coverage без warnings/failures.
+- Обязательные bid/ask/mark/funding/OI/quote-volume дали `100%` на каждой из
+  Binance/Bybit/OKX/KuCoin/Gate. Gzip/report/status согласованы, invalid BBO,
+  parse/subscription/REST/cycle errors — `0`.
+- Выполнено `2924` candidate-scoped REST calls, `2864` updates, `1,675,285`
+  response bytes. Provenance различима по `source_channels`; все `184` OKX rows
+  имеют `volume_24h_quote_derived=true`, поэтому derived quote-volume не
+  выдаётся за native turnover.
+- Нагрузка: CPU `52.188s` (`1.45%` core), RSS start/end/peak
+  `64.5/79.6/101.8 MB`, max delay `0.016s`, storage `288,724 bytes/hour` и
+  forecast `6.93 MB/day`.
+
+Решение: v2 готов к отдельному bounded `24h` QA. Он проверяет funding boundaries,
+редкие rate/timeouts, длительную field completeness и disk/RSS, но ещё не
+является O1 monthly collector, shadow positions или стратегией.

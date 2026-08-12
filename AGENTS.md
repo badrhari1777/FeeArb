@@ -109,6 +109,15 @@ Open Questions / Decisions to Make
 - Kucoin: REST order requests include leverage=3, but position updates reported `realLeverage: 1.0`; check if explicit leverage-setting API call is required.
 
 Recent Changes
+- The field-complete Strategy Lab v2 one-hour run passed on 2026-08-13 as
+  `preflight-20260812T205407Z`: 60/60 cycles, 2,115 rows, all 49 symbols, 100%
+  pairs, and 100% bid/ask/mark/funding/OI/quote-volume coverage on all five
+  venues. Its 2,924 candidate-scoped REST calls transferred 1.68 MB with zero
+  REST/feed/cycle errors. Gzip/report/status counts match, source-channel
+  provenance is retained, and all OKX derived quote-volume rows are explicitly
+  flagged. CPU was 1.45% of one core, peak RSS 101.8 MB, max delay 0.016s, and
+  disk forecast 6.93 MB/day. This approves a separately hard-capped 24h
+  research QA profile, not monthly collection, shadow positions, or trading.
 - Strategy Lab public observations were made field-complete on 2026-08-12 with
   candidate-scoped REST seeding, without bulk-universe polling or credentials.
   Each rotating window fetches Binance ticker+OI, OKX ticker+OI, KuCoin contract

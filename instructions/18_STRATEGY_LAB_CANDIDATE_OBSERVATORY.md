@@ -996,3 +996,13 @@ runtime status и точный следующий шаг. Нельзя объя�
 - Full regression: `790 passed`, `8 subtests`, `15 warnings`. Точный следующий
   шаг — зафиксировать код и проверить длительную rate/error/field стабильность;
   месячный O1 и strategy shadow ещё не включены.
+
+## Checkpoint 2026-08-13 — v2 one-hour PASS
+
+- `preflight-20260812T205407Z`: `PASS`, `60/60`, `2115` rows, `49/49` symbols,
+  `100%` pairs и `100%` bid/ask/mark/funding/OI/quote-volume на всех пяти venues.
+- `2924` REST calls / `1.68 MB`, errors `0`; gzip/report/status совпали.
+  Source provenance сохранён, включая явный derived flag для OKX quote-volume.
+- CPU `1.45%` core, peak RSS `101.8 MB`, delay `0.016s`, disk forecast
+  `6.93 MB/day`. Следующий safe step — отдельный bounded `24h` QA profile;
+  prospective month/shadow/trading пока не разрешены этим результатом.
