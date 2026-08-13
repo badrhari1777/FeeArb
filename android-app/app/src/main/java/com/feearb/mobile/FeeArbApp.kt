@@ -250,7 +250,6 @@ fun FeeArbApp(viewModel: MobileViewModel) {
                         currentTab = AppTab.Grid
                     },
                     onPositionAction = viewModel::startPositionAction,
-                    onSaveAutoExit = viewModel::saveAutoExit,
                     actionLoading = state.positionActionLoading,
                     modifier = Modifier.padding(padding),
                 )
@@ -383,7 +382,6 @@ private fun PositionsScreen(
     onUseInManual: (PositionCardDto) -> Unit,
     onUseInGrid: (PositionCardDto) -> Unit,
     onPositionAction: (PositionCardDto, String, String) -> Unit,
-    onSaveAutoExit: (PositionCardDto, Boolean, String, String) -> Unit,
     actionLoading: Boolean,
     modifier: Modifier = Modifier,
     ) {
@@ -468,7 +466,6 @@ private fun PositionsScreen(
                                         PositionFilter.All -> filters["all"] ?: cards.size
                                         PositionFilter.Risk -> filters["risk"] ?: 0
                                         PositionFilter.FundingSoon -> filters["funding_soon"] ?: 0
-                                        PositionFilter.AutoExitOn -> filters["auto_exit_on"] ?: 0
                                     }
                                     FilterChip(
                                         selected = selectedFilter == filter,
@@ -532,9 +529,6 @@ private fun PositionsScreen(
                     onUseInManual = { onUseInManual(card) },
                     onUseInGrid = { onUseInGrid(card) },
                     onPositionAction = { action, percent -> onPositionAction(card, action, percent) },
-                    onSaveAutoExit = { enabled, target, percent ->
-                        onSaveAutoExit(card, enabled, target, percent)
-                    },
                 )
             }
         }
@@ -872,19 +866,9 @@ private fun PositionCard(
     onUseInManual: () -> Unit,
     onUseInGrid: () -> Unit,
     onPositionAction: (String, String) -> Unit,
-    onSaveAutoExit: (Boolean, String, String) -> Unit,
 ) {
     var expanded by remember(card.symbol, card.pair_label) { mutableStateOf(false) }
     var actionPercent by remember(card.symbol, card.pair_label) { mutableStateOf("100") }
-    var autoExitEnabled by remember(card.symbol, card.auto_exit.spread_enabled) {
-        mutableStateOf(card.auto_exit.spread_enabled)
-    }
-    var autoExitTarget by remember(card.symbol, card.auto_exit.target_spread_pct) {
-        mutableStateOf(card.auto_exit.target_spread_pct?.let(::formatNumber).orEmpty())
-    }
-    var autoExitPercent by remember(card.symbol, card.auto_exit.exit_percent) {
-        mutableStateOf(formatNumber(card.auto_exit.exit_percent ?: 100.0))
-    }
     Card(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)),
@@ -956,53 +940,6 @@ private fun PositionCard(
                     Text("Exit $actionPercent%")
                 }
             }
-            HorizontalDivider()
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Column {
-                    Text("Auto exit", style = MaterialTheme.typography.labelLarge)
-                    Text(
-                        "${card.auto_exit.status ?: "off"} · one time",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                Switch(checked = autoExitEnabled, onCheckedChange = { autoExitEnabled = it })
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                OutlinedTextField(
-                    value = autoExitTarget,
-                    onValueChange = { autoExitTarget = it },
-                    label = { Text("Spread target") },
-                    suffix = { Text("%") },
-                    modifier = Modifier.weight(1f),
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                )
-                OutlinedTextField(
-                    value = autoExitPercent,
-                    onValueChange = { autoExitPercent = it },
-                    label = { Text("Exit size") },
-                    suffix = { Text("%") },
-                    modifier = Modifier.weight(1f),
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                )
-            }
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("25", "50", "75", "100").forEach { value ->
-                    AssistChip(
-                        onClick = { autoExitPercent = value },
-                        label = { Text("$value%") },
-                    )
-                }
-                Button(onClick = { onSaveAutoExit(autoExitEnabled, autoExitTarget, autoExitPercent) }) {
-                    Text("Save auto exit")
-                }
-            }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 TextButton(onClick = onUseInManual) { Text("Manual setup") }
                 TextButton(onClick = onUseInGrid) { Text("Grid setup") }
@@ -1034,11 +971,6 @@ private fun PositionCard(
                         KeyValue("Net funding", formatPercent(card.funding.net_funding_rate?.times(100.0)))
                         KeyValue("Next funding USDT", formatSigned(card.funding.expected_funding))
                         KeyValue("Next funding", formatMinutes(card.funding.minutes_to_next_funding))
-                    }
-                    SectionCard("More") {
-                        KeyValue("Status", card.auto_exit.status ?: "-")
-                        KeyValue("Raw status", card.auto_exit.raw_status ?: "-")
-                        KeyValue("Reason", card.auto_exit.reason ?: "-")
                     }
                     SectionCard("Legs") {
                         card.legs.forEachIndexed { index, leg ->

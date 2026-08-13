@@ -22,7 +22,6 @@ enum class PositionFilter(val label: String) {
     All("All"),
     Risk("Risk"),
     FundingSoon("Funding Soon"),
-    AutoExitOn("Auto Exit On"),
 }
 
 enum class PositionSort(val label: String) {
@@ -429,42 +428,6 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
         )
     }
 
-    fun saveAutoExit(card: PositionCardDto, enabled: Boolean, targetSpreadPct: String, exitPercentText: String) {
-        val longExchange = card.long_exchange ?: return
-        val shortExchange = card.short_exchange ?: return
-        viewModelScope.launch {
-            val target = targetSpreadPct.toInputDoubleOrNull()
-            val exitPercent = exitPercentText.toInputDoubleOrNull()
-            if (enabled && target == null) {
-                uiState = uiState.copy(statusText = "Auto-exit target spread is required.")
-                return@launch
-            }
-            if (exitPercent == null || exitPercent <= 0.0 || exitPercent > 100.0) {
-                uiState = uiState.copy(statusText = "Auto-exit percent must be from 1 to 100.")
-                return@launch
-            }
-            runCatching {
-                api.updateAutoExitRule(
-                    AutoExitRuleRequest(
-                        symbol = card.symbol,
-                        long_exchange = longExchange,
-                        short_exchange = shortExchange,
-                        enabled = enabled,
-                        spread_enabled = enabled,
-                        target_spread_pct = if (enabled) target else null,
-                        exit_percent = exitPercent,
-                        exit_once = true,
-                    )
-                )
-            }.onSuccess {
-                uiState = uiState.copy(statusText = "Auto-exit updated.")
-                refreshPositions()
-            }.onFailure { error ->
-                uiState = uiState.copy(statusText = "Auto-exit update failed: ${error.message}")
-            }
-        }
-    }
-
     fun startPositionAction(card: PositionCardDto, action: String, percentText: String) {
         val longExchange = card.long_exchange
         val shortExchange = card.short_exchange
@@ -743,7 +706,6 @@ class MobileViewModel(application: Application) : AndroidViewModel(application) 
                 PositionFilter.All -> true
                 PositionFilter.Risk -> card.flags["risk"] == true
                 PositionFilter.FundingSoon -> card.flags["funding_soon"] == true
-                PositionFilter.AutoExitOn -> card.flags["auto_exit_on"] == true
             }
         }
         return when (uiState.positionSort) {

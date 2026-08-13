@@ -392,37 +392,6 @@ class NotificationTestPayload(BaseModel):
     message: Optional[str] = "FeeArb notification test from backend."
 
 
-class AutoExitDefaultsPayload(BaseModel):
-    max_runtime_sec: Optional[int] = None
-    cooldown_sec: Optional[int] = None
-    require_live: Optional[bool] = None
-    auto_clear_no_position_sec: Optional[int] = None
-    restore_spread_on_missing: Optional[bool] = None
-    clear_verified_missing: Optional[bool] = None
-    verified_missing_confirmations: Optional[int] = Field(default=None, ge=2)
-    position_mode: Optional[str] = None
-    spread_confirm_cycles: Optional[int] = Field(default=None, ge=1)
-
-
-class AutoExitRulePayload(BaseModel):
-    symbol: str
-    long_exchange: str
-    short_exchange: str
-    enabled: Optional[bool] = True
-    spread_enabled: Optional[bool] = None
-    v1_enabled: Optional[bool] = None
-    target_spread_pct: Optional[float] = None
-    exit_percent: Optional[float] = Field(default=None, gt=0, le=100)
-    exit_once: Optional[bool] = None
-    position_mode: Optional[str] = None
-    spread_confirm_cycles: Optional[int] = Field(default=None, ge=1)
-
-
-class AutoExitClearSpreadPayload(BaseModel):
-    symbol: Optional[str] = None
-    clear_v1: Optional[bool] = False
-
-
 class HedgeClusterRulePayload(BaseModel):
     symbol: str
     kind: Optional[str] = "hedged_pair"
@@ -1419,7 +1388,7 @@ async def get_settings() -> JSONResponse:
 @app.get("/api/mobile/positions")
 async def mobile_positions() -> JSONResponse:
     payload = with_pump_account_balances(
-        service.mobile_positions_payload(),
+        service.mobile_positions_payload(include_auto_exit=False),
         bybit_pump_short_lab.pump_live_status(),
     )
     return JSONResponse(jsonable_encoder(payload))
@@ -1455,11 +1424,6 @@ async def position_action(payload: PositionActionPayload) -> JSONResponse:
         logger.exception("position action failed: %s", exc)
         result = {"errors": [str(exc)]}
     return JSONResponse(jsonable_encoder(result))
-
-
-@app.get("/api/auto-exit")
-async def get_auto_exit() -> JSONResponse:
-    return JSONResponse(service.auto_exit_payload())
 
 
 @app.get("/api/auto-arb")
@@ -1668,30 +1632,6 @@ async def update_settings(payload: SettingsPayload) -> JSONResponse:
             "settings": settings_manager.as_dict(),
         }
     )
-
-
-@app.post("/api/auto-exit/defaults")
-async def update_auto_exit_defaults(payload: AutoExitDefaultsPayload) -> JSONResponse:
-    try:
-        result = await service.update_auto_exit_defaults(payload.dict(exclude_none=True))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return JSONResponse(result)
-
-
-@app.post("/api/auto-exit/rule")
-async def update_auto_exit_rule(payload: AutoExitRulePayload) -> JSONResponse:
-    try:
-        result = await service.update_auto_exit_rule(payload.dict(exclude_none=True))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return JSONResponse(result)
-
-
-@app.post("/api/auto-exit/clear-spread-cache")
-async def clear_auto_exit_spread_cache(payload: AutoExitClearSpreadPayload) -> JSONResponse:
-    result = await service.clear_auto_exit_spread_cache(payload.symbol, clear_v1=bool(payload.clear_v1))
-    return JSONResponse(result)
 
 
 @app.post("/api/hedge-clusters/rule")

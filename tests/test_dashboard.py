@@ -95,6 +95,10 @@ class DashboardApiTestCase(unittest.IsolatedAsyncioTestCase):
         assert "/coin/{symbol}" not in paths
         assert "/api/strategies" not in paths
         assert "/api/strategies/preflight" not in paths
+        assert "/api/auto-exit" not in paths
+        assert "/api/auto-exit/defaults" not in paths
+        assert "/api/auto-exit/rule" not in paths
+        assert "/api/auto-exit/clear-spread-cache" not in paths
         assert "/api/snapshot" not in paths
         assert "/api/refresh" not in paths
 

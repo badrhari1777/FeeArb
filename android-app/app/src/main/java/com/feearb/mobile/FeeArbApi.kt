@@ -24,9 +24,6 @@ interface FeeArbApi {
     @POST("api/mobile/manual-spread")
     suspend fun getManualSpread(@Body payload: MobileManualSpreadRequest): MobileManualSpreadResponse
 
-    @POST("api/auto-exit/rule")
-    suspend fun updateAutoExitRule(@Body payload: AutoExitRuleRequest): JsonObject
-
     @GET("api/auto-arb")
     suspend fun getAutoArb(): JsonObject
 

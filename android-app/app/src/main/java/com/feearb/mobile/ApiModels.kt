@@ -61,26 +61,10 @@ data class PositionCardDto(
     val liq_distance_pct: Double? = null,
     val risk_level: String? = null,
     val flags: Map<String, Boolean> = emptyMap(),
-    val auto_exit: AutoExitStateDto = AutoExitStateDto(),
     val position_summary: PositionSummaryDto = PositionSummaryDto(),
     val risk: PositionRiskDto = PositionRiskDto(),
     val funding: PositionFundingDto = PositionFundingDto(),
     val legs: List<PositionLegDto> = emptyList(),
-)
-
-data class AutoExitStateDto(
-    val key: String? = null,
-    val spread_enabled: Boolean = false,
-    val v1_enabled: Boolean = false,
-    val target_spread_pct: Double? = null,
-    val exit_percent: Double? = 100.0,
-    val exit_once: Boolean = true,
-    val live_spread_pct: Double? = null,
-    val live_spread_source: String? = null,
-    val status: String? = null,
-    val raw_status: String? = null,
-    val reason: String? = null,
-    val updated_at: String? = null,
 )
 
 data class PositionSummaryDto(
@@ -337,17 +321,6 @@ data class ManualDefaultsDto(
     val use_orderbook_check: Boolean = true,
     val exit_allow_flip: Boolean = false,
     val expensive_leg: String? = null,
-)
-
-data class AutoExitRuleRequest(
-    val symbol: String,
-    val long_exchange: String,
-    val short_exchange: String,
-    val enabled: Boolean,
-    val spread_enabled: Boolean? = null,
-    val target_spread_pct: Double?,
-    val exit_percent: Double? = null,
-    val exit_once: Boolean? = true,
 )
 
 data class AutoArbRuleRequest(

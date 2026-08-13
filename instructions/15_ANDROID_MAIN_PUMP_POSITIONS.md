@@ -113,3 +113,10 @@ The desktop `/api/dashboard` contract must preserve `accounts.balance_summary`.
 If the API contains totals but the summary cards show `-`, verify rendering in
 `webapp/static/dashboard.js` and refresh the cache-busted static bundle before
 investigating exchange balances.
+
+## Auto Exit retirement (2026-08-13)
+
+Android no longer displays or mutates legacy Auto Exit rules and no longer has
+an `Auto exit ON` position filter. The Positions tab remains a factual Main/Pump
+view. Explicit operator actions `Add` and `Exit` for Main positions remain
+available; Grid ownership and Pump controls remain on their dedicated screens.
