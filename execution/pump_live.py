@@ -5841,12 +5841,17 @@ class PumpLiveController:
         entries were armed before the first missing-position scan, so operator
         disarms and unrelated hard failures can never be undone here.
         """
-        if not self._state.get("close_recovery_pending"):
-            return False
-        if self._state.get("blocked_reason") != "position_absent_unconfirmed":
-            self._state["close_recovery_pending"] = False
-            self._state["close_recovery_healthy_cycles"] = 0
-            return False
+        if (
+            not self._state.get("close_recovery_pending")
+            or self._state.get("blocked_reason") != "position_absent_unconfirmed"
+        ):
+            return bool(
+                self._state_machine.reduce_close_recovery(
+                    self._state,
+                    evidence_ready=False,
+                    recovery_cycles=TRANSIENT_RECOVERY_CYCLES,
+                )["recovered"]
+            )
         symbol = _normalize_symbol(self._state.get("close_recovery_symbol"))
         closed = next(
             (
@@ -5858,39 +5863,36 @@ class PumpLiveController:
             None,
         )
         if not closed:
-            return False
-        if self._unknown_exchange_positions(exchange_positions):
-            return False
-        if self._unknown_open_orders(open_orders):
-            return False
-        exchange_symbols = {
-            _normalize_symbol(item.get("symbol"))
-            for item in exchange_positions
-            if item.get("side") == "short" and _safe_float(item.get("qty"), 0.0) > 0
-        }
-        if symbol in exchange_symbols:
-            return False
-        remaining = self._open_positions(self._state)
-        if any(
-            item.get("status") != "open"
-            or _normalize_symbol(item.get("symbol")) not in exchange_symbols
-            or _safe_float(item.get("qty"), 0.0) <= 0
-            or _safe_float(item.get("tp_price"), 0.0) <= 0
-            or _safe_float(item.get("stop_price"), 0.0) <= 0
-            for item in remaining
-        ):
-            return False
-        healthy = _safe_int(self._state.get("close_recovery_healthy_cycles"), 0) + 1
-        self._state["close_recovery_healthy_cycles"] = healthy
-        if healthy < TRANSIENT_RECOVERY_CYCLES:
-            return False
-        self._state["entry_armed"] = True
-        self._state["monitor_enabled"] = True
-        self._state["blocked_reason"] = None
-        self._state["close_recovery_pending"] = False
-        self._state["close_recovery_symbol"] = None
-        self._state["close_recovery_healthy_cycles"] = 0
-        return True
+            evidence_ready = False
+        elif self._unknown_exchange_positions(exchange_positions):
+            evidence_ready = False
+        elif self._unknown_open_orders(open_orders):
+            evidence_ready = False
+        else:
+            exchange_symbols = {
+                _normalize_symbol(item.get("symbol"))
+                for item in exchange_positions
+                if item.get("side") == "short" and _safe_float(item.get("qty"), 0.0) > 0
+            }
+            remaining = self._open_positions(self._state)
+            evidence_ready = bool(
+                symbol not in exchange_symbols
+                and not any(
+                    item.get("status") != "open"
+                    or _normalize_symbol(item.get("symbol")) not in exchange_symbols
+                    or _safe_float(item.get("qty"), 0.0) <= 0
+                    or _safe_float(item.get("tp_price"), 0.0) <= 0
+                    or _safe_float(item.get("stop_price"), 0.0) <= 0
+                    for item in remaining
+                )
+            )
+        return bool(
+            self._state_machine.reduce_close_recovery(
+                self._state,
+                evidence_ready=evidence_ready,
+                recovery_cycles=TRANSIENT_RECOVERY_CYCLES,
+            )["recovered"]
+        )
 
     def _cancel_position_orders(self, item: dict[str, Any]) -> None:
         symbol = _normalize_symbol(item.get("symbol"))
