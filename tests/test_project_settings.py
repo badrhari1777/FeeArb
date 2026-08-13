@@ -31,8 +31,6 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self._service_path_patchers = [
             patch("webapp.services.AUTO_ARB_STATE_PATH", state_dir / "auto_arb_rules.json"),
             patch("webapp.services.AUTO_ARB_HISTORY_PATH", log_dir / "auto_arb_history.jsonl"),
-            patch("webapp.services.AUTO_STRATEGY_STATE_PATH", state_dir / "auto_strategies.json"),
-            patch("webapp.services.AUTO_STRATEGY_HISTORY_PATH", log_dir / "auto_strategy_history.jsonl"),
             patch("webapp.services.AUTO_EXIT_STATE_PATH", state_dir / "auto_exit_rules.json"),
             patch("webapp.services.AUTO_EXIT_HISTORY_PATH", log_dir / "auto_exit_history.jsonl"),
             patch("webapp.services.HEDGE_CLUSTER_STATE_PATH", state_dir / "hedge_clusters.json"),
@@ -3370,7 +3368,6 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
 
         service._auto_derisk_cycle = lambda: _record("derisk")  # type: ignore[assignment]
         service._auto_exit_cycle = lambda: _record("auto_exit")  # type: ignore[assignment]
-        service._auto_strategy_cycle = lambda: _record("strategy")  # type: ignore[assignment]
         service._auto_arb_cycle = lambda: _record("grid")  # type: ignore[assignment]
 
         await service._automation_cycle()  # type: ignore[attr-defined]
