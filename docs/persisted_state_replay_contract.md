@@ -142,5 +142,11 @@ fresh hedged quantity plus a queued level transition into an explicit I/O intent
 submit quantity, persisted transition, position target, entry risk target and
 completion tolerance. `tests/fixtures/grid_transition_start_intent_v1.json`
 freezes new enter/exit, material continuation, fresh-position rebase and
-already-complete outcomes. Production start execution is intentionally not wired
-to this planner yet.
+already-complete outcomes. The initial parity-only checkpoint intentionally did
+not wire production start execution.
+
+The production Grid start path now consumes that same intent after its existing
+fresh position refresh. Level-range validation still happens before refresh;
+KuCoin risk-limit checks consume the intent's explicit entry target; completion
+still short-circuits before order submission. Manual execution, exchange reads,
+state locking and persistence remain in `DataService`.

@@ -41,7 +41,6 @@ from execution.auto_arb_grid import (
     MAX_LEVELS,
     MIN_LEVELS,
     build_grid_levels,
-    build_grid_pending_transition,
     reduce_grid_transition_execution,
     reduce_grid_hedge_repair_execution,
     reduce_missing_grid_execution,
@@ -2235,12 +2234,6 @@ class DataService:
         level_index = to_level - 1 if action == "enter" else from_level - 1
         if level_index < 0 or level_index >= len(levels):
             raise ValueError("Grid transition level is outside the configured range.")
-        level_qty = float(levels[level_index].get("qty") or 0.0)
-        level_target_qty = (
-            float(levels[to_level - 1].get("cumulative_qty") or 0.0)
-            if to_level > 0
-            else 0.0
-        )
         try:
             quantities = await self._auto_arb_refresh_quantities(rule_copy)
         except Exception as exc:  # pylint: disable=broad-except
@@ -2254,25 +2247,18 @@ class DataService:
                     self._save_auto_arb_config()
             return
         current_hedged_qty = float(quantities.get("hedged_qty") or 0.0)
-        pending_built = build_grid_pending_transition(
-            existing_transition=(rule_copy.get("pending_transition") or {}),
+        start_intent = self._grid_machine.plan_transition_start(
+            rule_copy,
             action=action,
             from_level=from_level,
             to_level=to_level,
-            level_qty=level_qty,
-            level_target_qty=level_target_qty,
             current_hedged_qty=current_hedged_qty,
             now_iso=datetime.now(timezone.utc).isoformat(),
         )
-        transition = dict(pending_built["transition"])
-        qty = float(pending_built["qty"])
-        total_transition_qty = float(pending_built["total_transition_qty"])
-        position_target_qty = float(pending_built["position_target_qty"])
-        tolerance = self._auto_arb_transition_completion_tolerance(
-            rule_copy,
-            total_transition_qty,
-        )
-        if qty <= tolerance:
+        transition = dict(start_intent["transition"])
+        qty = float(start_intent["qty"])
+        position_target_qty = float(start_intent["position_target_qty"])
+        if start_intent["kind"] == "transition_complete":
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
                 if isinstance(current, dict):
@@ -2287,7 +2273,7 @@ class DataService:
         if action == "enter":
             risk_limit_preflight = await self._auto_arb_entry_risk_limit_preflight(
                 rule_copy,
-                target_position_qty=current_hedged_qty + qty,
+                target_position_qty=float(start_intent["entry_risk_target_qty"]),
             )
             if not bool(risk_limit_preflight.get("ready")):
                 now_iso = datetime.now(timezone.utc).isoformat()
@@ -2312,7 +2298,7 @@ class DataService:
                         "rule_id": rule_id,
                         "from_level": from_level,
                         "to_level": to_level,
-                        "target_position_qty": current_hedged_qty + qty,
+                        "target_position_qty": start_intent["entry_risk_target_qty"],
                         "risk_limit_preflight": risk_limit_preflight,
                         "ts": now_iso,
                     }
