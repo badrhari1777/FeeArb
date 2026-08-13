@@ -35,6 +35,7 @@ from execution.allocator import Allocator
 from execution.lifecycle import LifecycleController
 from execution.settings import ExecutionSettings
 from execution.storage import JsonStateStore, JsonlEventStore, RotatingJsonlEventStore
+from execution.state_replay_contract import GRID_STATE_SCHEMA, audit_grid_state
 from execution.auto_arb_grid import (
     MAX_LEVELS,
     MIN_LEVELS,
@@ -932,6 +933,7 @@ class DataService:
             raw = {}
         rules = raw.get("rules")
         return {
+            "schema": GRID_STATE_SCHEMA,
             "version": 1,
             "rules": dict(rules) if isinstance(rules, Mapping) else {},
         }
@@ -943,6 +945,7 @@ class DataService:
         rules = list((self._auto_arb.get("rules") or {}).values())
         rules.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         return {
+            "schema": GRID_STATE_SCHEMA,
             "version": 1,
             "mode": "live",
             "live_limits": {
@@ -951,6 +954,7 @@ class DataService:
                 "max_live_rules": None,
             },
             "rules": rules,
+            "state_contract": audit_grid_state(self._auto_arb).as_dict(),
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 

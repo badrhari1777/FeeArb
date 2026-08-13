@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
 from config import BASE_DIR
+from execution.state_replay_contract import audit_pump_state
 
 try:
     import ccxt  # type: ignore
@@ -1467,6 +1468,7 @@ class PumpLiveController:
     def status(self) -> dict[str, Any]:
         with self._lock:
             payload = json.loads(json.dumps(self._state, ensure_ascii=True))
+        payload["state_contract"] = audit_pump_state(payload).as_dict()
         config = self.config()
         payload["config"] = asdict(config)
         payload["config"]["slot_margin_usd"] = round(config.slot_margin_usd, 6)
