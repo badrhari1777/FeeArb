@@ -1914,7 +1914,6 @@ class DataService:
             rule_copy,
             quantities=quantities,
         )
-        imbalance_qty = float(repair_intent["imbalance_qty"])
         if repair_intent["kind"] == "settle_within_tolerance":
             now_iso = datetime.now(timezone.utc).isoformat()
             settle_event: dict[str, Any] = {}
@@ -1936,8 +1935,6 @@ class DataService:
             settle_event.update({"rule_id": rule_id, "ts": now_iso})
             self._auto_arb_history_store.append(settle_event)
             return
-        cleanup_exchange = repair_intent["cleanup_exchange"]
-        cleanup_side = str(repair_intent["cleanup_side"] or "")
         analysis_request = dict(repair_intent["analysis_request"] or {})
         preflight: dict[str, Any] = {}
         try:
@@ -1972,40 +1969,25 @@ class DataService:
             return
         payload = dict(repair_intent["cleanup_payload"] or {})
         result = await self.manual_orphan_cleanup(payload)
-        exec_id = str((result or {}).get("execution_id") or "")
         now_iso = datetime.now(timezone.utc).isoformat()
+        worker_event: dict[str, Any] = {}
         async with self._auto_arb_lock:
             current = (self._auto_arb.get("rules") or {}).get(rule_id)
             if not isinstance(current, dict):
                 return
-            if exec_id:
-                current["active_execution_id"] = exec_id
-                current["active_action"] = "repair"
-                current["active_start_hedged_qty"] = float(
-                    quantities.get("hedged_qty") or 0.0
-                )
-                current["status"] = "repairing_hedge"
-                current["blocked_reason"] = None
-            else:
-                current["status"] = "hedge_repair_retry"
-                current["blocked_reason"] = str(
-                    (result or {}).get("error") or "hedge_repair_worker_busy"
-                )
-                current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+            worker_reduced = self._grid_machine.reduce_hedge_repair_worker_start(
+                current,
+                result=result,
+                quantities=quantities,
+                repair_intent=repair_intent,
+                now_ts=time.time(),
+                retry_sec=AUTO_ARB_RETRY_SEC,
+            )
+            worker_event = dict(worker_reduced["event"])
             current["updated_at"] = now_iso
             self._save_auto_arb_config()
-        self._auto_arb_history_store.append(
-            {
-                "event": "live_hedge_repair_started" if exec_id else "live_hedge_repair_deferred",
-                "rule_id": rule_id,
-                "execution_id": exec_id or None,
-                "cleanup_exchange": cleanup_exchange,
-                "cleanup_side": cleanup_side,
-                "qty": imbalance_qty,
-                "result": result,
-                "ts": now_iso,
-            }
-        )
+        worker_event.update({"rule_id": rule_id, "ts": now_iso})
+        self._auto_arb_history_store.append(worker_event)
 
     async def _start_auto_arb_live_transition(
         self,

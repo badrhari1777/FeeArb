@@ -222,4 +222,8 @@ ownership and records the fresh hedged start quantity; an explicit error or empt
 result schedules the existing retry and busy fallback. The reducer returns the
 history event fragment but performs no Manual call, save, or history append. Three
 golden cases compare the full mutated rule and event with the preserved sequence.
-Production is not wired to this reducer yet.
+The initial parity-only checkpoint did not wire production to this reducer.
+
+Production now calls the reducer inside the existing lock only after the same
+`manual_orphan_cleanup` call returns. `DataService` still owns submission,
+`updated_at`, durable save, rule/timestamp event envelope and history append.
