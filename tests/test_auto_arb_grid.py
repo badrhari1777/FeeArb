@@ -9,6 +9,7 @@ from execution.auto_arb_grid import (
     complete_pending_grid_transition,
     build_grid_levels,
     decide_grid_transition,
+    reduce_partial_grid_transition,
     grid_completion_tolerance,
     grid_level_count_for_existing_qty,
     grid_rules_share_live_ownership,
@@ -18,6 +19,35 @@ from execution.auto_arb_grid import (
 
 
 class AutoArbGridTestCase(unittest.TestCase):
+    def test_partial_transition_reducer_matches_golden_fixtures(self) -> None:
+        fixture_path = Path(__file__).parent / "fixtures" / "grid_partial_transition_v1.json"
+        cases = json.loads(fixture_path.read_text(encoding="utf-8"))
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                rule = dict(case["rule"])
+                pending_transition = dict(case["pending_transition"])
+                result = reduce_partial_grid_transition(
+                    rule,
+                    pending_transition=pending_transition,
+                    current_level=case["current_level"],
+                    entry_spread_pct=case["entry_spread_pct"],
+                    exit_spread_pct=case["exit_spread_pct"],
+                    now_iso="2026-08-13T00:00:00+00:00",
+                )
+                for key, expected in case["expected_decision"].items():
+                    self.assertEqual(result["decision"].get(key), expected, key)
+                for key, expected in case["expected_pending_transition"].items():
+                    self.assertEqual(
+                        result["pending_transition"].get(key), expected, key
+                    )
+                for key, expected in case.get("expected_rule", {}).items():
+                    self.assertEqual(rule.get(key), expected, key)
+                event = result.get("transition_event")
+                self.assertEqual(
+                    event.get("event") if event else None,
+                    case.get("expected_event"),
+                )
+
     def test_confirmation_reducer_matches_golden_fixtures(self) -> None:
         fixture_path = Path(__file__).parent / "fixtures" / "grid_transition_confirmation_v1.json"
         cases = json.loads(fixture_path.read_text(encoding="utf-8"))

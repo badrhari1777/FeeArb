@@ -1,0 +1,175 @@
+[
+  {
+    "name": "partial_exit_continues_at_frontier",
+    "rule": {
+      "id": "grid-partial-exit",
+      "chunk_qty": 100.0,
+      "actual_hedged_qty": 160.0,
+      "levels": [
+        {"entry_spread_pct": -2.0, "exit_spread_pct": -1.5, "cumulative_qty": 100.0},
+        {"entry_spread_pct": -4.0, "exit_spread_pct": -3.5, "cumulative_qty": 200.0},
+        {"entry_spread_pct": -6.0, "exit_spread_pct": -5.5, "cumulative_qty": 300.0}
+      ]
+    },
+    "pending_transition": {
+      "action": "exit",
+      "from_level": 2,
+      "to_level": 1,
+      "target_qty": 100.0,
+      "filled_qty": 40.0,
+      "remaining_qty": 60.0
+    },
+    "current_level": 2,
+    "entry_spread_pct": -3.4,
+    "exit_spread_pct": -3.4,
+    "expected_decision": {"action": "exit", "target_level": 1, "continuation": true},
+    "expected_pending_transition": {"origin_hedged_qty": 200.0, "position_target_qty": 100.0},
+    "expected_event": null
+  },
+  {
+    "name": "partial_exit_reverses_from_fresh_position",
+    "rule": {
+      "id": "grid-partial-exit-reversal",
+      "chunk_qty": 100.0,
+      "actual_hedged_qty": 160.0,
+      "levels": [
+        {"entry_spread_pct": -2.0, "exit_spread_pct": -1.5, "cumulative_qty": 100.0},
+        {"entry_spread_pct": -4.0, "exit_spread_pct": -3.5, "cumulative_qty": 200.0},
+        {"entry_spread_pct": -6.0, "exit_spread_pct": -5.5, "cumulative_qty": 300.0}
+      ]
+    },
+    "pending_transition": {
+      "action": "exit",
+      "from_level": 2,
+      "to_level": 1,
+      "target_qty": 100.0,
+      "filled_qty": 40.0,
+      "remaining_qty": 60.0
+    },
+    "current_level": 2,
+    "entry_spread_pct": -4.1,
+    "exit_spread_pct": -3.8,
+    "expected_decision": {"action": "enter", "target_level": 2, "reversal": true, "restore_qty": 40.0},
+    "expected_pending_transition": {
+      "action": "enter",
+      "from_level": 1,
+      "to_level": 2,
+      "target_qty": 40.0,
+      "origin_hedged_qty": 160.0,
+      "position_target_qty": 200.0,
+      "rebase_from_positions": true,
+      "reason": "partial_exit_reversed_by_entry_trigger"
+    },
+    "expected_event": "live_partial_exit_reversal_queued"
+  },
+  {
+    "name": "zero_fill_exit_is_cleared_for_fresh_entry",
+    "rule": {
+      "id": "grid-zero-fill-exit",
+      "chunk_qty": 100.0,
+      "actual_hedged_qty": 200.0,
+      "pending_action": "exit",
+      "pending_samples": 2,
+      "blocked_reason": "old exit",
+      "levels": [
+        {"entry_spread_pct": -2.0, "exit_spread_pct": -1.5, "cumulative_qty": 100.0},
+        {"entry_spread_pct": -4.0, "exit_spread_pct": -3.5, "cumulative_qty": 200.0},
+        {"entry_spread_pct": -6.0, "exit_spread_pct": -5.5, "cumulative_qty": 300.0}
+      ]
+    },
+    "pending_transition": {
+      "action": "exit",
+      "from_level": 2,
+      "to_level": 1,
+      "target_qty": 100.0,
+      "filled_qty": 0.0,
+      "remaining_qty": 100.0
+    },
+    "current_level": 2,
+    "entry_spread_pct": -6.1,
+    "exit_spread_pct": -3.8,
+    "expected_decision": {"action": "enter", "target_level": 3, "stale_pending_exit_cleared": true},
+    "expected_pending_transition": {},
+    "expected_rule": {"pending_transition": null, "pending_action": null, "pending_samples": 0, "blocked_reason": null},
+    "expected_event": "live_pending_exit_cleared"
+  },
+  {
+    "name": "unfilled_exit_reversal_returns_to_original_exit",
+    "rule": {
+      "id": "grid-cancel-reversal",
+      "chunk_qty": 100.0,
+      "actual_hedged_qty": 160.0,
+      "levels": [
+        {"entry_spread_pct": -2.0, "exit_spread_pct": -1.5, "cumulative_qty": 100.0},
+        {"entry_spread_pct": -4.0, "exit_spread_pct": -3.5, "cumulative_qty": 200.0},
+        {"entry_spread_pct": -6.0, "exit_spread_pct": -5.5, "cumulative_qty": 300.0}
+      ]
+    },
+    "pending_transition": {
+      "action": "enter",
+      "from_level": 1,
+      "to_level": 2,
+      "target_qty": 40.0,
+      "filled_qty": 0.0,
+      "remaining_qty": 40.0,
+      "origin_hedged_qty": 160.0,
+      "position_target_qty": 200.0,
+      "reason": "partial_exit_reversed_by_entry_trigger",
+      "reversal_of": {
+        "action": "exit",
+        "from_level": 2,
+        "to_level": 1,
+        "target_qty": 100.0,
+        "filled_qty": 40.0,
+        "remaining_qty": 60.0,
+        "origin_hedged_qty": 200.0,
+        "position_target_qty": 100.0,
+        "spread_min_pct": -3.5
+      }
+    },
+    "current_level": 2,
+    "entry_spread_pct": -3.8,
+    "exit_spread_pct": -3.4,
+    "expected_decision": {"action": "exit", "target_level": 1, "reversal_cancelled": true},
+    "expected_pending_transition": {"action": "exit", "from_level": 2, "to_level": 1, "remaining_qty": 60.0},
+    "expected_event": "live_partial_exit_reversal_cancelled"
+  },
+  {
+    "name": "partial_enter_rolls_back_from_fresh_position",
+    "rule": {
+      "id": "grid-partial-enter-reversal",
+      "chunk_qty": 100.0,
+      "actual_hedged_qty": 140.0,
+      "levels": [
+        {"entry_spread_pct": -2.0, "exit_spread_pct": -1.5, "cumulative_qty": 100.0},
+        {"entry_spread_pct": -4.0, "exit_spread_pct": -3.5, "cumulative_qty": 200.0},
+        {"entry_spread_pct": -6.0, "exit_spread_pct": -5.5, "cumulative_qty": 300.0}
+      ]
+    },
+    "pending_transition": {
+      "action": "enter",
+      "from_level": 1,
+      "to_level": 2,
+      "target_qty": 100.0,
+      "filled_qty": 40.0,
+      "remaining_qty": 60.0,
+      "origin_hedged_qty": 100.0,
+      "position_target_qty": 200.0
+    },
+    "current_level": 1,
+    "entry_spread_pct": -3.8,
+    "exit_spread_pct": -3.4,
+    "expected_decision": {"action": "exit", "target_level": 1, "reversal": true, "rollback_qty": 40.0},
+    "expected_pending_transition": {
+      "action": "exit",
+      "from_level": 2,
+      "to_level": 1,
+      "target_qty": 40.0,
+      "origin_hedged_qty": 140.0,
+      "position_target_qty": 100.0,
+      "rebase_from_positions": true,
+      "reason": "partial_enter_reversed_by_exit_trigger"
+    },
+    "expected_event": null
+  }
+]

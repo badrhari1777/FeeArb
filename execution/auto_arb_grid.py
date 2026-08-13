@@ -570,3 +570,279 @@ def complete_pending_grid_transition(
         "transition_event": event,
         "pending_transition": {},
     }
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def reduce_partial_grid_transition(
+    rule: dict[str, Any],
+    *,
+    pending_transition: dict[str, Any],
+    current_level: int,
+    entry_spread_pct: float,
+    exit_spread_pct: float,
+    now_iso: str,
+) -> dict[str, Any]:
+    """Reduce an incomplete transition using persisted quantities and frontier prices."""
+    pending_remaining = max(
+        0.0,
+        float(pending_transition.get("remaining_qty") or 0.0),
+    )
+    pending_filled = max(
+        0.0,
+        float(pending_transition.get("filled_qty") or 0.0),
+    )
+    pending_action = str(pending_transition.get("action") or "")
+    from_level = int(pending_transition.get("from_level") or current_level)
+    to_level = int(pending_transition.get("to_level") or current_level)
+    levels = rule.get("levels") or []
+    actual_qty = float(rule.get("actual_hedged_qty") or 0.0)
+    origin_qty = _optional_float(pending_transition.get("origin_hedged_qty"))
+    if origin_qty is None:
+        origin_qty = (
+            max(0.0, actual_qty - pending_filled)
+            if pending_action == "enter"
+            else actual_qty + pending_filled
+        )
+    pending_transition["origin_hedged_qty"] = float(origin_qty)
+    if pending_transition.get("position_target_qty") is None:
+        pending_transition["position_target_qty"] = grid_level_qty(rule, to_level)
+    rule["pending_transition"] = pending_transition
+    level_index = to_level - 1 if pending_action == "enter" else from_level - 1
+    trigger_level = levels[level_index] if 0 <= level_index < len(levels) else {}
+    trigger_matched = (
+        entry_spread_pct <= float(trigger_level.get("entry_spread_pct"))
+        if pending_action == "enter"
+        and trigger_level.get("entry_spread_pct") is not None
+        else exit_spread_pct >= float(trigger_level.get("exit_spread_pct"))
+        if pending_action == "exit"
+        and trigger_level.get("exit_spread_pct") is not None
+        else False
+    )
+    decision: dict[str, Any] = {
+        "action": pending_action if trigger_matched else "none",
+        "current_level": current_level,
+        "target_level": to_level,
+        "entry_target_level": None,
+        "exit_target_level": None,
+        "levels_delta": to_level - from_level,
+        "continuation": True,
+        "remaining_qty": pending_transition.get("remaining_qty"),
+    }
+    transition_event: dict[str, Any] | None = None
+
+    if (
+        pending_action == "enter"
+        and not trigger_matched
+        and pending_filled <= 0
+        and str(pending_transition.get("reason") or "")
+        == "partial_exit_reversed_by_entry_trigger"
+    ):
+        original_exit = dict(pending_transition.get("reversal_of") or {})
+        original_from_level = int(original_exit.get("from_level") or to_level)
+        original_to_level = int(original_exit.get("to_level") or from_level)
+        original_exit_level = (
+            levels[original_from_level - 1]
+            if 0 <= original_from_level - 1 < len(levels)
+            else {}
+        )
+        original_exit_threshold = original_exit.get("spread_min_pct")
+        if original_exit_threshold is None:
+            original_exit_threshold = original_exit_level.get("exit_spread_pct")
+        original_exit_matched = (
+            str(original_exit.get("action") or "") == "exit"
+            and original_exit_threshold is not None
+            and exit_spread_pct >= float(original_exit_threshold)
+        )
+        if original_exit_matched:
+            pending_transition = original_exit
+            rule["pending_transition"] = pending_transition
+            decision = {
+                "action": "exit",
+                "current_level": current_level,
+                "target_level": original_to_level,
+                "entry_target_level": None,
+                "exit_target_level": original_to_level,
+                "levels_delta": original_to_level - original_from_level,
+                "continuation": True,
+                "reversal_cancelled": True,
+                "remaining_qty": original_exit.get("remaining_qty"),
+            }
+            transition_event = {
+                "event": "live_partial_exit_reversal_cancelled",
+                "rule_id": rule.get("id"),
+                "generation": rule.get("generation"),
+                "symbol": rule.get("symbol"),
+                "long_exchange": rule.get("long_exchange"),
+                "short_exchange": rule.get("short_exchange"),
+                "from_level": original_from_level,
+                "to_level": original_to_level,
+                "remaining_qty": original_exit.get("remaining_qty"),
+                "exit_threshold_pct": float(original_exit_threshold),
+                "entry_spread_pct": entry_spread_pct,
+                "exit_spread_pct": exit_spread_pct,
+                "ts": now_iso,
+            }
+
+    if pending_action == "exit" and not trigger_matched and pending_filled <= 0:
+        fresh_decision = decide_grid_transition(
+            entry_spread_pct=entry_spread_pct,
+            exit_spread_pct=exit_spread_pct,
+            levels=levels,
+            current_level=current_level,
+            max_levels_per_cycle=rule.get("max_levels_per_cycle") or 1,
+        )
+        if fresh_decision.get("action") == "enter":
+            rule["pending_transition"] = None
+            rule["pending_action"] = None
+            rule["pending_samples"] = 0
+            rule["blocked_reason"] = None
+            decision = {
+                **fresh_decision,
+                "stale_pending_exit_cleared": True,
+                "cleared_pending_exit": dict(pending_transition),
+            }
+            transition_event = {
+                "event": "live_pending_exit_cleared",
+                "rule_id": rule.get("id"),
+                "generation": rule.get("generation"),
+                "symbol": rule.get("symbol"),
+                "long_exchange": rule.get("long_exchange"),
+                "short_exchange": rule.get("short_exchange"),
+                "from_level": from_level,
+                "to_level": to_level,
+                "remaining_qty": pending_remaining,
+                "reason": "entry_trigger_recovered_after_zero_fill_exit",
+                "entry_spread_pct": entry_spread_pct,
+                "exit_spread_pct": exit_spread_pct,
+                "ts": now_iso,
+            }
+            pending_transition = {}
+
+    if (
+        pending_action == "exit"
+        and not trigger_matched
+        and pending_filled > 0
+        and from_level > 0
+    ):
+        entry_level = levels[from_level - 1] if 0 <= from_level - 1 < len(levels) else {}
+        entry_threshold = entry_level.get("entry_spread_pct")
+        restore_qty = max(0.0, float(origin_qty) - actual_qty)
+        tolerance = grid_completion_tolerance(rule, restore_qty or None)
+        reversal_matched = (
+            entry_threshold is not None
+            and restore_qty > tolerance
+            and entry_spread_pct <= float(entry_threshold)
+        )
+        if reversal_matched:
+            reversed_transition = dict(rule.get("pending_transition") or pending_transition)
+            pending_transition = {
+                "action": "enter",
+                "from_level": to_level,
+                "to_level": from_level,
+                "target_qty": restore_qty,
+                "filled_qty": 0.0,
+                "remaining_qty": restore_qty,
+                "origin_hedged_qty": actual_qty,
+                "position_target_qty": float(origin_qty),
+                "rebase_from_positions": True,
+                "spread_max_pct": float(entry_threshold),
+                "created_at": now_iso,
+                "reversal_of": reversed_transition,
+                "reason": "partial_exit_reversed_by_entry_trigger",
+            }
+            rule["pending_transition"] = pending_transition
+            decision = {
+                "action": "enter",
+                "current_level": current_level,
+                "target_level": from_level,
+                "entry_target_level": from_level,
+                "exit_target_level": None,
+                "levels_delta": from_level - to_level,
+                "continuation": False,
+                "reversal": True,
+                "restore_qty": restore_qty,
+                "entry_threshold_pct": float(entry_threshold),
+            }
+            transition_event = {
+                "event": "live_partial_exit_reversal_queued",
+                "rule_id": rule.get("id"),
+                "generation": rule.get("generation"),
+                "symbol": rule.get("symbol"),
+                "long_exchange": rule.get("long_exchange"),
+                "short_exchange": rule.get("short_exchange"),
+                "from_level": from_level,
+                "to_level": to_level,
+                "restore_qty": restore_qty,
+                "entry_threshold_pct": float(entry_threshold),
+                "entry_spread_pct": entry_spread_pct,
+                "exit_spread_pct": exit_spread_pct,
+                "ts": now_iso,
+            }
+
+    if pending_action == "enter" and not trigger_matched and from_level > 0:
+        rollback_target_qty = float(origin_qty)
+        if (
+            str(pending_transition.get("reason") or "")
+            == "partial_exit_reversed_by_entry_trigger"
+        ):
+            original_exit = pending_transition.get("reversal_of")
+            if hasattr(original_exit, "get"):
+                original_exit_target = _optional_float(
+                    original_exit.get("position_target_qty")
+                )
+                if original_exit_target is None:
+                    original_exit_target = grid_level_qty(
+                        rule,
+                        int(original_exit.get("to_level") or from_level),
+                    )
+                rollback_target_qty = float(original_exit_target)
+        rollback_qty = max(0.0, actual_qty - rollback_target_qty)
+        tolerance = grid_completion_tolerance(rule, rollback_qty or None)
+        exit_level = levels[to_level - 1] if 0 <= to_level - 1 < len(levels) else {}
+        exit_threshold = exit_level.get("exit_spread_pct")
+        reversal_matched = (
+            exit_threshold is not None
+            and rollback_qty > tolerance
+            and exit_spread_pct >= float(exit_threshold)
+        )
+        if reversal_matched:
+            pending_transition = {
+                "action": "exit",
+                "from_level": to_level,
+                "to_level": from_level,
+                "target_qty": rollback_qty,
+                "filled_qty": 0.0,
+                "remaining_qty": rollback_qty,
+                "origin_hedged_qty": actual_qty,
+                "position_target_qty": rollback_target_qty,
+                "rebase_from_positions": True,
+                "spread_min_pct": float(exit_threshold),
+                "created_at": now_iso,
+                "reversal_of": dict(rule.get("pending_transition") or {}),
+                "reason": "partial_enter_reversed_by_exit_trigger",
+            }
+            rule["pending_transition"] = pending_transition
+            decision = {
+                "action": "exit",
+                "current_level": current_level,
+                "target_level": from_level,
+                "entry_target_level": None,
+                "exit_target_level": from_level,
+                "levels_delta": from_level - to_level,
+                "continuation": False,
+                "reversal": True,
+                "rollback_qty": rollback_qty,
+                "exit_threshold_pct": float(exit_threshold),
+            }
+    return {
+        "decision": decision,
+        "transition_event": transition_event,
+        "pending_transition": pending_transition,
+    }

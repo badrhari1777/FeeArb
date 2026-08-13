@@ -86,3 +86,12 @@ partial execution and protection uncertainty.
 Grid reducer golden cases live in
 `tests/fixtures/grid_transition_confirmation_v1.json`. They freeze the output for
 idle, partial-frontier wait, confirmed Live queue and entry-risk cooldown states.
+
+Partial transition replay is frozen separately in
+`tests/fixtures/grid_partial_transition_v1.json`. Its cases cover frontier
+continuation, a partially filled exit reversing back to enter, clearing an
+unfilled stale exit, cancelling an unfilled reversal back to the original exit,
+and rolling a partially filled enter back from fresh exchange quantity. The
+deterministic reducer is `reduce_partial_grid_transition`; it may update only the
+provided rule state and returns a decision/event. Exchange refresh, order
+submission and execution reconciliation remain outside it in `DataService`.

@@ -43,12 +43,12 @@ from execution.auto_arb_grid import (
     apply_grid_decision_confirmation,
     complete_pending_grid_transition,
     decide_grid_transition,
+    reduce_partial_grid_transition,
     grid_completion_tolerance,
     grid_dust_only_errors,
     grid_hedge_imbalance_tolerance,
     grid_level_count_for_existing_qty,
     grid_level_for_qty,
-    grid_level_qty,
     grid_live_conflict,
     grid_live_conflict_message,
     grid_non_closeable_dust,
@@ -1536,13 +1536,6 @@ class DataService:
     ) -> int | None:
         return grid_level_for_qty(rule, hedged_qty)
 
-    @staticmethod
-    def _auto_arb_level_qty(
-        rule: Mapping[str, Any],
-        level: int,
-    ) -> float:
-        return grid_level_qty(rule, level)
-
     @classmethod
     def _auto_arb_partial_adoption_level_for_qty(
         cls,
@@ -2821,302 +2814,23 @@ class DataService:
                                 completed_transition["pending_transition"]
                             )
                         else:
-                            pending_action = str(pending_transition.get("action") or "")
-                            from_level = int(
-                                pending_transition.get("from_level") or current_level
+                            partial_reduced = reduce_partial_grid_transition(
+                                current,
+                                pending_transition=pending_transition,
+                                current_level=current_level,
+                                entry_spread_pct=entry_spread,
+                                exit_spread_pct=exit_spread,
+                                now_iso=now_iso,
                             )
-                            to_level = int(
-                                pending_transition.get("to_level") or current_level
+                            decision = dict(partial_reduced["decision"])
+                            transition_event = (
+                                dict(partial_reduced["transition_event"])
+                                if partial_reduced.get("transition_event")
+                                else None
                             )
-                            levels = current.get("levels") or []
-                            actual_qty = float(current.get("actual_hedged_qty") or 0.0)
-                            origin_qty = _safe_float(
-                                pending_transition.get("origin_hedged_qty")
+                            pending_transition = dict(
+                                partial_reduced["pending_transition"]
                             )
-                            if origin_qty is None:
-                                origin_qty = (
-                                    max(0.0, actual_qty - pending_filled)
-                                    if pending_action == "enter"
-                                    else actual_qty + pending_filled
-                                )
-                            pending_transition["origin_hedged_qty"] = float(origin_qty)
-                            if pending_transition.get("position_target_qty") is None:
-                                pending_transition["position_target_qty"] = (
-                                    self._auto_arb_level_qty(current, to_level)
-                                )
-                            current["pending_transition"] = pending_transition
-                            level_index = to_level - 1 if pending_action == "enter" else from_level - 1
-                            trigger_level = (
-                                levels[level_index]
-                                if 0 <= level_index < len(levels)
-                                else {}
-                            )
-                            trigger_matched = (
-                                entry_spread
-                                <= float(trigger_level.get("entry_spread_pct"))
-                                if pending_action == "enter"
-                                and trigger_level.get("entry_spread_pct") is not None
-                                else exit_spread
-                                >= float(trigger_level.get("exit_spread_pct"))
-                                if pending_action == "exit"
-                                and trigger_level.get("exit_spread_pct") is not None
-                                else False
-                            )
-                            decision = {
-                                "action": pending_action if trigger_matched else "none",
-                                "current_level": current_level,
-                                "target_level": to_level,
-                                "entry_target_level": None,
-                                "exit_target_level": None,
-                                "levels_delta": to_level - from_level,
-                                "continuation": True,
-                                "remaining_qty": pending_transition.get("remaining_qty"),
-                            }
-                            if (
-                                pending_action == "enter"
-                                and not trigger_matched
-                                and pending_filled <= 0
-                                and str(pending_transition.get("reason") or "")
-                                == "partial_exit_reversed_by_entry_trigger"
-                            ):
-                                original_exit = dict(
-                                    pending_transition.get("reversal_of") or {}
-                                )
-                                original_from_level = int(
-                                    original_exit.get("from_level") or to_level
-                                )
-                                original_to_level = int(
-                                    original_exit.get("to_level") or from_level
-                                )
-                                original_exit_level = (
-                                    levels[original_from_level - 1]
-                                    if 0 <= original_from_level - 1 < len(levels)
-                                    else {}
-                                )
-                                original_exit_threshold = original_exit.get("spread_min_pct")
-                                if original_exit_threshold is None:
-                                    original_exit_threshold = original_exit_level.get(
-                                        "exit_spread_pct"
-                                    )
-                                original_exit_matched = (
-                                    str(original_exit.get("action") or "") == "exit"
-                                    and original_exit_threshold is not None
-                                    and exit_spread >= float(original_exit_threshold)
-                                )
-                                if original_exit_matched:
-                                    pending_transition = original_exit
-                                    current["pending_transition"] = pending_transition
-                                    decision = {
-                                        "action": "exit",
-                                        "current_level": current_level,
-                                        "target_level": original_to_level,
-                                        "entry_target_level": None,
-                                        "exit_target_level": original_to_level,
-                                        "levels_delta": (
-                                            original_to_level - original_from_level
-                                        ),
-                                        "continuation": True,
-                                        "reversal_cancelled": True,
-                                        "remaining_qty": original_exit.get(
-                                            "remaining_qty"
-                                        ),
-                                    }
-                                    transition_event = {
-                                        "event": "live_partial_exit_reversal_cancelled",
-                                        "rule_id": current.get("id"),
-                                        "generation": current.get("generation"),
-                                        "symbol": current.get("symbol"),
-                                        "long_exchange": current.get("long_exchange"),
-                                        "short_exchange": current.get("short_exchange"),
-                                        "from_level": original_from_level,
-                                        "to_level": original_to_level,
-                                        "remaining_qty": original_exit.get(
-                                            "remaining_qty"
-                                        ),
-                                        "exit_threshold_pct": float(
-                                            original_exit_threshold
-                                        ),
-                                        "entry_spread_pct": entry_spread,
-                                        "exit_spread_pct": exit_spread,
-                                        "ts": now_iso,
-                                    }
-                            if (
-                                pending_action == "exit"
-                                and not trigger_matched
-                                and pending_filled <= 0
-                            ):
-                                fresh_decision = decide_grid_transition(
-                                    entry_spread_pct=entry_spread,
-                                    exit_spread_pct=exit_spread,
-                                    levels=levels,
-                                    current_level=current_level,
-                                    max_levels_per_cycle=(
-                                        current.get("max_levels_per_cycle") or 1
-                                    ),
-                                )
-                                if fresh_decision.get("action") == "enter":
-                                    current["pending_transition"] = None
-                                    current["pending_action"] = None
-                                    current["pending_samples"] = 0
-                                    current["blocked_reason"] = None
-                                    decision = {
-                                        **fresh_decision,
-                                        "stale_pending_exit_cleared": True,
-                                        "cleared_pending_exit": dict(pending_transition),
-                                    }
-                                    transition_event = {
-                                        "event": "live_pending_exit_cleared",
-                                        "rule_id": current.get("id"),
-                                        "generation": current.get("generation"),
-                                        "symbol": current.get("symbol"),
-                                        "long_exchange": current.get("long_exchange"),
-                                        "short_exchange": current.get("short_exchange"),
-                                        "from_level": from_level,
-                                        "to_level": to_level,
-                                        "remaining_qty": pending_remaining,
-                                        "reason": "entry_trigger_recovered_after_zero_fill_exit",
-                                        "entry_spread_pct": entry_spread,
-                                        "exit_spread_pct": exit_spread,
-                                        "ts": now_iso,
-                                    }
-                                    pending_transition = {}
-                            if (
-                                pending_action == "exit"
-                                and not trigger_matched
-                                and pending_filled > 0
-                                and from_level > 0
-                            ):
-                                entry_level = (
-                                    levels[from_level - 1]
-                                    if 0 <= from_level - 1 < len(levels)
-                                    else {}
-                                )
-                                entry_threshold = entry_level.get("entry_spread_pct")
-                                restore_qty = max(0.0, float(origin_qty) - actual_qty)
-                                tolerance = self._auto_arb_completion_tolerance(
-                                    current,
-                                    restore_qty or None,
-                                )
-                                reversal_matched = (
-                                    entry_threshold is not None
-                                    and restore_qty > tolerance
-                                    and entry_spread <= float(entry_threshold)
-                                )
-                                if reversal_matched:
-                                    reversed_transition = dict(
-                                        current.get("pending_transition") or pending_transition
-                                    )
-                                    pending_transition = {
-                                        "action": "enter",
-                                        "from_level": to_level,
-                                        "to_level": from_level,
-                                        "target_qty": restore_qty,
-                                        "filled_qty": 0.0,
-                                        "remaining_qty": restore_qty,
-                                        "origin_hedged_qty": actual_qty,
-                                        "position_target_qty": float(origin_qty),
-                                        "rebase_from_positions": True,
-                                        "spread_max_pct": float(entry_threshold),
-                                        "created_at": now_iso,
-                                        "reversal_of": reversed_transition,
-                                        "reason": "partial_exit_reversed_by_entry_trigger",
-                                    }
-                                    current["pending_transition"] = pending_transition
-                                    decision = {
-                                        "action": "enter",
-                                        "current_level": current_level,
-                                        "target_level": from_level,
-                                        "entry_target_level": from_level,
-                                        "exit_target_level": None,
-                                        "levels_delta": from_level - to_level,
-                                        "continuation": False,
-                                        "reversal": True,
-                                        "restore_qty": restore_qty,
-                                        "entry_threshold_pct": float(entry_threshold),
-                                    }
-                                    transition_event = {
-                                        "event": "live_partial_exit_reversal_queued",
-                                        "rule_id": current.get("id"),
-                                        "generation": current.get("generation"),
-                                        "symbol": current.get("symbol"),
-                                        "long_exchange": current.get("long_exchange"),
-                                        "short_exchange": current.get("short_exchange"),
-                                        "from_level": from_level,
-                                        "to_level": to_level,
-                                        "restore_qty": restore_qty,
-                                        "entry_threshold_pct": float(entry_threshold),
-                                        "entry_spread_pct": entry_spread,
-                                        "exit_spread_pct": exit_spread,
-                                        "ts": now_iso,
-                                    }
-                            if (
-                                pending_action == "enter"
-                                and not trigger_matched
-                                and from_level > 0
-                            ):
-                                rollback_target_qty = float(origin_qty)
-                                if (
-                                    str(pending_transition.get("reason") or "")
-                                    == "partial_exit_reversed_by_entry_trigger"
-                                ):
-                                    original_exit = pending_transition.get("reversal_of")
-                                    if isinstance(original_exit, Mapping):
-                                        original_exit_target = _safe_float(
-                                            original_exit.get("position_target_qty")
-                                        )
-                                        if original_exit_target is None:
-                                            original_exit_target = self._auto_arb_level_qty(
-                                                current,
-                                                int(original_exit.get("to_level") or from_level),
-                                            )
-                                        rollback_target_qty = float(original_exit_target)
-                                rollback_qty = max(0.0, actual_qty - rollback_target_qty)
-                                tolerance = self._auto_arb_completion_tolerance(
-                                    current,
-                                    rollback_qty or None,
-                                )
-                                exit_level = (
-                                    levels[to_level - 1]
-                                    if 0 <= to_level - 1 < len(levels)
-                                    else {}
-                                )
-                                exit_threshold = exit_level.get("exit_spread_pct")
-                                reversal_matched = (
-                                    exit_threshold is not None
-                                    and rollback_qty > tolerance
-                                    and exit_spread >= float(exit_threshold)
-                                )
-                                if reversal_matched:
-                                    pending_transition = {
-                                        "action": "exit",
-                                        "from_level": to_level,
-                                        "to_level": from_level,
-                                        "target_qty": rollback_qty,
-                                        "filled_qty": 0.0,
-                                        "remaining_qty": rollback_qty,
-                                        "origin_hedged_qty": actual_qty,
-                                        "position_target_qty": rollback_target_qty,
-                                        "rebase_from_positions": True,
-                                        "spread_min_pct": float(exit_threshold),
-                                        "created_at": now_iso,
-                                        "reversal_of": dict(
-                                            current.get("pending_transition") or {}
-                                        ),
-                                        "reason": "partial_enter_reversed_by_exit_trigger",
-                                    }
-                                    current["pending_transition"] = pending_transition
-                                    decision = {
-                                        "action": "exit",
-                                        "current_level": current_level,
-                                        "target_level": from_level,
-                                        "entry_target_level": None,
-                                        "exit_target_level": from_level,
-                                        "levels_delta": from_level - to_level,
-                                        "continuation": False,
-                                        "reversal": True,
-                                        "rollback_qty": rollback_qty,
-                                        "exit_threshold_pct": float(exit_threshold),
-                                    }
                     else:
                         decision = decide_grid_transition(
                             entry_spread_pct=entry_spread,
