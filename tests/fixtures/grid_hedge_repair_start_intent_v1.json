@@ -1,0 +1,79 @@
+[
+  {
+    "name": "balanced_legs_settle_without_cleanup_io",
+    "rule": {"id": "grid-balanced", "chunk_qty": 100.0, "symbol": "AAAUSDT", "long_exchange": "binance", "short_exchange": "kucoin"},
+    "quantities": {"long_qty": 100.0, "short_qty": 99.5, "hedged_qty": 99.5},
+    "preflight": null,
+    "expected": {"kind": "settle_within_tolerance", "imbalance_qty": 0.5, "tolerance_qty": 1.0, "cleanup_exchange": null, "analysis_request": null, "cleanup_payload": null}
+  },
+  {
+    "name": "long_surplus_requests_sell_analysis",
+    "rule": {"id": "grid-long", "generation": 3, "chunk_qty": 100.0, "symbol": "AAAUSDT", "long_exchange": "binance", "short_exchange": "kucoin", "max_slippage_bps": 6.0},
+    "quantities": {"long_qty": 120.0, "short_qty": 100.0, "hedged_qty": 100.0},
+    "preflight": null,
+    "expected": {
+      "kind": "analyze_cleanup",
+      "imbalance_qty": 20.0,
+      "tolerance_qty": 1.0,
+      "cleanup_exchange": "binance",
+      "cleanup_side": "long",
+      "close_side": "sell",
+      "analysis_request": {"exchange": "binance", "symbol": "AAAUSDT", "side": "sell", "qty_base": 20.0, "max_slippage_bps": 6.0}
+    }
+  },
+  {
+    "name": "short_surplus_requests_buy_analysis",
+    "rule": {"id": "grid-short", "generation": 4, "chunk_qty": 100.0, "symbol": "BBBUSDT", "long_exchange": "bybit", "short_exchange": "kucoin"},
+    "quantities": {"long_qty": 100.0, "short_qty": 130.0, "hedged_qty": 100.0},
+    "preflight": null,
+    "expected": {
+      "kind": "analyze_cleanup",
+      "imbalance_qty": 30.0,
+      "tolerance_qty": 1.0,
+      "cleanup_exchange": "kucoin",
+      "cleanup_side": "short",
+      "close_side": "buy",
+      "analysis_request": {"exchange": "kucoin", "symbol": "BBBUSDT", "side": "buy", "qty_base": 30.0, "max_slippage_bps": 8.0}
+    }
+  },
+  {
+    "name": "exchange_minimum_turns_imbalance_into_terminal_dust",
+    "rule": {"id": "grid-dust", "generation": 2, "chunk_qty": 100.0, "symbol": "CCCUSDT", "long_exchange": "binance", "short_exchange": "kucoin"},
+    "quantities": {"long_qty": 120.0, "short_qty": 100.0, "hedged_qty": 100.0},
+    "preflight": {"min_qty_required": 25.0},
+    "expected": {"kind": "settle_non_closeable_dust", "imbalance_qty": 20.0, "tolerance_qty": 1.0, "cleanup_exchange": "binance", "cleanup_side": "long", "close_side": "sell", "min_qty_required": 25.0, "cleanup_payload": null}
+  },
+  {
+    "name": "closeable_imbalance_builds_existing_cleanup_payload",
+    "rule": {"id": "grid-submit", "generation": 7, "chunk_qty": 100.0, "symbol": "DDDUSDT", "long_exchange": "bybit", "short_exchange": "kucoin", "max_slippage_bps": 5.0},
+    "quantities": {"long_qty": 100.0, "short_qty": 120.0, "hedged_qty": 100.0},
+    "preflight": {"min_qty_required": 5.0},
+    "expected": {
+      "kind": "submit_cleanup",
+      "imbalance_qty": 20.0,
+      "tolerance_qty": 1.0,
+      "cleanup_exchange": "kucoin",
+      "cleanup_side": "short",
+      "close_side": "buy",
+      "min_qty_required": 5.0,
+      "cleanup_payload": {
+        "symbol": "DDDUSDT",
+        "qty": 20.0,
+        "cleanup_exchange": "kucoin",
+        "cleanup_position_side": "short",
+        "panic_cleanup_mode": false,
+        "max_slippage_bps": 5.0,
+        "max_runtime_sec": 120,
+        "reprice_sec": 4.0,
+        "use_orderbook_check": true,
+        "fallback_to_market": false,
+        "async_run": true,
+        "dry_run": false,
+        "margin_mode": "isolated",
+        "auto_arb_agent": true,
+        "auto_arb_rule_id": "grid-submit",
+        "auto_arb_rule_generation": 7
+      }
+    }
+  }
+]

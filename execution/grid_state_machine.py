@@ -364,6 +364,95 @@ class GridStateMachine:
             "event": event,
         }
 
+    def plan_hedge_repair_start(
+        self,
+        rule: Mapping[str, Any],
+        *,
+        quantities: Mapping[str, Any],
+        preflight: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Plan hedge-repair analysis or cleanup without mutating state or doing I/O."""
+        long_qty = float(quantities.get("long_qty") or 0.0)
+        short_qty = float(quantities.get("short_qty") or 0.0)
+        hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+        imbalance_qty = abs(long_qty - short_qty)
+        tolerance = grid_hedge_imbalance_tolerance(
+            rule,
+            hedged_qty=hedged_qty,
+        )
+        base = {
+            "imbalance_qty": imbalance_qty,
+            "tolerance_qty": tolerance,
+            "hedged_qty": hedged_qty,
+            "cleanup_exchange": None,
+            "cleanup_side": None,
+            "close_side": None,
+            "min_qty_required": None,
+            "analysis_request": None,
+            "cleanup_payload": None,
+        }
+        if imbalance_qty <= tolerance:
+            return {**base, "kind": "settle_within_tolerance"}
+
+        cleanup_long = long_qty > short_qty
+        cleanup_exchange = (
+            rule.get("long_exchange")
+            if cleanup_long
+            else rule.get("short_exchange")
+        )
+        cleanup_side = "long" if cleanup_long else "short"
+        close_side = "sell" if cleanup_side == "long" else "buy"
+        max_slippage_bps = float(rule.get("max_slippage_bps") or 8.0)
+        routed = {
+            **base,
+            "cleanup_exchange": cleanup_exchange,
+            "cleanup_side": cleanup_side,
+            "close_side": close_side,
+        }
+        if preflight is None:
+            return {
+                **routed,
+                "kind": "analyze_cleanup",
+                "analysis_request": {
+                    "exchange": str(cleanup_exchange or ""),
+                    "symbol": str(rule.get("symbol") or ""),
+                    "side": close_side,
+                    "qty_base": imbalance_qty,
+                    "max_slippage_bps": max_slippage_bps,
+                },
+            }
+
+        min_required = self._optional_float(preflight.get("min_qty_required"))
+        if min_required and imbalance_qty < min_required:
+            return {
+                **routed,
+                "kind": "settle_non_closeable_dust",
+                "min_qty_required": min_required,
+            }
+        return {
+            **routed,
+            "kind": "submit_cleanup",
+            "min_qty_required": min_required,
+            "cleanup_payload": {
+                "symbol": rule.get("symbol"),
+                "qty": imbalance_qty,
+                "cleanup_exchange": cleanup_exchange,
+                "cleanup_position_side": cleanup_side,
+                "panic_cleanup_mode": False,
+                "max_slippage_bps": max_slippage_bps,
+                "max_runtime_sec": 120,
+                "reprice_sec": 4.0,
+                "use_orderbook_check": True,
+                "fallback_to_market": False,
+                "async_run": True,
+                "dry_run": False,
+                "margin_mode": "isolated",
+                "auto_arb_agent": True,
+                "auto_arb_rule_id": rule.get("id"),
+                "auto_arb_rule_generation": int(rule.get("generation") or 0),
+            },
+        }
+
     @staticmethod
     def _optional_float(value: Any) -> float | None:
         try:

@@ -341,3 +341,31 @@ def test_execution_reconcile_after_refresh_matches_legacy_golden_cases() -> None
             assert (
                 machine_rule["next_eligible_ts"] == expected["next_eligible_ts"]
             ), case["name"]
+
+
+def test_hedge_repair_start_intent_matches_golden_cases_without_mutation() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "grid_hedge_repair_start_intent_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = GridStateMachine()
+    for case in cases:
+        rule = deepcopy(case["rule"])
+        quantities = deepcopy(case["quantities"])
+        preflight = deepcopy(case.get("preflight"))
+        original_rule = deepcopy(rule)
+        original_quantities = deepcopy(quantities)
+        original_preflight = deepcopy(preflight)
+        actual = machine.plan_hedge_repair_start(
+            rule,
+            quantities=quantities,
+            preflight=preflight,
+        )
+        for key, expected in case["expected"].items():
+            assert actual.get(key) == expected, f"{case['name']}:{key}"
+        assert rule == original_rule, case["name"]
+        assert quantities == original_quantities, case["name"]
+        assert preflight == original_preflight, case["name"]

@@ -184,3 +184,12 @@ that facade. `DataService` still owns the Manual run lookup, exchange position
 refresh, event envelope, lock, durable save, history append, and any later hedge
 repair launch. This keeps I/O ordering and failure boundaries outside the pure
 state machine.
+
+`GridStateMachine.plan_hedge_repair_start` now freezes the next dormant I/O
+boundary. From a fresh two-leg quantity snapshot it distinguishes an imbalance
+already within tolerance, the need for a Manual rebalance analysis, an
+exchange-minimum non-closeable remainder, and a submit-ready cleanup. It returns
+the exact analysis request or existing reduce-only cleanup payload without
+mutating rule, quantities, or preflight. Five golden cases cover long and short
+surpluses in `tests/fixtures/grid_hedge_repair_start_intent_v1.json`. Production
+repair start is not wired to this planner yet.
