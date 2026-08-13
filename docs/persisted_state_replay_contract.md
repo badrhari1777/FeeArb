@@ -120,3 +120,11 @@ resume partial/monitoring state; a material leg imbalance requests hedge repair;
 a failed refresh preserves the active reference in `waiting_reconcile`.
 `tests/fixtures/grid_missing_execution_v1.json` freezes these restart outcomes,
 including a flat repair that clears stale level/transition state.
+
+The result of a reduce-only hedge-repair worker is reduced by
+`reduce_grid_hedge_repair_execution`. Fresh imbalance, not the worker status,
+decides whether repair succeeded. Balanced legs resume partial/monitoring state
+or reset a flat Grid; a remaining imbalance either requests another cleanup or
+retains an explicit execution error for a later retry. Golden cases live in
+`tests/fixtures/grid_hedge_repair_result_v1.json`; the reducer never submits the
+next cleanup itself.

@@ -1,0 +1,47 @@
+[
+  {
+    "name": "balanced_repair_resumes_partial_transition",
+    "rule": {"id": "repair-balanced", "enabled": true, "chunk_qty": 100.0, "live_level": 1},
+    "transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 50.0, "remaining_qty": 50.0},
+    "hedged_qty": 150.0,
+    "imbalance_qty": 0.5,
+    "hedge_tolerance": 1.0,
+    "expected_result": {"completed": true, "retry_repair": false},
+    "expected_rule": {"status": "partial_enter", "live_level": 1, "blocked_reason": null, "next_eligible_ts": 102.0},
+    "expected_event": {"event": "live_hedge_repaired", "actual_hedged_qty": 150.0, "imbalance_qty": 0.5, "flat_repair_reset": false}
+  },
+  {
+    "name": "balanced_flat_repair_clears_stale_grid",
+    "rule": {"id": "repair-flat", "enabled": true, "chunk_qty": 100.0, "live_level": 1, "pending_transition": {"action": "exit"}},
+    "transition": {"action": "exit", "from_level": 1, "to_level": 0, "target_qty": 100.0, "filled_qty": 90.0, "remaining_qty": 10.0},
+    "hedged_qty": 0.0,
+    "imbalance_qty": 0.0,
+    "hedge_tolerance": 1.0,
+    "expected_result": {"completed": true, "retry_repair": false},
+    "expected_rule": {"status": "waiting_entry", "live_level": 0, "pending_transition": null, "blocked_reason": null},
+    "expected_event": {"event": "live_hedge_repaired", "flat_repair_reset": true}
+  },
+  {
+    "name": "completed_partial_repair_requests_retry",
+    "rule": {"id": "repair-retry", "enabled": true, "chunk_qty": 100.0, "live_level": 1},
+    "hedged_qty": 150.0,
+    "imbalance_qty": 5.0,
+    "hedge_tolerance": 1.0,
+    "execution_status": "completed",
+    "expected_result": {"completed": false, "retry_repair": true},
+    "expected_rule": {"status": "hedge_repair_retry", "blocked_reason": "hedge_imbalance_above_tolerance", "next_eligible_ts": 102.0},
+    "expected_event": {"event": "live_hedge_repair_partial", "imbalance_qty": 5.0}
+  },
+  {
+    "name": "failed_repair_with_error_waits_before_retry",
+    "rule": {"id": "repair-error", "enabled": true, "chunk_qty": 100.0, "live_level": 1},
+    "hedged_qty": 150.0,
+    "imbalance_qty": 5.0,
+    "hedge_tolerance": 1.0,
+    "execution_status": "completed_with_errors",
+    "execution_result": {"errors": ["cleanup order rejected"]},
+    "expected_result": {"completed": false, "retry_repair": false},
+    "expected_rule": {"status": "hedge_repair_retry", "blocked_reason": "cleanup order rejected", "next_eligible_ts": 102.0},
+    "expected_event": {"event": "live_hedge_repair_partial", "imbalance_qty": 5.0, "error": "cleanup order rejected"}
+  }
+]

@@ -45,6 +45,7 @@ from execution.auto_arb_grid import (
     complete_pending_grid_transition,
     decide_grid_transition,
     reduce_grid_transition_execution,
+    reduce_grid_hedge_repair_execution,
     reduce_missing_grid_execution,
     reduce_partial_grid_transition,
     grid_completion_tolerance,
@@ -1902,49 +1903,22 @@ class DataService:
                     "reconciled_at": now_iso,
                 }
                 if active_action == "repair":
-                    if imbalance_qty <= hedge_tolerance:
-                        flat_repair_reset = self._auto_arb_reset_after_flat_repair(
-                            current,
-                            hedged_qty,
-                        )
-                        if flat_repair_reset:
-                            current["status"] = "waiting_entry"
-                        else:
-                            current["status"] = (
-                                f"partial_{transition.get('action')}"
-                                if transition
-                                else (
-                                    "waiting_entry"
-                                    if not current.get("live_level")
-                                    else "monitoring"
-                                )
-                            )
-                        current["blocked_reason"] = None
-                        current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
-                        event["event"] = "live_hedge_repaired"
-                        event["actual_hedged_qty"] = hedged_qty
-                        event["imbalance_qty"] = imbalance_qty
-                        event["flat_repair_reset"] = flat_repair_reset
-                        completed = True
-                    else:
-                        current["status"] = "hedge_repair_retry"
-                        run_result = run.get("result")
-                        result_errors = []
-                        if isinstance(run_result, Mapping):
-                            result_errors = [
-                                str(item) for item in (run_result.get("errors") or [])
-                            ]
-                        repair_error = str(run.get("error") or "") or "; ".join(result_errors)
-                        current["blocked_reason"] = (
-                            repair_error or "hedge_imbalance_above_tolerance"
-                        )
-                        current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
-                        if status == "completed" or not repair_error:
-                            repair_quantities = dict(quantities)
-                        event["event"] = "live_hedge_repair_partial"
-                        event["imbalance_qty"] = imbalance_qty
-                        if repair_error:
-                            event["error"] = repair_error
+                    repair_reduced = reduce_grid_hedge_repair_execution(
+                        current,
+                        transition=transition,
+                        execution_status=status,
+                        execution_error=run.get("error"),
+                        execution_result=run.get("result"),
+                        hedged_qty=hedged_qty,
+                        imbalance_qty=imbalance_qty,
+                        hedge_tolerance=hedge_tolerance,
+                        now_ts=time.time(),
+                        retry_sec=AUTO_ARB_RETRY_SEC,
+                    )
+                    event.update(repair_reduced["event"])
+                    if repair_reduced["retry_repair"]:
+                        repair_quantities = dict(quantities)
+                    completed = bool(repair_reduced["completed"])
                 elif transition:
                     transition_reduced = reduce_grid_transition_execution(
                         current,

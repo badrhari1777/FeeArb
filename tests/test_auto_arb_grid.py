@@ -11,6 +11,7 @@ from execution.auto_arb_grid import (
     build_grid_pending_transition,
     decide_grid_transition,
     reduce_grid_transition_execution,
+    reduce_grid_hedge_repair_execution,
     reduce_missing_grid_execution,
     reduce_partial_grid_transition,
     grid_completion_tolerance,
@@ -22,6 +23,31 @@ from execution.auto_arb_grid import (
 
 
 class AutoArbGridTestCase(unittest.TestCase):
+    def test_hedge_repair_reducer_matches_golden_fixtures(self) -> None:
+        fixture_path = Path(__file__).parent / "fixtures" / "grid_hedge_repair_result_v1.json"
+        cases = json.loads(fixture_path.read_text(encoding="utf-8"))
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                rule = dict(case["rule"])
+                result = reduce_grid_hedge_repair_execution(
+                    rule,
+                    transition=case.get("transition"),
+                    execution_status=case.get("execution_status", "completed"),
+                    execution_error=case.get("execution_error"),
+                    execution_result=case.get("execution_result"),
+                    hedged_qty=case["hedged_qty"],
+                    imbalance_qty=case["imbalance_qty"],
+                    hedge_tolerance=case["hedge_tolerance"],
+                    now_ts=100.0,
+                    retry_sec=2.0,
+                )
+                for key, expected in case["expected_result"].items():
+                    self.assertEqual(result.get(key), expected, key)
+                for key, expected in case["expected_rule"].items():
+                    self.assertEqual(rule.get(key), expected, key)
+                for key, expected in case["expected_event"].items():
+                    self.assertEqual(result["event"].get(key), expected, key)
+
     def test_missing_execution_reducer_matches_golden_fixtures(self) -> None:
         fixture_path = Path(__file__).parent / "fixtures" / "grid_missing_execution_v1.json"
         cases = json.loads(fixture_path.read_text(encoding="utf-8"))

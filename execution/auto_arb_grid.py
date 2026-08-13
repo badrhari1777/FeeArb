@@ -889,6 +889,65 @@ def reduce_missing_grid_execution(
     }
 
 
+def reduce_grid_hedge_repair_execution(
+    rule: dict[str, Any],
+    *,
+    transition: Mapping[str, Any] | None,
+    execution_status: str,
+    execution_error: Any,
+    execution_result: Any,
+    hedged_qty: float,
+    imbalance_qty: float,
+    hedge_tolerance: float,
+    now_ts: float,
+    retry_sec: float,
+) -> dict[str, Any]:
+    """Reduce a finished hedge-repair worker from fresh two-leg quantities."""
+    current_transition = dict(transition or {})
+    event: dict[str, Any] = {"imbalance_qty": imbalance_qty}
+    completed = False
+    retry_repair = False
+    if imbalance_qty <= hedge_tolerance:
+        flat_repair_reset = grid_reset_after_flat_repair(rule, hedged_qty)
+        if flat_repair_reset:
+            rule["status"] = "waiting_entry"
+        else:
+            rule["status"] = (
+                f"partial_{current_transition.get('action')}"
+                if current_transition
+                else ("waiting_entry" if not rule.get("live_level") else "monitoring")
+            )
+        rule["blocked_reason"] = None
+        rule["next_eligible_ts"] = now_ts + retry_sec
+        event.update(
+            {
+                "event": "live_hedge_repaired",
+                "actual_hedged_qty": hedged_qty,
+                "flat_repair_reset": flat_repair_reset,
+            }
+        )
+        completed = True
+    else:
+        rule["status"] = "hedge_repair_retry"
+        result_errors = []
+        if hasattr(execution_result, "get"):
+            result_errors = [
+                str(item) for item in (execution_result.get("errors") or [])
+            ]
+        repair_error = str(execution_error or "") or "; ".join(result_errors)
+        rule["blocked_reason"] = repair_error or "hedge_imbalance_above_tolerance"
+        rule["next_eligible_ts"] = now_ts + retry_sec
+        retry_repair = execution_status == "completed" or not repair_error
+        event["event"] = "live_hedge_repair_partial"
+        if repair_error:
+            event["error"] = repair_error
+    return {
+        "completed": completed,
+        "retry_repair": retry_repair,
+        "event": event,
+    }
+
+
 def reduce_partial_grid_transition(
     rule: dict[str, Any],
     *,
