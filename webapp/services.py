@@ -41,6 +41,20 @@ from execution.auto_arb_grid import (
     MIN_LEVELS,
     build_grid_levels,
     decide_grid_transition,
+    grid_completion_tolerance,
+    grid_dust_only_errors,
+    grid_hedge_imbalance_tolerance,
+    grid_level_count_for_existing_qty,
+    grid_level_for_qty,
+    grid_level_qty,
+    grid_live_conflict,
+    grid_live_conflict_message,
+    grid_non_closeable_dust,
+    grid_partial_adoption_level_for_qty,
+    grid_reset_after_flat_repair,
+    grid_rules_share_live_ownership,
+    grid_symbol_ownership_key,
+    grid_transition_completion_tolerance,
     normalize_level_count,
     recommend_level_count,
 )
@@ -1437,32 +1451,14 @@ class DataService:
 
     @staticmethod
     def _auto_arb_symbol_ownership_key(rule: Mapping[str, Any]) -> str:
-        symbol = normalize_symbol(str(rule.get("symbol") or "")).upper()
-        for quote in ("USDT", "USDC", "USD"):
-            if symbol.endswith(quote) and len(symbol) > len(quote):
-                return symbol[: -len(quote)]
-        return symbol
+        return grid_symbol_ownership_key(rule)
 
     @staticmethod
     def _auto_arb_rules_share_live_ownership(
         left: Mapping[str, Any],
         right: Mapping[str, Any],
     ) -> bool:
-        left_symbol = DataService._auto_arb_symbol_ownership_key(left)
-        right_symbol = DataService._auto_arb_symbol_ownership_key(right)
-        if not left_symbol or left_symbol != right_symbol:
-            return False
-        left_venues = {
-            normalize_exchange_name(str(left.get("long_exchange") or "")),
-            normalize_exchange_name(str(left.get("short_exchange") or "")),
-        }
-        right_venues = {
-            normalize_exchange_name(str(right.get("long_exchange") or "")),
-            normalize_exchange_name(str(right.get("short_exchange") or "")),
-        }
-        left_venues.discard("")
-        right_venues.discard("")
-        return bool(left_venues.intersection(right_venues))
+        return grid_rules_share_live_ownership(left, right)
 
     def _auto_arb_live_grid_conflict(
         self,
@@ -1470,45 +1466,22 @@ class DataService:
         *,
         exclude_rule_id: str = "",
     ) -> Mapping[str, Any] | None:
-        excluded = str(exclude_rule_id or rule.get("id") or "")
-        for candidate in (self._auto_arb.get("rules") or {}).values():
-            if not isinstance(candidate, Mapping):
-                continue
-            candidate_id = str(candidate.get("id") or "")
-            if candidate_id and candidate_id == excluded:
-                continue
-            if not candidate.get("enabled") or candidate.get("mode") != "live":
-                continue
-            if self._auto_arb_rules_share_live_ownership(rule, candidate):
-                return candidate
-        return None
+        return grid_live_conflict(
+            self._auto_arb.get("rules") or {},
+            rule,
+            exclude_rule_id=exclude_rule_id,
+        )
 
     @staticmethod
     def _auto_arb_live_grid_conflict_message(conflict: Mapping[str, Any]) -> str:
-        conflict_id = str(conflict.get("id") or "unknown")
-        symbol = normalize_symbol(str(conflict.get("symbol") or "")).upper()
-        return (
-            f"Grid Live ownership conflict with rule {conflict_id}: {symbol} already "
-            "has a Live Grid on one or both requested exchanges. Pause or delete that "
-            "Grid before starting another one, including Adopt grid."
-        )
+        return grid_live_conflict_message(conflict)
 
     @staticmethod
     def _auto_arb_completion_tolerance(
         rule: Mapping[str, Any],
         target_qty: float | None = None,
     ) -> float:
-        qty = max(
-            0.0,
-            float(
-                target_qty
-                if target_qty is not None
-                else rule.get("chunk_qty")
-                or rule.get("max_qty")
-                or 0.0
-            ),
-        )
-        return max(1e-8, qty * AUTO_ARB_COMPLETION_TOLERANCE_PCT / 100.0)
+        return grid_completion_tolerance(rule, target_qty)
 
     @classmethod
     def _auto_arb_transition_completion_tolerance(
@@ -1516,10 +1489,7 @@ class DataService:
         rule: Mapping[str, Any],
         transition_qty: float | None = None,
     ) -> float:
-        return max(
-            cls._auto_arb_completion_tolerance(rule, transition_qty),
-            cls._auto_arb_completion_tolerance(rule),
-        )
+        return grid_transition_completion_tolerance(rule, transition_qty)
 
     @classmethod
     def _auto_arb_hedge_imbalance_tolerance(
@@ -1529,60 +1499,24 @@ class DataService:
         transition_qty: float | None = None,
         hedged_qty: float | None = None,
     ) -> float:
-        tolerance = max(
-            cls._auto_arb_completion_tolerance(rule, transition_qty),
-            cls._auto_arb_completion_tolerance(rule),
+        return grid_hedge_imbalance_tolerance(
+            rule,
+            transition_qty=transition_qty,
+            hedged_qty=hedged_qty,
         )
-        if str(rule.get("setup_mode") or "") == "adopt_existing_full_grid":
-            current_qty = _safe_float(hedged_qty)
-            if current_qty and current_qty > 0:
-                tolerance = max(
-                    tolerance,
-                    cls._auto_arb_completion_tolerance(rule, current_qty),
-                )
-        return tolerance
 
     @staticmethod
     def _auto_arb_non_closeable_dust(
         result: Mapping[str, Any] | None,
         remaining_qty: float,
     ) -> bool:
-        if remaining_qty <= 0 or not isinstance(result, Mapping):
-            return False
-        messages: list[str] = []
-        messages.extend(str(item) for item in (result.get("errors") or []))
-        messages.extend(str(item) for item in (result.get("warnings") or []))
-        for action in result.get("actions") or []:
-            if not isinstance(action, Mapping):
-                continue
-            messages.append(str(action.get("error") or ""))
-            messages.append(str(action.get("error_type") or ""))
-            messages.append(str(action.get("market_reason") or ""))
-        joined = " ".join(messages).lower()
-        return (
-            "non-closeable dust" in joined
-            or "below exchange minimum" in joined
-            or "below min qty" in joined
-            or "min_order_size" in joined
-        )
+        return grid_non_closeable_dust(result, remaining_qty)
 
     @staticmethod
     def _auto_arb_dust_only_errors(
         result: Mapping[str, Any] | None,
     ) -> bool:
-        if not isinstance(result, Mapping):
-            return False
-        errors = [str(item).lower() for item in (result.get("errors") or [])]
-        if not errors:
-            return False
-        dust_tokens = (
-            "qty_below_step",
-            "below min qty",
-            "below exchange minimum",
-            "min_order_size",
-            "non-closeable dust",
-        )
-        return all(any(token in error for token in dust_tokens) for error in errors)
+        return grid_dust_only_errors(result)
 
     @classmethod
     def _auto_arb_reset_after_flat_repair(
@@ -1590,13 +1524,7 @@ class DataService:
         rule: dict[str, Any],
         hedged_qty: float,
     ) -> bool:
-        if max(0.0, float(hedged_qty or 0.0)) > cls._auto_arb_completion_tolerance(rule):
-            return False
-        rule["live_level"] = 0
-        rule["pending_transition"] = None
-        rule["pending_action"] = None
-        rule["pending_samples"] = 0
-        return True
+        return grid_reset_after_flat_repair(rule, hedged_qty)
 
     @classmethod
     def _auto_arb_level_for_qty(
@@ -1604,30 +1532,14 @@ class DataService:
         rule: Mapping[str, Any],
         hedged_qty: float,
     ) -> int | None:
-        qty = max(0.0, float(hedged_qty or 0.0))
-        tolerance = cls._auto_arb_completion_tolerance(rule)
-        if qty <= tolerance:
-            return 0
-        for level in rule.get("levels") or []:
-            cumulative = float(level.get("cumulative_qty") or 0.0)
-            if abs(qty - cumulative) <= tolerance:
-                return int(level.get("level") or 0)
-        return None
+        return grid_level_for_qty(rule, hedged_qty)
 
     @staticmethod
     def _auto_arb_level_qty(
         rule: Mapping[str, Any],
         level: int,
     ) -> float:
-        if level <= 0:
-            return 0.0
-        levels = rule.get("levels") or []
-        if level > len(levels):
-            return 0.0
-        try:
-            return float((levels[level - 1] or {}).get("cumulative_qty") or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
+        return grid_level_qty(rule, level)
 
     @classmethod
     def _auto_arb_partial_adoption_level_for_qty(
@@ -1635,24 +1547,7 @@ class DataService:
         rule: Mapping[str, Any],
         hedged_qty: float,
     ) -> int | None:
-        qty = max(0.0, float(hedged_qty or 0.0))
-        tolerance = cls._auto_arb_completion_tolerance(rule)
-        if qty <= tolerance:
-            return 0
-        levels = list(rule.get("levels") or [])
-        if not levels:
-            return None
-        max_level = len(levels)
-        max_qty = cls._auto_arb_level_qty(rule, max_level)
-        if max_qty <= 0:
-            max_qty = float(rule.get("max_qty") or 0.0)
-        if max_qty <= 0 or qty > max_qty + tolerance:
-            return None
-        for level in levels:
-            cumulative = float(level.get("cumulative_qty") or 0.0)
-            if qty <= cumulative + tolerance:
-                return int(level.get("level") or 0)
-        return max_level
+        return grid_partial_adoption_level_for_qty(rule, hedged_qty)
 
     @staticmethod
     def _auto_arb_level_count_for_existing_qty(
@@ -1661,47 +1556,10 @@ class DataService:
         existing_qty: float,
         preferred_count: int,
     ) -> dict[str, Any] | None:
-        if total_qty <= 0 or existing_qty <= 0:
-            return None
-        preferred = max(MIN_LEVELS, min(MAX_LEVELS, int(preferred_count or MIN_LEVELS)))
-        candidates: list[dict[str, Any]] = []
-        for count in range(MIN_LEVELS, MAX_LEVELS + 1):
-            chunk_qty = float(total_qty) / count
-            if chunk_qty <= 0:
-                continue
-            level = max(0, min(count, int(round(float(existing_qty) / chunk_qty))))
-            cumulative_qty = float(level) * chunk_qty
-            diff_qty = abs(float(existing_qty) - cumulative_qty)
-            tolerance_qty = max(
-                1e-8,
-                chunk_qty * AUTO_ARB_COMPLETION_TOLERANCE_PCT / 100.0,
-            )
-            matches = diff_qty <= tolerance_qty
-            candidates.append(
-                {
-                    "level_count": count,
-                    "level": level,
-                    "chunk_qty": chunk_qty,
-                    "cumulative_qty": cumulative_qty,
-                    "existing_qty": float(existing_qty),
-                    "diff_qty": diff_qty,
-                    "tolerance_qty": tolerance_qty,
-                    "matches": matches,
-                    "distance_from_preferred": abs(count - preferred),
-                    "normalized_diff": diff_qty / tolerance_qty if tolerance_qty else math.inf,
-                }
-            )
-        if not candidates:
-            return None
-        matching = [item for item in candidates if item["matches"]]
-        pool = matching or candidates
-        return min(
-            pool,
-            key=lambda item: (
-                item["distance_from_preferred"],
-                item["normalized_diff"],
-                item["level_count"],
-            ),
+        return grid_level_count_for_existing_qty(
+            total_qty=total_qty,
+            existing_qty=existing_qty,
+            preferred_count=preferred_count,
         )
 
     async def _auto_arb_refresh_quantities(self, rule: Mapping[str, Any]) -> dict[str, float]:

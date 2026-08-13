@@ -5,6 +5,10 @@ import unittest
 from execution.auto_arb_grid import (
     build_grid_levels,
     decide_grid_transition,
+    grid_completion_tolerance,
+    grid_level_count_for_existing_qty,
+    grid_rules_share_live_ownership,
+    grid_symbol_ownership_key,
     recommend_level_count,
 )
 
@@ -95,6 +99,33 @@ class AutoArbGridTestCase(unittest.TestCase):
         self.assertEqual(recommend_level_count(total_qty=10_000, safe_chunk_qty=1_200), 9)
         self.assertEqual(recommend_level_count(total_qty=10_000, safe_chunk_qty=20_000), 2)
         self.assertEqual(recommend_level_count(total_qty=10_000, safe_chunk_qty=10), 20)
+
+    def test_live_ownership_normalizes_contract_symbols_and_exchange_alias(self) -> None:
+        left = {
+            "symbol": "TUT/USDT:USDT",
+            "long_exchange": "kukoin",
+            "short_exchange": "bybit",
+        }
+        right = {
+            "symbol": "TUTUSDT",
+            "long_exchange": "kucoin",
+            "short_exchange": "okx",
+        }
+
+        self.assertEqual(grid_symbol_ownership_key(left), "TUT")
+        self.assertTrue(grid_rules_share_live_ownership(left, right))
+
+    def test_quantity_fit_uses_same_one_percent_completion_tolerance(self) -> None:
+        fit = grid_level_count_for_existing_qty(
+            total_qty=10_000,
+            existing_qty=2_010,
+            preferred_count=5,
+        )
+
+        self.assertIsNotNone(fit)
+        self.assertEqual(fit["level_count"], 5)
+        self.assertEqual(fit["level"], 1)
+        self.assertAlmostEqual(grid_completion_tolerance({"chunk_qty": 2_000}), 20.0)
 
 
 if __name__ == "__main__":

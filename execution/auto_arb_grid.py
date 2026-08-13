@@ -6,6 +6,7 @@ from typing import Any
 
 MIN_LEVELS = 2
 MAX_LEVELS = 20
+COMPLETION_TOLERANCE_PCT = 1.0
 
 
 def _positive_float(value: Any, field: str) -> float:
@@ -153,3 +154,261 @@ def recommend_level_count(
     chunk = _positive_float(safe_chunk_qty, "safe_chunk_qty")
     return max(minimum, min(maximum, int(math.ceil(total / chunk))))
 
+
+def grid_symbol_ownership_key(rule: dict[str, Any] | Any) -> str:
+    symbol = "".join(
+        char for char in str(rule.get("symbol") or "").upper() if char.isalnum()
+    )
+    for settle in ("USDT", "USDC", "USD"):
+        duplicated = settle + settle
+        while symbol.endswith(duplicated):
+            symbol = symbol[: -len(settle)]
+    for quote in ("USDT", "USDC", "USD"):
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            return symbol[: -len(quote)]
+    return symbol
+
+
+def _grid_exchange_name(value: Any) -> str:
+    name = str(value or "").lower()
+    return "kucoin" if name == "kukoin" else name
+
+
+def grid_rules_share_live_ownership(left: dict[str, Any] | Any, right: dict[str, Any] | Any) -> bool:
+    left_symbol = grid_symbol_ownership_key(left)
+    right_symbol = grid_symbol_ownership_key(right)
+    if not left_symbol or left_symbol != right_symbol:
+        return False
+    left_venues = {
+        _grid_exchange_name(left.get("long_exchange")),
+        _grid_exchange_name(left.get("short_exchange")),
+    }
+    right_venues = {
+        _grid_exchange_name(right.get("long_exchange")),
+        _grid_exchange_name(right.get("short_exchange")),
+    }
+    left_venues.discard("")
+    right_venues.discard("")
+    return bool(left_venues.intersection(right_venues))
+
+
+def grid_live_conflict(
+    rules: Any,
+    rule: Any,
+    *,
+    exclude_rule_id: str = "",
+) -> Any | None:
+    excluded = str(exclude_rule_id or rule.get("id") or "")
+    candidates = rules.values() if hasattr(rules, "values") else []
+    for candidate in candidates:
+        if not hasattr(candidate, "get"):
+            continue
+        candidate_id = str(candidate.get("id") or "")
+        if candidate_id and candidate_id == excluded:
+            continue
+        if not candidate.get("enabled") or candidate.get("mode") != "live":
+            continue
+        if grid_rules_share_live_ownership(rule, candidate):
+            return candidate
+    return None
+
+
+def grid_live_conflict_message(conflict: Any) -> str:
+    conflict_id = str(conflict.get("id") or "unknown")
+    symbol = "".join(
+        char for char in str(conflict.get("symbol") or "").upper() if char.isalnum()
+    )
+    for settle in ("USDT", "USDC", "USD"):
+        duplicated = settle + settle
+        while symbol.endswith(duplicated):
+            symbol = symbol[: -len(settle)]
+    return (
+        f"Grid Live ownership conflict with rule {conflict_id}: {symbol} already "
+        "has a Live Grid on one or both requested exchanges. Pause or delete that "
+        "Grid before starting another one, including Adopt grid."
+    )
+
+
+def grid_completion_tolerance(
+    rule: Any,
+    target_qty: float | None = None,
+    *,
+    tolerance_pct: float = COMPLETION_TOLERANCE_PCT,
+) -> float:
+    qty = max(
+        0.0,
+        float(
+            target_qty
+            if target_qty is not None
+            else rule.get("chunk_qty") or rule.get("max_qty") or 0.0
+        ),
+    )
+    return max(1e-8, qty * tolerance_pct / 100.0)
+
+
+def grid_transition_completion_tolerance(rule: Any, transition_qty: float | None = None) -> float:
+    return max(
+        grid_completion_tolerance(rule, transition_qty),
+        grid_completion_tolerance(rule),
+    )
+
+
+def grid_hedge_imbalance_tolerance(
+    rule: Any,
+    *,
+    transition_qty: float | None = None,
+    hedged_qty: float | None = None,
+) -> float:
+    tolerance = grid_transition_completion_tolerance(rule, transition_qty)
+    if str(rule.get("setup_mode") or "") == "adopt_existing_full_grid":
+        try:
+            current_qty = float(hedged_qty) if hedged_qty is not None else 0.0
+        except (TypeError, ValueError):
+            current_qty = 0.0
+        if current_qty > 0:
+            tolerance = max(tolerance, grid_completion_tolerance(rule, current_qty))
+    return tolerance
+
+
+def grid_non_closeable_dust(result: Any, remaining_qty: float) -> bool:
+    if remaining_qty <= 0 or not hasattr(result, "get"):
+        return False
+    messages = [str(item) for item in (result.get("errors") or [])]
+    messages.extend(str(item) for item in (result.get("warnings") or []))
+    for action in result.get("actions") or []:
+        if not hasattr(action, "get"):
+            continue
+        messages.extend(
+            (
+                str(action.get("error") or ""),
+                str(action.get("error_type") or ""),
+                str(action.get("market_reason") or ""),
+            )
+        )
+    joined = " ".join(messages).lower()
+    return any(
+        token in joined
+        for token in (
+            "non-closeable dust",
+            "below exchange minimum",
+            "below min qty",
+            "min_order_size",
+        )
+    )
+
+
+def grid_dust_only_errors(result: Any) -> bool:
+    if not hasattr(result, "get"):
+        return False
+    errors = [str(item).lower() for item in (result.get("errors") or [])]
+    if not errors:
+        return False
+    dust_tokens = (
+        "qty_below_step",
+        "below min qty",
+        "below exchange minimum",
+        "min_order_size",
+        "non-closeable dust",
+    )
+    return all(any(token in error for token in dust_tokens) for error in errors)
+
+
+def grid_reset_after_flat_repair(rule: dict[str, Any], hedged_qty: float) -> bool:
+    if max(0.0, float(hedged_qty or 0.0)) > grid_completion_tolerance(rule):
+        return False
+    rule["live_level"] = 0
+    rule["pending_transition"] = None
+    rule["pending_action"] = None
+    rule["pending_samples"] = 0
+    return True
+
+
+def grid_level_for_qty(rule: Any, hedged_qty: float) -> int | None:
+    qty = max(0.0, float(hedged_qty or 0.0))
+    tolerance = grid_completion_tolerance(rule)
+    if qty <= tolerance:
+        return 0
+    for level in rule.get("levels") or []:
+        cumulative = float(level.get("cumulative_qty") or 0.0)
+        if abs(qty - cumulative) <= tolerance:
+            return int(level.get("level") or 0)
+    return None
+
+
+def grid_level_qty(rule: Any, level: int) -> float:
+    if level <= 0:
+        return 0.0
+    levels = rule.get("levels") or []
+    if level > len(levels):
+        return 0.0
+    try:
+        return float((levels[level - 1] or {}).get("cumulative_qty") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def grid_partial_adoption_level_for_qty(rule: Any, hedged_qty: float) -> int | None:
+    qty = max(0.0, float(hedged_qty or 0.0))
+    tolerance = grid_completion_tolerance(rule)
+    if qty <= tolerance:
+        return 0
+    levels = list(rule.get("levels") or [])
+    if not levels:
+        return None
+    max_level = len(levels)
+    max_qty = grid_level_qty(rule, max_level)
+    if max_qty <= 0:
+        max_qty = float(rule.get("max_qty") or 0.0)
+    if max_qty <= 0 or qty > max_qty + tolerance:
+        return None
+    for level in levels:
+        cumulative = float(level.get("cumulative_qty") or 0.0)
+        if qty <= cumulative + tolerance:
+            return int(level.get("level") or 0)
+    return max_level
+
+
+def grid_level_count_for_existing_qty(
+    *,
+    total_qty: float,
+    existing_qty: float,
+    preferred_count: int,
+) -> dict[str, Any] | None:
+    if total_qty <= 0 or existing_qty <= 0:
+        return None
+    preferred = max(MIN_LEVELS, min(MAX_LEVELS, int(preferred_count or MIN_LEVELS)))
+    candidates: list[dict[str, Any]] = []
+    for count in range(MIN_LEVELS, MAX_LEVELS + 1):
+        chunk_qty = float(total_qty) / count
+        if chunk_qty <= 0:
+            continue
+        level = max(0, min(count, int(round(float(existing_qty) / chunk_qty))))
+        cumulative_qty = float(level) * chunk_qty
+        diff_qty = abs(float(existing_qty) - cumulative_qty)
+        tolerance_qty = max(1e-8, chunk_qty * COMPLETION_TOLERANCE_PCT / 100.0)
+        matches = diff_qty <= tolerance_qty
+        candidates.append(
+            {
+                "level_count": count,
+                "level": level,
+                "chunk_qty": chunk_qty,
+                "cumulative_qty": cumulative_qty,
+                "existing_qty": float(existing_qty),
+                "diff_qty": diff_qty,
+                "tolerance_qty": tolerance_qty,
+                "matches": matches,
+                "distance_from_preferred": abs(count - preferred),
+                "normalized_diff": diff_qty / tolerance_qty if tolerance_qty else math.inf,
+            }
+        )
+    if not candidates:
+        return None
+    matching = [item for item in candidates if item["matches"]]
+    return min(
+        matching or candidates,
+        key=lambda item: (
+            item["distance_from_preferred"],
+            item["normalized_diff"],
+            item["level_count"],
+        ),
+    )
