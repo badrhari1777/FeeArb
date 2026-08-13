@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import types
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import execution.accounts as accounts_module
 from execution.accounts import (
@@ -185,6 +185,14 @@ class _PartialCollectGateway:
 
 
 class AccountMonitorPartialCollectTestCase(unittest.IsolatedAsyncioTestCase):
+    async def test_background_scheduler_does_not_duplicate_startup_refresh(self) -> None:
+        monitor = AccountMonitor(refresh_interval=60, summary_interval=60)
+        with patch.object(monitor, "_refresh", new_callable=AsyncMock) as refresh_mock:
+            await monitor.start()
+            await asyncio.sleep(0)
+            refresh_mock.assert_not_awaited()
+            await monitor.stop()
+
     async def test_balance_error_does_not_drop_positions(self) -> None:
         monitor = AccountMonitor(refresh_interval=60, summary_interval=60)
         monitor._gateways = {"bitget": _PartialCollectGateway()}  # type: ignore[assignment]

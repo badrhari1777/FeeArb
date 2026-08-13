@@ -1234,8 +1234,8 @@ class AccountMonitor:
     async def _run(self) -> None:
         try:
             while True:
-                await self._refresh()
                 await asyncio.sleep(self._interval)
+                await self._refresh()
         except asyncio.CancelledError:
             raise
 
