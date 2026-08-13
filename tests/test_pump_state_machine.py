@@ -271,3 +271,45 @@ def test_monitor_error_reducer_matches_legacy_golden_cases() -> None:
         for key, value in case["expected"].items():
             source = actual_result if key in actual_result else machine_state
             assert source[key] == value, f"{case['name']}:{key}"
+
+
+def _legacy_reduce_arm_success(state: dict[str, Any]) -> dict[str, Any]:
+    state.update(
+        {
+            "status": "armed",
+            "monitor_enabled": True,
+            "entry_armed": True,
+            "armed_at_ms": NOW_MS,
+            "updated_at_ms": NOW_MS,
+            "blocked_reason": None,
+            "pending_signals": [],
+            "transient_recovery_pending": False,
+            "healthy_recovery_cycles": 0,
+            "portfolio_risk_freeze_active": False,
+            "portfolio_risk_freeze_reason": None,
+            "portfolio_risk_freeze_symbol": None,
+            "portfolio_risk_freeze_buffer_pct": None,
+            "portfolio_risk_restore_armed": False,
+            "portfolio_risk_recovery_cycles": 0,
+        }
+    )
+    return {"start_monitor": True}
+
+
+def test_arm_success_reducer_matches_legacy_golden_cases() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent / "fixtures" / "pump_arm_success_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = PumpStateMachine()
+    for case in cases:
+        legacy_state = deepcopy(case["state"])
+        machine_state = deepcopy(case["state"])
+        expected_result = _legacy_reduce_arm_success(legacy_state)
+        actual_result = machine.reduce_arm_success(machine_state, now_ms=NOW_MS)
+        assert machine_state == legacy_state, case["name"]
+        assert actual_result == expected_result, case["name"]
+        for key, value in case["expected"].items():
+            source = actual_result if key in actual_result else machine_state
+            assert source[key] == value, f"{case['name']}:{key}"

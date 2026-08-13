@@ -147,3 +147,32 @@ class PumpStateMachine:
             state["blocked_reason"] = "monitor_cycle_error"
         state["updated_at_ms"] = now_ms
         return {"recovery_pending": recovery_pending}
+
+    @staticmethod
+    def reduce_arm_success(
+        state: dict[str, Any],
+        *,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Arm only after the controller has completed every external check."""
+
+        state.update(
+            {
+                "status": "armed",
+                "monitor_enabled": True,
+                "entry_armed": True,
+                "armed_at_ms": now_ms,
+                "updated_at_ms": now_ms,
+                "blocked_reason": None,
+                "pending_signals": [],
+                "transient_recovery_pending": False,
+                "healthy_recovery_cycles": 0,
+                "portfolio_risk_freeze_active": False,
+                "portfolio_risk_freeze_reason": None,
+                "portfolio_risk_freeze_symbol": None,
+                "portfolio_risk_freeze_buffer_pct": None,
+                "portfolio_risk_restore_armed": False,
+                "portfolio_risk_recovery_cycles": 0,
+            }
+        )
+        return {"start_monitor": True}
