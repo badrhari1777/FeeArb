@@ -792,3 +792,65 @@ def test_transition_pre_submit_outcomes_match_legacy_golden_cases() -> None:
                 ) == value, case["name"]
             else:
                 assert machine_rule.get(key) == value, f"{case['name']}:{key}"
+
+
+def _legacy_reduce_transition_admission(
+    rule, *, kind, conflict_rule_id, execution_id
+):
+    admitted = False
+    if kind == "live_rule_conflict":
+        rule["status"] = "blocked_conflict"
+        rule["blocked_reason"] = f"matching_live_grid_rule:{conflict_rule_id or ''}"
+        rule["pending_action"] = None
+        rule["pending_samples"] = 0
+    elif kind == "manual_worker_conflict":
+        rule["status"] = "blocked_conflict"
+        rule["blocked_reason"] = f"execution_running:{execution_id or ''}"
+        rule["pending_action"] = None
+        rule["pending_samples"] = 0
+    elif kind == "paused_before_submit":
+        rule["status"] = "paused"
+        rule["pending_action"] = None
+        rule["pending_samples"] = 0
+    elif kind == "reserve_submission":
+        rule["transition_starting"] = True
+        admitted = True
+    else:
+        rule.pop("transition_starting", None)
+    return {"admitted": admitted}
+
+
+def test_transition_admission_matches_legacy_golden_cases() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "grid_transition_admission_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = GridStateMachine()
+    for case in cases:
+        legacy_rule = deepcopy(case["rule"])
+        machine_rule = deepcopy(case["rule"])
+        kwargs = {
+            "kind": case["kind"],
+            "conflict_rule_id": case.get("conflict_rule_id"),
+            "execution_id": case.get("execution_id"),
+        }
+        expected_result = _legacy_reduce_transition_admission(
+            legacy_rule,
+            **kwargs,
+        )
+        actual_result = machine.reduce_transition_admission(
+            machine_rule,
+            **kwargs,
+        )
+        assert machine_rule == legacy_rule, case["name"]
+        assert actual_result == expected_result, case["name"]
+        for key, value in case["expected"].items():
+            if key == "admitted":
+                assert actual_result[key] == value, case["name"]
+            elif value == "absent":
+                assert key not in machine_rule, f"{case['name']}:{key}"
+            else:
+                assert machine_rule.get(key) == value, f"{case['name']}:{key}"

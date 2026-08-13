@@ -1,0 +1,42 @@
+[
+  {
+    "name": "matching_live_rule_blocks_and_clears_confirmation",
+    "rule": {"id": "grid-conflict", "status": "pending_enter", "pending_action": "enter", "pending_samples": 2},
+    "kind": "live_rule_conflict",
+    "conflict_rule_id": "other-grid",
+    "execution_id": null,
+    "expected": {"admitted": false, "status": "blocked_conflict", "blocked_reason": "matching_live_grid_rule:other-grid", "pending_action": null, "pending_samples": 0}
+  },
+  {
+    "name": "global_manual_worker_blocks_transition",
+    "rule": {"id": "grid-worker-conflict", "status": "pending_exit", "pending_action": "exit", "pending_samples": 2},
+    "kind": "manual_worker_conflict",
+    "conflict_rule_id": null,
+    "execution_id": "manual-exec-1",
+    "expected": {"admitted": false, "status": "blocked_conflict", "blocked_reason": "execution_running:manual-exec-1", "pending_action": null, "pending_samples": 0}
+  },
+  {
+    "name": "disabled_recheck_pauses_before_order",
+    "rule": {"id": "grid-paused", "enabled": false, "status": "pending_enter", "pending_action": "enter", "pending_samples": 2},
+    "kind": "paused_before_submit",
+    "conflict_rule_id": null,
+    "execution_id": null,
+    "expected": {"admitted": false, "status": "paused", "pending_action": null, "pending_samples": 0}
+  },
+  {
+    "name": "valid_recheck_reserves_single_submission",
+    "rule": {"id": "grid-reserved", "enabled": true, "status": "pending_enter"},
+    "kind": "reserve_submission",
+    "conflict_rule_id": null,
+    "execution_id": null,
+    "expected": {"admitted": true, "transition_starting": true}
+  },
+  {
+    "name": "submission_exception_releases_reservation",
+    "rule": {"id": "grid-exception", "enabled": true, "status": "pending_exit", "transition_starting": true},
+    "kind": "submission_exception",
+    "conflict_rule_id": null,
+    "execution_id": null,
+    "expected": {"admitted": false, "transition_starting": "absent"}
+  }
+]

@@ -713,6 +713,39 @@ class GridStateMachine:
             raise ValueError(f"Unsupported transition pre-submit outcome: {kind}")
         return {"event": event}
 
+    def reduce_transition_admission(
+        self,
+        rule: dict[str, Any],
+        *,
+        kind: str,
+        conflict_rule_id: str | None = None,
+        execution_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Reduce transition admission/reservation without performing any I/O."""
+        admitted = False
+        if kind == "live_rule_conflict":
+            rule["status"] = "blocked_conflict"
+            rule["blocked_reason"] = f"matching_live_grid_rule:{conflict_rule_id or ''}"
+            rule["pending_action"] = None
+            rule["pending_samples"] = 0
+        elif kind == "manual_worker_conflict":
+            rule["status"] = "blocked_conflict"
+            rule["blocked_reason"] = f"execution_running:{execution_id or ''}"
+            rule["pending_action"] = None
+            rule["pending_samples"] = 0
+        elif kind == "paused_before_submit":
+            rule["status"] = "paused"
+            rule["pending_action"] = None
+            rule["pending_samples"] = 0
+        elif kind == "reserve_submission":
+            rule["transition_starting"] = True
+            admitted = True
+        elif kind == "submission_exception":
+            rule.pop("transition_starting", None)
+        else:
+            raise ValueError(f"Unsupported transition admission outcome: {kind}")
+        return {"admitted": admitted}
+
     @staticmethod
     def _optional_float(value: Any) -> float | None:
         try:
