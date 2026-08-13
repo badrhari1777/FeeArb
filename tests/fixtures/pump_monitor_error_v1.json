@@ -1,0 +1,26 @@
+[
+  {
+    "name": "transient_error_while_armed_enters_recovery",
+    "transient": true,
+    "state": {"status": "armed", "entry_armed": true, "transient_recovery_pending": false, "healthy_recovery_cycles": 1},
+    "expected": {"status": "recovering_monitor", "blocked_reason": "monitor_cycle_transient_error", "recovery_pending": true}
+  },
+  {
+    "name": "second_transient_error_keeps_existing_recovery",
+    "transient": true,
+    "state": {"status": "recovering_monitor", "entry_armed": false, "transient_recovery_pending": true, "healthy_recovery_cycles": 1},
+    "expected": {"status": "recovering_monitor", "blocked_reason": "monitor_cycle_transient_error", "recovery_pending": true}
+  },
+  {
+    "name": "transient_error_while_disarmed_is_sticky",
+    "transient": true,
+    "state": {"status": "monitoring", "entry_armed": false, "transient_recovery_pending": false, "healthy_recovery_cycles": 0},
+    "expected": {"status": "error_monitoring", "blocked_reason": "monitor_cycle_error", "recovery_pending": false}
+  },
+  {
+    "name": "hard_error_is_sticky",
+    "transient": false,
+    "state": {"status": "armed", "entry_armed": true, "transient_recovery_pending": false, "healthy_recovery_cycles": 2},
+    "expected": {"status": "error_monitoring", "blocked_reason": "monitor_cycle_error", "recovery_pending": false}
+  }
+]

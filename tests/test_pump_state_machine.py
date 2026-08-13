@@ -220,3 +220,54 @@ def test_emergency_request_reducer_matches_legacy_golden_cases() -> None:
         for key, value in case["expected"].items():
             source = actual_result if key in actual_result else machine_state
             assert source[key] == value, f"{case['name']}:{key}"
+
+
+def _legacy_reduce_monitor_error(
+    state: dict[str, Any],
+    *,
+    error: str,
+    transient: bool,
+) -> dict[str, Any]:
+    recovery_pending = bool(
+        transient
+        and (state.get("entry_armed") or state.get("transient_recovery_pending"))
+    )
+    state["last_error"] = error
+    state["entry_armed"] = False
+    state["transient_recovery_pending"] = recovery_pending
+    state["healthy_recovery_cycles"] = 0
+    if recovery_pending:
+        state["status"] = "recovering_monitor"
+        state["blocked_reason"] = "monitor_cycle_transient_error"
+    else:
+        state["status"] = "error_monitoring"
+        state["blocked_reason"] = "monitor_cycle_error"
+    state["updated_at_ms"] = NOW_MS
+    return {"recovery_pending": recovery_pending}
+
+
+def test_monitor_error_reducer_matches_legacy_golden_cases() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent / "fixtures" / "pump_monitor_error_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = PumpStateMachine()
+    for case in cases:
+        legacy_state = deepcopy(case["state"])
+        machine_state = deepcopy(case["state"])
+        kwargs = {"error": "simulated_gateway_timeout", "transient": case["transient"]}
+        expected_result = _legacy_reduce_monitor_error(legacy_state, **kwargs)
+        actual_result = machine.reduce_monitor_error(
+            machine_state,
+            **kwargs,
+            now_ms=NOW_MS,
+        )
+        assert machine_state == legacy_state, case["name"]
+        assert actual_result == expected_result, case["name"]
+        assert machine_state["last_error"] == kwargs["error"]
+        assert machine_state["entry_armed"] is False
+        assert machine_state["healthy_recovery_cycles"] == 0
+        for key, value in case["expected"].items():
+            source = actual_result if key in actual_result else machine_state
+            assert source[key] == value, f"{case['name']}:{key}"

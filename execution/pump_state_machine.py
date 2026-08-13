@@ -117,3 +117,33 @@ class PumpStateMachine:
         state["portfolio_risk_recovery_cycles"] = 0
         state["updated_at_ms"] = now_ms
         return {"start_monitor": True, "wake_monitor": True}
+
+    @staticmethod
+    def reduce_monitor_error(
+        state: dict[str, Any],
+        *,
+        error: str,
+        transient: bool,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Fail closed after an already-classified monitor-cycle failure."""
+
+        recovery_pending = bool(
+            transient
+            and (
+                state.get("entry_armed")
+                or state.get("transient_recovery_pending")
+            )
+        )
+        state["last_error"] = error
+        state["entry_armed"] = False
+        state["transient_recovery_pending"] = recovery_pending
+        state["healthy_recovery_cycles"] = 0
+        if recovery_pending:
+            state["status"] = "recovering_monitor"
+            state["blocked_reason"] = "monitor_cycle_transient_error"
+        else:
+            state["status"] = "error_monitoring"
+            state["blocked_reason"] = "monitor_cycle_error"
+        state["updated_at_ms"] = now_ms
+        return {"recovery_pending": recovery_pending}
