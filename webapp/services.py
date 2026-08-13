@@ -2039,9 +2039,18 @@ class DataService:
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
                 if isinstance(current, dict):
-                    current["status"] = "waiting_positions"
-                    current["blocked_reason"] = f"position_refresh_failed: {exc}"
-                    current["next_eligible_ts"] = time.time() + 30.0
+                    self._grid_machine.reduce_transition_pre_submit_outcome(
+                        current,
+                        kind="position_refresh_failed",
+                        from_level=from_level,
+                        to_level=to_level,
+                        current_hedged_qty=None,
+                        error=str(exc),
+                        risk_limit_preflight=None,
+                        risk_blocked_reason=None,
+                        entry_risk_target_qty=None,
+                        now_ts=time.time(),
+                    )
                     current["updated_at"] = datetime.now(timezone.utc).isoformat()
                     self._save_auto_arb_config()
             return
@@ -2061,11 +2070,18 @@ class DataService:
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
                 if isinstance(current, dict):
-                    current["live_level"] = to_level
-                    current["pending_transition"] = None
-                    current["actual_hedged_qty"] = current_hedged_qty
-                    current["status"] = "waiting_entry" if to_level == 0 else "monitoring"
-                    current["blocked_reason"] = None
+                    self._grid_machine.reduce_transition_pre_submit_outcome(
+                        current,
+                        kind="transition_complete",
+                        from_level=from_level,
+                        to_level=to_level,
+                        current_hedged_qty=current_hedged_qty,
+                        error=None,
+                        risk_limit_preflight=None,
+                        risk_blocked_reason=None,
+                        entry_risk_target_qty=None,
+                        now_ts=time.time(),
+                    )
                     current["updated_at"] = datetime.now(timezone.utc).isoformat()
                     self._save_auto_arb_config()
             return
@@ -2079,36 +2095,61 @@ class DataService:
                 blocked_reason = self._auto_arb_risk_limit_error(
                     risk_limit_preflight
                 )
+                risk_preview = self._grid_machine.reduce_transition_pre_submit_outcome(
+                    dict(rule_copy),
+                    kind="risk_limit_blocked",
+                    from_level=from_level,
+                    to_level=to_level,
+                    current_hedged_qty=current_hedged_qty,
+                    error=None,
+                    risk_limit_preflight=risk_limit_preflight,
+                    risk_blocked_reason=blocked_reason,
+                    entry_risk_target_qty=start_intent["entry_risk_target_qty"],
+                    now_ts=time.time(),
+                )
+                risk_event = dict(risk_preview["event"] or {})
                 async with self._auto_arb_lock:
                     current = (self._auto_arb.get("rules") or {}).get(rule_id)
                     if isinstance(current, dict):
-                        current["status"] = "blocked_risk_limit"
-                        current["blocked_reason"] = blocked_reason
-                        current["entry_blocked_reason"] = blocked_reason
-                        current["risk_limit_preflight"] = risk_limit_preflight
-                        current["pending_action"] = None
-                        current["pending_samples"] = 0
-                        current["entry_next_eligible_ts"] = time.time() + 300.0
+                        risk_reduced = (
+                            self._grid_machine.reduce_transition_pre_submit_outcome(
+                                current,
+                                kind="risk_limit_blocked",
+                                from_level=from_level,
+                                to_level=to_level,
+                                current_hedged_qty=current_hedged_qty,
+                                error=None,
+                                risk_limit_preflight=risk_limit_preflight,
+                                risk_blocked_reason=blocked_reason,
+                                entry_risk_target_qty=start_intent[
+                                    "entry_risk_target_qty"
+                                ],
+                                now_ts=time.time(),
+                            )
+                        )
+                        risk_event = dict(risk_reduced["event"] or risk_event)
                         current["updated_at"] = now_iso
                         self._save_auto_arb_config()
-                self._auto_arb_history_store.append(
-                    {
-                        "event": "live_entry_risk_limit_blocked",
-                        "rule_id": rule_id,
-                        "from_level": from_level,
-                        "to_level": to_level,
-                        "target_position_qty": start_intent["entry_risk_target_qty"],
-                        "risk_limit_preflight": risk_limit_preflight,
-                        "ts": now_iso,
-                    }
-                )
+                risk_event.update({"rule_id": rule_id, "ts": now_iso})
+                self._auto_arb_history_store.append(risk_event)
                 return
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
                 if isinstance(current, dict):
-                    current["risk_limit_preflight"] = risk_limit_preflight
-                    current["entry_blocked_reason"] = None
-                    current["entry_next_eligible_ts"] = 0.0
+                    self._grid_machine.reduce_transition_pre_submit_outcome(
+                        current,
+                        kind="risk_limit_ready",
+                        from_level=from_level,
+                        to_level=to_level,
+                        current_hedged_qty=current_hedged_qty,
+                        error=None,
+                        risk_limit_preflight=risk_limit_preflight,
+                        risk_blocked_reason=None,
+                        entry_risk_target_qty=start_intent[
+                            "entry_risk_target_qty"
+                        ],
+                        now_ts=time.time(),
+                    )
         worst_tier = max(
             venue_liquidity_tier(str(rule_copy.get("long_exchange") or "")),
             venue_liquidity_tier(str(rule_copy.get("short_exchange") or "")),

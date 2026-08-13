@@ -246,4 +246,10 @@ no-order boundary before Manual submission: fail-closed position refresh,
 already-complete transition, entry risk-limit rejection, and successful risk
 preflight state clearing. It mutates only rule state and returns an optional risk
 history fragment. Four golden cases preserve the exact cooldowns and fields.
-Production is not wired to this reducer yet; exchange and risk checks remain I/O.
+The initial parity-only checkpoint did not wire production to this reducer;
+exchange and risk checks remain I/O.
+
+Production now delegates only the state response after those existing I/O calls.
+`DataService` still owns `updated_at`, durable save, and the risk history envelope;
+the optional event is also generated from a pure preview so the historical event
+is retained if the rule disappears before the lock is reacquired.
