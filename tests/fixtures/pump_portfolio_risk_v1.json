@@ -1,0 +1,53 @@
+{
+  "freeze": [
+    {
+      "name": "armed_entry_gate_is_claimed_and_restorable",
+      "snapshot": {"reason": "warning_buffer", "symbol": "ACEUSDT", "buffer_pct": 9.0},
+      "state": {"status": "armed", "entry_armed": true, "blocked_reason": null, "portfolio_risk_freeze_active": false, "portfolio_risk_restore_armed": false, "pending_signals": [{"symbol": "NEW1"}, {"symbol": "NEW2"}]},
+      "expected": {"status": "monitoring", "entry_armed": false, "blocked_reason": "portfolio_risk_freeze", "portfolio_risk_restore_armed": true, "changed": true, "dropped_pending_signals": 2, "auto_recovery_eligible": true}
+    },
+    {
+      "name": "existing_operator_block_is_not_stolen",
+      "snapshot": {"reason": "warning_buffer", "symbol": "BMTUSDT", "buffer_pct": 8.0},
+      "state": {"status": "monitoring", "entry_armed": false, "blocked_reason": "operator_disarm", "portfolio_risk_freeze_active": false, "portfolio_risk_restore_armed": false, "pending_signals": []},
+      "expected": {"status": "monitoring", "entry_armed": false, "blocked_reason": "operator_disarm", "portfolio_risk_restore_armed": false, "changed": true, "dropped_pending_signals": 0, "auto_recovery_eligible": false}
+    }
+  ],
+  "recovery": [
+    {
+      "name": "inactive_freeze_is_noop",
+      "snapshot": {"freeze_required": false, "all_calm": true, "buffer_pct": 40.0},
+      "evidence_ready": true,
+      "state": {"portfolio_risk_freeze_active": false},
+      "expected": {"recovered": false, "save_state": false}
+    },
+    {
+      "name": "risk_still_hot_resets_cycles",
+      "snapshot": {"freeze_required": true, "all_calm": false, "buffer_pct": 12.0},
+      "evidence_ready": true,
+      "state": {"portfolio_risk_freeze_active": true, "portfolio_risk_recovery_cycles": 1, "portfolio_risk_restore_armed": true, "blocked_reason": "portfolio_risk_freeze"},
+      "expected": {"recovered": false, "save_state": true, "portfolio_risk_recovery_cycles": 0, "portfolio_risk_freeze_buffer_pct": 12.0}
+    },
+    {
+      "name": "operator_owned_block_clears_freeze_without_rearm",
+      "snapshot": {"freeze_required": false, "all_calm": true, "buffer_pct": 40.0},
+      "evidence_ready": true,
+      "state": {"portfolio_risk_freeze_active": true, "portfolio_risk_recovery_cycles": 1, "portfolio_risk_restore_armed": false, "blocked_reason": "operator_disarm", "portfolio_risk_freeze_reason": "warning", "portfolio_risk_freeze_symbol": "ACEUSDT"},
+      "expected": {"recovered": false, "save_state": true, "portfolio_risk_freeze_active": false, "blocked_reason": "operator_disarm"}
+    },
+    {
+      "name": "first_calm_verified_cycle_advances",
+      "snapshot": {"freeze_required": false, "all_calm": true, "buffer_pct": 40.0},
+      "evidence_ready": true,
+      "state": {"portfolio_risk_freeze_active": true, "portfolio_risk_recovery_cycles": 0, "portfolio_risk_restore_armed": true, "blocked_reason": "portfolio_risk_freeze", "entry_armed": false, "monitor_enabled": true},
+      "expected": {"recovered": false, "save_state": true, "portfolio_risk_recovery_cycles": 1}
+    },
+    {
+      "name": "second_calm_verified_cycle_rearms",
+      "snapshot": {"freeze_required": false, "all_calm": true, "buffer_pct": 41.0},
+      "evidence_ready": true,
+      "state": {"portfolio_risk_freeze_active": true, "portfolio_risk_recovery_cycles": 1, "portfolio_risk_restore_armed": true, "blocked_reason": "portfolio_risk_freeze", "entry_armed": false, "monitor_enabled": true},
+      "expected": {"recovered": true, "save_state": true, "portfolio_risk_freeze_active": false, "portfolio_risk_recovery_cycles": 0, "entry_armed": true, "blocked_reason": null, "armed_at_ms": 1786650000000}
+    }
+  ]
+}

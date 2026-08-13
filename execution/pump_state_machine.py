@@ -257,3 +257,95 @@ class PumpStateMachine:
         state["close_recovery_symbol"] = None
         state["close_recovery_healthy_cycles"] = 0
         return {"recovered": True}
+
+    @staticmethod
+    def reduce_portfolio_risk_freeze(
+        state: dict[str, Any],
+        *,
+        snapshot: Mapping[str, Any],
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Apply an already-calculated portfolio entry-risk freeze."""
+
+        was_active = bool(state.get("portfolio_risk_freeze_active"))
+        prior_reason = state.get("portfolio_risk_freeze_reason")
+        prior_symbol = state.get("portfolio_risk_freeze_symbol")
+        restore_armed = bool(state.get("portfolio_risk_restore_armed"))
+        may_claim_entry_gate = bool(
+            (state.get("entry_armed") and not state.get("blocked_reason"))
+            or (
+                was_active
+                and state.get("blocked_reason") == "portfolio_risk_freeze"
+            )
+        )
+        if state.get("entry_armed") and not state.get("blocked_reason"):
+            restore_armed = True
+        dropped_pending = len(state.get("pending_signals") or [])
+        state["entry_armed"] = False
+        state["portfolio_risk_freeze_active"] = True
+        state["portfolio_risk_freeze_reason"] = snapshot.get("reason")
+        state["portfolio_risk_freeze_symbol"] = snapshot.get("symbol")
+        state["portfolio_risk_freeze_buffer_pct"] = snapshot.get("buffer_pct")
+        state["portfolio_risk_restore_armed"] = restore_armed
+        state["portfolio_risk_recovery_cycles"] = 0
+        state["pending_signals"] = []
+        if may_claim_entry_gate:
+            state["blocked_reason"] = "portfolio_risk_freeze"
+            state["status"] = "monitoring"
+        state["updated_at_ms"] = now_ms
+        changed = bool(
+            not was_active
+            or prior_reason != snapshot.get("reason")
+            or prior_symbol != snapshot.get("symbol")
+        )
+        return {
+            "changed": changed,
+            "dropped_pending_signals": dropped_pending,
+            "auto_recovery_eligible": restore_armed,
+        }
+
+    @staticmethod
+    def reduce_portfolio_risk_recovery(
+        state: dict[str, Any],
+        *,
+        snapshot: Mapping[str, Any],
+        evidence_ready: bool,
+        recovery_cycles: int,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Advance risk recovery from calculated market/exchange evidence."""
+
+        if not state.get("portfolio_risk_freeze_active"):
+            return {"recovered": False, "save_state": False}
+        state["portfolio_risk_freeze_buffer_pct"] = snapshot.get("buffer_pct")
+        if snapshot.get("freeze_required") or not snapshot.get("all_calm"):
+            state["portfolio_risk_recovery_cycles"] = 0
+            return {"recovered": False, "save_state": True}
+        restore_armed = bool(state.get("portfolio_risk_restore_armed"))
+        if not restore_armed or state.get("blocked_reason") != "portfolio_risk_freeze":
+            state["portfolio_risk_freeze_active"] = False
+            state["portfolio_risk_freeze_reason"] = None
+            state["portfolio_risk_freeze_symbol"] = None
+            state["portfolio_risk_freeze_buffer_pct"] = None
+            state["portfolio_risk_restore_armed"] = False
+            state["portfolio_risk_recovery_cycles"] = 0
+            return {"recovered": False, "save_state": True}
+        if not evidence_ready:
+            state["portfolio_risk_recovery_cycles"] = 0
+            return {"recovered": False, "save_state": True}
+        healthy = int(state.get("portfolio_risk_recovery_cycles") or 0) + 1
+        state["portfolio_risk_recovery_cycles"] = healthy
+        state["monitor_enabled"] = True
+        if healthy < recovery_cycles:
+            return {"recovered": False, "save_state": True}
+        state["entry_armed"] = True
+        state["armed_at_ms"] = now_ms
+        state["blocked_reason"] = None
+        state["portfolio_risk_freeze_active"] = False
+        state["portfolio_risk_freeze_reason"] = None
+        state["portfolio_risk_freeze_symbol"] = None
+        state["portfolio_risk_freeze_buffer_pct"] = None
+        state["portfolio_risk_restore_armed"] = False
+        state["portfolio_risk_recovery_cycles"] = 0
+        state["updated_at_ms"] = now_ms
+        return {"recovered": True, "save_state": True}
