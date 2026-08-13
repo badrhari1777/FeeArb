@@ -17,11 +17,6 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
         self.patchers = [
             patch("webapp.services.AUTO_ARB_STATE_PATH", root / "state" / "auto_arb.json"),
             patch("webapp.services.AUTO_ARB_HISTORY_PATH", root / "logs" / "auto_arb.jsonl"),
-            patch("webapp.services.AUTO_EXIT_STATE_PATH", root / "state" / "auto_exit.json"),
-            patch("webapp.services.AUTO_EXIT_HISTORY_PATH", root / "logs" / "auto_exit.jsonl"),
-            patch("webapp.services.HEDGE_CLUSTER_STATE_PATH", root / "state" / "clusters.json"),
-            patch("webapp.services.DERISK_HISTORY_PATH", root / "logs" / "derisk.jsonl"),
-            patch("webapp.services.DERISK_OUTCOME_STATE_PATH", root / "state" / "outcomes.json"),
             patch("execution.wallet.WalletService.DEFAULT_STATE_PATH", root / "state" / "wallet.json"),
         ]
         for patcher in self.patchers:
@@ -774,24 +769,6 @@ class AutoArbServiceTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["rule"]["mode"], "live")
         self.assertTrue(result["rule"]["enabled"])
 
-    def test_live_grid_conflicts_with_symbol_wide_multileg_auto_exit(self) -> None:
-        self.service._auto_exit["rules"]["HUSDT|multileg|multileg"] = {
-            "symbol": "HUSDT",
-            "long_exchange": "multileg",
-            "short_exchange": "multileg",
-            "enabled": True,
-            "v1_enabled": False,
-        }
-
-        conflict = self.service._auto_arb_auto_exit_conflict(
-            {
-                "symbol": "HUSDT",
-                "long_exchange": "kucoin",
-                "short_exchange": "bybit",
-            }
-        )
-
-        self.assertTrue(conflict)
 
     def test_paused_grid_does_not_block_live_ownership(self) -> None:
         self.service._auto_arb["rules"]["paused-old"] = {

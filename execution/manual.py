@@ -38,9 +38,6 @@ VENUE_LIQUIDITY_TIERS = {
     "binance": 1,
     "okx": 2,
 }
-AUTO_EXIT_RECOMMENDED_CHUNK_SAFETY_FACTOR = 0.5
-AUTO_EXIT_FALLBACK_CHUNK_PCT = 0.25
-AUTO_EXIT_MARKET_FALLBACK_MAX_TIER = 2
 SMART_CHUNK_NOTIONAL_CAP_BY_TIER = {
     1: 750.0,
     2: 500.0,
@@ -1430,124 +1427,6 @@ class ManualTradeManager:
     def _stop_force_finalize(self) -> bool:
         return bool(self._stop_signal().get("force_finalize"))
 
-    def _auto_exit_market_fallback_allowed(
-        self,
-        payload: Mapping[str, Any] | None,
-        exchange: str | None,
-        *,
-        notional_usd: float | None = None,
-    ) -> bool:
-        if not payload or not bool(payload.get("auto_exit_agent")):
-            return True
-        tier_limit = int(
-            _safe_float(payload.get("auto_exit_market_tier_max")) or AUTO_EXIT_MARKET_FALLBACK_MAX_TIER
-        )
-        if venue_liquidity_tier(exchange) > max(1, tier_limit):
-            return False
-        cleanup_cap = _safe_float(payload.get("auto_exit_market_cleanup_notional_max"))
-        if cleanup_cap is not None:
-            if cleanup_cap <= 0:
-                return False
-            if notional_usd is not None and notional_usd > cleanup_cap:
-                return False
-        return True
-
-    def _auto_exit_final_reconcile_blocked(
-        self,
-        payload: Mapping[str, Any] | None,
-        exchange: str | None,
-        *,
-        notional_usd: float | None = None,
-        primary_delta: float | None = None,
-        hedge_delta: float | None = None,
-        primary_filled_total: float | None = None,
-        hedge_filled_total: float | None = None,
-    ) -> bool:
-        filled_exposure_exists = any(
-            (_safe_float(value) or 0.0) > 0
-            for value in (primary_delta, hedge_delta, primary_filled_total, hedge_filled_total)
-        )
-        if filled_exposure_exists:
-            return False
-        return not self._auto_exit_market_fallback_allowed(
-            payload,
-            exchange,
-            notional_usd=notional_usd,
-        )
-
-    def _apply_auto_exit_exit_overrides(
-        self,
-        payload: Mapping[str, Any],
-        plan: Mapping[str, Any],
-        *,
-        log_cb: Optional[callable] = None,
-    ) -> Mapping[str, Any]:
-        if str(plan.get("action") or "") != "exit" or not bool(payload.get("auto_exit_agent")):
-            return payload
-        updated_payload = dict(payload)
-        changes: dict[str, Any] = {}
-
-        suggested_leg = (plan.get("suggested_expensive_leg") or {}).get("suggested_leg")
-        if not updated_payload.get("expensive_leg") and suggested_leg in ("long", "short"):
-            updated_payload["expensive_leg"] = suggested_leg
-            changes["expensive_leg"] = suggested_leg
-
-        requested_chunk = _safe_float(updated_payload.get("chunk_qty"))
-        dynamic_chunking = bool(updated_payload.get("auto_exit_dynamic_chunk"))
-        recommended_chunk = _safe_float(plan.get("recommended_chunk_qty"))
-        min_chunk_qty = _safe_float(plan.get("min_chunk_qty"))
-        qty = _safe_float(plan.get("qty"))
-        if (requested_chunk is None or requested_chunk <= 0) and not dynamic_chunking:
-            safe_chunk = None
-            if recommended_chunk and recommended_chunk > 0:
-                safe_chunk = recommended_chunk * AUTO_EXIT_RECOMMENDED_CHUNK_SAFETY_FACTOR
-            elif qty and qty > 0:
-                safe_chunk = qty * AUTO_EXIT_FALLBACK_CHUNK_PCT
-            amount_steps = [
-                _safe_float((info or {}).get("amount_step"))
-                for info in (plan.get("market_constraints") or {}).values()
-            ]
-            amount_step = max([step for step in amount_steps if step], default=None)
-            if safe_chunk and min_chunk_qty:
-                safe_chunk = max(safe_chunk, min_chunk_qty)
-            if safe_chunk and qty:
-                safe_chunk = min(safe_chunk, qty)
-            if safe_chunk and amount_step:
-                safe_chunk = _round_to_step(safe_chunk, amount_step, mode="down")
-                if min_chunk_qty and safe_chunk < min_chunk_qty:
-                    safe_chunk = _round_to_step(min_chunk_qty, amount_step, mode="up")
-            if safe_chunk and safe_chunk > 0:
-                updated_payload["chunk_qty"] = safe_chunk
-                changes["chunk_qty"] = safe_chunk
-
-        if not updated_payload.get("hedge_order_type"):
-            updated_payload["hedge_order_type"] = "limit"
-            changes["hedge_order_type"] = "limit"
-        if updated_payload.get("hedge_limit_mode") != "aggressive":
-            updated_payload["hedge_limit_mode"] = "aggressive"
-            changes["hedge_limit_mode"] = "aggressive"
-        if updated_payload.get("hedge_offset_ticks") is None and updated_payload.get("hedge_offset_bps") is None:
-            updated_payload["hedge_offset_ticks"] = 1
-            changes["hedge_offset_ticks"] = 1
-        if updated_payload.get("hedge_favorable_bps") is None:
-            updated_payload["hedge_favorable_bps"] = 2.0
-            changes["hedge_favorable_bps"] = 2.0
-        if updated_payload.get("hedge_adverse_bps") is None:
-            updated_payload["hedge_adverse_bps"] = 6.0
-            changes["hedge_adverse_bps"] = 6.0
-        if updated_payload.get("hedge_reprice_min_sec") is None:
-            updated_payload["hedge_reprice_min_sec"] = 2.0
-            changes["hedge_reprice_min_sec"] = 2.0
-        if updated_payload.get("max_limit_deviation_bps") is None:
-            updated_payload["max_limit_deviation_bps"] = 20.0
-            changes["max_limit_deviation_bps"] = 20.0
-        if updated_payload.get("auto_exit_market_tier_max") is None:
-            updated_payload["auto_exit_market_tier_max"] = AUTO_EXIT_MARKET_FALLBACK_MAX_TIER
-            changes["auto_exit_market_tier_max"] = AUTO_EXIT_MARKET_FALLBACK_MAX_TIER
-
-        if changes:
-            self._emit_log(log_cb, "decision", "auto-exit safety overrides applied", changes)
-        return updated_payload
 
     async def _ensure_ws_positions(
         self,
@@ -2100,11 +1979,6 @@ class ManualTradeManager:
                 return plan
             adjusted_payload = payload
             adjusted_plan = plan
-            adjusted_payload = self._apply_auto_exit_exit_overrides(
-                adjusted_payload,
-                adjusted_plan,
-                log_cb=log_cb,
-            )
             precheck_errors: list[str] = []
             if action == "enter":
                 balances, balance_errors = await self._fetch_balances_with_retry(
@@ -5449,38 +5323,11 @@ class ManualTradeManager:
                     qty_needed = abs(imbalance)
                 qty_needed = _round_to_step(qty_needed, step, mode="down") if step else qty_needed
                 if qty_needed > 0:
-                    reconcile_price = _reconcile_price_for_exchange(leg.get("exchange"))
-                    reconcile_notional = (
-                        qty_needed * reconcile_price if reconcile_price and reconcile_price > 0 else None
-                    )
                     if threshold and qty_needed < threshold:
                         _vlog(
                             "wait",
                             "final imbalance below fallback threshold",
                             {"imbalance": imbalance, "min_qty": threshold},
-                        )
-                    elif self._auto_exit_final_reconcile_blocked(
-                        payload,
-                        leg.get("exchange"),
-                        notional_usd=reconcile_notional,
-                        primary_delta=primary_delta,
-                        hedge_delta=hedge_delta,
-                        primary_filled_total=primary_filled_total,
-                        hedge_filled_total=hedge_filled_total,
-                    ):
-                        warnings.append(
-                            f"{leg['exchange']}: final reconcile market skipped by auto-exit tier guard"
-                        )
-                        self._emit_log(
-                            log_cb,
-                            "warn",
-                            "final reconcile market skipped by auto-exit tier guard",
-                            {
-                                "exchange": leg.get("exchange"),
-                                "qty": qty_needed,
-                                "venue_tier": venue_liquidity_tier(leg.get("exchange")),
-                                "market_notional_est": reconcile_notional,
-                            },
                         )
                     else:
                         self._emit_log(
@@ -10173,33 +10020,6 @@ class ManualTradeManager:
                         )
                         await asyncio.sleep(max(0.5, hedge_reprice_min_sec))
                         continue
-                    market_price_est = (
-                        stats.best_ask if leg["side"] == "buy" else stats.best_bid
-                    ) or order_price
-                    market_notional_est = (
-                        remaining * market_price_est if market_price_est and market_price_est > 0 else None
-                    )
-                    if not self._auto_exit_market_fallback_allowed(
-                        payload,
-                        leg.get("exchange"),
-                        notional_usd=market_notional_est,
-                    ):
-                        order_id = None
-                        order_price = None
-                        self._emit_log(
-                            log_cb,
-                            "reprice",
-                            "hedge adverse move on lower-tier venue; repricing limit instead of market",
-                            {
-                                "exchange": leg.get("exchange"),
-                                "adverse_bps": adverse_bps,
-                                "adverse_ticks": adverse_ticks,
-                                "remaining_qty": remaining,
-                                "venue_tier": venue_liquidity_tier(leg.get("exchange")),
-                                "market_notional_est": market_notional_est,
-                            },
-                        )
-                        continue
                     self._emit_story(
                         log_cb,
                         (
@@ -11027,25 +10847,6 @@ class ManualTradeManager:
             if close_qty <= 0:
                 continue
             residual_notional = _safe_float(item.get("residual_notional"))
-            if not self._auto_exit_market_fallback_allowed(
-                payload,
-                exchange,
-                notional_usd=residual_notional,
-            ):
-                warnings.append(f"{exchange}: dust finalize skipped by auto-exit tier guard")
-                self._emit_log(
-                    log_cb,
-                    "warn",
-                    "dust finalize skipped by auto-exit tier guard",
-                    {
-                        "exchange": exchange,
-                        "symbol": symbol,
-                        "qty": close_qty,
-                        "venue_tier": venue_liquidity_tier(exchange),
-                        "market_notional_est": residual_notional,
-                    },
-                )
-                continue
             self._emit_log(
                 log_cb,
                 "submit",

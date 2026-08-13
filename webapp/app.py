@@ -93,7 +93,7 @@ def _dashboard_payload() -> dict[str, object]:
     pump_status = bybit_pump_short_lab.pump_live_status()
     return build_dashboard_payload(
         service.dashboard_runtime_payload(),
-        service.mobile_positions_payload(include_auto_exit=False),
+        service.mobile_positions_payload(),
         pump_status,
     )
 
@@ -392,18 +392,6 @@ class NotificationTestPayload(BaseModel):
     message: Optional[str] = "FeeArb notification test from backend."
 
 
-class HedgeClusterRulePayload(BaseModel):
-    symbol: str
-    kind: Optional[str] = "hedged_pair"
-    long_exchange: Optional[str] = None
-    short_exchange: Optional[str] = None
-    exchange: Optional[str] = None
-    side: Optional[str] = None
-    enabled: Optional[bool] = True
-    qty_tolerance_pct: Optional[float] = None
-    rehedge_allowed: Optional[bool] = None
-
-
 class CoinPaperEnterPayload(BaseModel):
     symbol: str
     qty: float = Field(..., gt=0)
@@ -650,7 +638,7 @@ async def strategy_lab_observatory_feed_probe_api(
 @app.get("/api/positions/overview")
 async def positions_overview_api() -> JSONResponse:
     payload = build_positions_overview(
-        service.mobile_positions_payload(include_auto_exit=False),
+        service.mobile_positions_payload(),
         bybit_pump_short_lab.pump_live_status(),
     )
     return JSONResponse(jsonable_encoder(payload))
@@ -1388,7 +1376,7 @@ async def get_settings() -> JSONResponse:
 @app.get("/api/mobile/positions")
 async def mobile_positions() -> JSONResponse:
     payload = with_pump_account_balances(
-        service.mobile_positions_payload(include_auto_exit=False),
+        service.mobile_positions_payload(),
         bybit_pump_short_lab.pump_live_status(),
     )
     return JSONResponse(jsonable_encoder(payload))
@@ -1512,10 +1500,6 @@ async def auto_arb_history(rule_id: str, limit: int = 100) -> JSONResponse:
     return JSONResponse(jsonable_encoder(service.auto_arb_history(rule_id, limit=limit)))
 
 
-@app.get("/api/hedge-clusters")
-async def get_hedge_clusters() -> JSONResponse:
-    return JSONResponse(service.hedge_cluster_payload())
-
 @app.websocket("/ws/manual")
 async def manual_stream(websocket: WebSocket) -> None:
     await websocket.accept()
@@ -1633,14 +1617,6 @@ async def update_settings(payload: SettingsPayload) -> JSONResponse:
         }
     )
 
-
-@app.post("/api/hedge-clusters/rule")
-async def update_hedge_cluster_rule(payload: HedgeClusterRulePayload) -> JSONResponse:
-    try:
-        result = await service.update_hedge_cluster_rule(payload.dict(exclude_none=True))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return JSONResponse(result)
 
 @app.post("/api/manual/enter")
 async def manual_enter(payload: ManualEnterPayload) -> JSONResponse:

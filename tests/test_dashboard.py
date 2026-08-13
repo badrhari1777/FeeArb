@@ -99,6 +99,8 @@ class DashboardApiTestCase(unittest.IsolatedAsyncioTestCase):
         assert "/api/auto-exit/defaults" not in paths
         assert "/api/auto-exit/rule" not in paths
         assert "/api/auto-exit/clear-spread-cache" not in paths
+        assert "/api/hedge-clusters" not in paths
+        assert "/api/hedge-clusters/rule" not in paths
         assert "/api/snapshot" not in paths
         assert "/api/refresh" not in paths
 
@@ -127,5 +129,5 @@ class DashboardApiTestCase(unittest.IsolatedAsyncioTestCase):
         assert payload["schema"] == "dashboard_v2"
         assert payload["positions"]["summary"]["main_positions"] == 1
         runtime_mock.assert_called_once_with()
-        positions_mock.assert_called_once_with(include_auto_exit=False)
+        positions_mock.assert_called_once_with()
         pump_mock.assert_called_once_with()

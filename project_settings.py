@@ -51,26 +51,6 @@ MIN_REFRESH_SECONDS: Final[int] = 30
 MAX_REFRESH_SECONDS: Final[int] = 24 * 60 * 60  # one day
 
 
-def _default_manual_auto_exit_policy() -> Dict[str, Dict[str, float]]:
-    return {
-        "tier1": {
-            "chunk_notional_cap_usd": 750.0,
-            "market_cleanup_notional_cap_usd": 1500.0,
-            "edge_buffer_bps": 2.0,
-        },
-        "tier2": {
-            "chunk_notional_cap_usd": 500.0,
-            "market_cleanup_notional_cap_usd": 800.0,
-            "edge_buffer_bps": 4.0,
-        },
-        "lower_tier": {
-            "chunk_notional_cap_usd": 250.0,
-            "market_cleanup_notional_cap_usd": 0.0,
-            "edge_buffer_bps": 8.0,
-        },
-    }
-
-
 def _normalise_bool_map(
     baseline: Mapping[str, bool],
     incoming: Mapping[str, object] | None,
@@ -145,26 +125,7 @@ class AppSettings:
             "margin_reduce_pct": 0.10,
             "margin_adjust_cooldown_sec": 300,
             "position_check_interval_sec": 60,
-            "auto_derisk_enabled": False,
-            "auto_derisk_shadow_mode": True,
             "orphan_cleanup_enabled": True,
-            "derisk_poll_sec": 5,
-            "derisk_target_buffer_pct": 0.30,
-            "derisk_warning_buffer_pct": 0.20,
-            "derisk_panic_buffer_pct": 0.15,
-            "derisk_recovery_buffer_pct": 0.35,
-            "derisk_min_free_balance_abs": 500.0,
-            "derisk_stale_positions_max_sec": 180,
-            "derisk_failure_block_count": 2,
-            "derisk_confirm_cycles": 2,
-            "derisk_cooldown_sec": 120,
-            "derisk_velocity_trigger_bps": 120.0,
-            "derisk_qty_tolerance_pct": 0.10,
-            "derisk_max_single_action_notional_usd": 500.0,
-            "derisk_max_candidate_score": 0.25,
-            "derisk_preflight_ttl_sec": 60,
-            "derisk_market_cleanup_only_in_emergency": True,
-            "derisk_dust_notional_usd": 10.0,
         }
     )
     manual: Dict[str, object] = field(
@@ -173,7 +134,6 @@ class AppSettings:
             "enter_live_depth": 5,
             "exit_live_orderbook": False,
             "exit_live_depth": 5,
-            "auto_exit_policy": _default_manual_auto_exit_policy(),
             "ws_orders_health": {
                 "bybit": {
                     "heartbeat_interval": 15.0,
@@ -332,30 +292,17 @@ class AppSettings:
             "margin_reduce_pct": 0.10,
             "margin_adjust_cooldown_sec": 300,
             "position_check_interval_sec": 60,
-            "auto_derisk_enabled": False,
-            "auto_derisk_shadow_mode": True,
             "orphan_cleanup_enabled": True,
-            "derisk_poll_sec": 5,
-            "derisk_target_buffer_pct": 0.30,
-            "derisk_warning_buffer_pct": 0.20,
-            "derisk_panic_buffer_pct": 0.15,
-            "derisk_recovery_buffer_pct": 0.35,
-            "derisk_min_free_balance_abs": 500.0,
-            "derisk_stale_positions_max_sec": 180,
-            "derisk_failure_block_count": 2,
-            "derisk_confirm_cycles": 2,
-            "derisk_cooldown_sec": 120,
-            "derisk_velocity_trigger_bps": 120.0,
-            "derisk_qty_tolerance_pct": 0.10,
-            "derisk_max_single_action_notional_usd": 500.0,
-            "derisk_max_candidate_score": 0.25,
-            "derisk_preflight_ttl_sec": 60,
-            "derisk_market_cleanup_only_in_emergency": True,
-            "derisk_dust_notional_usd": 10.0,
         }
         merged = dict(defaults)
         if isinstance(self.protective, dict):
             merged.update(self.protective)
+        for key in tuple(merged):
+            if key.startswith("derisk_") or key in {
+                "auto_derisk_enabled",
+                "auto_derisk_shadow_mode",
+            }:
+                merged.pop(key, None)
         # Retired after a KuCoin incident: an exchange-native conditional stop
         # does not become unsafe merely because it is old. Rotating it on a
         # timer created a cancel-before-replace protection gap.
@@ -366,7 +313,6 @@ class AppSettings:
             "enter_live_depth": 5,
             "exit_live_orderbook": False,
             "exit_live_depth": 5,
-            "auto_exit_policy": _default_manual_auto_exit_policy(),
             "ws_orders_health": {
                 "binance": {
                     "heartbeat_interval": 15.0,
@@ -415,28 +361,7 @@ class AppSettings:
         manual = dict(manual_defaults)
         if isinstance(self.manual, dict):
             manual.update(self.manual)
-        auto_exit_policy = manual.get("auto_exit_policy")
-        merged_auto_exit_policy = _default_manual_auto_exit_policy()
-        if isinstance(auto_exit_policy, Mapping):
-            legacy_chunk_caps = {
-                "tier1": 350.0,
-                "tier2": 250.0,
-                "lower_tier": 150.0,
-            }
-            for tier_key, defaults in merged_auto_exit_policy.items():
-                incoming_section = auto_exit_policy.get(tier_key)
-                if isinstance(incoming_section, Mapping):
-                    merged_auto_exit_policy[tier_key] = dict(defaults)
-                    merged_auto_exit_policy[tier_key].update(incoming_section)
-                    incoming_cap = incoming_section.get("chunk_notional_cap_usd")
-                    if (
-                        incoming_cap is not None
-                        and float(incoming_cap) == legacy_chunk_caps.get(tier_key)
-                    ):
-                        merged_auto_exit_policy[tier_key]["chunk_notional_cap_usd"] = defaults[
-                            "chunk_notional_cap_usd"
-                        ]
-        manual["auto_exit_policy"] = merged_auto_exit_policy
+        manual.pop("auto_exit_policy", None)
         self.manual = manual
         return self
 
@@ -479,22 +404,6 @@ class AppSettings:
                 raise ValueError("fallback_take_rr_pct must be > 0 and <= 0.50.")
             if float(protective.get("target_leverage", 3.0) or 0.0) <= 0:
                 raise ValueError("target_leverage must be > 0.")
-            if float(protective.get("derisk_target_buffer_pct", 0.30) or 0.0) < 0:
-                raise ValueError("derisk_target_buffer_pct must be >= 0.")
-            if float(protective.get("derisk_warning_buffer_pct", 0.20) or 0.0) < 0:
-                raise ValueError("derisk_warning_buffer_pct must be >= 0.")
-            if float(protective.get("derisk_panic_buffer_pct", 0.15) or 0.0) < 0:
-                raise ValueError("derisk_panic_buffer_pct must be >= 0.")
-            if float(protective.get("derisk_recovery_buffer_pct", 0.35) or 0.0) < 0:
-                raise ValueError("derisk_recovery_buffer_pct must be >= 0.")
-            if int(protective.get("derisk_confirm_cycles", 2) or 0) < 1:
-                raise ValueError("derisk_confirm_cycles must be >= 1.")
-            if int(protective.get("derisk_failure_block_count", 2) or 0) < 1:
-                raise ValueError("derisk_failure_block_count must be >= 1.")
-            if float(protective.get("derisk_max_candidate_score", 0.25)) < 0:
-                raise ValueError("derisk_max_candidate_score must be >= 0.")
-            if int(protective.get("derisk_preflight_ttl_sec", 60) or 0) < 1:
-                raise ValueError("derisk_preflight_ttl_sec must be >= 1.")
             primary_channel = str(protective.get("notification_primary_channel", "telegram") or "").strip().lower()
             if primary_channel not in {"telegram", "pushbullet", "ntfy"}:
                 raise ValueError("notification_primary_channel must be telegram, pushbullet, or ntfy.")
@@ -503,23 +412,6 @@ class AppSettings:
                 raise ValueError("notification_fallback_channel must be none, telegram, pushbullet, or ntfy.")
         except Exception as exc:
             raise ValueError(f"Invalid protective settings: {exc}") from exc
-        try:
-            manual = self.manual or {}
-            auto_exit_policy = manual.get("auto_exit_policy") or {}
-            for tier_key, section in auto_exit_policy.items():
-                if not isinstance(section, Mapping):
-                    raise ValueError(f"manual.auto_exit_policy.{tier_key} must be an object.")
-                for field_name in (
-                    "chunk_notional_cap_usd",
-                    "market_cleanup_notional_cap_usd",
-                    "edge_buffer_bps",
-                ):
-                    value = float(section.get(field_name, 0.0) or 0.0)
-                    if value < 0:
-                        raise ValueError(f"manual.auto_exit_policy.{tier_key}.{field_name} must be >= 0.")
-        except Exception as exc:
-            raise ValueError(f"Invalid manual settings: {exc}") from exc
-
     def to_dict(self) -> Dict[str, object]:
         return {
             "sources": dict(self.sources),
