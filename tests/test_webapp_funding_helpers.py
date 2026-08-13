@@ -101,7 +101,7 @@ class FundingHistoryAnalysisTestCase(unittest.IsolatedAsyncioTestCase):
 
         service = DataService(settings_manager=SettingsManager())
         with patch(
-            "webapp.services.get_adapter_cached",
+            "webapp.funding_history.get_adapter_cached",
             side_effect=lambda exchange: _FakeAdapter(exchange),
         ):
             payload = await service.analyze_funding_history(
@@ -145,7 +145,7 @@ class FundingHistoryAnalysisTestCase(unittest.IsolatedAsyncioTestCase):
                 return []
 
         with patch(
-            "webapp.services.get_adapter_cached",
+            "webapp.funding_history.get_adapter_cached",
             side_effect=lambda exchange: _FakeAdapter(exchange),
         ):
             payload = await service.analyze_funding_history(
