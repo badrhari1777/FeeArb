@@ -82,3 +82,26 @@ No further mechanical splitting of `DataService` is required for the current
 production set. A future new strategy must arrive with its own state machine,
 repository, gateway/effect controller and replay tests; it must not add another
 decision loop to the facade.
+
+## Regression and deployment evidence
+
+- Focused architecture/account/lifecycle/dashboard/Grid set: `121 passed`,
+  `8 subtests`.
+- Full suite: `745 passed`, `36 subtests`; one known dependency deprecation
+  warning.
+- Pre-restart gate: Manual running `0`, Grid rules/active `0`, Pump tracked and
+  exchange positions `2/2`, exchange protective orders `4`, state-contract
+  issues `0`.
+- Cold restart recovered `ACEUSDT` and `BMTUSDT` fail-closed with entries
+  disarmed. Main startup reached `ready`; positions-market completed without
+  the former signature error.
+- Explicit `ARM PUMP LIVE 3000` restored policy `v3_3000_pool600`. Three later
+  monitor cycles kept ARM, monitor, ownership `2/2`, four orders and zero
+  contract/protection issues. The observed liquidation-buffer range was
+  `26.64%..52.16%`.
+- `/`, `/positions` and `/pump-short-strategies` returned HTTP `200`; the
+  canonical launcher enforced Caddy, Tailscale Funnel and Cloudflare Tunnel.
+- Live API counters showed the configured seven Main venues cost seven balance
+  plus seven positions calls per account cycle, with zero call errors. The
+  positions-market path had one active exchange/symbol per executed cycle and
+  skipped fresh duplicate requests.
