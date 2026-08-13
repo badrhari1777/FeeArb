@@ -1,0 +1,137 @@
+[
+  {
+    "name": "partial_transition_keeps_remaining_quantity",
+    "rule": {
+      "id": "grid-partial",
+      "enabled": true,
+      "chunk_qty": 100.0,
+      "live_level": 1,
+      "active_execution_id": "exec-partial",
+      "active_action": "enter",
+      "active_from_level": 1,
+      "active_to_level": 2,
+      "active_target_qty": 100.0,
+      "active_start_hedged_qty": 100.0,
+      "pending_transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 0.0, "remaining_qty": 100.0}
+    },
+    "run": {"status": "completed", "error": null, "result": {}},
+    "quantities": {"hedged_qty": 160.0, "imbalance_qty": 0.0},
+    "reconcile_error": null,
+    "expected": {"completed": false, "repair_required": false, "event": "live_enter_partial", "status": "partial_enter"}
+  },
+  {
+    "name": "transition_imbalance_requests_repair",
+    "rule": {
+      "id": "grid-imbalanced",
+      "enabled": true,
+      "chunk_qty": 100.0,
+      "live_level": 1,
+      "active_execution_id": "exec-imbalanced",
+      "active_action": "enter",
+      "active_from_level": 1,
+      "active_to_level": 2,
+      "active_target_qty": 100.0,
+      "active_start_hedged_qty": 100.0,
+      "pending_transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 0.0, "remaining_qty": 100.0}
+    },
+    "run": {"status": "completed", "error": null, "result": {}},
+    "quantities": {"hedged_qty": 150.0, "imbalance_qty": 5.0},
+    "reconcile_error": null,
+    "expected": {"completed": false, "repair_required": true, "event": "live_hedge_repair_required", "status": "hedge_repair_required"}
+  },
+  {
+    "name": "balanced_repair_resumes_partial_transition",
+    "rule": {
+      "id": "grid-repaired",
+      "enabled": true,
+      "chunk_qty": 100.0,
+      "live_level": 1,
+      "active_execution_id": "exec-repair",
+      "active_action": "repair",
+      "active_start_hedged_qty": 150.0,
+      "pending_transition": {"action": "exit", "from_level": 2, "to_level": 1, "target_qty": 100.0, "filled_qty": 50.0, "remaining_qty": 50.0}
+    },
+    "run": {"status": "completed", "error": null, "result": {}},
+    "quantities": {"hedged_qty": 150.0, "imbalance_qty": 0.5},
+    "reconcile_error": null,
+    "expected": {"completed": true, "repair_required": false, "event": "live_hedge_repaired", "status": "partial_exit"}
+  },
+  {
+    "name": "completed_partial_repair_requests_retry",
+    "rule": {
+      "id": "grid-repair-retry",
+      "enabled": true,
+      "chunk_qty": 100.0,
+      "live_level": 1,
+      "active_execution_id": "exec-repair-retry",
+      "active_action": "repair",
+      "active_start_hedged_qty": 150.0
+    },
+    "run": {"status": "completed", "error": null, "result": {}},
+    "quantities": {"hedged_qty": 150.0, "imbalance_qty": 5.0},
+    "reconcile_error": null,
+    "expected": {"completed": false, "repair_required": true, "event": "live_hedge_repair_partial", "status": "hedge_repair_retry"}
+  },
+  {
+    "name": "terminal_worker_without_transition_settles_monitoring",
+    "rule": {
+      "id": "grid-settle",
+      "enabled": true,
+      "chunk_qty": 100.0,
+      "live_level": 1,
+      "active_execution_id": "exec-settle",
+      "active_action": "exit",
+      "active_from_level": 1,
+      "active_to_level": 0,
+      "active_start_hedged_qty": 100.0
+    },
+    "run": {"status": "completed_no_fill", "error": null, "result": {}},
+    "quantities": {"hedged_qty": 100.0, "imbalance_qty": 0.0},
+    "reconcile_error": null,
+    "expected": {"completed": true, "repair_required": false, "event": null, "status": "monitoring"}
+  },
+  {
+    "name": "disabled_balanced_rule_settles_paused",
+    "rule": {
+      "id": "grid-paused",
+      "enabled": false,
+      "chunk_qty": 100.0,
+      "live_level": 1,
+      "active_execution_id": "exec-paused",
+      "active_action": "exit",
+      "active_start_hedged_qty": 100.0
+    },
+    "run": {"status": "completed", "error": null, "result": {}},
+    "quantities": {"hedged_qty": 100.0, "imbalance_qty": 0.0},
+    "reconcile_error": null,
+    "expected": {"completed": true, "repair_required": false, "event": null, "status": "paused", "next_eligible_ts": 0.0}
+  },
+  {
+    "name": "refresh_failure_restores_persisted_active_snapshot",
+    "rule": {
+      "id": "grid-refresh-failed",
+      "enabled": true,
+      "chunk_qty": 100.0,
+      "live_level": 1,
+      "active_execution_id": "exec-refresh",
+      "active_action": "enter",
+      "active_from_level": 1,
+      "active_to_level": 2,
+      "active_target_qty": 100.0,
+      "active_start_hedged_qty": 100.0,
+      "status": "entering"
+    },
+    "active_snapshot": {
+      "active_execution_id": "exec-refresh",
+      "active_action": "enter",
+      "active_from_level": 1,
+      "active_to_level": 2,
+      "active_target_qty": 100.0,
+      "active_start_hedged_qty": 100.0
+    },
+    "run": {"status": "completed_with_errors", "error": "worker error", "result": {"errors": ["worker error"]}},
+    "quantities": null,
+    "reconcile_error": "exchange timeout",
+    "expected": {"completed": false, "repair_required": false, "event": "live_reconcile_deferred", "status": "waiting_reconcile", "next_eligible_ts": 130.0}
+  }
+]

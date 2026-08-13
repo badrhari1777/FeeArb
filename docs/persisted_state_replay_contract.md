@@ -167,3 +167,13 @@ missing/running/terminal routing and repeats terminal reducer selection from the
 fresh in-lock rule. The planner does not receive exchange quantities and does not
 apply reducer output. Fresh position reads, active-field cleanup, reducers,
 state lock/save, history append and repair launch all remain in `DataService`.
+
+`GridStateMachine.reduce_execution_reconcile_after_refresh` defines a dormant
+pure boundary after the caller has attempted the fresh two-leg position read. It
+clears or restores active execution fields, records the observed execution,
+routes to the existing transition/repair reducers, applies paused-state parity,
+and returns only the event fragment plus completion/repair intent. It performs no
+exchange read, persistence, history append, or repair launch. Seven trajectories
+in `tests/fixtures/grid_execution_reconcile_after_refresh_v1.json` compare the
+entire mutated rule and result with the preserved production sequence, including
+position-refresh failure. Production is not wired to this facade yet.

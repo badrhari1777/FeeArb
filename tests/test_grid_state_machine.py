@@ -9,7 +9,10 @@ from execution.auto_arb_grid import (
     build_grid_pending_transition,
     complete_pending_grid_transition,
     decide_grid_transition,
+    grid_hedge_imbalance_tolerance,
     grid_transition_completion_tolerance,
+    reduce_grid_hedge_repair_execution,
+    reduce_grid_transition_execution,
     reduce_partial_grid_transition,
 )
 from execution.grid_state_machine import GridStateMachine
@@ -152,3 +155,189 @@ def test_execution_reconcile_io_plan_matches_golden_cases_without_mutation() -> 
         assert actual == case["expected"], case["name"]
         assert rule == original_rule, case["name"]
         assert run == original_run, case["name"]
+
+
+def _legacy_reduce_execution_reconcile_after_refresh(
+    rule, *, run, quantities, reconcile_error, active_snapshot
+):
+    snapshot = active_snapshot or rule
+    execution_id = str(
+        snapshot.get("active_execution_id")
+        or rule.get("active_execution_id")
+        or ""
+    )
+    execution_status = str(run.get("status") or "")
+    active_action = str(rule.get("active_action") or "")
+    try:
+        start_hedged_qty = (
+            None
+            if rule.get("active_start_hedged_qty") is None
+            else float(rule.get("active_start_hedged_qty"))
+        )
+    except (TypeError, ValueError):
+        start_hedged_qty = None
+    reconcile_reducer = (
+        "hedge_repair_execution"
+        if active_action == "repair"
+        else (
+            "transition_execution"
+            if rule.get("pending_transition")
+            else "settle_without_transition"
+        )
+    )
+    for key in (
+        "active_execution_id",
+        "active_action",
+        "active_from_level",
+        "active_to_level",
+        "active_target_qty",
+        "active_start_hedged_qty",
+    ):
+        rule[key] = None
+    if quantities is None:
+        rule["active_execution_id"] = execution_id
+        for key in (
+            "active_action",
+            "active_from_level",
+            "active_to_level",
+            "active_target_qty",
+            "active_start_hedged_qty",
+        ):
+            rule[key] = snapshot.get(key)
+        rule["status"] = "waiting_reconcile"
+        rule["blocked_reason"] = (
+            f"position_refresh_failed: {reconcile_error}"
+            if reconcile_error
+            else f"execution_{execution_status or 'unknown'}"
+        )
+        rule["next_eligible_ts"] = NOW_TS + 30.0
+        return {
+            "completed": False,
+            "repair_required": False,
+            "event": {
+                "event": "live_reconcile_deferred",
+                "error": reconcile_error or run.get("error"),
+                "result": run.get("result"),
+            },
+        }
+
+    hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+    imbalance_qty = float(quantities.get("imbalance_qty") or 0.0)
+    transition = dict(rule.get("pending_transition") or {})
+    total_transition_qty = max(0.0, float(transition.get("target_qty") or 0.0))
+    hedge_tolerance = grid_hedge_imbalance_tolerance(
+        rule,
+        transition_qty=total_transition_qty or None,
+        hedged_qty=hedged_qty,
+    )
+    rule["actual_hedged_qty"] = hedged_qty
+    rule["last_execution"] = {
+        "execution_id": execution_id,
+        "status": execution_status,
+        "error": run.get("error"),
+        "result": run.get("result"),
+        "observed_hedged_qty": hedged_qty,
+        "observed_imbalance_qty": imbalance_qty,
+        "reconciled_at": NOW_ISO,
+    }
+    completed = False
+    repair_required = False
+    event = {}
+    if reconcile_reducer == "hedge_repair_execution":
+        reduced = reduce_grid_hedge_repair_execution(
+            rule,
+            transition=transition,
+            execution_status=execution_status,
+            execution_error=run.get("error"),
+            execution_result=run.get("result"),
+            hedged_qty=hedged_qty,
+            imbalance_qty=imbalance_qty,
+            hedge_tolerance=hedge_tolerance,
+            now_ts=NOW_TS,
+            retry_sec=RETRY_SEC,
+        )
+        event.update(reduced["event"])
+        repair_required = bool(reduced["retry_repair"])
+        completed = bool(reduced["completed"])
+    elif reconcile_reducer == "transition_execution":
+        reduced = reduce_grid_transition_execution(
+            rule,
+            transition=transition,
+            active_action=active_action,
+            execution_id=execution_id,
+            execution_status=execution_status,
+            execution_error=run.get("error"),
+            execution_result=run.get("result"),
+            hedged_qty=hedged_qty,
+            imbalance_qty=imbalance_qty,
+            start_hedged_qty=start_hedged_qty,
+            now_iso=NOW_ISO,
+            now_ts=NOW_TS,
+            retry_sec=RETRY_SEC,
+        )
+        event.update(reduced["event"])
+        repair_required = bool(reduced["repair_required"])
+        completed = bool(reduced["completed"])
+    else:
+        rule["status"] = "monitoring"
+        rule["blocked_reason"] = None
+        completed = True
+    if (
+        not rule.get("enabled")
+        and imbalance_qty <= hedge_tolerance
+        and not repair_required
+    ):
+        rule["status"] = "paused"
+        rule["blocked_reason"] = None
+        rule["next_eligible_ts"] = 0.0
+    return {
+        "completed": completed,
+        "repair_required": repair_required,
+        "event": event,
+    }
+
+
+def test_execution_reconcile_after_refresh_matches_legacy_golden_cases() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "grid_execution_reconcile_after_refresh_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = GridStateMachine()
+    for case in cases:
+        legacy_rule = deepcopy(case["rule"])
+        machine_rule = deepcopy(case["rule"])
+        kwargs = {
+            "run": deepcopy(case["run"]),
+            "quantities": deepcopy(case.get("quantities")),
+            "reconcile_error": case.get("reconcile_error"),
+            "active_snapshot": deepcopy(case.get("active_snapshot")),
+        }
+        expected_result = _legacy_reduce_execution_reconcile_after_refresh(
+            legacy_rule,
+            **deepcopy(kwargs),
+        )
+        actual_result = machine.reduce_execution_reconcile_after_refresh(
+            machine_rule,
+            **deepcopy(kwargs),
+            now_iso=NOW_ISO,
+            now_ts=NOW_TS,
+            retry_sec=RETRY_SEC,
+        )
+        assert machine_rule == legacy_rule, case["name"]
+        assert actual_result == expected_result, case["name"]
+        expected = case["expected"]
+        assert actual_result["completed"] == expected["completed"], case["name"]
+        assert (
+            actual_result["repair_required"] == expected["repair_required"]
+        ), case["name"]
+        assert (
+            actual_result["event"].get("event") == expected["event"]
+        ), case["name"]
+        assert machine_rule["status"] == expected["status"], case["name"]
+        if "next_eligible_ts" in expected:
+            assert (
+                machine_rule["next_eligible_ts"] == expected["next_eligible_ts"]
+            ), case["name"]

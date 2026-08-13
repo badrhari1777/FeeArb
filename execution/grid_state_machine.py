@@ -7,7 +7,10 @@ from .auto_arb_grid import (
     build_grid_pending_transition,
     complete_pending_grid_transition,
     decide_grid_transition,
+    grid_hedge_imbalance_tolerance,
     grid_transition_completion_tolerance,
+    reduce_grid_hedge_repair_execution,
+    reduce_grid_transition_execution,
     reduce_partial_grid_transition,
 )
 
@@ -222,3 +225,150 @@ class GridStateMachine:
             "requires_position_refresh": True,
             "reducer": reducer,
         }
+
+    def reduce_execution_reconcile_after_refresh(
+        self,
+        rule: dict[str, Any],
+        *,
+        run: Mapping[str, Any],
+        quantities: Mapping[str, Any] | None,
+        reconcile_error: str | None,
+        active_snapshot: Mapping[str, Any] | None,
+        now_iso: str,
+        now_ts: float,
+        retry_sec: float,
+    ) -> dict[str, Any]:
+        """Reduce a terminal execution after the caller's position refresh."""
+        snapshot = active_snapshot or rule
+        intent = self.plan_execution_reconcile_io(rule, run=run)
+        reconcile_reducer = intent.get("reducer")
+        execution_id = str(
+            snapshot.get("active_execution_id")
+            or rule.get("active_execution_id")
+            or ""
+        )
+        execution_status = str(run.get("status") or "")
+        active_action = str(rule.get("active_action") or "")
+        start_hedged_qty = self._optional_float(rule.get("active_start_hedged_qty"))
+
+        rule["active_execution_id"] = None
+        rule["active_action"] = None
+        rule["active_from_level"] = None
+        rule["active_to_level"] = None
+        rule["active_target_qty"] = None
+        rule["active_start_hedged_qty"] = None
+
+        if quantities is None:
+            rule["active_execution_id"] = execution_id
+            rule["active_action"] = snapshot.get("active_action")
+            rule["active_from_level"] = snapshot.get("active_from_level")
+            rule["active_to_level"] = snapshot.get("active_to_level")
+            rule["active_target_qty"] = snapshot.get("active_target_qty")
+            rule["active_start_hedged_qty"] = snapshot.get(
+                "active_start_hedged_qty"
+            )
+            rule["status"] = "waiting_reconcile"
+            rule["blocked_reason"] = (
+                f"position_refresh_failed: {reconcile_error}"
+                if reconcile_error
+                else f"execution_{execution_status or 'unknown'}"
+            )
+            rule["next_eligible_ts"] = now_ts + 30.0
+            return {
+                "completed": False,
+                "repair_required": False,
+                "event": {
+                    "event": "live_reconcile_deferred",
+                    "error": reconcile_error or run.get("error"),
+                    "result": run.get("result"),
+                },
+            }
+
+        hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+        imbalance_qty = float(quantities.get("imbalance_qty") or 0.0)
+        transition = dict(rule.get("pending_transition") or {})
+        total_transition_qty = max(
+            0.0,
+            float(transition.get("target_qty") or 0.0),
+        )
+        hedge_tolerance = grid_hedge_imbalance_tolerance(
+            rule,
+            transition_qty=total_transition_qty or None,
+            hedged_qty=hedged_qty,
+        )
+        rule["actual_hedged_qty"] = hedged_qty
+        rule["last_execution"] = {
+            "execution_id": execution_id,
+            "status": execution_status,
+            "error": run.get("error"),
+            "result": run.get("result"),
+            "observed_hedged_qty": hedged_qty,
+            "observed_imbalance_qty": imbalance_qty,
+            "reconciled_at": now_iso,
+        }
+
+        repair_required = False
+        completed = False
+        event: dict[str, Any] = {}
+        if reconcile_reducer == "hedge_repair_execution":
+            reduced = reduce_grid_hedge_repair_execution(
+                rule,
+                transition=transition,
+                execution_status=execution_status,
+                execution_error=run.get("error"),
+                execution_result=run.get("result"),
+                hedged_qty=hedged_qty,
+                imbalance_qty=imbalance_qty,
+                hedge_tolerance=hedge_tolerance,
+                now_ts=now_ts,
+                retry_sec=retry_sec,
+            )
+            event.update(reduced["event"])
+            repair_required = bool(reduced["retry_repair"])
+            completed = bool(reduced["completed"])
+        elif reconcile_reducer == "transition_execution":
+            reduced = reduce_grid_transition_execution(
+                rule,
+                transition=transition,
+                active_action=active_action,
+                execution_id=execution_id,
+                execution_status=execution_status,
+                execution_error=run.get("error"),
+                execution_result=run.get("result"),
+                hedged_qty=hedged_qty,
+                imbalance_qty=imbalance_qty,
+                start_hedged_qty=start_hedged_qty,
+                now_iso=now_iso,
+                now_ts=now_ts,
+                retry_sec=retry_sec,
+            )
+            event.update(reduced["event"])
+            repair_required = bool(reduced["repair_required"])
+            completed = bool(reduced["completed"])
+        else:
+            rule["status"] = "monitoring"
+            rule["blocked_reason"] = None
+            completed = True
+
+        if (
+            not rule.get("enabled")
+            and imbalance_qty <= hedge_tolerance
+            and not repair_required
+        ):
+            rule["status"] = "paused"
+            rule["blocked_reason"] = None
+            rule["next_eligible_ts"] = 0.0
+        return {
+            "completed": completed,
+            "repair_required": repair_required,
+            "event": event,
+        }
+
+    @staticmethod
+    def _optional_float(value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
