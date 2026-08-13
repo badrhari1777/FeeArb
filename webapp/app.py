@@ -27,6 +27,7 @@ from .services import (
 from .manual_stream import ManualSpreadStream
 from .manual_trade_stream import ManualTradeStream
 from .balance_views import with_pump_account_balances
+from .dashboard import build_dashboard_payload
 from .positions_overview import build_positions_overview
 from .ws_trade_raw import WsTradeRawStream
 from .ws_trade_private_raw import WsTradePrivateRawStream
@@ -54,7 +55,7 @@ from strategy_lab import StrategyLabObservatory
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-08-12-strategy-lab-observatory-v2"
+STATIC_VERSION = "v2026-08-13-dashboard-v2"
 
 app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -93,6 +94,15 @@ def _ui_state_payload() -> dict[str, object]:
         service.state_payload(),
         bybit_pump_short_lab.pump_live_status(),
         accounts_key="accounts",
+    )
+
+
+def _dashboard_payload() -> dict[str, object]:
+    pump_status = bybit_pump_short_lab.pump_live_status()
+    return build_dashboard_payload(
+        service.dashboard_runtime_payload(),
+        service.mobile_positions_payload(include_auto_exit=False),
+        pump_status,
     )
 
 
@@ -486,12 +496,12 @@ async def favicon() -> FileResponse:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
-    state = _ui_state_payload()
+    dashboard = _dashboard_payload()
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
-            "state": state,
+            "dashboard": dashboard,
             "static_version": STATIC_VERSION,
         },
     )
@@ -693,6 +703,11 @@ async def spread_monitor_page(request: Request) -> HTMLResponse:
 @app.get("/api/snapshot")
 async def snapshot_api() -> JSONResponse:
     return JSONResponse(jsonable_encoder(_ui_state_payload()))
+
+
+@app.get("/api/dashboard")
+async def dashboard_api() -> JSONResponse:
+    return JSONResponse(jsonable_encoder(_dashboard_payload()))
 
 
 @app.get("/api/strategy-lab/observatory")

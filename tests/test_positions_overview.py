@@ -197,7 +197,7 @@ class PositionsOverviewApiTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("pp-pump-stress-headroom", body)
         self.assertNotIn("Emergency close all", body)
 
-    async def test_main_page_exposes_all_main_and_pump_position_tabs(self) -> None:
+    async def test_main_page_exposes_compact_operational_dashboard(self) -> None:
         request = Request(
             {
                 "type": "http",
@@ -211,13 +211,17 @@ class PositionsOverviewApiTestCase(unittest.IsolatedAsyncioTestCase):
                 "server": ("127.0.0.1", 8000),
             }
         )
-        with patch.object(webapp_app.service, "state_payload", return_value={"status": "ready"}):
+        with patch.object(webapp_app, "_dashboard_payload", return_value={"schema": "dashboard_v2"}):
             response = await webapp_app.index(request)
         body = response.body.decode("utf-8")
 
-        self.assertIn('data-positions-tab="all"', body)
-        self.assertIn('data-positions-tab="main"', body)
-        self.assertIn('data-positions-tab="pump"', body)
+        self.assertIn("/static/dashboard.js", body)
         self.assertIn('href="/positions"', body)
-        self.assertIn("Position now", body)
-        self.assertIn("Next funding", body)
+        self.assertIn('href="/spread-monitor"', body)
+        self.assertIn('href="/funding-history"', body)
+        self.assertIn('href="/auto-arbitrage"', body)
+        self.assertIn('id="main-positions-body"', body)
+        self.assertIn('id="pump-positions-body"', body)
+        self.assertIn('class="settings-disclosure"', body)
+        self.assertNotIn('href="/strategies"', body)
+        self.assertNotIn("Coin analysis", body)

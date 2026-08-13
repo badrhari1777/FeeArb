@@ -1,1053 +1,221 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
   <meta charset="utf-8" />
-  <title>Funding Arbitrage Monitor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FeeArb Control Center</title>
   {% set rp = request.scope.get('root_path', '') %}
   <link rel="icon" type="image/svg+xml" href="{{ rp }}/static/favicon.svg?v={{ static_version }}">
   <link rel="stylesheet" href="{{ rp }}/static/styles.css?v={{ static_version }}" />
-  {% set snapshot = {} %}
-  {% set status = state.get('status', 'idle') %}
-  {% set status_class = status|lower|replace(' ', '-') %}
-  {% set settings = state.get('settings', {}) %}
-{% set refresh_interval = settings.get('table_refresh_seconds', state.get('refresh_interval', 300)) %}
-{% set account_interval = settings.get('account_refresh_seconds', state.get('account_refresh_interval', 90)) %}
-{% set positions_market_interval = settings.get('positions_market_refresh_seconds', state.get('positions_market_refresh_interval', 30)) %}
-  {% set exchange_status_rows = state.get('exchange_status', []) %}
-  {% set events = state.get('events', []) %}
-  {% set last_event = events[-1] if events %}
-  {% set accounts = state.get('accounts', {}) %}
-  {% set manual_settings = settings.get('manual', {}) %}
-  {% set auto_exit_policy = manual_settings.get('auto_exit_policy', {}) %}
-  {% set account_status_rows = accounts.get('status', []) %}
-  {% set account_balance_rows = accounts.get('balances', []) %}
-  {% set balance_summary = accounts.get('balance_summary', {}) %}
-  {% set balance_overall = balance_summary.get('overall', {}) %}
-  {% set balance_bybit_main = balance_summary.get('bybit_main', {}) %}
-  {% set balance_bybit_pump = balance_summary.get('bybit_pump', {}) %}
-  {% set balance_bybit_combined = balance_summary.get('bybit_combined', {}) %}
-  {% set symbol_position_rows = accounts.get('positions_by_symbol', []) %}
-  {% set account_last_checked = accounts.get('last_updated') %}
   <script>
-    window.__INITIAL_STATE__ = {{ state | tojson | safe }};
+    window.__ROOT_PATH__ = {{ rp | tojson | safe }};
+    window.__INITIAL_DASHBOARD__ = {{ dashboard | tojson | safe }};
   </script>
-  <script defer src="{{ rp }}/static/app.js?v={{ static_version }}"></script>
+  <script defer src="{{ rp }}/static/dashboard.js?v={{ static_version }}"></script>
 </head>
-<body class="page">
-  <header class="masthead">
-    <div>
-      <h1>Funding Arbitrage Monitor</h1>
-      <p class="subtitle">Positions, balances, protection and execution controls</p>
+<body class="page page--dashboard">
+  <header class="dashboard-hero">
+    <div class="dashboard-hero__copy">
+      <span class="dashboard-eyebrow">FeeArb · operational control center</span>
+      <h1>Портфель под контролем</h1>
+      <p>Балансы, реальные позиции, защита, Pump Live и Grid — без устаревших торговых гипотез.</p>
     </div>
-    <div class="status-block">
+    <div class="dashboard-hero__status">
+      <div class="dashboard-live-line">
+        <span id="dashboard-status" class="status-pill status-pill--pending">загрузка</span>
+        <span id="dashboard-risk" class="status-pill status-pill--pending">проверка риска</span>
+      </div>
       <dl>
-        <div>
-          <dt>Status</dt>
-          <dd>
-            <span id="status-pill" class="status-pill status-pill--{{ status_class }}">{{ status }}</span>
-          </dd>
-        </div>
-        <div>
-          <dt>Last Updated</dt>
-          <dd id="last-updated">{{ account_last_checked or state.get('last_updated') or "-" }}</dd>
-        </div>
-        <div>
-          <dt>Last error</dt>
-          {% set last_error = state.get('last_error') %}
-          <dd id="last-error" title="{{ last_error or '' }}">{{ last_error or "None" }}</dd>
-        </div>
-        <div>
-          <dt>Last progress</dt>
-          <dd id="last-progress">
-            {% if last_event %}
-              {{ last_event.payload.message or last_event.event }}
-            {% else %}
-              -
-            {% endif %}
-          </dd>
-        </div>
-        <div>
-          <dt>Exchange responses</dt>
-          <dd id="exchange-summary">
-            {% if exchange_status_rows %}
-              {{ exchange_status_rows | length }} tracked
-            {% else %}
-              -
-            {% endif %}
-          </dd>
-        </div>
+        <div><dt>Данные аккаунтов</dt><dd id="dashboard-updated">—</dd></div>
+        <div><dt>Следующее обновление</dt><dd id="dashboard-countdown">—</dd></div>
+        <div><dt>Последняя ошибка</dt><dd id="dashboard-error">нет</dd></div>
       </dl>
-      <a class="button" href="/manual">Manual trading</a>
-      <a class="button" href="/positions">Positions</a>
-      <a class="button" href="/strategies">Strategies</a>
-      <a class="button" href="/funding-history">Funding history</a>
-      <a class="button" href="/pump-short-lab">Pump Short Lab</a>
-      <a class="button" href="/strategy-lab-observatory">Strategy Lab</a>
-      <p class="hint">UI refresh: {{ refresh_interval }} s | Account refresh: {{ account_interval }} s | Positions market: {{ positions_market_interval }} s</p>
+      <button type="button" class="button" id="dashboard-refresh">Обновить сейчас</button>
     </div>
   </header>
 
-  <main class="content">
-    <section class="panel">
-      <h2>Coin analysis</h2>
-      <form id="quick-analyze-form" class="analysis-form">
-        <label>
-          Symbol
-          <input type="text" id="quick-analyze-input" placeholder="e.g. BTCUSDT" autocomplete="off" />
-        </label>
-        <label>
-          1m window (minutes)
-          <input type="number" id="quick-window-input" min="60" max="4320" step="60" value="4320" />
-        </label>
-        <label>
-          Funding points
-          <input type="number" id="quick-funding-input" min="24" max="200" step="4" value="120" />
-        </label>
-        <button type="submit" class="button" id="quick-analyze-button">Анализировать</button>
-        <span class="settings-status" id="quick-analyze-status" aria-live="polite"></span>
-      </form>
-      <p class="muted">Или нажмите на символ в таблице возможностей, чтобы открыть детальный вид.</p>
-    </section>
-    <section class="panel" id="settings-panel">
-      <h2>Configuration</h2>
-      <form id="settings-form">
-        <fieldset class="settings-fieldset">
-          <legend>Exchanges (analysis)</legend>
-          {% set analysis_exchanges = settings.get('analysis_exchanges', {}) %}
-          {% for name, enabled in analysis_exchanges.items() %}
-          <label class="settings-checkbox">
-            <input type="checkbox" name="analysis_exchanges" value="{{ name }}"{% if enabled %} checked{% endif %} />
-            {{ name|upper }}
-          </label>
-          {% endfor %}
-        </fieldset>
-        <div class="settings-intervals">
-          <label>
-            UI refresh (seconds)
-            <input type="number" id="table-interval" min="30" max="86400" step="1" value="{{ refresh_interval }}" />
-          </label>
-          <label>
-            Account refresh (seconds)
-            <input type="number" id="account-interval" min="30" max="86400" step="1" value="{{ account_interval }}" />
-          </label>
-          <label>
-            Positions market refresh (seconds)
-            <input type="number" id="positions-market-interval" min="30" max="86400" step="1" value="{{ positions_market_interval }}" />
-          </label>
-        </div>
-        <p class="settings-note muted">Candidate discovery moved to the research-only Strategy Lab Observatory.</p>
-        <fieldset class="settings-fieldset">
-          <legend>Protective orders</legend>
-          <div class="settings-intervals">
-            <label>
-              Notification primary
-              <select id="notification-primary">
-                <option value="telegram" {% if settings.get('protective', {}).get('notification_primary_channel', 'ntfy') == 'telegram' %}selected{% endif %}>Telegram</option>
-                <option value="pushbullet" {% if settings.get('protective', {}).get('notification_primary_channel', 'ntfy') == 'pushbullet' %}selected{% endif %}>Pushbullet</option>
-                <option value="ntfy" {% if settings.get('protective', {}).get('notification_primary_channel', 'ntfy') == 'ntfy' %}selected{% endif %}>Ntfy</option>
-              </select>
-            </label>
-            <label>
-              Notification fallback
-              <select id="notification-fallback">
-                <option value="none" {% if settings.get('protective', {}).get('notification_fallback_channel', 'telegram') == 'none' %}selected{% endif %}>None</option>
-                <option value="telegram" {% if settings.get('protective', {}).get('notification_fallback_channel', 'telegram') == 'telegram' %}selected{% endif %}>Telegram</option>
-                <option value="pushbullet" {% if settings.get('protective', {}).get('notification_fallback_channel', 'telegram') == 'pushbullet' %}selected{% endif %}>Pushbullet</option>
-                <option value="ntfy" {% if settings.get('protective', {}).get('notification_fallback_channel', 'telegram') == 'ntfy' %}selected{% endif %}>Ntfy</option>
-              </select>
-            </label>
-          </div>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="protect-auto" {% if settings.get('protective', {}).get('auto_protect_enabled', True) %}checked{% endif %} />
-            Auto-place protective stops
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="take-auto" {% if settings.get('protective', {}).get('auto_take_enabled', True) %}checked{% endif %} />
-            Auto-place protective takes
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="alert-missing-stops" {% if settings.get('protective', {}).get('send_missing_stop_alerts', True) %}checked{% endif %} />
-            Notifications: missing stop/take
-          </label>
-          <div class="settings-intervals">
-            <label>
-              Stop gap from liq (decimal)
-              <input type="number" id="stop-gap" step="0.001" min="0" value="{{ settings.get('protective', {}).get('stop_gap_from_liq_pct', 0.025) }}" />
-            </label>
-            <label>
-              Requote threshold (decimal)
-              <input type="number" id="stop-requote" step="0.001" min="0" value="{{ settings.get('protective', {}).get('stop_requote_threshold_pct', 0.0025) }}" />
-            </label>
-            <label>
-              Fallback liq (long, multiplier)
-              <input type="number" id="fallback-long" step="0.01" min="0" value="{{ settings.get('protective', {}).get('fallback_liq_factor_long', 0.33) }}" />
-            </label>
-            <label>
-              Fallback liq (short, multiplier)
-              <input type="number" id="fallback-short" step="0.01" min="0" value="{{ settings.get('protective', {}).get('fallback_liq_factor_short', 1.66) }}" />
-            </label>
-          </div>
-          <div class="settings-intervals">
-            <label class="settings-checkbox">
-              <input type="checkbox" id="rebalance-auto" {% if settings.get('protective', {}).get('auto_rebalance_enabled', False) %}checked{% endif %} />
-              Auto rebalance legs (limit -> market, excludes MEXC)
-            </label>
-            <label>
-              Rebalance delta (decimal)
-              <input type="number" id="rebalance-delta" step="0.01" min="0" max="1" value="{{ settings.get('protective', {}).get('rebalance_delta_pct', 0.2) }}" />
-            </label>
-            <label>
-              Rebalance cooldown (seconds)
-              <input type="number" id="rebalance-cooldown" step="1" min="0" value="{{ settings.get('protective', {}).get('rebalance_cooldown_sec', 120) }}" />
-            </label>
-            <label>
-              Rebalance limit timeout (seconds)
-              <input type="number" id="rebalance-timeout" step="1" min="1" value="{{ settings.get('protective', {}).get('rebalance_limit_timeout_sec', 10) }}" />
-            </label>
-            <label>
-              Rebalance limit offset (bps)
-              <input type="number" id="rebalance-offset" step="0.1" min="0" value="{{ settings.get('protective', {}).get('rebalance_limit_offset_bps', 2) }}" />
-            </label>
-            <label>
-              Rebalance max slippage (bps)
-              <input type="number" id="rebalance-slippage" step="0.1" min="0" value="{{ settings.get('protective', {}).get('rebalance_max_slippage_bps', 8) }}" />
-            </label>
-          </div>
-        </fieldset>
-        <fieldset class="settings-fieldset">
-          <legend>Auto Exit</legend>
-          <div class="settings-intervals">
-            <label>
-              Exit runtime (seconds)
-              <input type="number" id="auto-exit-runtime" min="30" max="86400" step="1" value="600" />
-            </label>
-            <label>
-              Cooldown (seconds)
-              <input type="number" id="auto-exit-cooldown" min="0" max="86400" step="1" value="300" />
-            </label>
-          </div>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="auto-exit-require-live" checked />
-            Require live spread (WS)
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="auto-exit-restore-spread" checked />
-            Restore spread toggles after missing positions
-          </label>
-          <div class="settings-actions">
-            <button class="button button-secondary" type="button" id="auto-exit-clear-spread-cache">Clear spread cache</button>
-            <span class="settings-note muted">Disables saved spread auto-exit toggles; v1-only rules stay enabled.</span>
-          </div>
-          <div class="settings-intervals">
-            <label>
-              Binance chunk cap (USDT)
-              <input type="number" id="auto-exit-tier1-chunk-cap" min="0" step="100" value="{{ auto_exit_policy.get('tier1', {}).get('chunk_notional_cap_usd', 25000.0) }}" />
-            </label>
-            <label>
-              Binance market cleanup cap (USDT)
-              <input type="number" id="auto-exit-tier1-cleanup-cap" min="0" step="100" value="{{ auto_exit_policy.get('tier1', {}).get('market_cleanup_notional_cap_usd', 15000.0) }}" />
-            </label>
-            <label>
-              Binance edge buffer (bps)
-              <input type="number" id="auto-exit-tier1-edge-buffer" min="0" step="0.1" value="{{ auto_exit_policy.get('tier1', {}).get('edge_buffer_bps', 2.0) }}" />
-            </label>
-          </div>
-          <div class="settings-intervals">
-            <label>
-              OKX chunk cap (USDT)
-              <input type="number" id="auto-exit-tier2-chunk-cap" min="0" step="100" value="{{ auto_exit_policy.get('tier2', {}).get('chunk_notional_cap_usd', 10000.0) }}" />
-            </label>
-            <label>
-              OKX market cleanup cap (USDT)
-              <input type="number" id="auto-exit-tier2-cleanup-cap" min="0" step="100" value="{{ auto_exit_policy.get('tier2', {}).get('market_cleanup_notional_cap_usd', 2500.0) }}" />
-            </label>
-            <label>
-              OKX edge buffer (bps)
-              <input type="number" id="auto-exit-tier2-edge-buffer" min="0" step="0.1" value="{{ auto_exit_policy.get('tier2', {}).get('edge_buffer_bps', 4.0) }}" />
-            </label>
-          </div>
-          <div class="settings-intervals">
-            <label>
-              Lower-tier chunk cap (USDT)
-              <input type="number" id="auto-exit-lower-chunk-cap" min="0" step="100" value="{{ auto_exit_policy.get('lower_tier', {}).get('chunk_notional_cap_usd', 2500.0) }}" />
-            </label>
-            <label>
-              Lower-tier market cleanup cap (USDT)
-              <input type="number" id="auto-exit-lower-cleanup-cap" min="0" step="100" value="{{ auto_exit_policy.get('lower_tier', {}).get('market_cleanup_notional_cap_usd', 0.0) }}" />
-            </label>
-            <label>
-              Lower-tier edge buffer (bps)
-              <input type="number" id="auto-exit-lower-edge-buffer" min="0" step="0.1" value="{{ auto_exit_policy.get('lower_tier', {}).get('edge_buffer_bps', 8.0) }}" />
-            </label>
-          </div>
-          <p class="settings-note muted">Tier mapping: Binance = tier1, OKX = tier2, all other venues = lower-tier.</p>
-        </fieldset>
-        <fieldset class="settings-fieldset">
-          <legend>Margin control</legend>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="auto-margin-add" {% if settings.get('protective', {}).get('auto_margin_enabled', True) %}checked{% endif %} />
-            Auto add margin (isolated)
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="auto-margin-reduce" {% if settings.get('protective', {}).get('auto_margin_reduce_enabled', False) %}checked{% endif %} />
-            Auto reduce margin (isolated)
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="alert-margin" {% if settings.get('protective', {}).get('send_margin_alerts', True) %}checked{% endif %} />
-            Notifications: margin top-up failed
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="enforce-isolated-margin" {% if settings.get('protective', {}).get('enforce_isolated_margin', True) %}checked{% endif %} />
-            Enforce isolated margin mode
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="enforce-leverage" {% if settings.get('protective', {}).get('enforce_leverage', True) %}checked{% endif %} />
-            Enforce target leverage
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="kucoin-topup-only" {% if settings.get('protective', {}).get('kucoin_isolated_topup_only', True) %}checked{% endif %} />
-            KuCoin isolated: top-up only
-          </label>
-          <div class="settings-intervals">
-            <label>
-              Target leverage
-              <input type="number" id="target-leverage" step="0.1" min="0.1" value="{{ settings.get('protective', {}).get('target_leverage', 3.0) }}" />
-            </label>
-          </div>
-          <p class="settings-note muted">KuCoin isolated top-up only blocks auto margin reduction on KuCoin and only adds margin when effective leverage rises above target.</p>
-        </fieldset>
-        <fieldset class="settings-fieldset">
-          <legend>Emergency De-Risk</legend>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="derisk-enabled" {% if settings.get('protective', {}).get('auto_derisk_enabled', False) %}checked{% endif %} />
-            Enable emergency de-risk
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="derisk-shadow-mode" {% if settings.get('protective', {}).get('auto_derisk_shadow_mode', True) %}checked{% endif %} />
-            Shadow mode only
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="orphan-cleanup-enabled" {% if settings.get('protective', {}).get('orphan_cleanup_enabled', True) %}checked{% endif %} />
-            Orphan detection / cleanup
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="derisk-market-cleanup-only-emergency" {% if settings.get('protective', {}).get('derisk_market_cleanup_only_in_emergency', True) %}checked{% endif %} />
-            Market cleanup only in panic
-          </label>
-          <div class="settings-intervals">
-            <label>
-              Poll (seconds)
-              <input type="number" id="derisk-poll-sec" step="1" min="2" value="{{ settings.get('protective', {}).get('derisk_poll_sec', 5) }}" />
-            </label>
-            <label>
-              Target buffer
-              <input type="number" id="derisk-target-buffer" step="0.01" min="0" value="{{ settings.get('protective', {}).get('derisk_target_buffer_pct', 0.30) }}" />
-            </label>
-            <label>
-              Warning buffer
-              <input type="number" id="derisk-warning-buffer" step="0.01" min="0" value="{{ settings.get('protective', {}).get('derisk_warning_buffer_pct', 0.20) }}" />
-            </label>
-            <label>
-              Panic buffer
-              <input type="number" id="derisk-panic-buffer" step="0.01" min="0" value="{{ settings.get('protective', {}).get('derisk_panic_buffer_pct', 0.15) }}" />
-            </label>
-            <label>
-              Recovery buffer
-              <input type="number" id="derisk-recovery-buffer" step="0.01" min="0" value="{{ settings.get('protective', {}).get('derisk_recovery_buffer_pct', 0.35) }}" />
-            </label>
-            <label>
-              Min free balance
-              <input type="number" id="derisk-min-free-balance" step="1" min="0" value="{{ settings.get('protective', {}).get('derisk_min_free_balance_abs', 500.0) }}" />
-            </label>
-          </div>
-          <div class="settings-intervals">
-            <label>
-              Stale positions max (sec)
-              <input type="number" id="derisk-stale-max" step="1" min="10" value="{{ settings.get('protective', {}).get('derisk_stale_positions_max_sec', 180) }}" />
-            </label>
-            <label>
-              Failure block count
-              <input type="number" id="derisk-failure-block" step="1" min="1" value="{{ settings.get('protective', {}).get('derisk_failure_block_count', 2) }}" />
-            </label>
-            <label>
-              Confirm cycles
-              <input type="number" id="derisk-confirm-cycles" step="1" min="1" value="{{ settings.get('protective', {}).get('derisk_confirm_cycles', 2) }}" />
-            </label>
-            <label>
-              Cooldown (sec)
-              <input type="number" id="derisk-cooldown-sec" step="1" min="0" value="{{ settings.get('protective', {}).get('derisk_cooldown_sec', 120) }}" />
-            </label>
-            <label>
-              Velocity trigger (bps)
-              <input type="number" id="derisk-velocity-bps" step="1" min="0" value="{{ settings.get('protective', {}).get('derisk_velocity_trigger_bps', 120.0) }}" />
-            </label>
-            <label>
-              Qty tolerance
-              <input type="number" id="derisk-qty-tolerance" step="0.01" min="0" value="{{ settings.get('protective', {}).get('derisk_qty_tolerance_pct', 0.10) }}" />
-            </label>
-          </div>
-          <div class="settings-intervals">
-            <label>
-              Max single action (USDT)
-              <input type="number" id="derisk-max-action-notional" step="10" min="0" value="{{ settings.get('protective', {}).get('derisk_max_single_action_notional_usd', 500.0) }}" />
-            </label>
-            <label>
-              Dust notional (USDT)
-              <input type="number" id="derisk-dust-notional" step="1" min="0" value="{{ settings.get('protective', {}).get('derisk_dust_notional_usd', 10.0) }}" />
-            </label>
-            <label>
-              Max candidate score
-              <input type="number" id="derisk-max-candidate-score" step="0.01" min="0" value="{{ settings.get('protective', {}).get('derisk_max_candidate_score', 0.25) }}" />
-            </label>
-            <label>
-              Preflight cache (sec)
-              <input type="number" id="derisk-preflight-ttl" step="1" min="1" value="{{ settings.get('protective', {}).get('derisk_preflight_ttl_sec', 60) }}" />
-            </label>
-          </div>
-          <p class="settings-note muted">Emergency de-risk only acts on confirmed hedged clusters. If exchange API health is stale/auth-failed, orphan detection is blocked and only diagnostics/logs update.</p>
-        </fieldset>
-        <div class="settings-actions">
-          <button type="submit" class="button" id="settings-submit">Save settings</button>
-          <span class="settings-status" id="settings-status" aria-live="polite"></span>
-        </div>
-      </form>
-    </section>
-    <section class="panel panel--alert" id="messages" style="display: none;">
-      <h2>Operational messages</h2>
-      <ul id="messages-list"></ul>
-    </section>
-    <section class="panel" id="account-status-panel">
-      <h2>Exchange API Status</h2>
-      <p class="muted">Last check: <span id="account-last-updated">{{ account_last_checked or "-" }}</span></p>
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Exchange</th>
-            <th>Status</th>
-            <th>Message</th>
-            <th>Checked</th>
-          </tr>
-        </thead>
-        <tbody id="account-status-body">
-          {% for row in account_status_rows %}
-            <tr>
-              <td>{{ row.exchange }}</td>
-              <td>{{ row.status }}</td>
-              <td>{{ row.message or row.error or "-" }}</td>
-              <td>{{ row.checked_at or "-" }}</td>
-            </tr>
-          {% endfor %}
-          {% if account_status_rows | length == 0 %}
-            <tr><td colspan="4" class="muted">No credential checks have been run yet.</td></tr>
-          {% endif %}
-        </tbody>
-      </table>
+  <nav class="dashboard-nav" aria-label="Основные разделы">
+    <a href="{{ rp }}/positions">Все позиции</a>
+    <a href="{{ rp }}/manual">Ручная торговля</a>
+    <a href="{{ rp }}/auto-arbitrage">Grid-бот</a>
+    <a href="{{ rp }}/spread-monitor">Ручной монитор спреда</a>
+    <a href="{{ rp }}/funding-history">История фандинга</a>
+    <a href="{{ rp }}/pump-short-strategies">Pump Live</a>
+    <a href="{{ rp }}/strategy-lab-observatory">Strategy Lab</a>
+  </nav>
+
+  <main class="content content--dashboard">
+    <section class="dashboard-metrics" aria-label="Сводка портфеля">
+      <article class="dashboard-metric dashboard-metric--primary">
+        <span>Все аккаунты</span>
+        <strong id="metric-total">—</strong>
+        <small id="metric-total-note">доступно —</small>
+      </article>
+      <article class="dashboard-metric">
+        <span>Bybit Main</span>
+        <strong id="metric-bybit-main">—</strong>
+        <small id="metric-bybit-main-note">доступно —</small>
+      </article>
+      <article class="dashboard-metric">
+        <span>Bybit Pump</span>
+        <strong id="metric-bybit-pump">—</strong>
+        <small id="metric-bybit-pump-note">доступно —</small>
+      </article>
+      <article class="dashboard-metric">
+        <span>Открытый PnL</span>
+        <strong id="metric-pnl">—</strong>
+        <small id="metric-pnl-note">Main — · Pump —</small>
+      </article>
+      <article class="dashboard-metric">
+        <span>Позиции</span>
+        <strong id="metric-positions">—</strong>
+        <small id="metric-positions-note">Main — · Pump —</small>
+      </article>
+      <article class="dashboard-metric">
+        <span>Минимум до ликвидации</span>
+        <strong id="metric-liq">—</strong>
+        <small id="metric-protection">защита проверяется</small>
+      </article>
     </section>
 
-    <section class="panel" id="perp-balances">
-      <h2>Perpetual Account Balances</h2>
-      <div class="balance-summary-grid" id="balance-summary-grid">
-        <article class="balance-summary-card">
-          <span>All accounts</span>
-          <strong id="balance-summary-overall">{{ balance_overall.get('total') | round(2) if balance_overall.get('total') is number else "-" }}</strong>
-          <small id="balance-summary-overall-available">Available {{ balance_overall.get('available') | round(2) if balance_overall.get('available') is number else "-" }} USDT</small>
-        </article>
-        <article class="balance-summary-card">
-          <span>Bybit main</span>
-          <strong id="balance-summary-bybit-main">{{ balance_bybit_main.get('total') | round(2) if balance_bybit_main.get('total') is number else "-" }}</strong>
-          <small id="balance-summary-bybit-main-available">Available {{ balance_bybit_main.get('available') | round(2) if balance_bybit_main.get('available') is number else "-" }} USDT</small>
-        </article>
-        <article class="balance-summary-card balance-summary-card--pump">
-          <span>Bybit Pump subaccount</span>
-          <strong id="balance-summary-bybit-pump">{{ balance_bybit_pump.get('total') | round(2) if balance_bybit_pump.get('total') is number else "-" }}</strong>
-          <small id="balance-summary-bybit-pump-available">Available {{ balance_bybit_pump.get('available') | round(2) if balance_bybit_pump.get('available') is number else "-" }} USDT</small>
-          <small id="balance-summary-bybit-pump-temporary">Temporarily occupied {{ balance_bybit_pump.get('temporary_occupied_usd') | round(2) if balance_bybit_pump.get('temporary_occupied_usd') is number else "-" }} USDT</small>
-        </article>
-        <article class="balance-summary-card balance-summary-card--combined">
-          <span>Bybit combined</span>
-          <strong id="balance-summary-bybit-combined">{{ balance_bybit_combined.get('total') | round(2) if balance_bybit_combined.get('total') is number else "-" }}</strong>
-          <small id="balance-summary-bybit-combined-available">Available {{ balance_bybit_combined.get('available') | round(2) if balance_bybit_combined.get('available') is number else "-" }} USDT</small>
-          <small id="balance-summary-bybit-combined-temporary">Temporarily occupied {{ balance_bybit_combined.get('temporary_occupied_usd') | round(2) if balance_bybit_combined.get('temporary_occupied_usd') is number else "-" }} USDT</small>
-        </article>
-      </div>
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Exchange</th>
-            <th>Account</th>
-            <th>Asset</th>
-            <th>Total</th>
-            <th>Available</th>
-            <th>In Use</th>
-            <th>Temporarily occupied</th>
-            <th>Margin Ratio</th>
-            <th>Equity</th>
-            <th>Buffer %</th>
-            <th>Status</th>
-            <th>Note</th>
-            <th>Updated</th>
-          </tr>
-        </thead>
-        <tbody id="account-balance-body">
-          {% for row in account_balance_rows %}
-            <tr>
-                <td>{{ row.exchange }}</td>
-                <td>{{ row.account_label or "Main account" }}</td>
-                <td>{{ row.asset }}</td>
-                <td>{{ row.total if row.total is not none else "-" }}</td>
-                <td>{{ row.available if row.available is not none else "-" }}</td>
-                <td>{{ row.used if row.used is not none else "-" }}</td>
-                <td>{{ row.temporary_occupied_usd if row.temporary_occupied_usd is not none else "-" }}</td>
-                <td>
-                {% if row.margin_ratio is number %}
-                  {{ row.margin_ratio | round(4) }}
-                {% else %}
-                  -
-                {% endif %}
-                </td>
-                <td>
-                {% if row.equity is number %}
-                  {{ row.equity | round(4) }}
-                {% else %}
-                  -
-                {% endif %}
-                </td>
-                <td>
-                {% if row.buffer_pct is number %}
-                  {{ row.buffer_pct | round(2) }}%
-                {% else %}
-                  -
-                {% endif %}
-                </td>
-                <td>{{ row.status or "ok" }}</td>
-                <td>{{ row.error or row.message or "-" }}</td>
-                <td>{{ row.timestamp or "-" }}</td>
-            </tr>
-          {% endfor %}
-          {% if account_balance_rows | length == 0 %}
-            <tr><td colspan="13" class="muted">Balances will appear after the first refresh.</td></tr>
-          {% endif %}
-        </tbody>
-      </table>
-    </section>
+    <section id="dashboard-alert" class="dashboard-alert" hidden></section>
 
-    <section class="panel" id="grid-strategies-panel">
-      <div class="panel-heading">
-        <h2>Grid Strategies</h2>
-        <a class="button button--ghost" href="/auto-arbitrage">Open Grid</a>
-      </div>
-      <div id="grid-strategies-list" class="auto-arb-rule-grid">
-        <p class="muted">No grid strategies.</p>
-      </div>
-    </section>
-
-    <section class="panel" id="live-strategies-panel">
-      <div class="panel-heading">
-        <h2>Live Auto Strategies</h2>
-        <a class="button button--ghost" href="/strategies">Open Strategies</a>
-      </div>
-      <div id="live-strategies-list" class="auto-arb-rule-grid">
-        <p class="muted">No live entry or exit strategies.</p>
-      </div>
-    </section>
-
-    <section class="panel" id="symbol-positions-panel">
+    <section class="panel dashboard-panel">
       <div class="panel-heading">
         <div>
-          <h2>Positions</h2>
-          <p class="muted">Main hedged positions and the dedicated Pump Live subaccount remain visibly separated.</p>
+          <span class="dashboard-section-kicker">Капитал</span>
+          <h2>Балансы бирж и аккаунтов</h2>
+          <p class="muted">USDT-балансы из последнего аккаунт-снимка. Pump показан отдельной строкой.</p>
         </div>
-        <a class="button button--ghost" href="/positions">Detailed positions</a>
+        <span id="balance-health" class="status-pill status-pill--pending">загрузка</span>
       </div>
-      <div class="positions-overview-band">
-        <div><span>Main</span><strong id="positions-summary-main">0</strong></div>
-        <div><span>Pump Live</span><strong id="positions-summary-pump">0 / 4</strong></div>
-        <div><span>Total PnL</span><strong id="positions-summary-pnl">$0.00</strong></div>
-        <div><span>Min liq buffer</span><strong id="positions-summary-liq">-</strong></div>
-        <div><span>Protection</span><strong id="positions-summary-protection">checking</strong></div>
-        <div><span>Pump cycle</span><strong id="positions-summary-pump-cycle">-</strong></div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table dashboard-table">
+          <thead><tr><th>Биржа</th><th>Аккаунт</th><th>Всего</th><th>Доступно</th><th>Использовано</th><th>Загрузка маржи</th><th>Статус</th><th>Обновлено</th></tr></thead>
+          <tbody id="balances-body"><tr><td colspan="8" class="muted">Загрузка балансов…</td></tr></tbody>
+        </table>
       </div>
-      <div class="positions-tabs" role="tablist" aria-label="Position module filter">
-        <button type="button" class="positions-tab is-active" data-positions-tab="all" role="tab" aria-selected="true">All positions</button>
-        <button type="button" class="positions-tab" data-positions-tab="main" role="tab" aria-selected="false">Main module</button>
-        <button type="button" class="positions-tab" data-positions-tab="pump" role="tab" aria-selected="false">Pump Live</button>
-      </div>
-      <div class="positions-pane" id="positions-main-pane" data-positions-pane="main">
-      <h3>Main hedged positions</h3>
-      <table class="data-table data-table--wide data-table--symbol-positions">
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Exchange</th>
-            <th>Quantity</th>
-            <th title="Current position exposure: absolute coin quantity multiplied by the current Mark Price"><span class="th-wrap">Position now<br>(USDT)</span></th>
-            <th>Entry</th>
-            <th>Mark</th>
-            <th>PnL</th>
-            <th><span class="th-wrap">Liq<br>Price</span></th>
-            <th><span class="th-wrap">Liq<br>Dist %</span></th>
-            <th>Lev.</th>
-            <th title="Funding rate for the venue funding interval">Funding / period</th>
-            <th title="Estimated next funding payment from the current Mark Price position value"><span class="th-wrap">Next funding<br>(USDT)</span></th>
-            <th><span class="th-wrap">Stop<br>Price</span></th>
-            <th><span class="th-wrap">Take<br>Price</span></th>
-            <th><span class="th-wrap">Next<br>Funding</span></th>
-            <th><span class="th-wrap">Live<br>Spread %</span></th>
-            <th>Auto Exit</th>
-            <th><span class="th-wrap">Exit<br>Spread %</span></th>
-            <th><span class="th-wrap">Position<br>Action</span></th>
-          </tr>
-        </thead>
-                <tbody id="symbol-positions-body">
-          {% for row in symbol_position_rows %}
-            {% set tone = '' %}
-            {% if row.type == 'summary' %}
-              {% set pnl = row.unrealized_pnl %}
-              {% set exp = row.expected_funding %}
-              {% set pnl_sign = 1 if pnl is number and pnl > 0 else (-1 if pnl is number and pnl < 0 else 0) %}
-              {% set exp_sign = 1 if exp is number and exp > 0 else (-1 if exp is number and exp < 0 else 0) %}
-              {% if pnl_sign == 1 and exp_sign == 1 %}
-                {% set tone = 'tone-pos' %}
-              {% elif pnl_sign == -1 and exp_sign == -1 %}
-                {% set tone = 'tone-neg' %}
-              {% else %}
-                {% set tone = 'tone-mixed' %}
-              {% endif %}
-            {% endif %}
-            <tr class="{{ ('summary-row ' + tone) if row.type == 'summary' else '' }}" data-symbol="{{ row.symbol or '' }}">
-              <td>{{ row.symbol }}</td>
-              <td>{{ row.exchange or "-" }}</td>
-              <td>{{ row.quantity }}</td>
-              <td>{{ row.amount | round(2) if row.amount is not none else "-" }}</td>
-              <td>{{ row.entry_price or "-" }}</td>
-              <td>{{ row.current_mark_price if row.type != 'summary' and row.current_mark_price is defined and row.current_mark_price is not none else (row.mark_price or "-") if row.type == 'summary' else "-" }}</td>
-              <td>{{ row.unrealized_pnl or "-" }}</td>
-              <td>{{ row.liquidation_price if row.liquidation_price is not none else "-" }}</td>
-              <td>
-                {% if row.dist_to_liq_pct is defined and row.dist_to_liq_pct is not none %}
-                  {{ row.dist_to_liq_pct | round(3) }}%
-                {% else %}
-                  -
-                {% endif %}
-              </td>
-              <td>{{ row.leverage if row.leverage is not none else "-" }}</td>
-              <td>
-                {% if row.funding_rate is not none %}
-                  {{ ((row.funding_rate or 0) * 100) | round(4) }}%{% if row.funding_interval_hours is defined and row.funding_interval_hours %} / {{ row.funding_interval_hours | round(2) }}h{% endif %}
-                {% else %}
-                  -
-                {% endif %}
-              </td>
-              <td>
-                {% if row.expected_funding is defined and row.expected_funding is not none %}
-                  {{ row.expected_funding | round(3) }}
-                {% else %}
-                  -
-                {% endif %}
-              </td>
-              <td>
-                {% if row.stop_price is defined and row.stop_price is not none %}
-                  {{ row.stop_price | round(6) }}
-                {% else %}
-                  -
-                {% endif %}
-              </td>
-              <td>
-                {% if row.take_price is defined and row.take_price is not none %}
-                  {{ row.take_price | round(6) }}
-                {% else %}
-                  -
-                {% endif %}
-              </td>
-              <td>{{ row.next_funding_eta or row.next_funding or "-" }}</td>
-              <td>-</td>
-              <td>-</td>
-              <td>-</td>
-              <td>-</td>
-            </tr>
-          {% endfor %}
-          {% if symbol_position_rows | length == 0 %}
-            <tr><td colspan="19" class="muted">No live positions detected.</td></tr>
-          {% endif %}
-        </tbody>
-      </table>
     </section>
 
-    <section class="panel" id="auto-exit-v1-diagnostics-panel">
-      <div class="panel-header">
-        <h2>Auto Exit V1 Diagnostics</h2>
-      </div>
-      <table class="data-table data-table--wide">
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Rule Pair</th>
-            <th>Selected Pair</th>
-            <th>Status</th>
-            <th>Stage</th>
-            <th>Interval Min</th>
-            <th>To Event Min</th>
-            <th>Funding bps</th>
-            <th>Close Now bps</th>
-            <th>Reversion bps</th>
-            <th>Wait Score</th>
-            <th>TP Need</th>
-            <th>TP K</th>
-            <th>Decision</th>
-            <th>Pending</th>
-          </tr>
-        </thead>
-        <tbody id="auto-exit-v1-diagnostics-body">
-          <tr><td colspan="15" class="muted">No Auto Exit V1 diagnostics yet.</td></tr>
-        </tbody>
-      </table>
-      <div class="muted" id="auto-exit-v1-diagnostics-empty">Rows appear for active auto-exit rules; `v1`-off rules stay monitor-only.</div>
-    </section>
-
-    <section class="panel" id="margin-diagnostics-panel">
-      <h2>Margin Diagnostics</h2>
-      <table class="data-table data-table--wide">
-        <thead>
-          <tr>
-            <th>Exchange</th>
-            <th>Symbol</th>
-            <th>Side</th>
-            <th>Mode</th>
-            <th>Lev.</th>
-            <th>Lev Source</th>
-            <th>Target Lev.</th>
-            <th>Liq Buffer %</th>
-            <th>Base Margin</th>
-            <th>Min Required</th>
-            <th>Max Add</th>
-            <th>Max Reduce</th>
-            <th>Decision</th>
-            <th>Reason</th>
-            <th>Updated</th>
-          </tr>
-        </thead>
-        <tbody id="margin-diagnostics-body">
-          <tr><td colspan="15" class="muted">Margin diagnostics will appear after the first refresh.</td></tr>
-        </tbody>
-      </table>
-      <div class="muted" id="margin-diagnostics-empty">No margin diagnostics yet.</div>
-      <div class="panel-subsection">
-        <h3>Margin Logic Log</h3>
-        <div class="log-box log-box--compact">
-          <ol class="event-log" id="margin-logic-log"></ol>
+    <section class="panel dashboard-panel">
+      <div class="panel-heading">
+        <div>
+          <span class="dashboard-section-kicker">Main account</span>
+          <h2>Основные позиции</h2>
+          <p class="muted" id="main-freshness">Реальные позиции, фандинг и биржевая защита.</p>
         </div>
-        <div class="muted" id="margin-logic-log-empty">No margin logic events yet.</div>
+        <a class="button button--ghost" href="{{ rp }}/positions">Подробный центр позиций</a>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table dashboard-table">
+          <thead><tr><th>Монета</th><th>Ноги</th><th>Текущая позиция</th><th>PnL</th><th>Фандинг до выплаты</th><th>Следующий фандинг</th><th>До ликвидации</th><th>Стопы / тейки</th><th>Риск</th></tr></thead>
+          <tbody id="main-positions-body"><tr><td colspan="9" class="muted">Загрузка позиций…</td></tr></tbody>
+        </table>
       </div>
     </section>
 
-    <section class="panel" id="derisk-health-panel">
-      <h2>Emergency De-Risk Exchange Health</h2>
-      <table class="data-table data-table--wide">
-        <thead>
-          <tr>
-            <th>Exchange</th>
-            <th>Health</th>
-            <th>Last Status</th>
-            <th>Failures</th>
-            <th>Stale Sec</th>
-            <th>Error Kind</th>
-            <th>Last Error</th>
-          </tr>
-        </thead>
-        <tbody id="derisk-exchange-health-body">
-          <tr><td colspan="7" class="muted">No exchange health data yet.</td></tr>
-        </tbody>
-      </table>
+    <section class="panel dashboard-panel dashboard-panel--pump">
+      <div class="panel-heading">
+        <div>
+          <span class="dashboard-section-kicker">Bybit subaccount</span>
+          <h2>Pump Live</h2>
+          <p class="muted" id="pump-freshness">Защитный цикл, лестницы и общий пул маржи.</p>
+        </div>
+        <div class="panel-actions">
+          <span id="pump-arm" class="status-pill status-pill--idle">disarmed</span>
+          <a class="button button--ghost" href="{{ rp }}/pump-short-strategies">Управление Pump</a>
+        </div>
       </div>
-      <div class="positions-pane" id="positions-pump-pane" data-positions-pane="pump">
+      <div class="dashboard-submetrics">
+        <div><span>Статус</span><strong id="pump-status">—</strong></div>
+        <div><span>Доступно</span><strong id="pump-available">—</strong></div>
+        <div><span>Резерв</span><strong id="pump-reserve">—</strong></div>
+        <div><span>Временно занято</span><strong id="pump-temporary">—</strong></div>
+        <div><span>Режим капитала</span><strong id="pump-regime">—</strong></div>
+        <div><span>Новые входы</span><strong id="pump-entry-headroom">—</strong></div>
+      </div>
+      <div class="table-wrapper table-wrapper--wide">
+        <table class="table dashboard-table">
+          <thead><tr><th>Монета</th><th>Ступени</th><th>Entry / Mark</th><th>PnL</th><th>Ликвидация / запас</th><th>TP / защитный SL</th><th>Доп. маржа</th><th>Следующая ступень</th><th>Время</th><th>Риск</th></tr></thead>
+          <tbody id="pump-positions-body"><tr><td colspan="10" class="muted">Загрузка Pump Live…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="dashboard-two-column">
+      <article class="panel dashboard-panel">
         <div class="panel-heading">
-          <h3>Pump Live positions</h3>
-          <a class="button button--ghost" href="/pump-short-strategies">Open Pump controls</a>
+          <div>
+            <span class="dashboard-section-kicker">Execution</span>
+            <h2>Grid-бот</h2>
+          </div>
+          <a class="button button--ghost" href="{{ rp }}/auto-arbitrage">Открыть Grid</a>
         </div>
-        <div class="table-wrapper table-wrapper--wide">
-          <table class="table table--compact">
-            <thead>
-              <tr>
-                <th>Symbol</th>
-                <th>Status</th>
-                <th>Qty</th>
-                <th>Entry / Mark</th>
-                <th>PnL</th>
-                <th>TP / Stop</th>
-                <th>Liq / Buffer</th>
-                <th>Top-up / Base / Cap</th>
-                <th>Legs</th>
-                <th>Time left</th>
-              </tr>
-            </thead>
-            <tbody id="positions-pump-body">
-              <tr><td colspan="10" class="muted">Pump Live positions are loading.</td></tr>
-            </tbody>
-          </table>
+        <div class="dashboard-submetrics dashboard-submetrics--compact">
+          <div><span>Правил</span><strong id="grid-total">0</strong></div>
+          <div><span>Включено</span><strong id="grid-enabled">0</strong></div>
+          <div><span>Активно</span><strong id="grid-active">0</strong></div>
         </div>
-      </div>
-    </section>
+        <div id="grid-rules" class="dashboard-list"><p class="muted">Grid-правила загружаются…</p></div>
+      </article>
 
-    <section class="panel" id="hedge-clusters-panel">
-      <div class="panel-header">
-        <h2>Hedge Clusters</h2>
-      </div>
-      <form id="hedge-cluster-form">
-        <div class="settings-intervals">
-          <label>
-            Symbol
-            <input type="text" id="hedge-cluster-symbol" placeholder="BTCUSDT" />
-          </label>
-          <label>
-            Kind
-            <select id="hedge-cluster-kind">
-              <option value="hedged_pair">Hedged pair</option>
-              <option value="standalone">Standalone</option>
-            </select>
-          </label>
-          <label>
-            Long exchange
-            <input type="text" id="hedge-cluster-long-exchange" placeholder="binance" />
-          </label>
-          <label>
-            Short exchange
-            <input type="text" id="hedge-cluster-short-exchange" placeholder="okx" />
-          </label>
-          <label>
-            Exchange
-            <input type="text" id="hedge-cluster-exchange" placeholder="gate" />
-          </label>
-          <label>
-            Side
-            <select id="hedge-cluster-side">
-              <option value="">Any</option>
-              <option value="long">Long</option>
-              <option value="short">Short</option>
-            </select>
-          </label>
-          <label>
-            Qty tolerance
-            <input type="number" id="hedge-cluster-qty-tolerance" step="0.01" min="0" value="0.10" />
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="hedge-cluster-enabled" checked />
-            Enabled
-          </label>
-          <label class="settings-checkbox">
-            <input type="checkbox" id="hedge-cluster-rehedge" />
-            Re-hedge allowed
-          </label>
+      <article class="panel dashboard-panel">
+        <div class="panel-heading">
+          <div>
+            <span class="dashboard-section-kicker">Runtime</span>
+            <h2>Рабочие контуры</h2>
+          </div>
         </div>
-        <div class="settings-actions">
-          <button type="submit" class="button" id="hedge-cluster-submit">Save cluster rule</button>
-          <span class="settings-status" id="hedge-cluster-status" aria-live="polite"></span>
-        </div>
-      </form>
-      <table class="data-table data-table--wide">
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Kind</th>
-            <th>Pair / Venue</th>
-            <th>Side</th>
-            <th>Enabled</th>
-            <th>Qty Tol.</th>
-            <th>Re-hedge</th>
-            <th>Source</th>
-            <th>Updated</th>
-          </tr>
-        </thead>
-        <tbody id="hedge-clusters-body">
-          <tr><td colspan="9" class="muted">No hedge clusters yet.</td></tr>
-        </tbody>
-      </table>
+        <div id="runtime-modules" class="module-registry"></div>
+        <p class="muted dashboard-runtime-note">Отключённые исследовательские и торговые гипотезы не запускают фоновые циклы.</p>
+      </article>
     </section>
 
-    <section class="panel" id="derisk-diagnostics-panel">
-      <h2>Emergency De-Risk Diagnostics</h2>
-      <table class="data-table data-table--wide">
-        <thead>
-          <tr>
-            <th>Kind</th>
-            <th>Symbol</th>
-            <th>Status</th>
-            <th>Reason</th>
-            <th>Long</th>
-            <th>Short</th>
-            <th>Health</th>
-            <th>Missing</th>
-            <th>Stress</th>
-            <th>Action Qty</th>
-            <th>Action Mode</th>
-            <th>Score</th>
-            <th>Residual</th>
-            <th>Funding Next</th>
-            <th>PNL</th>
-            <th>Updated</th>
-          </tr>
-        </thead>
-        <tbody id="derisk-diagnostics-body">
-          <tr><td colspan="16" class="muted">No emergency de-risk diagnostics yet.</td></tr>
-        </tbody>
-      </table>
-      <div class="muted" id="derisk-diagnostics-empty">Rows appear after the next de-risk cycle.</div>
-    </section>
-
-    <section class="panel" id="derisk-log-panel">
-      <h2>Emergency De-Risk Log</h2>
-      <div class="log-box">
-        <ul class="event-log" id="derisk-event-log"></ul>
-      </div>
-      <div class="muted" id="derisk-event-log-empty">No emergency de-risk events yet.</div>
-    </section>
-
-    <section class="panel" id="auto-exit-log-panel">
-      <div class="panel-header">
-        <h2>Auto Exit Log</h2>
-        <div class="panel-actions">
-          <button type="button" class="button button--ghost" id="auto-exit-log-copy">Copy</button>
-        </div>
-      </div>
-      <div class="log-box" id="auto-exit-log-box">
-        <ul class="event-log" id="auto-exit-log"></ul>
-      </div>
-      <div class="muted" id="auto-exit-log-empty">No auto-exit events yet.</div>
-    </section>
-
-    <section class="panel" id="auto-exit-diagnostics-panel">
-      <div class="panel-header">
-        <h2>Auto Exit Diagnostics</h2>
-      </div>
-      <table class="data-table data-table--wide">
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Rule Pair</th>
-            <th>Selected Pair</th>
-            <th>Tier</th>
-            <th>Status</th>
-            <th>Primary Leg</th>
-            <th>Hedge Leg</th>
-            <th>Decision</th>
-            <th>Gross %</th>
-            <th>Net %</th>
-            <th>Need %</th>
-            <th>Edge Δ bps</th>
-            <th>Safe Chunk</th>
-            <th>Chunk Notional</th>
-            <th>Chunk Cap</th>
-            <th>Cleanup Cap</th>
-            <th>Market Cleanup</th>
-            <th>Updated</th>
-          </tr>
-        </thead>
-        <tbody id="auto-exit-diagnostics-body">
-          <tr><td colspan="18" class="muted">No auto-exit diagnostics yet.</td></tr>
-        </tbody>
-      </table>
-      <div class="muted" id="auto-exit-diagnostics-empty">Diagnostics will appear after the next auto-exit cycle.</div>
-    </section>
-
-    <section class="panel" id="auto-exit-agent-panel">
-      <div class="panel-header">
-        <h2>Auto Agent</h2>
-        <div class="panel-actions">
-          <button type="button" class="button button--ghost" id="auto-exit-agent-copy">Copy</button>
-          <button type="button" class="button button--ghost" id="auto-exit-agent-open-log">Open log</button>
-          <button type="button" class="button button--danger" id="auto-exit-agent-stop">Stop</button>
-        </div>
-      </div>
-      <div class="muted" id="auto-exit-agent-status">No auto-agent execution yet.</div>
-      <div class="muted" id="auto-exit-agent-meta"></div>
-      <div class="value-neg" id="auto-exit-agent-errors"></div>
-      <div class="log-box" id="auto-exit-agent-log-box">
-        <ul class="event-log" id="auto-exit-agent-log"></ul>
-      </div>
-      <div class="muted" id="auto-exit-agent-log-empty">No agent logs yet.</div>
-    </section>
-
-    <section class="panel" id="candidate-testing-panel">
-      <h2>Candidate Testing</h2>
-      <table class="data-table data-table--wide">
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Exchange</th>
-            <th>Edge</th>
-            <th>Funding %</th>
-            <th>Spread %</th>
-            <th>Liquidity</th>
-            <th>Notes</th>
-          </tr>
-        </thead>
-        <tbody id="candidate-testing-body">
-          <tr><td colspan="7" class="muted">No candidates yet (testing table placeholder).</td></tr>
-        </tbody>
-      </table>
-    </section>
-
-    <section class="panel" id="reduction-candidates">
-      <h2>Risk Reduction Candidates</h2>
-      <table class="data-table data-table--wide">
-        <thead>
-          <tr>
-            <th>Exchange</th>
-            <th>Symbol</th>
-            <th>Side</th>
-            <th>Qty</th>
-            <th>Suggested Close</th>
-            <th>Paired Exchange</th>
-            <th>Funding&nbsp;%</th>
-            <th>Margin Ratio</th>
-            <th>Reason</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in accounts.get('reduction_candidates', []) %}
-            <tr>
-              <td>{{ row.exchange }}</td>
-              <td>{{ row.symbol }}</td>
-              <td>{{ row.side }}</td>
-              <td>{{ row.quantity }}</td>
-              <td>{{ row.close_quantity }}</td>
-              <td>{{ row.paired_exchange }}</td>
-              <td>
-                {% if row.funding_rate is not none %}
-                  {{ (row.funding_rate * 100) | round(4) }}
-                {% else %}
-                  -
-                {% endif %}
-              </td>
-              <td>{{ row.margin_ratio if row.margin_ratio is not none else "-" }}</td>
-              <td>{{ row.reason }}</td>
-            </tr>
-          {% endfor %}
-          {% if accounts.get('reduction_candidates', []) | length == 0 %}
-            <tr><td colspan="9" class="muted">No candidates detected based on margin thresholds.</td></tr>
-          {% endif %}
-        </tbody>
-      </table>
-    </section>
-
-    <section class="panel" id="execution-reservations">
-      <h2>Active Reservations</h2>
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Exchanges</th>
-            <th>Notional</th>
-            <th>Created</th>
-            <th>Reservation</th>
-          </tr>
-        </thead>
-        <tbody id="reservation-table-body"></tbody>
-      </table>
-    </section>
-
-    <section class="panel" id="execution-activity-panel">
-      <h2>Execution Activity</h2>
-      <ul class="event-log" id="execution-activity"></ul>
+    <section class="panel dashboard-panel">
+      <details class="settings-disclosure">
+        <summary>
+          <span><strong>Актуальные настройки мониторинга и защиты</strong><small>Раскрывайте только для изменения системных параметров.</small></span>
+          <span class="settings-disclosure__chevron">⌄</span>
+        </summary>
+        <form id="dashboard-settings-form" class="dashboard-settings">
+          <fieldset>
+            <legend>Биржи для ручного анализа и аккаунт-мониторинга</legend>
+            <div id="analysis-exchanges" class="exchange-check-grid"></div>
+          </fieldset>
+          <fieldset>
+            <legend>Частота обновлений</legend>
+            <div class="settings-intervals">
+              <label>Страница, сек.<input id="setting-table-refresh" type="number" min="30" max="86400" step="1"></label>
+              <label>Аккаунты, сек.<input id="setting-account-refresh" type="number" min="30" max="86400" step="1"></label>
+              <label>Рынок позиций, сек.<input id="setting-positions-refresh" type="number" min="30" max="86400" step="1"></label>
+              <label>Сводка, сек.<input id="setting-summary-refresh" type="number" min="30" max="86400" step="1"></label>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>Биржевая защита</legend>
+            <div class="dashboard-settings-grid">
+              <label class="settings-checkbox"><input id="setting-auto-protect" type="checkbox"> Автоматически поддерживать стопы</label>
+              <label class="settings-checkbox"><input id="setting-auto-take" type="checkbox"> Автоматически поддерживать тейки</label>
+              <label class="settings-checkbox"><input id="setting-margin-alerts" type="checkbox"> Уведомлять о марже</label>
+              <label class="settings-checkbox"><input id="setting-stop-alerts" type="checkbox"> Уведомлять об отсутствии стопа</label>
+              <label class="settings-checkbox"><input id="setting-auto-margin" type="checkbox"> Разрешить безопасное добавление маржи</label>
+              <label class="settings-checkbox"><input id="setting-isolated" type="checkbox"> Контролировать isolated margin</label>
+              <label class="settings-checkbox"><input id="setting-leverage" type="checkbox"> Контролировать плечо</label>
+              <label class="settings-checkbox"><input id="setting-kucoin-topup" type="checkbox"> KuCoin: только isolated top-up</label>
+              <label>Целевое плечо<input id="setting-target-leverage" type="number" min="1" max="20" step="0.1"></label>
+              <label>Отступ стопа от ликвидации<input id="setting-stop-gap" type="number" min="0.001" max="0.25" step="0.001"></label>
+              <label>Порог перестановки стопа<input id="setting-stop-requote" type="number" min="0.0001" max="0.25" step="0.0001"></label>
+              <label>Fallback TP, доля<input id="setting-fallback-take" type="number" min="0.01" max="2" step="0.01"></label>
+              <label>Основной канал<select id="setting-notify-primary"><option value="ntfy">Ntfy</option><option value="telegram">Telegram</option><option value="pushbullet">Pushbullet</option></select></label>
+              <label>Резервный канал<select id="setting-notify-fallback"><option value="none">Нет</option><option value="ntfy">Ntfy</option><option value="telegram">Telegram</option><option value="pushbullet">Pushbullet</option></select></label>
+            </div>
+          </fieldset>
+          <div class="dashboard-settings__footer">
+            <button type="submit" class="button">Сохранить настройки</button>
+            <span id="settings-status" class="settings-status" aria-live="polite"></span>
+          </div>
+        </form>
+      </details>
     </section>
   </main>
 </body>

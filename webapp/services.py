@@ -12091,7 +12091,54 @@ class DataService:
             "accounts": self._account_state(),
         }
 
-    def mobile_positions_payload(self) -> dict[str, Any]:
+    def dashboard_runtime_payload(self) -> dict[str, object]:
+        """Return compact cached runtime state for the main dashboard.
+
+        Unlike ``state_payload`` this intentionally skips all retired decision
+        modules and the expanded account diagnostics tree. The companion
+        ``mobile_positions_payload`` supplies the whitelisted position cards.
+        """
+
+        snapshot_dict = self._latest_snapshot_dict_cached()
+        status = self._status
+        if status == "idle" and snapshot_dict:
+            status = "ready"
+        settings_payload = self._settings_manager.as_dict()
+        return {
+            "status": status,
+            "last_error": self._last_error,
+            "last_updated": (
+                self._last_refreshed.isoformat() if self._last_refreshed else None
+            ),
+            "refresh_in_progress": self._in_progress,
+            "refresh_intervals": {
+                "dashboard_sec": int(
+                    settings_payload.get("table_refresh_seconds", self._parser_interval)
+                ),
+                "accounts_sec": int(
+                    settings_payload.get("account_refresh_seconds", self._account_interval)
+                ),
+                "positions_market_sec": int(
+                    settings_payload.get(
+                        "positions_market_refresh_seconds",
+                        self._positions_market_interval,
+                    )
+                ),
+                "summary_sec": int(
+                    settings_payload.get(
+                        "summary_refresh_seconds",
+                        getattr(self, "_summary_interval", 1800),
+                    )
+                ),
+            },
+            "events": list(self._events)[-20:],
+            "exchange_status": list(self._exchange_status.values()),
+            "settings": settings_payload,
+            "runtime_modules": self._runtime_modules.to_dict(),
+            "grid": self.auto_arb_payload(),
+        }
+
+    def mobile_positions_payload(self, *, include_auto_exit: bool = True) -> dict[str, Any]:
         accounts_snapshot = self._accounts.snapshot()
         positions = accounts_snapshot.get("positions") or []
         balances = self._mobile_compact_balances(
@@ -12107,7 +12154,11 @@ class DataService:
             market_lookup=market_lookup,
             market_ts_lookup=market_ts_lookup,
         )
-        auto_exit = self.auto_exit_payload()
+        auto_exit = (
+            self.auto_exit_payload()
+            if include_auto_exit
+            else {"rules": {}, "live_spreads": {}, "diagnostics": [], "defaults": {}}
+        )
         rules = {
             str(key): dict(value or {})
             for key, value in (auto_exit.get("rules") or {}).items()

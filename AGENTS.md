@@ -39,6 +39,9 @@ Project Overview
   keeps Grid, Manual, protection, Pump and Strategy Lab; Auto Exit, Auto
   Strategy, position-reduction/de-risk decisions, legacy Coin Analysis and
   legacy discovery are retired from recurring production work.
+- The main `/` page uses compact `/api/dashboard` plus `static/dashboard.js`.
+  It must remain read-only except for the collapsed safe settings form and
+  must not reintroduce retired module payloads or duplicate exchange polling.
 
 Live Trading Focus (Manual Enter/Exit/Roll)
 - Manual UI: `webapp/templates/manual.html` + `webapp/static/manual.js`.
