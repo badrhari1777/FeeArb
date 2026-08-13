@@ -560,6 +560,48 @@ class GridStateMachine:
             }
         return {"event": event}
 
+    def reduce_hedge_repair_worker_start(
+        self,
+        rule: dict[str, Any],
+        *,
+        result: Mapping[str, Any] | None,
+        quantities: Mapping[str, Any],
+        repair_intent: Mapping[str, Any],
+        now_ts: float,
+        retry_sec: float,
+    ) -> dict[str, Any]:
+        """Reduce cleanup worker ownership after the caller submits Manual I/O."""
+        worker_result = result if isinstance(result, Mapping) else {}
+        execution_id = str(worker_result.get("execution_id") or "")
+        if execution_id:
+            rule["active_execution_id"] = execution_id
+            rule["active_action"] = "repair"
+            rule["active_start_hedged_qty"] = float(
+                quantities.get("hedged_qty") or 0.0
+            )
+            rule["status"] = "repairing_hedge"
+            rule["blocked_reason"] = None
+        else:
+            rule["status"] = "hedge_repair_retry"
+            rule["blocked_reason"] = str(
+                worker_result.get("error") or "hedge_repair_worker_busy"
+            )
+            rule["next_eligible_ts"] = now_ts + retry_sec
+        return {
+            "event": {
+                "event": (
+                    "live_hedge_repair_started"
+                    if execution_id
+                    else "live_hedge_repair_deferred"
+                ),
+                "execution_id": execution_id or None,
+                "cleanup_exchange": repair_intent.get("cleanup_exchange"),
+                "cleanup_side": repair_intent.get("cleanup_side"),
+                "qty": float(repair_intent.get("imbalance_qty") or 0.0),
+                "result": result,
+            }
+        }
+
     @staticmethod
     def _optional_float(value: Any) -> float | None:
         try:

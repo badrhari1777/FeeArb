@@ -507,3 +507,84 @@ def test_hedge_repair_settle_reducer_matches_legacy_golden_cases() -> None:
                 source = actual_result["event"] if key in actual_result["event"] else machine_rule
                 assert source.get(key) == expected[key], f"{case['name']}:{key}"
         assert machine_rule["active_execution_id"] is None, case["name"]
+
+
+def _legacy_reduce_hedge_repair_worker_start(
+    rule, *, result, quantities, repair_intent
+):
+    worker_result = result or {}
+    execution_id = str(worker_result.get("execution_id") or "")
+    if execution_id:
+        rule["active_execution_id"] = execution_id
+        rule["active_action"] = "repair"
+        rule["active_start_hedged_qty"] = float(
+            quantities.get("hedged_qty") or 0.0
+        )
+        rule["status"] = "repairing_hedge"
+        rule["blocked_reason"] = None
+    else:
+        rule["status"] = "hedge_repair_retry"
+        rule["blocked_reason"] = str(
+            worker_result.get("error") or "hedge_repair_worker_busy"
+        )
+        rule["next_eligible_ts"] = NOW_TS + RETRY_SEC
+    return {
+        "event": {
+            "event": (
+                "live_hedge_repair_started"
+                if execution_id
+                else "live_hedge_repair_deferred"
+            ),
+            "execution_id": execution_id or None,
+            "cleanup_exchange": repair_intent.get("cleanup_exchange"),
+            "cleanup_side": repair_intent.get("cleanup_side"),
+            "qty": float(repair_intent.get("imbalance_qty") or 0.0),
+            "result": result,
+        }
+    }
+
+
+def test_hedge_repair_worker_start_matches_legacy_golden_cases() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "grid_hedge_repair_worker_start_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = GridStateMachine()
+    for case in cases:
+        legacy_rule = deepcopy(case["rule"])
+        machine_rule = deepcopy(case["rule"])
+        kwargs = {
+            "result": deepcopy(case.get("result")),
+            "quantities": deepcopy(case["quantities"]),
+            "repair_intent": deepcopy(case["repair_intent"]),
+        }
+        expected_result = _legacy_reduce_hedge_repair_worker_start(
+            legacy_rule,
+            **deepcopy(kwargs),
+        )
+        actual_result = machine.reduce_hedge_repair_worker_start(
+            machine_rule,
+            **deepcopy(kwargs),
+            now_ts=NOW_TS,
+            retry_sec=RETRY_SEC,
+        )
+        assert machine_rule == legacy_rule, case["name"]
+        assert actual_result == expected_result, case["name"]
+        expected = case["expected"]
+        for key in (
+            "status",
+            "blocked_reason",
+            "active_execution_id",
+            "active_action",
+            "active_start_hedged_qty",
+            "next_eligible_ts",
+        ):
+            if key in expected:
+                assert machine_rule.get(key) == expected[key], f"{case['name']}:{key}"
+        assert actual_result["event"]["event"] == expected["event"], case["name"]
+        assert (
+            actual_result["event"]["execution_id"] == expected["execution_id"]
+        ), case["name"]

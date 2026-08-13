@@ -215,3 +215,11 @@ branches to this reducer. `DataService` still adds the rule/timestamp event
 envelope, updates `updated_at`, saves state, appends history, and owns all Manual
 analysis and cleanup submission. No exchange or worker I/O moved into the state
 machine.
+
+`GridStateMachine.reduce_hedge_repair_worker_start` now freezes the dormant state
+boundary after `manual_orphan_cleanup` returns. A real execution ID acquires repair
+ownership and records the fresh hedged start quantity; an explicit error or empty
+result schedules the existing retry and busy fallback. The reducer returns the
+history event fragment but performs no Manual call, save, or history append. Three
+golden cases compare the full mutated rule and event with the preserved sequence.
+Production is not wired to this reducer yet.

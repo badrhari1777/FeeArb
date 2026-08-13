@@ -1,0 +1,26 @@
+[
+  {
+    "name": "worker_execution_acquires_repair_ownership",
+    "rule": {"id": "worker-started", "status": "hedge_repair_required", "blocked_reason": "old", "next_eligible_ts": 0.0},
+    "result": {"execution_id": "exec-repair-1", "status": "running"},
+    "quantities": {"hedged_qty": 150.0},
+    "repair_intent": {"cleanup_exchange": "kucoin", "cleanup_side": "short", "imbalance_qty": 20.0},
+    "expected": {"status": "repairing_hedge", "blocked_reason": null, "active_execution_id": "exec-repair-1", "active_action": "repair", "active_start_hedged_qty": 150.0, "event": "live_hedge_repair_started", "execution_id": "exec-repair-1"}
+  },
+  {
+    "name": "explicit_worker_error_schedules_retry",
+    "rule": {"id": "worker-error", "status": "hedge_repair_required", "blocked_reason": null, "next_eligible_ts": 0.0},
+    "result": {"error": "another execution is running"},
+    "quantities": {"hedged_qty": 150.0},
+    "repair_intent": {"cleanup_exchange": "binance", "cleanup_side": "long", "imbalance_qty": 15.0},
+    "expected": {"status": "hedge_repair_retry", "blocked_reason": "another execution is running", "next_eligible_ts": 102.0, "event": "live_hedge_repair_deferred", "execution_id": null}
+  },
+  {
+    "name": "empty_worker_result_uses_busy_fallback",
+    "rule": {"id": "worker-busy", "status": "hedge_repair_required", "blocked_reason": null, "next_eligible_ts": 0.0},
+    "result": null,
+    "quantities": {"hedged_qty": 90.0},
+    "repair_intent": {"cleanup_exchange": "bybit", "cleanup_side": "long", "imbalance_qty": 10.0},
+    "expected": {"status": "hedge_repair_retry", "blocked_reason": "hedge_repair_worker_busy", "next_eligible_ts": 102.0, "event": "live_hedge_repair_deferred", "execution_id": null}
+  }
+]
