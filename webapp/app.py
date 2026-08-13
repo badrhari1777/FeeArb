@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import os
 import tempfile
@@ -57,7 +58,36 @@ setup_logging(BASE_DIR.parent / "logs")
 
 STATIC_VERSION = "v2026-08-13-dashboard-v4"
 
-app = FastAPI(title="Funding Arbitrage Monitor", version="0.1.0")
+
+@asynccontextmanager
+async def app_lifespan(application: FastAPI):
+    """Own background startup and guarantee orderly service shutdown."""
+
+    async def _run_startup() -> None:
+        try:
+            await service.startup()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Data service startup failed")
+
+    startup_task = asyncio.create_task(_run_startup())
+    application.state.service_startup_task = startup_task
+    try:
+        yield
+    finally:
+        if not startup_task.done():
+            startup_task.cancel()
+        await asyncio.gather(startup_task, return_exceptions=True)
+        bybit_pump_short_lab.shutdown()
+        await service.shutdown()
+
+
+app = FastAPI(
+    title="Funding Arbitrage Monitor",
+    version="0.1.0",
+    lifespan=app_lifespan,
+)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
@@ -381,23 +411,6 @@ class PumpTemporaryTransferPayload(BaseModel):
 class NotificationTestPayload(BaseModel):
     title: Optional[str] = "FeeArb test notification"
     message: Optional[str] = "FeeArb notification test from backend."
-
-
-@app.on_event("startup")
-async def startup_event() -> None:
-    # Kick off background startup so FastAPI can serve immediately.
-    async def _run_startup() -> None:
-        try:
-            await service.startup()
-        except Exception:  # pylint: disable=broad-except
-            logger.exception("Data service startup failed")
-
-    asyncio.create_task(_run_startup())
-
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
-    bybit_pump_short_lab.shutdown()
-    await service.shutdown()
 
 
 @app.get("/favicon.ico")
