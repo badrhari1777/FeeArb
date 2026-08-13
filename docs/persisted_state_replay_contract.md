@@ -150,3 +150,13 @@ fresh position refresh. Level-range validation still happens before refresh;
 KuCoin risk-limit checks consume the intent's explicit entry target; completion
 still short-circuits before order submission. Manual execution, exchange reads,
 state locking and persistence remain in `DataService`.
+
+`GridStateMachine.plan_execution_reconcile_io` now defines the next dormant
+reconcile boundary. Given persisted active-execution fields and the process-local
+Manual run snapshot, it chooses whether a fresh position refresh is required and
+routes the future result to `missing_execution`, `transition_execution`,
+`hedge_repair_execution`, or `settle_without_transition`. It performs no I/O and
+does not mutate either input. Six cases in
+`tests/fixtures/grid_execution_reconcile_io_v1.json` freeze restart-missing,
+running and terminal routing. Production reconcile is not wired to this planner
+yet; exchange refresh, state persistence and repair launch remain unchanged.

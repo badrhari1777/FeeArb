@@ -132,3 +132,23 @@ def test_transition_start_intent_matches_legacy_planning() -> None:
             now_iso=NOW_ISO,
         )
         assert actual == expected, case["name"]
+
+
+def test_execution_reconcile_io_plan_matches_golden_cases_without_mutation() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "grid_execution_reconcile_io_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = GridStateMachine()
+    for case in cases:
+        rule = deepcopy(case["rule"])
+        run = deepcopy(case.get("run"))
+        original_rule = deepcopy(rule)
+        original_run = deepcopy(run)
+        actual = machine.plan_execution_reconcile_io(rule, run=run)
+        assert actual == case["expected"], case["name"]
+        assert rule == original_rule, case["name"]
+        assert run == original_run, case["name"]

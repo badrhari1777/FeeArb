@@ -165,3 +165,60 @@ class GridStateMachine:
             ),
             "completion_tolerance_qty": tolerance,
         }
+
+    def plan_execution_reconcile_io(
+        self,
+        rule: Mapping[str, Any],
+        *,
+        run: Mapping[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Plan reconcile I/O and reducer routing without reading exchange state."""
+        execution_id = str(rule.get("active_execution_id") or "")
+        active_action = str(rule.get("active_action") or "")
+        base = {
+            "execution_id": execution_id or None,
+            "execution_status": None,
+            "active_action": active_action or None,
+            "from_level": rule.get("active_from_level"),
+            "to_level": rule.get("active_to_level"),
+            "requires_position_refresh": False,
+            "reducer": None,
+        }
+        if not execution_id:
+            return {
+                **base,
+                "kind": "no_active_execution",
+                "completed": True,
+            }
+        if not isinstance(run, Mapping):
+            return {
+                **base,
+                "kind": "missing_execution",
+                "completed": False,
+                "requires_position_refresh": True,
+                "reducer": "missing_execution",
+            }
+
+        execution_status = str(run.get("status") or "")
+        if execution_status == "running":
+            return {
+                **base,
+                "kind": "execution_running",
+                "completed": False,
+                "execution_status": execution_status,
+            }
+
+        if active_action == "repair":
+            reducer = "hedge_repair_execution"
+        elif rule.get("pending_transition"):
+            reducer = "transition_execution"
+        else:
+            reducer = "settle_without_transition"
+        return {
+            **base,
+            "kind": "terminal_execution",
+            "completed": False,
+            "execution_status": execution_status,
+            "requires_position_refresh": True,
+            "reducer": reducer,
+        }

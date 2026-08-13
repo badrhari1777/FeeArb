@@ -1,0 +1,128 @@
+[
+  {
+    "name": "no_active_execution_is_already_complete",
+    "rule": {"id": "grid-1", "active_execution_id": null},
+    "run": null,
+    "expected": {
+      "kind": "no_active_execution",
+      "completed": true,
+      "execution_id": null,
+      "execution_status": null,
+      "active_action": null,
+      "from_level": null,
+      "to_level": null,
+      "requires_position_refresh": false,
+      "reducer": null
+    }
+  },
+  {
+    "name": "missing_process_run_requires_exchange_refresh",
+    "rule": {
+      "id": "grid-1",
+      "active_execution_id": "exec-missing",
+      "active_action": "enter",
+      "active_from_level": 0,
+      "active_to_level": 1
+    },
+    "run": null,
+    "expected": {
+      "kind": "missing_execution",
+      "completed": false,
+      "execution_id": "exec-missing",
+      "execution_status": null,
+      "active_action": "enter",
+      "from_level": 0,
+      "to_level": 1,
+      "requires_position_refresh": true,
+      "reducer": "missing_execution"
+    }
+  },
+  {
+    "name": "running_worker_waits_without_exchange_refresh",
+    "rule": {
+      "id": "grid-1",
+      "active_execution_id": "exec-running",
+      "active_action": "exit",
+      "active_from_level": 2,
+      "active_to_level": 1
+    },
+    "run": {"status": "running"},
+    "expected": {
+      "kind": "execution_running",
+      "completed": false,
+      "execution_id": "exec-running",
+      "execution_status": "running",
+      "active_action": "exit",
+      "from_level": 2,
+      "to_level": 1,
+      "requires_position_refresh": false,
+      "reducer": null
+    }
+  },
+  {
+    "name": "terminal_transition_routes_to_transition_reducer",
+    "rule": {
+      "id": "grid-1",
+      "active_execution_id": "exec-enter",
+      "active_action": "enter",
+      "active_from_level": 1,
+      "active_to_level": 2,
+      "pending_transition": {"action": "enter", "remaining_qty": 40.0}
+    },
+    "run": {"status": "completed"},
+    "expected": {
+      "kind": "terminal_execution",
+      "completed": false,
+      "execution_id": "exec-enter",
+      "execution_status": "completed",
+      "active_action": "enter",
+      "from_level": 1,
+      "to_level": 2,
+      "requires_position_refresh": true,
+      "reducer": "transition_execution"
+    }
+  },
+  {
+    "name": "terminal_repair_routes_to_repair_reducer",
+    "rule": {
+      "id": "grid-1",
+      "active_execution_id": "exec-repair",
+      "active_action": "repair",
+      "pending_transition": {"action": "exit", "remaining_qty": 20.0}
+    },
+    "run": {"status": "completed_with_errors"},
+    "expected": {
+      "kind": "terminal_execution",
+      "completed": false,
+      "execution_id": "exec-repair",
+      "execution_status": "completed_with_errors",
+      "active_action": "repair",
+      "from_level": null,
+      "to_level": null,
+      "requires_position_refresh": true,
+      "reducer": "hedge_repair_execution"
+    }
+  },
+  {
+    "name": "terminal_worker_without_transition_routes_to_balanced_settle",
+    "rule": {
+      "id": "grid-1",
+      "active_execution_id": "exec-flat",
+      "active_action": "exit",
+      "active_from_level": 1,
+      "active_to_level": 0
+    },
+    "run": {"status": "completed_no_fill"},
+    "expected": {
+      "kind": "terminal_execution",
+      "completed": false,
+      "execution_id": "exec-flat",
+      "execution_status": "completed_no_fill",
+      "active_action": "exit",
+      "from_level": 1,
+      "to_level": 0,
+      "requires_position_refresh": true,
+      "reducer": "settle_without_transition"
+    }
+  }
+]
