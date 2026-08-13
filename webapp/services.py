@@ -1915,81 +1915,26 @@ class DataService:
             quantities=quantities,
         )
         imbalance_qty = float(repair_intent["imbalance_qty"])
-        tolerance = float(repair_intent["tolerance_qty"])
         if repair_intent["kind"] == "settle_within_tolerance":
             now_iso = datetime.now(timezone.utc).isoformat()
+            settle_event: dict[str, Any] = {}
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
                 if not isinstance(current, dict):
                     return
-                transition = dict(current.get("pending_transition") or {})
-                remaining_qty = max(0.0, float(transition.get("remaining_qty") or 0.0))
-                transition_action = str(transition.get("action") or "")
-                transition_tolerance = self._auto_arb_transition_completion_tolerance(
+                settle_reduced = self._grid_machine.reduce_hedge_repair_settle(
                     current,
-                    float(transition.get("target_qty") or 0.0) or None,
+                    repair_intent=repair_intent,
+                    quantities=quantities,
+                    preflight=None,
+                    now_ts=time.time(),
+                    retry_sec=AUTO_ARB_RETRY_SEC,
                 )
-                last_execution = current.get("last_execution")
-                last_result = (
-                    last_execution.get("result")
-                    if isinstance(last_execution, Mapping)
-                    else None
-                )
-                non_closeable_dust = (
-                    bool(transition)
-                    and remaining_qty > 0
-                    and self._auto_arb_non_closeable_dust(
-                        last_result if isinstance(last_result, Mapping) else None,
-                        remaining_qty,
-                    )
-                )
-                hedged_qty = float(quantities.get("hedged_qty") or 0.0)
-                flat_repair_reset = self._auto_arb_reset_after_flat_repair(
-                    current,
-                    hedged_qty,
-                )
-                if flat_repair_reset:
-                    current["status"] = "waiting_entry"
-                elif transition and (remaining_qty <= transition_tolerance or non_closeable_dust):
-                    target_level = int(
-                        transition.get("to_level")
-                        or current.get("live_level")
-                        or 0
-                    )
-                    current["live_level"] = target_level
-                    current["pending_transition"] = None
-                    current["status"] = "waiting_entry" if target_level == 0 else "monitoring"
-                elif transition:
-                    current["status"] = f"partial_{transition_action or 'transition'}"
-                else:
-                    current["status"] = (
-                        "waiting_entry" if not current.get("live_level") else "monitoring"
-                    )
-                current["active_execution_id"] = None
-                current["active_action"] = None
-                current["active_from_level"] = None
-                current["active_to_level"] = None
-                current["active_target_qty"] = None
-                current["active_start_hedged_qty"] = None
-                current["actual_hedged_qty"] = hedged_qty
-                current["blocked_reason"] = None
-                current["pending_action"] = None
-                current["pending_samples"] = 0
-                current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+                settle_event = dict(settle_reduced["event"])
                 current["updated_at"] = now_iso
                 self._save_auto_arb_config()
-            self._auto_arb_history_store.append(
-                {
-                    "event": "live_hedge_imbalance_within_tolerance",
-                    "rule_id": rule_id,
-                    "imbalance_qty": imbalance_qty,
-                    "tolerance_qty": tolerance,
-                    "remaining_qty": remaining_qty,
-                    "non_closeable_dust_completed": bool(non_closeable_dust),
-                    "flat_repair_reset": flat_repair_reset,
-                    "ts": now_iso,
-                }
-            )
+            settle_event.update({"rule_id": rule_id, "ts": now_iso})
+            self._auto_arb_history_store.append(settle_event)
             return
         cleanup_exchange = repair_intent["cleanup_exchange"]
         cleanup_side = str(repair_intent["cleanup_side"] or "")
@@ -2004,48 +1949,26 @@ class DataService:
             quantities=quantities,
             preflight=preflight,
         )
-        min_required = repair_intent["min_qty_required"]
         if repair_intent["kind"] == "settle_non_closeable_dust":
             now_iso = datetime.now(timezone.utc).isoformat()
+            settle_event: dict[str, Any] = {}
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
                 if not isinstance(current, dict):
                     return
-                transition = dict(current.get("pending_transition") or {})
-                target_level = int(
-                    transition.get("to_level")
-                    or current.get("live_level")
-                    or 0
+                settle_reduced = self._grid_machine.reduce_hedge_repair_settle(
+                    current,
+                    repair_intent=repair_intent,
+                    quantities=quantities,
+                    preflight=preflight,
+                    now_ts=time.time(),
+                    retry_sec=AUTO_ARB_RETRY_SEC,
                 )
-                current["active_execution_id"] = None
-                current["active_action"] = None
-                current["active_from_level"] = None
-                current["active_to_level"] = None
-                current["active_target_qty"] = None
-                current["active_start_hedged_qty"] = None
-                current["actual_hedged_qty"] = float(quantities.get("hedged_qty") or 0.0)
-                current["live_level"] = target_level
-                current["pending_transition"] = None
-                current["pending_action"] = None
-                current["pending_samples"] = 0
-                current["status"] = "waiting_entry" if target_level == 0 else "monitoring"
-                current["blocked_reason"] = None
-                current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+                settle_event = dict(settle_reduced["event"])
                 current["updated_at"] = now_iso
                 self._save_auto_arb_config()
-            self._auto_arb_history_store.append(
-                {
-                    "event": "live_hedge_repair_non_closeable_dust",
-                    "rule_id": rule_id,
-                    "live_level": target_level,
-                    "cleanup_exchange": cleanup_exchange,
-                    "cleanup_side": cleanup_side,
-                    "imbalance_qty": imbalance_qty,
-                    "min_qty_required": min_required,
-                    "preflight": preflight,
-                    "ts": now_iso,
-                }
-            )
+            settle_event.update({"rule_id": rule_id, "ts": now_iso})
+            self._auto_arb_history_store.append(settle_event)
             return
         payload = dict(repair_intent["cleanup_payload"] or {})
         result = await self.manual_orphan_cleanup(payload)

@@ -207,4 +207,11 @@ minimum dust, flat repair reset, active-field cleanup and retry timing, returnin
 only an event fragment. Six golden trajectories compare the full mutated rule and
 result with the preserved production sequence. One fixture explicitly preserves
 the safety behavior that a non-flat snapshot cannot become `live_level=0` merely
-because a transition target was zero. Production is not wired to this reducer yet.
+because a transition target was zero. The initial parity-only checkpoint did not
+wire production to this reducer.
+
+Production hedge-repair settle now delegates the two existing in-lock no-order
+branches to this reducer. `DataService` still adds the rule/timestamp event
+envelope, updates `updated_at`, saves state, appends history, and owns all Manual
+analysis and cleanup submission. No exchange or worker I/O moved into the state
+machine.
