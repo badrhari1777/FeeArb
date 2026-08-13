@@ -44,17 +44,11 @@ from execution.auto_arb_grid import (
     reduce_missing_grid_execution,
     grid_completion_tolerance,
     grid_dust_only_errors,
-    grid_hedge_imbalance_tolerance,
     grid_level_count_for_existing_qty,
     grid_level_for_qty,
     grid_live_conflict,
     grid_live_conflict_message,
-    grid_non_closeable_dust,
     grid_partial_adoption_level_for_qty,
-    grid_reset_after_flat_repair,
-    grid_rules_share_live_ownership,
-    grid_symbol_ownership_key,
-    grid_transition_completion_tolerance,
     normalize_level_count,
     recommend_level_count,
 )
@@ -1450,17 +1444,6 @@ class DataService:
         )
         return {"rule": result}
 
-    @staticmethod
-    def _auto_arb_symbol_ownership_key(rule: Mapping[str, Any]) -> str:
-        return grid_symbol_ownership_key(rule)
-
-    @staticmethod
-    def _auto_arb_rules_share_live_ownership(
-        left: Mapping[str, Any],
-        right: Mapping[str, Any],
-    ) -> bool:
-        return grid_rules_share_live_ownership(left, right)
-
     def _auto_arb_live_grid_conflict(
         self,
         rule: Mapping[str, Any],
@@ -1484,48 +1467,11 @@ class DataService:
     ) -> float:
         return grid_completion_tolerance(rule, target_qty)
 
-    @classmethod
-    def _auto_arb_transition_completion_tolerance(
-        cls,
-        rule: Mapping[str, Any],
-        transition_qty: float | None = None,
-    ) -> float:
-        return grid_transition_completion_tolerance(rule, transition_qty)
-
-    @classmethod
-    def _auto_arb_hedge_imbalance_tolerance(
-        cls,
-        rule: Mapping[str, Any],
-        *,
-        transition_qty: float | None = None,
-        hedged_qty: float | None = None,
-    ) -> float:
-        return grid_hedge_imbalance_tolerance(
-            rule,
-            transition_qty=transition_qty,
-            hedged_qty=hedged_qty,
-        )
-
-    @staticmethod
-    def _auto_arb_non_closeable_dust(
-        result: Mapping[str, Any] | None,
-        remaining_qty: float,
-    ) -> bool:
-        return grid_non_closeable_dust(result, remaining_qty)
-
     @staticmethod
     def _auto_arb_dust_only_errors(
         result: Mapping[str, Any] | None,
     ) -> bool:
         return grid_dust_only_errors(result)
-
-    @classmethod
-    def _auto_arb_reset_after_flat_repair(
-        cls,
-        rule: dict[str, Any],
-        hedged_qty: float,
-    ) -> bool:
-        return grid_reset_after_flat_repair(rule, hedged_qty)
 
     @classmethod
     def _auto_arb_level_for_qty(
