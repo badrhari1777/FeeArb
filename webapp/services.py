@@ -34,8 +34,8 @@ from execution.accounts import _safe_float, bitget_position_side, bitget_private
 from execution.allocator import Allocator
 from execution.lifecycle import LifecycleController
 from execution.settings import ExecutionSettings
-from execution.storage import JsonStateStore, JsonlEventStore, RotatingJsonlEventStore
-from execution.state_replay_contract import GRID_STATE_SCHEMA, audit_grid_state
+from execution.storage import RotatingJsonlEventStore
+from execution.grid_state import GridStateRepository
 from execution.auto_arb_grid import (
     MAX_LEVELS,
     MIN_LEVELS,
@@ -636,10 +636,15 @@ class DataService:
         self._manual = ManualTradeManager(orderbook_provider=self._market_data)
         self._manual_runs: Dict[str, dict[str, Any]] = {}
         self._manual_run_ttl = 3600
-        self._auto_arb_store = JsonStateStore(AUTO_ARB_STATE_PATH)
-        self._auto_arb_history_store = JsonlEventStore(AUTO_ARB_HISTORY_PATH)
-        self._auto_arb: dict[str, Any] = self._load_auto_arb_config()
-        self._auto_arb_lock = asyncio.Lock()
+        self._grid_state = GridStateRepository(
+            state_path=AUTO_ARB_STATE_PATH,
+            history_path=AUTO_ARB_HISTORY_PATH,
+        )
+        # Compatibility aliases keep the transition migration incremental.
+        self._auto_arb_store = self._grid_state.store
+        self._auto_arb_history_store = self._grid_state.history
+        self._auto_arb = self._grid_state.state
+        self._auto_arb_lock = self._grid_state.lock
         self._auto_arb_task: Optional[asyncio.Task] = None
         self._auto_arb_poll_sec = 3.0
         self._automation_task: Optional[asyncio.Task] = None
@@ -927,36 +932,11 @@ class DataService:
             return await self._manual.roll(payload, positions)
         return await self._start_manual_run("roll", payload, positions)
 
-    def _load_auto_arb_config(self) -> dict[str, Any]:
-        raw = self._auto_arb_store.load({"version": 1, "rules": {}})
-        if not isinstance(raw, Mapping):
-            raw = {}
-        rules = raw.get("rules")
-        return {
-            "schema": GRID_STATE_SCHEMA,
-            "version": 1,
-            "rules": dict(rules) if isinstance(rules, Mapping) else {},
-        }
-
     def _save_auto_arb_config(self) -> None:
-        self._auto_arb_store.save(self._auto_arb)
+        self._grid_state.save()
 
     def auto_arb_payload(self) -> dict[str, Any]:
-        rules = list((self._auto_arb.get("rules") or {}).values())
-        rules.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-        return {
-            "schema": GRID_STATE_SCHEMA,
-            "version": 1,
-            "mode": "live",
-            "live_limits": {
-                "max_chunk_notional_usd": None,
-                "max_total_notional_usd": None,
-                "max_live_rules": None,
-            },
-            "rules": rules,
-            "state_contract": audit_grid_state(self._auto_arb).as_dict(),
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        }
+        return self._grid_state.payload()
 
     async def auto_arb_spreads(
         self,

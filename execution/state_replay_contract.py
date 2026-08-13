@@ -165,6 +165,14 @@ def audit_pump_state(state: Any) -> StateContractReport:
         state = {}
     for path in _nonfinite_paths(state):
         issues.append(_issue("nonfinite_number", path, "Persisted JSON numbers must be finite."))
+    if state.get("contract_error"):
+        issues.append(
+            _issue(
+                "state_load_error",
+                "$.contract_error",
+                str(state.get("contract_error")),
+            )
+        )
     schema = str(state.get("schema") or "") or None
     if schema != PUMP_STATE_SCHEMA:
         issues.append(
@@ -293,6 +301,14 @@ def audit_grid_state(state: Any) -> StateContractReport:
         state = {}
     for path in _nonfinite_paths(state):
         issues.append(_issue("nonfinite_number", path, "Persisted JSON numbers must be finite."))
+    if state.get("contract_error"):
+        issues.append(
+            _issue(
+                "state_load_error",
+                "$.contract_error",
+                str(state.get("contract_error")),
+            )
+        )
     schema = str(state.get("schema") or "") or None
     if schema is None:
         issues.append(

@@ -26,6 +26,12 @@ Read-only audit: `scripts/state_replay_audit.py`.
 7. Unknown, corrupt or overlapping ownership is an error, never an implicit flat
    or successful transition.
 
+A syntactically unreadable Grid snapshot is retained byte-for-byte and blocks
+subsequent state saves instead of being silently replaced by an empty rules map.
+Logical ownership conflicts remain persistable so the existing Grid cycle can
+record and disable the conflicting legacy rule; the contract stays invalid until
+that recovery completes.
+
 ## Pump Live contract
 
 Schema: `pump_live_state_v1`.
