@@ -3,56 +3,68 @@
 Пользовательские и эксплуатационные инструкции собраны в
 [`instructions/00_README_ИНСТРУКЦИИ.md`](instructions/00_README_ИНСТРУКЦИИ.md).
 
-Research tooling for cross-exchange funding-rate arbitrage. The latest architecture is fully asynchronous end-to-end: data ingestion, signal generation, execution, and telemetry all run on asyncio primitives, while a FastAPI dashboard streams progress (and fills) to the browser over WebSockets. Bybit and MEXC USDT perpetuals remain the default active venues, with additional adapters scaffolded for future expansion.
+FeeArb is an asynchronous trading, protection and research workspace for
+cross-exchange funding arbitrage and the separate Bybit Pump/Dump strategy.
+The production web runtime is intentionally smaller than the historical
+research tree: only the modules listed below may own recurring work.
 
 ## Highlights
-- **Async ingestion** – `pipeline/data_pipeline.py` fetches ArbitrageScanner and Coinglass concurrently via `aiohttp`, merges caches, and emits granular progress events.
-- **Execution layer** – `execution/` houses wallet/reservation services, position lifecycle management, an extensible `ExecutionEngine`, trading clients (simulated for now), and a fill simulator that estimates slippage/orphan risk.
-- **Risk & telemetry** – risk guard enforces leverage/orphan/slippage policies and emits telemetry (`risk:*` events). The `TelemetryClient` is asynchronous, persisting JSONL logs and broadcasting events to subscribers.
-- **Real-time dashboard** – FastAPI serves the state, while a WebSocket feed (`/ws/telemetry`) streams live activity into the UI (execution log, risk alerts, etc.). Manual refresh remains available but no longer blocks the page.
-- **Testing** – unit tests cover async snapshot collection, trading engine, orchestrator, telemetry, and other subsystems (`python -m unittest discover -s tests`).
+- **Active execution** – Manual Enter/Exit/Roll, Auto-Arbitrage Grid and Pump
+  Live. Pump uses a dedicated Bybit subaccount and an explicit ARM contract.
+- **Active protection** – cached account monitoring, isolated-margin control,
+  stop/take verification and orphan protective-order cleanup. Autonomous
+  position reduction and the old Auto Exit/Auto Strategy engines are retired.
+- **Read models** – the main dashboard, detailed positions view, funding
+  history and manual spread monitor consume cached snapshots wherever possible.
+- **Research boundary** – Strategy Lab and Pump shadow/paper collectors are
+  research-only. Historical `pipeline/`, analysis packages and databases are
+  retained for reproducibility, but do not belong to the main dashboard loop.
+- **API-load visibility** – account and positions-market refresh counters are
+  exposed in the cached dashboard runtime payload; they do not trigger extra
+  exchange requests.
+- **Testing** – pytest covers state replay, live safety contracts, execution,
+  cached read models and the production import boundary.
 
 ## Architecture Overview
 ```
-ArbitrageScanner  ┐
-Coinglass         │  (async fetch via aiohttp)        ┌─> SignalEngine ┐
-Exchange adapters ┘ ─> collect_snapshot_async -> DataSnapshot -> .. -> ExecutionEngine -> TradingClient(s) -> Fill telemetry
-                                                                               │
-                                            LifecycleController <--------------┘
-                                                                    │
-                                            TelemetryClient (async queue => JSONL + WebSocket broadcast)
+AccountMonitor (single-flight private refresh) ─┐
+Positions-market public cache ──────────────────┼─> cached dashboard/read models
+ProtectiveOrderManager ─────────────────────────┘
+
+ManualTradeManager ───────────────> explicit operator execution
+GridStateRepository + StateMachine -> guarded Grid execution
+PumpStateRepository + StateMachine -> guarded Bybit Pump execution
+
+Strategy Lab / historical pipeline -> research and shadow only
 ```
 
 ## Project Layout
 ```
 .
-|-- main.py                      # CLI snapshot runner (blocking wrapper around async collector)
-|-- pipeline/
-|   `-- data_pipeline.py         # Async aggregation of sources + exchange opportunities
+|-- pipeline/                    # Historical/offline candidate collection
 |-- orchestrator/
 |   |-- models.py                # Dataclasses shared across systems
 |   `-- opportunities.py         # Exchange polling + opportunity builder
 |-- execution/
-|   |-- adapters.py              # Trading client interfaces (simulated + stubs for real exchange APIs)
-|   |-- allocator.py             # Wallet reservations, cooldown tracking
-|   |-- engine.py                # Strategy execution, order submission, position updates
-|   |-- fills.py                 # Fill simulator (slippage/orphan estimation)
-|   |-- lifecycle.py             # Position observation + exit rules
-|   |-- market.py                # Websocket-ready market gateway / derived metrics
-|   |-- orders.py                # Order/Fills dataclasses
-|   |-- orchestrator.py          # Glue: snapshot -> decisions -> execution
-|   |-- risk.py                  # Risk guard emitting telemetry
-|   `-- telemetry.py             # Async telemetry queue + JSONL writer
-|-- parsers/                     # ArbitrageScanner & Coinglass scrapers
-|-- exchanges/                   # Funding snapshot adapters (Bybit + MEXC active)
+|   |-- accounts.py              # Private account gateway + single-flight cache
+|   |-- manual.py                # Manual live execution owner
+|   |-- auto_arb_grid.py         # Pure Grid decisions/reducers
+|   |-- grid_state*.py           # Versioned Grid state/replay
+|   |-- pump_live.py             # Pump exchange-effect controller
+|   `-- pump_state*.py           # Versioned Pump state/replay + pure reducers
+|-- exchanges/                   # Public funding/market adapters
 |-- webapp/
 |   |-- app.py                   # FastAPI routes + WebSocket endpoint
-|   |-- services.py              # Data service (async scheduler, telemetry bridge)
-|   |-- realtime.py              # WebSocket connection manager
+|   |-- services.py              # Compatibility facade / I/O composition root
+|   |-- service_lifecycle.py     # Active task lifecycle owner
+|   |-- funding_history.py       # Operator-invoked funding read service
+|   |-- manual_spread_service.py # Operator-invoked spread read service
+|   |-- main_positions_read_model.py
 |   |-- dashboard.py             # Compact dashboard read-model builder
 |   |-- templates/index.html     # Operational dashboard
 |   `-- static/dashboard.js      # Compact cached-state dashboard client
-|-- tests/                       # pytest/unittest suite (async-friendly)
+|-- analysis_*/                  # Historical/research-only packages
+|-- tests/                       # pytest suite
 |-- project_settings.py          # JSON-backed settings manager
 |-- requirements.txt             # Runtime dependencies
 |-- scripts/exchange_probe.py    # Diagnostics for raw exchange snapshots

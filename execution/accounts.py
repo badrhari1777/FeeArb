@@ -1053,6 +1053,19 @@ class AccountMonitor:
         self._refresh_lock = asyncio.Lock()
         self._refresh_generation = 0
         self._last_refresh_forced_env = False
+        self._api_load: dict[str, Any] = {
+            "refresh_requests": 0,
+            "refresh_cycles": 0,
+            "coalesced_requests": 0,
+            "balance_calls": 0,
+            "positions_calls": 0,
+            "call_errors": 0,
+            "requests_by_kind": {},
+            "last_kind": None,
+            "last_exchange_count": 0,
+            "last_duration_ms": None,
+            "last_completed_at": None,
+        }
         self._balances: list[dict[str, Any]] = []
         self._positions: list[dict[str, Any]] = []
         self._status: list[dict[str, Any]] = []
@@ -1123,7 +1136,10 @@ class AccountMonitor:
             pass
 
     async def refresh_now(self, *, force_env: bool = False) -> None:
-        await self._refresh(force_env=force_env)
+        await self._refresh(
+            force_env=force_env,
+            refresh_kind="forced" if force_env else "operator",
+        )
 
     async def refresh_now_for_protective(self, *, force_env: bool = False) -> None:
         """Force a fresh balances/positions pull without margin actions/alerts side effects."""
@@ -1133,6 +1149,7 @@ class AccountMonitor:
             evaluate_alerts=False,
             send_summary=False,
             coalesce=False,
+            refresh_kind="protective_verification",
         )
 
     def update_interval(self, seconds: int) -> None:
@@ -1235,13 +1252,17 @@ class AccountMonitor:
             "positions": [dict(entry) for entry in self._positions],
             "status": [dict(entry) for entry in self._status],
             "last_updated": self._last_updated,
+            "api_load": {
+                **self._api_load,
+                "requests_by_kind": dict(self._api_load.get("requests_by_kind") or {}),
+            },
         }
 
     async def _run(self) -> None:
         try:
             while True:
                 await asyncio.sleep(self._interval)
-                await self._refresh()
+                await self._refresh(refresh_kind="periodic")
         except asyncio.CancelledError:
             raise
 
@@ -1253,7 +1274,12 @@ class AccountMonitor:
         evaluate_alerts: bool = True,
         send_summary: bool = True,
         coalesce: bool = True,
+        refresh_kind: str = "routine",
     ) -> None:
+        kind = str(refresh_kind or "routine")
+        self._api_load["refresh_requests"] += 1
+        by_kind = self._api_load["requests_by_kind"]
+        by_kind[kind] = int(by_kind.get(kind) or 0) + 1
         observed_generation = self._refresh_generation
         async with self._refresh_lock:
             # A compatible refresh completed while this caller was waiting.
@@ -1264,7 +1290,11 @@ class AccountMonitor:
                 and observed_generation != self._refresh_generation
                 and (not force_env or self._last_refresh_forced_env)
             ):
+                self._api_load["coalesced_requests"] += 1
                 return
+            started = time.monotonic()
+            self._api_load["refresh_cycles"] += 1
+            self._api_load["last_kind"] = kind
             balances, positions, status, refreshed = await self._collect_all(
                 force_env=force_env
             )
@@ -1283,6 +1313,12 @@ class AccountMonitor:
                     self._last_updated = refreshed
             self._refresh_generation += 1
             self._last_refresh_forced_env = bool(force_env)
+            self._api_load["last_exchange_count"] = len(status)
+            self._api_load["last_duration_ms"] = round(
+                (time.monotonic() - started) * 1000.0,
+                3,
+            )
+            self._api_load["last_completed_at"] = datetime.now(timezone.utc).isoformat()
         # A margin-adjust callback deliberately requests a verification refresh.
         # It must run after releasing the lock to avoid re-entrant deadlock.
         if evaluate_alerts and margin_events and self._on_margin_adjust:
@@ -1309,6 +1345,7 @@ class AccountMonitor:
             timeouts = (20.0, 8.0)
             for timeout in timeouts:
                 try:
+                    self._api_load["positions_calls"] += 1
                     return await asyncio.wait_for(gateway.fetch_positions(), timeout=timeout)
                 except Exception as exc:  # pylint: disable=broad-except
                     last_exc = exc
@@ -1339,6 +1376,7 @@ class AccountMonitor:
                 positions_fetch_ok = False
                 balance_ok = False
                 try:
+                    self._api_load["balance_calls"] += 1
                     balance = await asyncio.wait_for(gateway.fetch_balance(), timeout=15.0)
                     if not balance.get("timestamp"):
                         # Ensure UI shows when this snapshot was taken even if the exchange omits a timestamp.
@@ -1346,12 +1384,14 @@ class AccountMonitor:
                     balances.append(balance)
                     balance_ok = True
                 except Exception as exc:  # pylint: disable=broad-except
+                    self._api_load["call_errors"] += 1
                     balance_error = redact_sensitive_text(exc)
                 try:
                     positions_result = await _fetch_positions_with_retry(gateway)
                     positions.extend(positions_result)
                     positions_fetch_ok = True
                 except Exception as exc:  # pylint: disable=broad-except
+                    self._api_load["call_errors"] += 1
                     positions_error = redact_sensitive_text(exc)
                 entry["positions_count"] = len(positions_result)
                 entry["positions_fetch_ok"] = positions_fetch_ok

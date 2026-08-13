@@ -50,6 +50,7 @@ def build_dashboard_payload(
             "last_updated": runtime.get("last_updated"),
             "refresh_in_progress": bool(runtime.get("refresh_in_progress")),
             "refresh_intervals": dict(runtime.get("refresh_intervals") or {}),
+            "api_load": dict(runtime.get("api_load") or {}),
         },
         "runtime_modules": dict(runtime.get("runtime_modules") or {}),
         "settings": dict(runtime.get("settings") or {}),

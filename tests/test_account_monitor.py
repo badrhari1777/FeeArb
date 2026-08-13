@@ -220,6 +220,11 @@ class AccountMonitorPartialCollectTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(peak_active, 1)
         self.assertEqual(collect_calls, 1)
+        api_load = monitor.snapshot()["api_load"]
+        self.assertEqual(api_load["refresh_requests"], 2)
+        self.assertEqual(api_load["refresh_cycles"], 1)
+        self.assertEqual(api_load["coalesced_requests"], 1)
+        self.assertEqual(api_load["requests_by_kind"], {"forced": 2})
 
     async def test_margin_callback_can_request_verification_refresh(self) -> None:
         monitor = AccountMonitor(refresh_interval=60, summary_interval=60)
@@ -242,6 +247,10 @@ class AccountMonitorPartialCollectTestCase(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(monitor.refresh_now(force_env=True), timeout=0.5)
 
         self.assertEqual(collect_calls, 2)
+        api_load = monitor.snapshot()["api_load"]
+        self.assertEqual(api_load["refresh_cycles"], 2)
+        self.assertEqual(api_load["requests_by_kind"]["forced"], 1)
+        self.assertEqual(api_load["requests_by_kind"]["protective_verification"], 1)
 
     async def test_forced_env_refresh_is_not_satisfied_by_routine_refresh(self) -> None:
         monitor = AccountMonitor(refresh_interval=60, summary_interval=60)

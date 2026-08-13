@@ -29,8 +29,7 @@ opens `/positions`.
 
 `/positions` is intentionally read-only. It shows:
 
-- main hedged cards, legs, spread, liquidation distance, stop/take coverage,
-  and auto-exit state;
+- main hedged cards, legs, spread, liquidation distance and stop/take coverage;
 - Pump balance and reserve, arm/monitor state, every open Pump position,
   ladder legs, TP, catastrophic SL, liquidation buffer, tracked top-up, and
   remaining hold time;
@@ -38,7 +37,7 @@ opens `/positions`.
 
 Trading and emergency controls stay on their owning pages:
 
-- main execution: `/manual` and `/strategies`;
+- main execution: `/manual`; Grid control: `/auto-arbitrage`;
 - Pump arm/disarm/emergency controls: `/pump-short-strategies`.
 
 This separation prevents a control intended for one account from being applied

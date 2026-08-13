@@ -30,7 +30,7 @@
   [`08_АВТОАРБИТРАЖ_GRID_LIVE_МАЛЫЙ_ОБЪЕМ.md`](08_АВТОАРБИТРАЖ_GRID_LIVE_МАЛЫЙ_ОБЪЕМ.md)
 - Архив удалённого Live-конструктора Auto Enter / Auto Exit (не запускать):
   [`09_LIVE_АВТОСТРАТЕГИИ_ВХОДА_И_ВЫХОДА.md`](09_LIVE_АВТОСТРАТЕГИИ_ВХОДА_И_ВЫХОДА.md)
-- Раздельная проверка защитных Shadow-контуров и small-volume Live для orphan/de-risk:
+- Архив старого orphan/de-risk контура; не запускать, использовать только как историю решений:
   [`10_ЗАЩИТНЫЕ_СТРАТЕГИИ_SHADOW_И_SMALL_VOLUME.md`](10_ЗАЩИТНЫЕ_СТРАТЕГИИ_SHADOW_И_SMALL_VOLUME.md)
 - Исследование полного цикла pump/squeeze, long-стратегий и short-exhaustion:
   [`11_PUMP_LIFECYCLE_RESEARCH.md`](11_PUMP_LIFECYCLE_RESEARCH.md)

@@ -56,7 +56,6 @@ from execution.accounts import AccountMonitor, normalize_symbol
 from risk.config import default_risk_config, RiskConfig
 from risk.stop_manager import ProtectiveOrderManager
 from utils.notifications import NotificationRouter
-from utils import purge_expired
 from utils.cache_db import get_or_fetch_funding_history
 from utils.funding import (
     enrich_history_intervals,
@@ -87,6 +86,7 @@ from .main_positions_read_model import (
 )
 from .manual_spread_service import ManualSpreadService
 from .runtime_modules import RUNTIME_MODULES, RuntimeModules
+from .service_lifecycle import RuntimeLifecycleMixin
 from uuid import uuid4
 
 FUNDING_CACHE_TTL_SEC = 120
@@ -567,7 +567,7 @@ def _filter_payload_list(payload: Any, key: str, match_value: str) -> tuple[Any,
 
 
 
-class DataService:
+class DataService(RuntimeLifecycleMixin):
     def __init__(
         self,
         settings_manager: SettingsManager | None = None,
@@ -613,6 +613,19 @@ class DataService:
         self._positions_market_status: list[dict[str, Any]] = []
         self._positions_market_diffs: list[dict[str, Any]] = []
         self._positions_market_last_account_update: str | None = None
+        self._positions_market_api_load: dict[str, Any] = {
+            "refresh_requests": 0,
+            "refresh_cycles": 0,
+            "skipped_fresh": 0,
+            "exchange_calls": 0,
+            "symbols_requested": 0,
+            "call_errors": 0,
+            "last_forced": False,
+            "last_exchange_count": 0,
+            "last_symbol_count": 0,
+            "last_duration_ms": None,
+            "last_completed_at": None,
+        }
         self._positions_market_task: Optional[asyncio.Task] = None
         self._settings_refresh_task: Optional[asyncio.Task] = None
         self._settings_refresh_pending = False
@@ -702,162 +715,6 @@ class DataService:
             funding_points=funding_points,
         )
 
-
-    async def startup(self) -> None:
-        self._loop = asyncio.get_running_loop()
-        purge_expired()
-        async with self._lock:
-            self._status = "pending"
-            self._account_interval = self._settings_manager.current.account_refresh_seconds
-        await self._accounts.start()
-        # Do an immediate balance/positions pull before other work.
-        await self._accounts.refresh_now(force_env=True)
-        await self._refresh_positions_market_snapshots(force=True)
-        await self._maybe_sync_protective_orders()
-        # The legacy main-dashboard candidate collectors are retired. External
-        # discovery now belongs to the isolated Strategy Lab Observatory and
-        # must never start as a side effect of the trading dashboard startup.
-        async with self._lock:
-            self._status = "ready"
-        if self._positions_market_task is None:
-            self._positions_market_task = asyncio.create_task(self._positions_market_scheduler())
-        if self._protective_task is None:
-            self._protective_task = asyncio.create_task(self._protective_scheduler())
-        if self._runtime_modules.auto_arb_grid and self._automation_task is None:
-            self._automation_task = asyncio.create_task(self._automation_scheduler())
-        await self._telemetry.start()
-
-    async def shutdown(self) -> None:
-        if self._settings_refresh_task:
-            self._settings_refresh_task.cancel()
-            try:
-                await self._settings_refresh_task
-            except asyncio.CancelledError:
-                pass
-            self._settings_refresh_task = None
-            self._settings_refresh_pending = False
-        if self._positions_market_task:
-            self._positions_market_task.cancel()
-            try:
-                await self._positions_market_task
-            except asyncio.CancelledError:
-                pass
-            self._positions_market_task = None
-        if self._automation_task:
-            self._automation_task.cancel()
-            try:
-                await self._automation_task
-            except asyncio.CancelledError:
-                pass
-            self._automation_task = None
-        if self._protective_task:
-            self._protective_task.cancel()
-            try:
-                await self._protective_task
-            except asyncio.CancelledError:
-                pass
-            self._protective_task = None
-        await self._market_data.shutdown()
-        await self._telemetry.stop()
-        await self._accounts.stop()
-        await self._manual.close()
-        await self._protective_manager.close()
-
-    async def _protective_scheduler(self) -> None:
-        """Independent loop for balance/position driven protective upkeep."""
-        try:
-            while True:
-                interval = max(30, int(self._protective_interval or self._account_interval))
-                await asyncio.sleep(interval)
-                await self._maybe_sync_protective_orders()
-        except asyncio.CancelledError:
-            raise
-
-    async def _restart_protective_scheduler(self) -> None:
-        if self._loop is None or self._loop.is_closed():
-            return
-        if self._protective_task:
-            self._protective_task.cancel()
-            try:
-                await self._protective_task
-            except asyncio.CancelledError:
-                pass
-            self._protective_task = None
-        self._protective_task = asyncio.create_task(self._protective_scheduler())
-
-    async def _positions_market_scheduler(self) -> None:
-        """Refresh market snapshots for live positions on a separate cadence."""
-        try:
-            while True:
-                interval = max(30, int(self._positions_market_interval or self._account_interval))
-                await asyncio.sleep(interval)
-                await self._refresh_positions_market_snapshots()
-        except asyncio.CancelledError:
-            raise
-
-    async def _restart_positions_market_scheduler(self) -> None:
-        if self._loop is None or self._loop.is_closed():
-            return
-        if self._positions_market_task:
-            self._positions_market_task.cancel()
-            try:
-                await self._positions_market_task
-            except asyncio.CancelledError:
-                pass
-            self._positions_market_task = None
-        self._positions_market_task = asyncio.create_task(self._positions_market_scheduler())
-
-
-    async def on_settings_updated(self) -> None:
-        async with self._lock:
-            current = self._settings_manager.current
-            self._account_interval = current.account_refresh_seconds
-            self._positions_market_interval = current.positions_market_refresh_seconds
-            self._summary_interval = current.summary_refresh_seconds
-            self._risk_config = self._risk_config_from_settings()
-            self._protective_manager.update_config(self._risk_config)
-            self._protective_interval = getattr(self._risk_config, "position_check_interval_sec", self._protective_interval)
-            self._apply_alert_settings()
-        # Legacy market-discovery scheduling intentionally stays disabled.
-        await self._restart_protective_scheduler()
-        await self._restart_positions_market_scheduler()
-        self._accounts.update_interval(self._account_interval)
-        self._accounts.update_summary_interval(self._summary_interval)
-        self._accounts.update_enabled_exchanges(self._account_monitor_enabled_exchanges())
-        # Build the public position-market universe from the newly refreshed
-        # account snapshot. Quick repeated saves coalesce into one follow-up.
-        self._settings_refresh_pending = True
-        if self._settings_refresh_task is None or self._settings_refresh_task.done():
-            self._settings_refresh_task = asyncio.create_task(
-                self._refresh_operational_state_after_settings()
-            )
-
-    async def _refresh_operational_state_after_settings(self) -> None:
-        try:
-            while self._settings_refresh_pending:
-                self._settings_refresh_pending = False
-                await self._accounts.refresh_now(force_env=True)
-                await self._refresh_positions_market_snapshots(force=True)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning("Post-settings operational refresh failed: %s", exc)
-        finally:
-            self._settings_refresh_task = None
-
-    def _account_monitor_enabled_exchanges(self) -> set[str]:
-        """Use both venue selectors so disabling a venue everywhere stops private polling."""
-        current = self._settings_manager.current
-        result: set[str] = set()
-        for flags in (
-            getattr(current, "exchanges", None) or {},
-            getattr(current, "analysis_exchanges", None) or {},
-        ):
-            for name, enabled in flags.items():
-                normalized = normalize_exchange_name(str(name))
-                if enabled and normalized:
-                    result.add(normalized)
-        return result
 
     async def manual_enter(self, payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("dry_run"):
@@ -4019,6 +3876,10 @@ class DataService:
             },
             "events": list(self._events)[-20:],
             "exchange_status": list(accounts_snapshot.get("status") or []),
+            "api_load": {
+                "accounts": dict(accounts_snapshot.get("api_load") or {}),
+                "positions_market": dict(self._positions_market_api_load),
+            },
             "settings": settings_payload,
             "runtime_modules": self._runtime_modules.to_dict(),
             "grid": self.auto_arb_payload(),
@@ -4573,9 +4434,8 @@ class DataService:
         }
 
     @staticmethod
-
     def _collect_positions_market_symbols(
-        self, positions: list[dict[str, Any]]
+        positions: list[dict[str, Any]],
     ) -> dict[str, list[str]]:
         by_exchange: dict[str, set[str]] = {}
         for entry in positions:
@@ -4591,6 +4451,7 @@ class DataService:
         return {ex: sorted(symbols) for ex, symbols in by_exchange.items()}
 
     async def _refresh_positions_market_snapshots(self, *, force: bool = False) -> None:
+        self._positions_market_api_load["refresh_requests"] += 1
         async with self._positions_market_lock:
             accounts_snapshot = self._accounts.snapshot()
             positions = accounts_snapshot.get("positions") or []
@@ -4606,6 +4467,7 @@ class DataService:
             ):
                 age = (now - self._positions_market_last_refresh).total_seconds()
                 if age < (interval + grace_sec):
+                    self._positions_market_api_load["skipped_fresh"] += 1
                     return
             symbols_by_exchange = self._collect_positions_market_symbols(positions)
             key_bits = [
@@ -4621,7 +4483,16 @@ class DataService:
             ):
                 age = (now - self._positions_market_last_refresh).total_seconds()
                 if age < (interval + grace_sec):
+                    self._positions_market_api_load["skipped_fresh"] += 1
                     return
+
+            started = time.monotonic()
+            exchange_count = len(symbols_by_exchange)
+            symbol_count = sum(len(symbols) for symbols in symbols_by_exchange.values())
+            self._positions_market_api_load["refresh_cycles"] += 1
+            self._positions_market_api_load["last_forced"] = bool(force)
+            self._positions_market_api_load["last_exchange_count"] = exchange_count
+            self._positions_market_api_load["last_symbol_count"] = symbol_count
 
             if not symbols_by_exchange:
                 self._positions_market_cache = {}
@@ -4632,6 +4503,11 @@ class DataService:
                 self._positions_market_last_account_update = account_last_updated
                 self._positions_market_status = []
                 self._positions_market_diffs = []
+                self._positions_market_api_load["last_duration_ms"] = round(
+                    (time.monotonic() - started) * 1000.0,
+                    3,
+                )
+                self._positions_market_api_load["last_completed_at"] = now.isoformat()
                 return
 
             async def _fetch_exchange(exchange: str, symbols: list[str]) -> dict[str, Any]:
@@ -4667,6 +4543,8 @@ class DataService:
                 asyncio.create_task(_fetch_exchange(exchange, symbols))
                 for exchange, symbols in symbols_by_exchange.items()
             ]
+            self._positions_market_api_load["exchange_calls"] += exchange_count
+            self._positions_market_api_load["symbols_requested"] += symbol_count
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             new_cache: dict[tuple[str, str], MarketSnapshot] = {}
@@ -4675,6 +4553,7 @@ class DataService:
             errors: list[str] = []
             for exchange, result in zip(symbols_by_exchange.keys(), results):
                 if isinstance(result, Exception):
+                    self._positions_market_api_load["call_errors"] += 1
                     status_rows.append(
                         {
                             "exchange": exchange,
@@ -4695,6 +4574,7 @@ class DataService:
                     }
                 )
                 if result.get("error"):
+                    self._positions_market_api_load["call_errors"] += 1
                     errors.append(str(result.get("error")))
                 for snapshot in result.get("snapshots") or []:
                     if not isinstance(snapshot, MarketSnapshot):
@@ -4718,6 +4598,11 @@ class DataService:
                 new_cache,
                 new_ts,
             )
+            self._positions_market_api_load["last_duration_ms"] = round(
+                (time.monotonic() - started) * 1000.0,
+                3,
+            )
+            self._positions_market_api_load["last_completed_at"] = now.isoformat()
 
     def _positions_market_diff_report(
         self,

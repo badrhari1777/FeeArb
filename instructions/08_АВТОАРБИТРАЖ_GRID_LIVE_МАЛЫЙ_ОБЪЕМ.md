@@ -100,16 +100,14 @@ https://app.feearb.ru/auto-arbitrage
 
 ## Общий worker и приоритет
 
-В одном цикле Auto Agent проверяет:
+Периодический automation cycle обслуживает только сохранённый Grid. Старые
+Auto Exit, Auto Strategy и autonomous de-risk из production runtime удалены.
+Orphan protective cleanup работает в отдельном защитном цикле и не принимает
+решений о сокращении позиции.
 
-1. emergency de-risk / orphan;
-2. Spread и V1 Auto Exit;
-3. лестничные Auto Exit / Auto Enter;
-4. Grid.
-
-Реальное исполнение одновременно только одно. Первый успешно запущенный
-механизм занимает worker. Ручной Execute использует тот же slot и получает
-`execution_busy`, если он уже занят. Ожидание Grid-триггера worker не занимает.
+Реальное исполнение Grid одновременно только одно. Ручной Execute использует
+тот же execution slot и получает `execution_busy`, если он уже занят. Ожидание
+Grid-триггера worker не занимает.
 
 ## Risk limit KuCoin до первого ордера
 

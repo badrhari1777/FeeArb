@@ -190,6 +190,22 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(calls, ["accounts", "markets"])
 
+    async def test_empty_positions_market_refresh_records_zero_api_calls(self) -> None:
+        service = DataService(settings_manager=self.manager)
+        service._accounts = type(  # type: ignore[attr-defined]
+            "X",
+            (),
+            {"snapshot": lambda self=None: {"positions": [], "last_updated": "now"}},
+        )()
+
+        await service._refresh_positions_market_snapshots(force=True)
+
+        api_load = service.dashboard_runtime_payload()["api_load"]["positions_market"]
+        self.assertEqual(api_load["refresh_requests"], 1)
+        self.assertEqual(api_load["refresh_cycles"], 1)
+        self.assertEqual(api_load["exchange_calls"], 0)
+        self.assertEqual(api_load["symbols_requested"], 0)
+
 
 
     def test_protective_issue_kind_detects_auth_errors(self) -> None:
