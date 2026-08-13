@@ -654,8 +654,6 @@ class DataService:
         self._auto_arb = self._grid_state.state
         self._auto_arb_lock = self._grid_state.lock
         self._grid_machine = GridStateMachine()
-        self._auto_arb_task: Optional[asyncio.Task] = None
-        self._auto_arb_poll_sec = 3.0
         self._automation_task: Optional[asyncio.Task] = None
         self._automation_poll_sec = 2.0
         self._mexc_alert_cooldown = 600  # seconds
@@ -753,13 +751,6 @@ class DataService:
             except asyncio.CancelledError:
                 pass
             self._automation_task = None
-        if self._auto_arb_task:
-            self._auto_arb_task.cancel()
-            try:
-                await self._auto_arb_task
-            except asyncio.CancelledError:
-                pass
-            self._auto_arb_task = None
         if self._protective_task:
             self._protective_task.cancel()
             try:
@@ -2309,17 +2300,6 @@ class DataService:
                 await self._start_auto_arb_live_transition(*live_transition)
                 if self._running_manual_execution():
                     break
-
-    async def _auto_arb_scheduler(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(max(1.0, float(self._auto_arb_poll_sec)))
-                try:
-                    await self._auto_arb_cycle()
-                except Exception:  # pylint: disable=broad-except
-                    logger.exception("Auto-arbitrage shadow cycle failed")
-        except asyncio.CancelledError:
-            raise
 
     async def manual_analyze(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload = dict(payload)
