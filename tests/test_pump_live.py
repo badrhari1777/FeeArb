@@ -5191,3 +5191,48 @@ def test_arm_resume_rejects_unknown_exchange_position(tmp_path: Path) -> None:
         assert "pump_live_resume_unknown_exchange_state" in str(exc)
     else:  # pragma: no cover - regression guard
         raise AssertionError("resume unexpectedly accepted an unknown position")
+def test_stop_monitor_delegation_blocks_open_position_without_mutation(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    controller = PumpLiveController(
+        gateway=FakePumpGateway(),
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    controller._state["positions"] = [  # pylint: disable=protected-access
+        {"live_id": "live-1", "status": "open"}
+    ]
+    before = json.loads(json.dumps(controller._state))  # pylint: disable=protected-access
+
+    with pytest.raises(
+        RuntimeError,
+        match="pump_live_monitor_required_while_positions_open",
+    ):
+        controller.stop_monitor()
+
+    assert controller._state == before  # pylint: disable=protected-access
+    assert controller._stop.is_set() is False  # pylint: disable=protected-access
+
+
+def test_stop_monitor_delegation_stops_flat_controller(tmp_path: Path) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    controller = PumpLiveController(
+        gateway=FakePumpGateway(),
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+
+    status = controller.stop_monitor()
+
+    assert status["status"] == "stopped"
+    assert status["entry_armed"] is False
+    assert status["monitor_enabled"] is False
+    assert controller._stop.is_set() is True  # pylint: disable=protected-access
+    assert controller._wake.is_set() is True  # pylint: disable=protected-access

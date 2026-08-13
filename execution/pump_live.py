@@ -2158,14 +2158,10 @@ class PumpLiveController:
 
     def stop_monitor(self) -> dict[str, Any]:
         with self._lock:
-            if self._open_positions(self._state):
-                raise RuntimeError("pump_live_monitor_required_while_positions_open")
-            self._state["entry_armed"] = False
-            self._state["monitor_enabled"] = False
-            self._state["status"] = "stopped"
-            self._state["transient_recovery_pending"] = False
-            self._state["healthy_recovery_cycles"] = 0
-            self._state["updated_at_ms"] = _now_ms()
+            self._state_machine.reduce_stop_monitor(
+                self._state,
+                now_ms=_now_ms(),
+            )
             self._save_state_locked()
         self._stop.set()
         self._wake.set()
