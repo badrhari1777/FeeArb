@@ -56,7 +56,7 @@ from strategy_lab import StrategyLabObservatory
 BASE_DIR = Path(__file__).resolve().parent
 setup_logging(BASE_DIR.parent / "logs")
 
-STATIC_VERSION = "v2026-08-13-dashboard-v4"
+STATIC_VERSION = "v2026-08-13-dashboard-v5"
 
 
 @asynccontextmanager

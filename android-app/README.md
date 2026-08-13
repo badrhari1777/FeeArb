@@ -13,7 +13,6 @@ Backend contract used by the app:
 - `GET /api/mobile/positions`
 - `GET /api/positions/overview`
 - `GET /api/mobile/manual-defaults`
-- `POST /api/auto-exit/rule`
 - `POST /api/position/action`
 - `POST /api/manual/analyze`
 - `POST /api/manual/enter`
