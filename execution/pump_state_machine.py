@@ -1,0 +1,43 @@
+from __future__ import annotations
+
+from typing import Any, Mapping
+
+
+class PumpStateMachine:
+    """Pure persisted-state reducers for Pump Live orchestration."""
+
+    @staticmethod
+    def reduce_cold_restart(state: dict[str, Any]) -> dict[str, Any]:
+        """Fail closed after process restart without performing I/O.
+
+        The caller remains responsible for persisting the mutation and starting
+        recovery monitoring only after constructing the rest of the controller.
+        """
+
+        state["entry_armed"] = False
+        state["transient_recovery_pending"] = False
+        state["healthy_recovery_cycles"] = 0
+        state["portfolio_risk_restore_armed"] = False
+        state["portfolio_risk_recovery_cycles"] = 0
+
+        positions = state.get("positions") or []
+        has_open_positions = any(
+            isinstance(item, Mapping) and item.get("status") != "closed"
+            for item in positions
+        )
+        save_state = False
+        if has_open_positions:
+            state["monitor_enabled"] = True
+            state["status"] = "recovery_monitoring"
+            save_state = True
+        elif state.get("status") not in {"disabled", "stopped"}:
+            state["monitor_enabled"] = False
+            state["status"] = "disarmed_after_restart"
+            state["blocked_reason"] = "backend_restart"
+            save_state = True
+
+        return {
+            "has_open_positions": has_open_positions,
+            "save_state": save_state,
+            "start_recovery_monitor": has_open_positions,
+        }

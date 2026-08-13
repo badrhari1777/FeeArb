@@ -1,0 +1,83 @@
+[
+  {
+    "name": "open_position_enters_recovery_monitoring",
+    "state": {
+      "status": "armed",
+      "monitor_enabled": false,
+      "entry_armed": true,
+      "transient_recovery_pending": true,
+      "healthy_recovery_cycles": 2,
+      "portfolio_risk_restore_armed": true,
+      "portfolio_risk_recovery_cycles": 2,
+      "blocked_reason": null,
+      "positions": [{"live_id": "live-1", "status": "open"}]
+    },
+    "expected": {
+      "status": "recovery_monitoring",
+      "monitor_enabled": true,
+      "entry_armed": false,
+      "transient_recovery_pending": false,
+      "healthy_recovery_cycles": 0,
+      "portfolio_risk_restore_armed": false,
+      "portfolio_risk_recovery_cycles": 0,
+      "blocked_reason": null,
+      "has_open_positions": true,
+      "save_state": true,
+      "start_recovery_monitor": true
+    }
+  },
+  {
+    "name": "flat_active_state_is_disarmed_after_restart",
+    "state": {
+      "status": "armed",
+      "monitor_enabled": true,
+      "entry_armed": true,
+      "transient_recovery_pending": true,
+      "healthy_recovery_cycles": 1,
+      "portfolio_risk_restore_armed": true,
+      "portfolio_risk_recovery_cycles": 1,
+      "blocked_reason": null,
+      "positions": [{"live_id": "closed-1", "status": "closed"}]
+    },
+    "expected": {
+      "status": "disarmed_after_restart",
+      "monitor_enabled": false,
+      "entry_armed": false,
+      "transient_recovery_pending": false,
+      "healthy_recovery_cycles": 0,
+      "portfolio_risk_restore_armed": false,
+      "portfolio_risk_recovery_cycles": 0,
+      "blocked_reason": "backend_restart",
+      "has_open_positions": false,
+      "save_state": true,
+      "start_recovery_monitor": false
+    }
+  },
+  {
+    "name": "flat_disabled_state_stays_disabled_without_persist",
+    "state": {
+      "status": "disabled",
+      "monitor_enabled": false,
+      "entry_armed": true,
+      "transient_recovery_pending": true,
+      "healthy_recovery_cycles": 3,
+      "portfolio_risk_restore_armed": true,
+      "portfolio_risk_recovery_cycles": 3,
+      "blocked_reason": "credentials_missing",
+      "positions": []
+    },
+    "expected": {
+      "status": "disabled",
+      "monitor_enabled": false,
+      "entry_armed": false,
+      "transient_recovery_pending": false,
+      "healthy_recovery_cycles": 0,
+      "portfolio_risk_restore_armed": false,
+      "portfolio_risk_recovery_cycles": 0,
+      "blocked_reason": "credentials_missing",
+      "has_open_positions": false,
+      "save_state": false,
+      "start_recovery_monitor": false
+    }
+  }
+]
