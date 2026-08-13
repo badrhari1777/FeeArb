@@ -2430,48 +2430,19 @@ class PumpLiveController:
         if not snapshot["freeze_required"]:
             return False
         with self._lock:
-            was_active = bool(self._state.get("portfolio_risk_freeze_active"))
-            prior_reason = self._state.get("portfolio_risk_freeze_reason")
-            prior_symbol = self._state.get("portfolio_risk_freeze_symbol")
-            restore_armed = bool(self._state.get("portfolio_risk_restore_armed"))
-            may_claim_entry_gate = bool(
-                (
-                    self._state.get("entry_armed")
-                    and not self._state.get("blocked_reason")
-                )
-                or (
-                    was_active
-                    and self._state.get("blocked_reason") == "portfolio_risk_freeze"
-                )
+            freeze = self._state_machine.reduce_portfolio_risk_freeze(
+                self._state,
+                snapshot=snapshot,
+                now_ms=_now_ms(),
             )
-            if self._state.get("entry_armed") and not self._state.get("blocked_reason"):
-                restore_armed = True
-            dropped_pending = len(self._state.get("pending_signals") or [])
-            self._state["entry_armed"] = False
-            self._state["portfolio_risk_freeze_active"] = True
-            self._state["portfolio_risk_freeze_reason"] = snapshot["reason"]
-            self._state["portfolio_risk_freeze_symbol"] = snapshot["symbol"]
-            self._state["portfolio_risk_freeze_buffer_pct"] = snapshot["buffer_pct"]
-            self._state["portfolio_risk_restore_armed"] = restore_armed
-            self._state["portfolio_risk_recovery_cycles"] = 0
-            self._state["pending_signals"] = []
-            if may_claim_entry_gate:
-                self._state["blocked_reason"] = "portfolio_risk_freeze"
-                self._state["status"] = "monitoring"
-            self._state["updated_at_ms"] = _now_ms()
             self._save_state_locked()
-        changed = bool(
-            not was_active
-            or prior_reason != snapshot["reason"]
-            or prior_symbol != snapshot["symbol"]
-        )
-        if changed:
+        if freeze["changed"]:
             self._event(
                 "portfolio_risk_freeze",
                 {
                     **snapshot,
-                    "dropped_pending_signals": dropped_pending,
-                    "auto_recovery_eligible": restore_armed,
+                    "dropped_pending_signals": freeze["dropped_pending_signals"],
+                    "auto_recovery_eligible": freeze["auto_recovery_eligible"],
                 },
             )
         return True
@@ -2486,100 +2457,73 @@ class PumpLiveController:
         with self._lock:
             if not self._state.get("portfolio_risk_freeze_active"):
                 return False
-            self._state["portfolio_risk_freeze_buffer_pct"] = snapshot.get("buffer_pct")
-            if snapshot["freeze_required"] or not snapshot["all_calm"]:
-                self._state["portfolio_risk_recovery_cycles"] = 0
-                self._save_state_locked()
-                return False
             restore_armed = bool(self._state.get("portfolio_risk_restore_armed"))
             if (
-                not restore_armed
+                snapshot["freeze_required"]
+                or not snapshot["all_calm"]
+                or not restore_armed
                 or self._state.get("blocked_reason") != "portfolio_risk_freeze"
             ):
-                self._state["portfolio_risk_freeze_active"] = False
-                self._state["portfolio_risk_freeze_reason"] = None
-                self._state["portfolio_risk_freeze_symbol"] = None
-                self._state["portfolio_risk_freeze_buffer_pct"] = None
-                self._state["portfolio_risk_restore_armed"] = False
-                self._state["portfolio_risk_recovery_cycles"] = 0
-                self._save_state_locked()
-                return False
-            if self._unknown_exchange_positions(exchange_positions):
-                self._state["portfolio_risk_recovery_cycles"] = 0
-                self._save_state_locked()
-                return False
-            if self._unknown_open_orders(open_orders):
-                self._state["portfolio_risk_recovery_cycles"] = 0
-                self._save_state_locked()
-                return False
-            open_items = self._open_positions(self._state)
-            if open_items:
-                exchange_symbols = {
-                    _normalize_symbol(item.get("symbol"))
-                    for item in exchange_positions
-                    if item.get("side") == "short"
-                    and _safe_float(item.get("qty"), 0.0) > 0
-                }
-                healthy_positions = all(
-                    item.get("status") == "open"
-                    and _normalize_symbol(item.get("symbol")) in exchange_symbols
-                    and _safe_float(item.get("qty"), 0.0) > 0
-                    and _safe_float(item.get("tp_price"), 0.0) > 0
-                    and _safe_float(item.get("stop_price"), 0.0) > 0
-                    for item in open_items
-                )
-                if not healthy_positions:
-                    self._state["portfolio_risk_recovery_cycles"] = 0
-                    self._save_state_locked()
-                    return False
+                evidence_ready = False
+            elif self._unknown_exchange_positions(exchange_positions):
+                evidence_ready = False
+            elif self._unknown_open_orders(open_orders):
+                evidence_ready = False
             else:
-                frozen_symbol = _normalize_symbol(
-                    self._state.get("portfolio_risk_freeze_symbol")
-                )
-                frozen_item = next(
-                    (
-                        item
-                        for item in self._state.get("positions") or []
-                        if _normalize_symbol(item.get("symbol")) == frozen_symbol
-                    ),
-                    None,
-                )
-                if (
-                    not frozen_item
-                    or frozen_item.get("close_accounting_status") != "complete"
-                    or str(frozen_item.get("close_reason") or "").startswith("emergency_")
-                ):
-                    self._state["portfolio_risk_recovery_cycles"] = 0
-                    self._save_state_locked()
-                    return False
-            healthy = _safe_int(
-                self._state.get("portfolio_risk_recovery_cycles"),
-                0,
-            ) + 1
-            self._state["portfolio_risk_recovery_cycles"] = healthy
-            self._state["monitor_enabled"] = True
-            if healthy < TRANSIENT_RECOVERY_CYCLES:
+                open_items = self._open_positions(self._state)
+                if open_items:
+                    exchange_symbols = {
+                        _normalize_symbol(item.get("symbol"))
+                        for item in exchange_positions
+                        if item.get("side") == "short"
+                        and _safe_float(item.get("qty"), 0.0) > 0
+                    }
+                    evidence_ready = all(
+                        item.get("status") == "open"
+                        and _normalize_symbol(item.get("symbol")) in exchange_symbols
+                        and _safe_float(item.get("qty"), 0.0) > 0
+                        and _safe_float(item.get("tp_price"), 0.0) > 0
+                        and _safe_float(item.get("stop_price"), 0.0) > 0
+                        for item in open_items
+                    )
+                else:
+                    frozen_symbol = _normalize_symbol(
+                        self._state.get("portfolio_risk_freeze_symbol")
+                    )
+                    frozen_item = next(
+                        (
+                            item
+                            for item in self._state.get("positions") or []
+                            if _normalize_symbol(item.get("symbol")) == frozen_symbol
+                        ),
+                        None,
+                    )
+                    evidence_ready = bool(
+                        frozen_item
+                        and frozen_item.get("close_accounting_status") == "complete"
+                        and not str(frozen_item.get("close_reason") or "").startswith(
+                            "emergency_"
+                        )
+                    )
+            recovery = self._state_machine.reduce_portfolio_risk_recovery(
+                self._state,
+                snapshot=snapshot,
+                evidence_ready=evidence_ready,
+                recovery_cycles=TRANSIENT_RECOVERY_CYCLES,
+                now_ms=_now_ms(),
+            )
+            if recovery["save_state"]:
                 self._save_state_locked()
-                return False
-            self._state["entry_armed"] = True
-            self._state["armed_at_ms"] = _now_ms()
-            self._state["blocked_reason"] = None
-            self._state["portfolio_risk_freeze_active"] = False
-            self._state["portfolio_risk_freeze_reason"] = None
-            self._state["portfolio_risk_freeze_symbol"] = None
-            self._state["portfolio_risk_freeze_buffer_pct"] = None
-            self._state["portfolio_risk_restore_armed"] = False
-            self._state["portfolio_risk_recovery_cycles"] = 0
-            self._state["updated_at_ms"] = _now_ms()
-            self._save_state_locked()
-        self._event(
-            "portfolio_risk_recovered",
-            {
-                "healthy_cycles": TRANSIENT_RECOVERY_CYCLES,
-                "calm_threshold_pct": config.entry_risk_restore_buffer_pct,
-            },
-        )
-        return True
+            recovered = bool(recovery["recovered"])
+        if recovered:
+            self._event(
+                "portfolio_risk_recovered",
+                {
+                    "healthy_cycles": TRANSIENT_RECOVERY_CYCLES,
+                    "calm_threshold_pct": config.entry_risk_restore_buffer_pct,
+                },
+            )
+        return recovered
 
     def _process_pending_signals(
         self,
