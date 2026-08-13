@@ -199,3 +199,12 @@ analysis and again with its preflight result. The existing in-lock settle/dust
 mutations, `analyze_rebalance`, `manual_orphan_cleanup`, state save, history, and
 worker ownership remain in `DataService`; the state machine only supplies routing
 and exact I/O payloads.
+
+`GridStateMachine.reduce_hedge_repair_settle` now freezes the dormant no-order
+state boundary for `settle_within_tolerance` and
+`settle_non_closeable_dust`. It handles partial/completed transitions, worker
+minimum dust, flat repair reset, active-field cleanup and retry timing, returning
+only an event fragment. Six golden trajectories compare the full mutated rule and
+result with the preserved production sequence. One fixture explicitly preserves
+the safety behavior that a non-flat snapshot cannot become `live_level=0` merely
+because a transition target was zero. Production is not wired to this reducer yet.

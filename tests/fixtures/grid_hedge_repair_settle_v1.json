@@ -1,0 +1,50 @@
+[
+  {
+    "name": "balanced_without_transition_resumes_monitoring",
+    "rule": {"id": "settle-monitor", "chunk_qty": 100.0, "live_level": 1, "active_execution_id": "repair-1", "active_action": "repair", "blocked_reason": "old"},
+    "repair_intent": {"kind": "settle_within_tolerance", "imbalance_qty": 0.5, "tolerance_qty": 1.0},
+    "quantities": {"hedged_qty": 100.0},
+    "preflight": null,
+    "expected": {"status": "monitoring", "live_level": 1, "event": "live_hedge_imbalance_within_tolerance", "flat_repair_reset": false, "non_closeable_dust_completed": false}
+  },
+  {
+    "name": "balanced_material_transition_stays_partial",
+    "rule": {"id": "settle-partial", "chunk_qty": 100.0, "live_level": 1, "active_execution_id": "repair-2", "active_action": "repair", "pending_transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 50.0, "remaining_qty": 50.0}},
+    "repair_intent": {"kind": "settle_within_tolerance", "imbalance_qty": 0.5, "tolerance_qty": 1.0},
+    "quantities": {"hedged_qty": 150.0},
+    "preflight": null,
+    "expected": {"status": "partial_enter", "live_level": 1, "event": "live_hedge_imbalance_within_tolerance", "remaining_qty": 50.0}
+  },
+  {
+    "name": "balanced_transition_within_tolerance_completes_level",
+    "rule": {"id": "settle-complete", "chunk_qty": 100.0, "live_level": 1, "active_execution_id": "repair-3", "active_action": "repair", "pending_transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 99.5, "remaining_qty": 0.5}},
+    "repair_intent": {"kind": "settle_within_tolerance", "imbalance_qty": 0.2, "tolerance_qty": 1.0},
+    "quantities": {"hedged_qty": 199.5},
+    "preflight": null,
+    "expected": {"status": "monitoring", "live_level": 2, "pending_transition": null, "event": "live_hedge_imbalance_within_tolerance"}
+  },
+  {
+    "name": "worker_result_marks_remaining_transition_as_non_closeable",
+    "rule": {"id": "settle-worker-dust", "chunk_qty": 100.0, "live_level": 1, "active_execution_id": "repair-4", "active_action": "repair", "pending_transition": {"action": "exit", "from_level": 1, "to_level": 0, "target_qty": 100.0, "filled_qty": 90.0, "remaining_qty": 10.0}, "last_execution": {"result": {"errors": ["qty 10 below min qty 20"]}}},
+    "repair_intent": {"kind": "settle_within_tolerance", "imbalance_qty": 0.0, "tolerance_qty": 1.0},
+    "quantities": {"hedged_qty": 100.0},
+    "preflight": null,
+    "expected": {"status": "monitoring", "live_level": 1, "pending_transition": null, "event": "live_hedge_imbalance_within_tolerance", "non_closeable_dust_completed": true}
+  },
+  {
+    "name": "balanced_flat_repair_resets_stale_grid_state",
+    "rule": {"id": "settle-flat", "chunk_qty": 100.0, "live_level": 1, "active_execution_id": "repair-5", "active_action": "repair", "pending_transition": {"action": "exit", "from_level": 1, "to_level": 0, "target_qty": 100.0, "filled_qty": 100.0, "remaining_qty": 0.0}},
+    "repair_intent": {"kind": "settle_within_tolerance", "imbalance_qty": 0.0, "tolerance_qty": 1.0},
+    "quantities": {"hedged_qty": 0.0},
+    "preflight": null,
+    "expected": {"status": "waiting_entry", "live_level": 0, "pending_transition": null, "event": "live_hedge_imbalance_within_tolerance", "flat_repair_reset": true}
+  },
+  {
+    "name": "exchange_minimum_dust_completes_target_level",
+    "rule": {"id": "settle-exchange-dust", "chunk_qty": 100.0, "live_level": 2, "active_execution_id": "repair-6", "active_action": "repair", "pending_transition": {"action": "exit", "from_level": 2, "to_level": 1, "target_qty": 100.0, "filled_qty": 80.0, "remaining_qty": 20.0}},
+    "repair_intent": {"kind": "settle_non_closeable_dust", "imbalance_qty": 20.0, "tolerance_qty": 1.0, "cleanup_exchange": "kucoin", "cleanup_side": "short", "min_qty_required": 25.0},
+    "quantities": {"hedged_qty": 100.0},
+    "preflight": {"min_qty_required": 25.0},
+    "expected": {"status": "monitoring", "live_level": 1, "pending_transition": null, "event": "live_hedge_repair_non_closeable_dust", "cleanup_exchange": "kucoin", "cleanup_side": "short"}
+  }
+]

@@ -8,6 +8,8 @@ from .auto_arb_grid import (
     complete_pending_grid_transition,
     decide_grid_transition,
     grid_hedge_imbalance_tolerance,
+    grid_non_closeable_dust,
+    grid_reset_after_flat_repair,
     grid_transition_completion_tolerance,
     reduce_grid_hedge_repair_execution,
     reduce_grid_transition_execution,
@@ -452,6 +454,111 @@ class GridStateMachine:
                 "auto_arb_rule_generation": int(rule.get("generation") or 0),
             },
         }
+
+    def reduce_hedge_repair_settle(
+        self,
+        rule: dict[str, Any],
+        *,
+        repair_intent: Mapping[str, Any],
+        quantities: Mapping[str, Any],
+        preflight: Mapping[str, Any] | None,
+        now_ts: float,
+        retry_sec: float,
+    ) -> dict[str, Any]:
+        """Reduce a no-order hedge-repair outcome without persistence or I/O."""
+        kind = str(repair_intent.get("kind") or "")
+        if kind not in {
+            "settle_within_tolerance",
+            "settle_non_closeable_dust",
+        }:
+            raise ValueError(f"Unsupported hedge-repair settle kind: {kind or 'missing'}")
+
+        hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+        transition = dict(rule.get("pending_transition") or {})
+        remaining_qty = max(0.0, float(transition.get("remaining_qty") or 0.0))
+        flat_repair_reset = False
+        non_closeable_dust = False
+
+        if kind == "settle_within_tolerance":
+            transition_action = str(transition.get("action") or "")
+            transition_tolerance = grid_transition_completion_tolerance(
+                rule,
+                float(transition.get("target_qty") or 0.0) or None,
+            )
+            last_execution = rule.get("last_execution")
+            last_result = (
+                last_execution.get("result")
+                if isinstance(last_execution, Mapping)
+                else None
+            )
+            non_closeable_dust = (
+                bool(transition)
+                and remaining_qty > 0
+                and grid_non_closeable_dust(
+                    last_result if isinstance(last_result, Mapping) else None,
+                    remaining_qty,
+                )
+            )
+            flat_repair_reset = grid_reset_after_flat_repair(rule, hedged_qty)
+            if flat_repair_reset:
+                rule["status"] = "waiting_entry"
+            elif transition and (
+                remaining_qty <= transition_tolerance or non_closeable_dust
+            ):
+                target_level = int(
+                    transition.get("to_level") or rule.get("live_level") or 0
+                )
+                rule["live_level"] = target_level
+                rule["pending_transition"] = None
+                rule["status"] = (
+                    "waiting_entry" if target_level == 0 else "monitoring"
+                )
+            elif transition:
+                rule["status"] = f"partial_{transition_action or 'transition'}"
+            else:
+                rule["status"] = (
+                    "waiting_entry" if not rule.get("live_level") else "monitoring"
+                )
+        else:
+            target_level = int(
+                transition.get("to_level") or rule.get("live_level") or 0
+            )
+            rule["live_level"] = target_level
+            rule["pending_transition"] = None
+            rule["status"] = "waiting_entry" if target_level == 0 else "monitoring"
+
+        rule["active_execution_id"] = None
+        rule["active_action"] = None
+        rule["active_from_level"] = None
+        rule["active_to_level"] = None
+        rule["active_target_qty"] = None
+        rule["active_start_hedged_qty"] = None
+        rule["actual_hedged_qty"] = hedged_qty
+        rule["blocked_reason"] = None
+        rule["pending_action"] = None
+        rule["pending_samples"] = 0
+        rule["next_eligible_ts"] = now_ts + retry_sec
+
+        if kind == "settle_non_closeable_dust":
+            event = {
+                "event": "live_hedge_repair_non_closeable_dust",
+                "live_level": int(rule.get("live_level") or 0),
+                "cleanup_exchange": repair_intent.get("cleanup_exchange"),
+                "cleanup_side": repair_intent.get("cleanup_side"),
+                "imbalance_qty": float(repair_intent.get("imbalance_qty") or 0.0),
+                "min_qty_required": repair_intent.get("min_qty_required"),
+                "preflight": dict(preflight or {}),
+            }
+        else:
+            event = {
+                "event": "live_hedge_imbalance_within_tolerance",
+                "imbalance_qty": float(repair_intent.get("imbalance_qty") or 0.0),
+                "tolerance_qty": float(repair_intent.get("tolerance_qty") or 0.0),
+                "remaining_qty": remaining_qty,
+                "non_closeable_dust_completed": bool(non_closeable_dust),
+                "flat_repair_reset": flat_repair_reset,
+            }
+        return {"event": event}
 
     @staticmethod
     def _optional_float(value: Any) -> float | None:

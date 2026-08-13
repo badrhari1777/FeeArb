@@ -10,6 +10,8 @@ from execution.auto_arb_grid import (
     complete_pending_grid_transition,
     decide_grid_transition,
     grid_hedge_imbalance_tolerance,
+    grid_non_closeable_dust,
+    grid_reset_after_flat_repair,
     grid_transition_completion_tolerance,
     reduce_grid_hedge_repair_execution,
     reduce_grid_transition_execution,
@@ -369,3 +371,139 @@ def test_hedge_repair_start_intent_matches_golden_cases_without_mutation() -> No
         assert rule == original_rule, case["name"]
         assert quantities == original_quantities, case["name"]
         assert preflight == original_preflight, case["name"]
+
+
+def _legacy_reduce_hedge_repair_settle(
+    rule, *, repair_intent, quantities, preflight
+):
+    kind = repair_intent["kind"]
+    hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+    transition = dict(rule.get("pending_transition") or {})
+    remaining_qty = max(0.0, float(transition.get("remaining_qty") or 0.0))
+    flat_repair_reset = False
+    non_closeable_dust = False
+    if kind == "settle_within_tolerance":
+        transition_action = str(transition.get("action") or "")
+        transition_tolerance = grid_transition_completion_tolerance(
+            rule,
+            float(transition.get("target_qty") or 0.0) or None,
+        )
+        last_execution = rule.get("last_execution")
+        last_result = (
+            last_execution.get("result")
+            if isinstance(last_execution, dict)
+            else None
+        )
+        non_closeable_dust = (
+            bool(transition)
+            and remaining_qty > 0
+            and grid_non_closeable_dust(last_result, remaining_qty)
+        )
+        flat_repair_reset = grid_reset_after_flat_repair(rule, hedged_qty)
+        if flat_repair_reset:
+            rule["status"] = "waiting_entry"
+        elif transition and (
+            remaining_qty <= transition_tolerance or non_closeable_dust
+        ):
+            target_level = int(
+                transition.get("to_level") or rule.get("live_level") or 0
+            )
+            rule["live_level"] = target_level
+            rule["pending_transition"] = None
+            rule["status"] = (
+                "waiting_entry" if target_level == 0 else "monitoring"
+            )
+        elif transition:
+            rule["status"] = f"partial_{transition_action or 'transition'}"
+        else:
+            rule["status"] = (
+                "waiting_entry" if not rule.get("live_level") else "monitoring"
+            )
+    else:
+        target_level = int(
+            transition.get("to_level") or rule.get("live_level") or 0
+        )
+        rule["live_level"] = target_level
+        rule["pending_transition"] = None
+        rule["status"] = "waiting_entry" if target_level == 0 else "monitoring"
+    for key in (
+        "active_execution_id",
+        "active_action",
+        "active_from_level",
+        "active_to_level",
+        "active_target_qty",
+        "active_start_hedged_qty",
+    ):
+        rule[key] = None
+    rule["actual_hedged_qty"] = hedged_qty
+    rule["blocked_reason"] = None
+    rule["pending_action"] = None
+    rule["pending_samples"] = 0
+    rule["next_eligible_ts"] = NOW_TS + RETRY_SEC
+    if kind == "settle_non_closeable_dust":
+        event = {
+            "event": "live_hedge_repair_non_closeable_dust",
+            "live_level": int(rule.get("live_level") or 0),
+            "cleanup_exchange": repair_intent.get("cleanup_exchange"),
+            "cleanup_side": repair_intent.get("cleanup_side"),
+            "imbalance_qty": float(repair_intent.get("imbalance_qty") or 0.0),
+            "min_qty_required": repair_intent.get("min_qty_required"),
+            "preflight": dict(preflight or {}),
+        }
+    else:
+        event = {
+            "event": "live_hedge_imbalance_within_tolerance",
+            "imbalance_qty": float(repair_intent.get("imbalance_qty") or 0.0),
+            "tolerance_qty": float(repair_intent.get("tolerance_qty") or 0.0),
+            "remaining_qty": remaining_qty,
+            "non_closeable_dust_completed": bool(non_closeable_dust),
+            "flat_repair_reset": flat_repair_reset,
+        }
+    return {"event": event}
+
+
+def test_hedge_repair_settle_reducer_matches_legacy_golden_cases() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "grid_hedge_repair_settle_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = GridStateMachine()
+    for case in cases:
+        legacy_rule = deepcopy(case["rule"])
+        machine_rule = deepcopy(case["rule"])
+        kwargs = {
+            "repair_intent": deepcopy(case["repair_intent"]),
+            "quantities": deepcopy(case["quantities"]),
+            "preflight": deepcopy(case.get("preflight")),
+        }
+        expected_result = _legacy_reduce_hedge_repair_settle(
+            legacy_rule,
+            **deepcopy(kwargs),
+        )
+        actual_result = machine.reduce_hedge_repair_settle(
+            machine_rule,
+            **deepcopy(kwargs),
+            now_ts=NOW_TS,
+            retry_sec=RETRY_SEC,
+        )
+        assert machine_rule == legacy_rule, case["name"]
+        assert actual_result == expected_result, case["name"]
+        expected = case["expected"]
+        assert machine_rule["status"] == expected["status"], case["name"]
+        assert machine_rule["live_level"] == expected["live_level"], case["name"]
+        assert actual_result["event"]["event"] == expected["event"], case["name"]
+        for key in (
+            "pending_transition",
+            "flat_repair_reset",
+            "non_closeable_dust_completed",
+            "remaining_qty",
+            "cleanup_exchange",
+            "cleanup_side",
+        ):
+            if key in expected:
+                source = actual_result["event"] if key in actual_result["event"] else machine_rule
+                assert source.get(key) == expected[key], f"{case['name']}:{key}"
+        assert machine_rule["active_execution_id"] is None, case["name"]
