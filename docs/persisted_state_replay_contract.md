@@ -234,4 +234,9 @@ the pending transition and records its fresh start quantity; an explicit error o
 empty result preserves the transition and schedules the existing conflict retry.
 It also clears the transient `transition_starting` marker and returns the history
 event fragment. Four golden cases compare the full rule, transition and event.
-Production is not wired to this reducer yet.
+The initial parity-only checkpoint did not wire production to this reducer.
+
+Production now delegates transition worker result state inside the same lock after
+the unchanged `manual_enter`/`manual_exit` call. Submission, exception cleanup,
+`updated_at`, durable save, rule/timestamp envelope and history stay in
+`DataService`.

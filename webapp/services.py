@@ -2185,53 +2185,31 @@ class DataService:
                 if isinstance(current, dict):
                     current.pop("transition_starting", None)
             raise
-        exec_id = str((result or {}).get("execution_id") or "")
         now_iso = datetime.now(timezone.utc).isoformat()
+        worker_event: dict[str, Any] = {}
         async with self._auto_arb_lock:
             current = (self._auto_arb.get("rules") or {}).get(rule_id)
             if not isinstance(current, dict):
                 return
-            current.pop("transition_starting", None)
-            current["pending_action"] = None
-            current["pending_samples"] = 0
-            if exec_id:
-                transition["last_start_hedged_qty"] = float(
-                    quantities.get("hedged_qty") or 0.0
-                )
-                transition["updated_at"] = now_iso
-                current["pending_transition"] = transition
-                current["active_execution_id"] = exec_id
-                current["active_action"] = action
-                current["active_from_level"] = from_level
-                current["active_to_level"] = to_level
-                current["active_target_qty"] = position_target_qty
-                current["active_start_hedged_qty"] = float(
-                    quantities.get("hedged_qty") or 0.0
-                )
-                current["status"] = f"executing_{action}"
-                current["blocked_reason"] = None
-            else:
-                current["pending_transition"] = transition
-                current["status"] = "blocked_conflict"
-                current["blocked_reason"] = str(
-                    (result or {}).get("error") or "execution_worker_busy"
-                )
-                current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
+            worker_reduced = self._grid_machine.reduce_transition_worker_start(
+                current,
+                result=result,
+                transition=transition,
+                quantities=quantities,
+                action=action,
+                from_level=from_level,
+                to_level=to_level,
+                position_target_qty=position_target_qty,
+                submit_qty=qty,
+                now_iso=now_iso,
+                now_ts=time.time(),
+                retry_sec=AUTO_ARB_RETRY_SEC,
+            )
+            worker_event = dict(worker_reduced["event"])
             current["updated_at"] = now_iso
             self._save_auto_arb_config()
-        self._auto_arb_history_store.append(
-            {
-                "event": f"live_{action}_started" if exec_id else "live_start_failed",
-                "rule_id": rule_id,
-                "execution_id": exec_id or None,
-                "from_level": from_level,
-                "to_level": to_level,
-                "qty": qty,
-                "liquidity_chunking": True,
-                "result": result,
-                "ts": now_iso,
-            }
-        )
+        worker_event.update({"rule_id": rule_id, "ts": now_iso})
+        self._auto_arb_history_store.append(worker_event)
 
     async def _auto_arb_cycle(self) -> None:
         async with self._auto_arb_lock:
