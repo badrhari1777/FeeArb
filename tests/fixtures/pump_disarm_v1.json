@@ -1,0 +1,52 @@
+[
+  {
+    "name": "open_position_keeps_monitoring",
+    "reason": "operator_disarm",
+    "state": {
+      "status": "armed",
+      "entry_armed": true,
+      "monitor_enabled": true,
+      "blocked_reason": null,
+      "transient_recovery_pending": true,
+      "healthy_recovery_cycles": 2,
+      "portfolio_risk_freeze_active": true,
+      "portfolio_risk_freeze_reason": "warning",
+      "portfolio_risk_freeze_symbol": "ACEUSDT",
+      "portfolio_risk_freeze_buffer_pct": 8.0,
+      "portfolio_risk_restore_armed": true,
+      "portfolio_risk_recovery_cycles": 2,
+      "pending_signals": [{"symbol": "NEWUSDT"}],
+      "positions": [{"live_id": "live-1", "status": "open"}]
+    },
+    "expected": {
+      "status": "monitoring",
+      "monitor_enabled": true,
+      "has_open_positions": true
+    }
+  },
+  {
+    "name": "flat_state_stops_monitoring",
+    "reason": "test_disarm",
+    "state": {
+      "status": "armed",
+      "entry_armed": true,
+      "monitor_enabled": true,
+      "blocked_reason": null,
+      "transient_recovery_pending": true,
+      "healthy_recovery_cycles": 1,
+      "portfolio_risk_freeze_active": true,
+      "portfolio_risk_freeze_reason": "warning",
+      "portfolio_risk_freeze_symbol": "OLDUSDT",
+      "portfolio_risk_freeze_buffer_pct": 9.0,
+      "portfolio_risk_restore_armed": true,
+      "portfolio_risk_recovery_cycles": 1,
+      "pending_signals": [{"symbol": "NEWUSDT"}],
+      "positions": [{"live_id": "closed-1", "status": "closed"}]
+    },
+    "expected": {
+      "status": "disarmed",
+      "monitor_enabled": false,
+      "has_open_positions": false
+    }
+  }
+]

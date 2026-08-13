@@ -41,3 +41,33 @@ class PumpStateMachine:
             "save_state": save_state,
             "start_recovery_monitor": has_open_positions,
         }
+
+    @staticmethod
+    def reduce_disarm(
+        state: dict[str, Any],
+        *,
+        reason: str,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Disable entries while preserving monitoring for owned positions."""
+
+        positions = state.get("positions") or []
+        has_open_positions = any(
+            isinstance(item, Mapping) and item.get("status") != "closed"
+            for item in positions
+        )
+        state["entry_armed"] = False
+        state["monitor_enabled"] = has_open_positions
+        state["status"] = "monitoring" if has_open_positions else "disarmed"
+        state["blocked_reason"] = reason
+        state["transient_recovery_pending"] = False
+        state["healthy_recovery_cycles"] = 0
+        state["portfolio_risk_freeze_active"] = False
+        state["portfolio_risk_freeze_reason"] = None
+        state["portfolio_risk_freeze_symbol"] = None
+        state["portfolio_risk_freeze_buffer_pct"] = None
+        state["portfolio_risk_restore_armed"] = False
+        state["portfolio_risk_recovery_cycles"] = 0
+        state["updated_at_ms"] = now_ms
+        state["pending_signals"] = []
+        return {"has_open_positions": has_open_positions}
