@@ -42,9 +42,6 @@ def runtime_payload() -> dict:
             "account_monitor": True,
             "auto_arb_grid": True,
             "pump_live": True,
-            "auto_exit": False,
-            "auto_strategies": False,
-            "position_reduction": False,
         },
         "exchange_status": [{"exchange": "binance", "status": "ok"}],
         "events": [{"event": "account_refreshed"}],
@@ -79,7 +76,9 @@ def test_dashboard_is_compact_and_keeps_main_and_pump_balances() -> None:
     assert payload["grid"]["total_rules"] == 3
     assert payload["grid"]["enabled_rules"] == 2
     assert payload["grid"]["active_rules"] == 1
-    assert payload["runtime_modules"]["auto_exit"] is False
+    assert "auto_exit" not in payload["runtime_modules"]
+    assert "auto_strategies" not in payload["runtime_modules"]
+    assert "position_reduction" not in payload["runtime_modules"]
     assert "auto_exit" not in payload
     assert "auto_strategies" not in payload
     assert "emergency_derisk" not in payload

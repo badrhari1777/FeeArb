@@ -22,15 +22,6 @@ class RuntimeModules:
     pump_live: bool = True
     strategy_lab_observatory: bool = True
 
-    # Superseded decision products.  Their historical code and evidence stay
-    # available during the staged refactor, but they have no recurring runtime
-    # ownership and cannot place orders.
-    auto_exit: bool = False
-    auto_strategies: bool = False
-    position_reduction: bool = False
-    legacy_coin_analysis: bool = False
-    legacy_candidate_discovery: bool = False
-
     def to_dict(self) -> dict[str, bool]:
         return asdict(self)
 

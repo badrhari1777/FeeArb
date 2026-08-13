@@ -322,12 +322,7 @@
       manual_execution: 'Ручная торговля',
       auto_arb_grid: 'Grid-бот',
       pump_live: 'Pump Live',
-      strategy_lab_observatory: 'Strategy Lab',
-      auto_exit: 'Auto Exit',
-      auto_strategies: 'Auto Strategy',
-      position_reduction: 'Сокращение позиций',
-      legacy_coin_analysis: 'Старый анализ монет',
-      legacy_candidate_discovery: 'Старый поиск кандидатов'
+      strategy_lab_observatory: 'Strategy Lab'
     };
     var order = Object.keys(labels);
     var node = $('runtime-modules');
