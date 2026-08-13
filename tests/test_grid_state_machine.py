@@ -698,3 +698,97 @@ def test_transition_worker_start_matches_legacy_golden_cases() -> None:
             actual_result["event"]["execution_id"] == expected["execution_id"]
         ), case["name"]
         assert "transition_starting" not in machine_rule, case["name"]
+
+
+def _legacy_reduce_transition_pre_submit_outcome(
+    rule,
+    *,
+    kind,
+    from_level,
+    to_level,
+    current_hedged_qty,
+    error,
+    risk_limit_preflight,
+    risk_blocked_reason,
+    entry_risk_target_qty,
+):
+    event = None
+    if kind == "position_refresh_failed":
+        rule["status"] = "waiting_positions"
+        rule["blocked_reason"] = f"position_refresh_failed: {error or 'unknown'}"
+        rule["next_eligible_ts"] = NOW_TS + 30.0
+    elif kind == "transition_complete":
+        rule["live_level"] = to_level
+        rule["pending_transition"] = None
+        rule["actual_hedged_qty"] = float(current_hedged_qty or 0.0)
+        rule["status"] = "waiting_entry" if to_level == 0 else "monitoring"
+        rule["blocked_reason"] = None
+    elif kind == "risk_limit_blocked":
+        preflight = dict(risk_limit_preflight or {})
+        blocked_reason = str(risk_blocked_reason or "risk_limit_not_ready")
+        rule["status"] = "blocked_risk_limit"
+        rule["blocked_reason"] = blocked_reason
+        rule["entry_blocked_reason"] = blocked_reason
+        rule["risk_limit_preflight"] = preflight
+        rule["pending_action"] = None
+        rule["pending_samples"] = 0
+        rule["entry_next_eligible_ts"] = NOW_TS + 300.0
+        event = {
+            "event": "live_entry_risk_limit_blocked",
+            "from_level": from_level,
+            "to_level": to_level,
+            "target_position_qty": entry_risk_target_qty,
+            "risk_limit_preflight": preflight,
+        }
+    else:
+        rule["risk_limit_preflight"] = dict(risk_limit_preflight or {})
+        rule["entry_blocked_reason"] = None
+        rule["entry_next_eligible_ts"] = 0.0
+    return {"event": event}
+
+
+def test_transition_pre_submit_outcomes_match_legacy_golden_cases() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "grid_transition_pre_submit_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = GridStateMachine()
+    for case in cases:
+        legacy_rule = deepcopy(case["rule"])
+        machine_rule = deepcopy(case["rule"])
+        kwargs = {
+            key: deepcopy(case.get(key))
+            for key in (
+                "kind",
+                "from_level",
+                "to_level",
+                "current_hedged_qty",
+                "error",
+                "risk_limit_preflight",
+                "risk_blocked_reason",
+                "entry_risk_target_qty",
+            )
+        }
+        expected_result = _legacy_reduce_transition_pre_submit_outcome(
+            legacy_rule,
+            **deepcopy(kwargs),
+        )
+        actual_result = machine.reduce_transition_pre_submit_outcome(
+            machine_rule,
+            **deepcopy(kwargs),
+            now_ts=NOW_TS,
+        )
+        assert machine_rule == legacy_rule, case["name"]
+        assert actual_result == expected_result, case["name"]
+        expected = case["expected"]
+        for key, value in expected.items():
+            if key == "event":
+                actual_event = actual_result["event"]
+                assert (
+                    actual_event.get("event") if actual_event else None
+                ) == value, case["name"]
+            else:
+                assert machine_rule.get(key) == value, f"{case['name']}:{key}"

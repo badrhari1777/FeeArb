@@ -662,6 +662,57 @@ class GridStateMachine:
             "transition": current_transition,
         }
 
+    def reduce_transition_pre_submit_outcome(
+        self,
+        rule: dict[str, Any],
+        *,
+        kind: str,
+        from_level: int,
+        to_level: int,
+        current_hedged_qty: float | None,
+        error: str | None,
+        risk_limit_preflight: Mapping[str, Any] | None,
+        risk_blocked_reason: str | None,
+        entry_risk_target_qty: float | None,
+        now_ts: float,
+    ) -> dict[str, Any]:
+        """Reduce a transition outcome that submits no Manual order."""
+        event: dict[str, Any] | None = None
+        if kind == "position_refresh_failed":
+            rule["status"] = "waiting_positions"
+            rule["blocked_reason"] = f"position_refresh_failed: {error or 'unknown'}"
+            rule["next_eligible_ts"] = now_ts + 30.0
+        elif kind == "transition_complete":
+            rule["live_level"] = to_level
+            rule["pending_transition"] = None
+            rule["actual_hedged_qty"] = float(current_hedged_qty or 0.0)
+            rule["status"] = "waiting_entry" if to_level == 0 else "monitoring"
+            rule["blocked_reason"] = None
+        elif kind == "risk_limit_blocked":
+            preflight = dict(risk_limit_preflight or {})
+            blocked_reason = str(risk_blocked_reason or "risk_limit_not_ready")
+            rule["status"] = "blocked_risk_limit"
+            rule["blocked_reason"] = blocked_reason
+            rule["entry_blocked_reason"] = blocked_reason
+            rule["risk_limit_preflight"] = preflight
+            rule["pending_action"] = None
+            rule["pending_samples"] = 0
+            rule["entry_next_eligible_ts"] = now_ts + 300.0
+            event = {
+                "event": "live_entry_risk_limit_blocked",
+                "from_level": from_level,
+                "to_level": to_level,
+                "target_position_qty": entry_risk_target_qty,
+                "risk_limit_preflight": preflight,
+            }
+        elif kind == "risk_limit_ready":
+            rule["risk_limit_preflight"] = dict(risk_limit_preflight or {})
+            rule["entry_blocked_reason"] = None
+            rule["entry_next_eligible_ts"] = 0.0
+        else:
+            raise ValueError(f"Unsupported transition pre-submit outcome: {kind}")
+        return {"event": event}
+
     @staticmethod
     def _optional_float(value: Any) -> float | None:
         try:

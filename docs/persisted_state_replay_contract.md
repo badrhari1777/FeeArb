@@ -240,3 +240,10 @@ Production now delegates transition worker result state inside the same lock aft
 the unchanged `manual_enter`/`manual_exit` call. Submission, exception cleanup,
 `updated_at`, durable save, rule/timestamp envelope and history stay in
 `DataService`.
+
+`GridStateMachine.reduce_transition_pre_submit_outcome` now freezes the dormant
+no-order boundary before Manual submission: fail-closed position refresh,
+already-complete transition, entry risk-limit rejection, and successful risk
+preflight state clearing. It mutates only rule state and returns an optional risk
+history fragment. Four golden cases preserve the exact cooldowns and fields.
+Production is not wired to this reducer yet; exchange and risk checks remain I/O.

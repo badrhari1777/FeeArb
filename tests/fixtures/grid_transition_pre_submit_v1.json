@@ -1,0 +1,54 @@
+[
+  {
+    "name": "position_refresh_failure_waits_fail_closed",
+    "rule": {"id": "refresh-failed", "status": "pending_enter", "blocked_reason": null, "next_eligible_ts": 0.0},
+    "kind": "position_refresh_failed",
+    "from_level": 0,
+    "to_level": 1,
+    "current_hedged_qty": null,
+    "error": "exchange timeout",
+    "risk_limit_preflight": null,
+    "risk_blocked_reason": null,
+    "entry_risk_target_qty": null,
+    "expected": {"status": "waiting_positions", "blocked_reason": "position_refresh_failed: exchange timeout", "next_eligible_ts": 130.0, "event": null}
+  },
+  {
+    "name": "already_complete_exit_sets_flat_level",
+    "rule": {"id": "already-flat", "status": "pending_exit", "live_level": 1, "pending_transition": {"action": "exit"}, "blocked_reason": "old"},
+    "kind": "transition_complete",
+    "from_level": 1,
+    "to_level": 0,
+    "current_hedged_qty": 0.5,
+    "error": null,
+    "risk_limit_preflight": null,
+    "risk_blocked_reason": null,
+    "entry_risk_target_qty": null,
+    "expected": {"status": "waiting_entry", "live_level": 0, "pending_transition": null, "actual_hedged_qty": 0.5, "blocked_reason": null, "event": null}
+  },
+  {
+    "name": "risk_limit_block_records_entry_only_cooldown",
+    "rule": {"id": "risk-blocked", "status": "pending_enter", "pending_action": "enter", "pending_samples": 2, "entry_next_eligible_ts": 0.0},
+    "kind": "risk_limit_blocked",
+    "from_level": 1,
+    "to_level": 2,
+    "current_hedged_qty": 100.0,
+    "error": null,
+    "risk_limit_preflight": {"ready": false, "required_max_risk_limit_usd": 6000.0},
+    "risk_blocked_reason": "kucoin_risk_limit_insufficient",
+    "entry_risk_target_qty": 200.0,
+    "expected": {"status": "blocked_risk_limit", "blocked_reason": "kucoin_risk_limit_insufficient", "entry_blocked_reason": "kucoin_risk_limit_insufficient", "pending_action": null, "pending_samples": 0, "entry_next_eligible_ts": 400.0, "event": "live_entry_risk_limit_blocked"}
+  },
+  {
+    "name": "risk_limit_ready_clears_entry_block_only",
+    "rule": {"id": "risk-ready", "status": "pending_enter", "entry_blocked_reason": "old", "entry_next_eligible_ts": 300.0},
+    "kind": "risk_limit_ready",
+    "from_level": 0,
+    "to_level": 1,
+    "current_hedged_qty": 0.0,
+    "error": null,
+    "risk_limit_preflight": {"ready": true, "selected_level": 2},
+    "risk_blocked_reason": null,
+    "entry_risk_target_qty": 100.0,
+    "expected": {"status": "pending_enter", "entry_blocked_reason": null, "entry_next_eligible_ts": 0.0, "event": null}
+  }
+]
