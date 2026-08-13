@@ -580,6 +580,101 @@ def _optional_float(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def build_grid_pending_transition(
+    *,
+    existing_transition: Mapping[str, Any] | None,
+    action: str,
+    from_level: int,
+    to_level: int,
+    level_qty: float,
+    level_target_qty: float,
+    current_hedged_qty: float,
+    now_iso: str,
+) -> dict[str, Any]:
+    """Build or rebase a pending transition from fresh hedged quantity."""
+    existing = dict(existing_transition or {})
+    same_transition = (
+        str(existing.get("action") or "") == action
+        and int(existing.get("from_level") or 0) == from_level
+        and int(existing.get("to_level") or 0) == to_level
+    )
+    existing_filled_qty = max(0.0, float(existing.get("filled_qty") or 0.0))
+    origin_hedged_qty = (
+        _optional_float(existing.get("origin_hedged_qty"))
+        if same_transition
+        else None
+    )
+    if origin_hedged_qty is None:
+        if same_transition and existing_filled_qty > 0:
+            origin_hedged_qty = (
+                max(0.0, current_hedged_qty - existing_filled_qty)
+                if action == "enter"
+                else current_hedged_qty + existing_filled_qty
+            )
+        else:
+            origin_hedged_qty = current_hedged_qty
+    position_target_qty = (
+        _optional_float(existing.get("position_target_qty"))
+        if same_transition
+        else None
+    )
+    if position_target_qty is None:
+        position_target_qty = level_target_qty
+    desired_qty = (
+        max(0.0, position_target_qty - current_hedged_qty)
+        if action == "enter"
+        else max(0.0, current_hedged_qty - position_target_qty)
+    )
+    transition_qty = desired_qty if desired_qty > 0 else level_qty
+    if same_transition:
+        transition = existing
+        transition["origin_hedged_qty"] = float(origin_hedged_qty)
+        transition["position_target_qty"] = float(position_target_qty)
+        if transition.pop("rebase_from_positions", False):
+            transition_qty = desired_qty
+            transition["origin_hedged_qty"] = current_hedged_qty
+            transition["target_qty"] = transition_qty
+            transition["filled_qty"] = 0.0
+            transition["remaining_qty"] = transition_qty
+            transition["rebased_at"] = now_iso
+    else:
+        transition = {
+            "action": action,
+            "from_level": from_level,
+            "to_level": to_level,
+            "target_qty": transition_qty,
+            "filled_qty": 0.0,
+            "remaining_qty": transition_qty,
+            "origin_hedged_qty": float(origin_hedged_qty),
+            "position_target_qty": float(position_target_qty),
+            "created_at": now_iso,
+        }
+    transition_target_qty = transition.get("target_qty")
+    total_transition_qty = max(
+        0.0,
+        float(
+            transition_target_qty
+            if transition_target_qty is not None
+            else transition_qty or level_qty
+        ),
+    )
+    transition_remaining_qty = transition.get("remaining_qty")
+    qty = max(
+        0.0,
+        float(
+            transition_remaining_qty
+            if transition_remaining_qty is not None
+            else total_transition_qty
+        ),
+    )
+    return {
+        "transition": transition,
+        "qty": qty,
+        "total_transition_qty": total_transition_qty,
+        "position_target_qty": float(position_target_qty),
+    }
+
+
 def reduce_partial_grid_transition(
     rule: dict[str, Any],
     *,

@@ -40,6 +40,7 @@ from execution.auto_arb_grid import (
     MAX_LEVELS,
     MIN_LEVELS,
     build_grid_levels,
+    build_grid_pending_transition,
     apply_grid_decision_confirmation,
     complete_pending_grid_transition,
     decide_grid_transition,
@@ -2412,85 +2413,21 @@ class DataService:
                     current["updated_at"] = datetime.now(timezone.utc).isoformat()
                     self._save_auto_arb_config()
             return
-        existing_transition = dict(rule_copy.get("pending_transition") or {})
-        same_transition = (
-            str(existing_transition.get("action") or "") == action
-            and int(existing_transition.get("from_level") or 0) == from_level
-            and int(existing_transition.get("to_level") or 0) == to_level
-        )
         current_hedged_qty = float(quantities.get("hedged_qty") or 0.0)
-        existing_filled_qty = max(
-            0.0,
-            float(existing_transition.get("filled_qty") or 0.0),
+        pending_built = build_grid_pending_transition(
+            existing_transition=(rule_copy.get("pending_transition") or {}),
+            action=action,
+            from_level=from_level,
+            to_level=to_level,
+            level_qty=level_qty,
+            level_target_qty=level_target_qty,
+            current_hedged_qty=current_hedged_qty,
+            now_iso=datetime.now(timezone.utc).isoformat(),
         )
-        origin_hedged_qty = (
-            _safe_float(existing_transition.get("origin_hedged_qty"))
-            if same_transition
-            else None
-        )
-        if origin_hedged_qty is None:
-            if same_transition and existing_filled_qty > 0:
-                origin_hedged_qty = (
-                    max(0.0, current_hedged_qty - existing_filled_qty)
-                    if action == "enter"
-                    else current_hedged_qty + existing_filled_qty
-                )
-            else:
-                origin_hedged_qty = current_hedged_qty
-        position_target_qty = (
-            _safe_float(existing_transition.get("position_target_qty"))
-            if same_transition
-            else None
-        )
-        if position_target_qty is None:
-            position_target_qty = level_target_qty
-        desired_qty = (
-            max(0.0, position_target_qty - current_hedged_qty)
-            if action == "enter"
-            else max(0.0, current_hedged_qty - position_target_qty)
-        )
-        transition_qty = desired_qty if desired_qty > 0 else level_qty
-        if same_transition:
-            transition = dict(existing_transition)
-            transition["origin_hedged_qty"] = float(origin_hedged_qty)
-            transition["position_target_qty"] = float(position_target_qty)
-            if transition.pop("rebase_from_positions", False):
-                transition_qty = desired_qty
-                transition["origin_hedged_qty"] = current_hedged_qty
-                transition["target_qty"] = transition_qty
-                transition["filled_qty"] = 0.0
-                transition["remaining_qty"] = transition_qty
-                transition["rebased_at"] = datetime.now(timezone.utc).isoformat()
-        else:
-            transition = {
-                "action": action,
-                "from_level": from_level,
-                "to_level": to_level,
-                "target_qty": transition_qty,
-                "filled_qty": 0.0,
-                "remaining_qty": transition_qty,
-                "origin_hedged_qty": float(origin_hedged_qty),
-                "position_target_qty": float(position_target_qty),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-        transition_target_qty = transition.get("target_qty")
-        total_transition_qty = max(
-            0.0,
-            float(
-                transition_target_qty
-                if transition_target_qty is not None
-                else transition_qty or level_qty
-            ),
-        )
-        transition_remaining_qty = transition.get("remaining_qty")
-        qty = max(
-            0.0,
-            float(
-                transition_remaining_qty
-                if transition_remaining_qty is not None
-                else total_transition_qty
-            ),
-        )
+        transition = dict(pending_built["transition"])
+        qty = float(pending_built["qty"])
+        total_transition_qty = float(pending_built["total_transition_qty"])
+        position_target_qty = float(pending_built["position_target_qty"])
         tolerance = self._auto_arb_transition_completion_tolerance(
             rule_copy,
             total_transition_qty,

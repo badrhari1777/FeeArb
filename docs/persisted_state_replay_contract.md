@@ -95,3 +95,11 @@ and rolling a partially filled enter back from fresh exchange quantity. The
 deterministic reducer is `reduce_partial_grid_transition`; it may update only the
 provided rule state and returns a decision/event. Exchange refresh, order
 submission and execution reconciliation remain outside it in `DataService`.
+
+New and resumed transition quantities are normalized by
+`build_grid_pending_transition` and frozen in
+`tests/fixtures/grid_pending_transition_v1.json`. The builder distinguishes an
+exact continuation from a different transition, derives missing origin quantity,
+preserves material remainder, and consumes `rebase_from_positions` only against
+fresh hedged quantity. It does not validate exchange risk, place an order or
+interpret an execution result.

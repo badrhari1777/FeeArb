@@ -1,0 +1,125 @@
+[
+  {
+    "name": "new_enter_targets_level_from_flat",
+    "existing_transition": null,
+    "action": "enter",
+    "from_level": 0,
+    "to_level": 1,
+    "level_qty": 100.0,
+    "level_target_qty": 100.0,
+    "current_hedged_qty": 0.0,
+    "expected_result": {"qty": 100.0, "total_transition_qty": 100.0, "position_target_qty": 100.0},
+    "expected_transition": {
+      "action": "enter",
+      "from_level": 0,
+      "to_level": 1,
+      "target_qty": 100.0,
+      "filled_qty": 0.0,
+      "remaining_qty": 100.0,
+      "origin_hedged_qty": 0.0,
+      "position_target_qty": 100.0,
+      "created_at": "2026-08-13T00:00:00+00:00"
+    }
+  },
+  {
+    "name": "new_exit_uses_fresh_position_delta",
+    "existing_transition": null,
+    "action": "exit",
+    "from_level": 2,
+    "to_level": 1,
+    "level_qty": 100.0,
+    "level_target_qty": 100.0,
+    "current_hedged_qty": 210.0,
+    "expected_result": {"qty": 110.0, "total_transition_qty": 110.0, "position_target_qty": 100.0},
+    "expected_transition": {
+      "action": "exit",
+      "target_qty": 110.0,
+      "origin_hedged_qty": 210.0,
+      "position_target_qty": 100.0
+    }
+  },
+  {
+    "name": "same_partial_exit_preserves_remainder_and_recovers_origin",
+    "existing_transition": {
+      "action": "exit",
+      "from_level": 2,
+      "to_level": 1,
+      "target_qty": 100.0,
+      "filled_qty": 60.0,
+      "remaining_qty": 40.0
+    },
+    "action": "exit",
+    "from_level": 2,
+    "to_level": 1,
+    "level_qty": 100.0,
+    "level_target_qty": 100.0,
+    "current_hedged_qty": 140.0,
+    "expected_result": {"qty": 40.0, "total_transition_qty": 100.0, "position_target_qty": 100.0},
+    "expected_transition": {
+      "target_qty": 100.0,
+      "filled_qty": 60.0,
+      "remaining_qty": 40.0,
+      "origin_hedged_qty": 200.0,
+      "position_target_qty": 100.0
+    }
+  },
+  {
+    "name": "rebase_reversal_uses_fresh_position",
+    "existing_transition": {
+      "action": "enter",
+      "from_level": 4,
+      "to_level": 5,
+      "target_qty": 600.0,
+      "filled_qty": 0.0,
+      "remaining_qty": 600.0,
+      "origin_hedged_qty": 4400.0,
+      "position_target_qty": 5000.0,
+      "rebase_from_positions": true,
+      "reason": "partial_exit_reversed_by_entry_trigger"
+    },
+    "action": "enter",
+    "from_level": 4,
+    "to_level": 5,
+    "level_qty": 1000.0,
+    "level_target_qty": 5000.0,
+    "current_hedged_qty": 4450.0,
+    "expected_result": {"qty": 550.0, "total_transition_qty": 550.0, "position_target_qty": 5000.0},
+    "expected_transition": {
+      "target_qty": 550.0,
+      "filled_qty": 0.0,
+      "remaining_qty": 550.0,
+      "origin_hedged_qty": 4450.0,
+      "position_target_qty": 5000.0,
+      "reason": "partial_exit_reversed_by_entry_trigger",
+      "rebased_at": "2026-08-13T00:00:00+00:00"
+    },
+    "absent_transition_keys": ["rebase_from_positions"]
+  },
+  {
+    "name": "different_transition_does_not_reuse_old_quantities",
+    "existing_transition": {
+      "action": "exit",
+      "from_level": 3,
+      "to_level": 2,
+      "target_qty": 999.0,
+      "remaining_qty": 777.0,
+      "position_target_qty": 200.0
+    },
+    "action": "enter",
+    "from_level": 1,
+    "to_level": 2,
+    "level_qty": 100.0,
+    "level_target_qty": 200.0,
+    "current_hedged_qty": 100.0,
+    "expected_result": {"qty": 100.0, "total_transition_qty": 100.0, "position_target_qty": 200.0},
+    "expected_transition": {
+      "action": "enter",
+      "from_level": 1,
+      "to_level": 2,
+      "target_qty": 100.0,
+      "remaining_qty": 100.0,
+      "origin_hedged_qty": 100.0,
+      "position_target_qty": 200.0
+    }
+  }
+]

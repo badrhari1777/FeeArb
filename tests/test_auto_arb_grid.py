@@ -8,6 +8,7 @@ from execution.auto_arb_grid import (
     apply_grid_decision_confirmation,
     complete_pending_grid_transition,
     build_grid_levels,
+    build_grid_pending_transition,
     decide_grid_transition,
     reduce_partial_grid_transition,
     grid_completion_tolerance,
@@ -19,6 +20,28 @@ from execution.auto_arb_grid import (
 
 
 class AutoArbGridTestCase(unittest.TestCase):
+    def test_pending_transition_builder_matches_golden_fixtures(self) -> None:
+        fixture_path = Path(__file__).parent / "fixtures" / "grid_pending_transition_v1.json"
+        cases = json.loads(fixture_path.read_text(encoding="utf-8"))
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                result = build_grid_pending_transition(
+                    existing_transition=case.get("existing_transition"),
+                    action=case["action"],
+                    from_level=case["from_level"],
+                    to_level=case["to_level"],
+                    level_qty=case["level_qty"],
+                    level_target_qty=case["level_target_qty"],
+                    current_hedged_qty=case["current_hedged_qty"],
+                    now_iso="2026-08-13T00:00:00+00:00",
+                )
+                for key, expected in case["expected_result"].items():
+                    self.assertEqual(result.get(key), expected, key)
+                for key, expected in case["expected_transition"].items():
+                    self.assertEqual(result["transition"].get(key), expected, key)
+                for key in case.get("absent_transition_keys", []):
+                    self.assertNotIn(key, result["transition"])
+
     def test_partial_transition_reducer_matches_golden_fixtures(self) -> None:
         fixture_path = Path(__file__).parent / "fixtures" / "grid_partial_transition_v1.json"
         cases = json.loads(fixture_path.read_text(encoding="utf-8"))
