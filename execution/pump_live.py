@@ -2279,36 +2279,23 @@ class PumpLiveController:
                     )
             recovered = False
             with self._lock:
-                recovery_pending = bool(
-                    self._state.get("transient_recovery_pending")
-                    and self._state.get("blocked_reason") == "monitor_cycle_transient_error"
-                    and not self._state.get("portfolio_risk_freeze_active")
+                health = self._state_machine.advance_monitor_health(
+                    self._state,
+                    recovery_cycles=TRANSIENT_RECOVERY_CYCLES,
                 )
-                if recovery_pending:
-                    healthy = _safe_int(self._state.get("healthy_recovery_cycles"), 0) + 1
-                    self._state["healthy_recovery_cycles"] = healthy
-                    if healthy >= TRANSIENT_RECOVERY_CYCLES:
-                        self._state["entry_armed"] = True
-                        self._state["transient_recovery_pending"] = False
-                        self._state["healthy_recovery_cycles"] = 0
-                        self._state["blocked_reason"] = None
-                        recovered = True
+                recovery_pending = bool(health["recovery_pending"])
+                recovered = bool(health["recovered"])
                 close_recovered = self._advance_confirmed_close_recovery_locked(
                     exchange_positions,
                     open_orders,
                 )
-                if self._state.get("monitor_enabled") and not recovery_pending:
-                    self._state["status"] = (
-                        "armed" if self._state.get("entry_armed") else "monitoring"
-                    )
-                elif self._state.get("monitor_enabled"):
-                    self._state["status"] = "recovering_monitor"
-                if recovered:
-                    self._state["status"] = "armed"
-                if close_recovered:
-                    self._state["status"] = "armed"
-                self._state["last_error"] = None
-                self._state["updated_at_ms"] = _now_ms()
+                self._state_machine.finalize_monitor_success(
+                    self._state,
+                    recovery_pending=recovery_pending,
+                    recovered=recovered,
+                    close_recovered=close_recovered,
+                    now_ms=_now_ms(),
+                )
                 self._save_state_locked()
             if recovered:
                 self._event(
