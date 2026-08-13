@@ -34,6 +34,11 @@ Project Overview
 - Default active venues in docs are Bybit and MEXC; adapters for more exist but are not all active.
 - Execution layer is mostly simulated today; manual trading is the active "live" surface.
 - Position-driven exit/roll decisions should use the positions-market cache (fresh, separate from candidates refresh).
+- The canonical active/retired module boundary and refactor ledger is
+  `instructions/19_РЕЕСТР_МОДУЛЕЙ_И_РЕФАКТОРИНГ.md`. Current recurring runtime
+  keeps Grid, Manual, protection, Pump and Strategy Lab; Auto Exit, Auto
+  Strategy, position-reduction/de-risk decisions, legacy Coin Analysis and
+  legacy discovery are retired from recurring production work.
 
 Live Trading Focus (Manual Enter/Exit/Roll)
 - Manual UI: `webapp/templates/manual.html` + `webapp/static/manual.js`.

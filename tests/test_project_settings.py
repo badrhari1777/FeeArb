@@ -3361,22 +3361,21 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(candidate["reduce_side"], "short")
         self.assertAlmostEqual(float(candidate["planned_qty"]), 5.0)
 
-    async def test_auto_agent_worker_runs_derisk_before_other_strategies(self) -> None:
+    async def test_automation_worker_runs_only_grid(self) -> None:
         service = DataService(settings_manager=self.manager)
         calls: list[str] = []
 
         async def _record(name: str) -> None:
             calls.append(name)
 
-        service._derisk_last_worker_cycle_ts = 0.0  # type: ignore[attr-defined]
         service._auto_derisk_cycle = lambda: _record("derisk")  # type: ignore[assignment]
         service._auto_exit_cycle = lambda: _record("auto_exit")  # type: ignore[assignment]
         service._auto_strategy_cycle = lambda: _record("strategy")  # type: ignore[assignment]
         service._auto_arb_cycle = lambda: _record("grid")  # type: ignore[assignment]
 
-        await service._auto_agent_cycle()  # type: ignore[attr-defined]
+        await service._automation_cycle()  # type: ignore[attr-defined]
 
-        self.assertEqual(calls, ["derisk", "auto_exit", "strategy", "grid"])
+        self.assertEqual(calls, ["grid"])
 
     def test_account_state_caches_grouping_when_snapshot_unchanged(self) -> None:
         service = DataService(settings_manager=self.manager)

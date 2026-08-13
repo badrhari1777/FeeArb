@@ -139,6 +139,7 @@ from exchanges import ADAPTER_FACTORIES, get_adapter_cached, normalize_exchange_
 from config import BASE_DIR, STATE_DIR, EXCHANGE_COMMISSIONS, SUPPORTED_EXCHANGES
 from .market_data import MarketDataBus
 from .manual_symbols import _normalize_input_symbol
+from .runtime_modules import RUNTIME_MODULES, RuntimeModules
 from uuid import uuid4
 
 FUNDING_CACHE_TTL_SEC = 120
@@ -3326,8 +3327,14 @@ def _oi_change_pct(history: list[dict[str, Any]], hours: int) -> float | None:
 
 
 class DataService:
-    def __init__(self, settings_manager: SettingsManager | None = None) -> None:
+    def __init__(
+        self,
+        settings_manager: SettingsManager | None = None,
+        *,
+        runtime_modules: RuntimeModules = RUNTIME_MODULES,
+    ) -> None:
         self._settings_manager = settings_manager or SettingsManager()
+        self._runtime_modules = runtime_modules
         self._parser_interval = self._settings_manager.current.parser_refresh_seconds
         self._exchange_interval = self._settings_manager.current.exchange_refresh_seconds
         self._account_interval = self._settings_manager.current.account_refresh_seconds
@@ -3420,7 +3427,7 @@ class DataService:
         )
         self._auto_exit: dict[str, Any] = self._load_auto_exit_config()
         self._auto_exit_lock = asyncio.Lock()
-        self._auto_exit_task: Optional[asyncio.Task] = None
+        self._automation_task: Optional[asyncio.Task] = None
         self._auto_exit_poll_sec = AUTO_EXIT_POLL_SEC
         self._auto_exit_inflight = False
         self._auto_exit_live_spreads: dict[str, float] = {}
@@ -6515,23 +6522,8 @@ class DataService:
             self._positions_market_task = asyncio.create_task(self._positions_market_scheduler())
         if self._protective_task is None:
             self._protective_task = asyncio.create_task(self._protective_scheduler())
-        if self._auto_exit_task is None:
-            self._auto_exit_task = asyncio.create_task(self._auto_exit_scheduler())
-        if self._coin_focus_task is None:
-            self._coin_focus_task = asyncio.create_task(self._coin_focus_scheduler())
-        if self._coin_outcomes_task is None:
-            self._coin_outcomes_task = asyncio.create_task(self._coin_outcomes_scheduler())
-        if self._coin_retention_task is None:
-            self._coin_retention_task = asyncio.create_task(self._coin_retention_scheduler())
-        if self._coin_position_watcher_task is None:
-            self._coin_position_watcher_task = asyncio.create_task(
-                self._coin_position_watcher_scheduler()
-            )
-        if not self._coin_retention_last_report:
-            try:
-                await self.run_coin_analysis_retention_once(reason="startup")
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.warning("Coin retention startup run failed: %s", exc)
+        if self._runtime_modules.auto_arb_grid and self._automation_task is None:
+            self._automation_task = asyncio.create_task(self._automation_scheduler())
         await self._telemetry.start()
 
     async def shutdown(self) -> None:
@@ -6542,13 +6534,13 @@ class DataService:
             except asyncio.CancelledError:
                 pass
             self._positions_market_task = None
-        if self._auto_exit_task:
-            self._auto_exit_task.cancel()
+        if self._automation_task:
+            self._automation_task.cancel()
             try:
-                await self._auto_exit_task
+                await self._automation_task
             except asyncio.CancelledError:
                 pass
-            self._auto_exit_task = None
+            self._automation_task = None
         if self._auto_arb_task:
             self._auto_arb_task.cancel()
             try:
@@ -6949,9 +6941,6 @@ class DataService:
         # Legacy market-discovery scheduling intentionally stays disabled.
         await self._restart_protective_scheduler()
         await self._restart_positions_market_scheduler()
-        await self._restart_derisk_scheduler()
-        await self._restart_coin_focus_scheduler()
-        await self._restart_coin_outcomes_scheduler()
         self._accounts.update_interval(self._account_interval)
         self._accounts.update_summary_interval(self._summary_interval)
         self._accounts.update_enabled_exchanges(self._account_monitor_enabled_exchanges())
@@ -12077,6 +12066,7 @@ class DataService:
             "events": list(self._events),
             "exchange_status": list(self._exchange_status.values()),
             "settings": settings_payload,
+            "runtime_modules": self._runtime_modules.to_dict(),
             "auto_exit": self.auto_exit_payload(),
             "auto_arb": self.auto_arb_payload(),
             "auto_strategies": self.auto_strategy_payload(),
@@ -16620,25 +16610,24 @@ class DataService:
                         self._auto_exit_store.save(self._auto_exit)
             self._auto_exit_event("rule_preserved_after_exit", event_payload)
 
-    async def _auto_agent_cycle(self) -> None:
-        now_ts = time.time()
-        if (
-            now_ts - float(self._derisk_last_worker_cycle_ts or 0.0)
-        ) >= max(2.0, float(self._derisk_poll_sec or 5.0)):
-            self._derisk_last_worker_cycle_ts = now_ts
-            await self._auto_derisk_cycle()
-        await self._auto_exit_cycle()
-        await self._auto_strategy_cycle()
-        await self._auto_arb_cycle()
+    async def _automation_cycle(self) -> None:
+        """Run only production-owned automation modules.
 
-    async def _auto_exit_scheduler(self) -> None:
+        Auto Exit, Auto Strategy and position-reduction/de-risk decision loops
+        are retired from runtime.  Grid keeps its independent state machine and
+        execution safety checks.
+        """
+        if self._runtime_modules.auto_arb_grid:
+            await self._auto_arb_cycle()
+
+    async def _automation_scheduler(self) -> None:
         while True:
             try:
-                await self._auto_agent_cycle()
+                await self._automation_cycle()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pylint: disable=broad-except
-                logger.exception("auto-agent loop failed: %s", exc)
+                logger.exception("automation loop failed: %s", exc)
             await asyncio.sleep(self._auto_exit_poll_sec)
 
     async def _auto_exit_cycle(self) -> None:

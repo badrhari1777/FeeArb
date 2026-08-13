@@ -49,6 +49,9 @@
 - Канонический план prospective-сбора funding/spread кандидатов, multi-venue median
   и roll для Strategy Lab Candidate Observatory:
   [`18_STRATEGY_LAB_CANDIDATE_OBSERVATORY.md`](18_STRATEGY_LAB_CANDIDATE_OBSERVATORY.md)
+- Канонический реестр active/retired модулей и безопасный порядок большого
+  рефакторинга:
+  [`19_РЕЕСТР_МОДУЛЕЙ_И_РЕФАКТОРИНГ.md`](19_РЕЕСТР_МОДУЛЕЙ_И_РЕФАКТОРИНГ.md)
 
 ## Важно
 
