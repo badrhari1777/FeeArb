@@ -210,10 +210,11 @@ class MobileManualSpreadPayload(BaseModel):
 
 
 def _manual_payload_dict(payload: ManualBasePayload) -> dict:
-    data = payload.dict()
-    provided_fields = getattr(payload, "__fields_set__", None)
+    model_dump = getattr(payload, "model_dump", None)
+    data = model_dump() if callable(model_dump) else payload.dict()
+    provided_fields = getattr(payload, "model_fields_set", None)
     if provided_fields is None:
-        provided_fields = getattr(payload, "model_fields_set", set())
+        provided_fields = getattr(payload, "__fields_set__", set())
     mode = str(data.get("mode") or "").lower()
     if mode.startswith("smart-") and "allow_liquidity_chunking" not in provided_fields:
         data["allow_liquidity_chunking"] = True
@@ -407,8 +408,9 @@ async def favicon() -> FileResponse:
 async def index(request: Request) -> HTMLResponse:
     dashboard = _dashboard_payload()
     return templates.TemplateResponse(
-        "index.html",
-        {
+        request=request,
+        name="index.html",
+        context={
             "request": request,
             "dashboard": dashboard,
             "static_version": STATIC_VERSION,
@@ -419,8 +421,9 @@ async def index(request: Request) -> HTMLResponse:
 @app.get("/positions", response_class=HTMLResponse)
 async def positions_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
-        "positions.html",
-        {
+        request=request,
+        name="positions.html",
+        context={
             "request": request,
             "static_version": STATIC_VERSION,
         },
@@ -430,8 +433,9 @@ async def positions_page(request: Request) -> HTMLResponse:
 @app.get("/strategy-lab-observatory", response_class=HTMLResponse)
 async def strategy_lab_observatory_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
-        "strategy_lab_observatory.html",
-        {
+        request=request,
+        name="strategy_lab_observatory.html",
+        context={
             "request": request,
             "initial": strategy_lab_observatory.status(),
             "static_version": STATIC_VERSION,
@@ -458,8 +462,9 @@ async def funding_history_page(
         ],
     }
     return templates.TemplateResponse(
-        "funding_history.html",
-        {
+        request=request,
+        name="funding_history.html",
+        context={
             "request": request,
             "symbol": symbol,
             "initial": initial,
@@ -471,8 +476,9 @@ async def funding_history_page(
 @app.get("/pump-short-lab", response_class=HTMLResponse)
 async def pump_short_lab_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
-        "pump_short_lab.html",
-        {
+        request=request,
+        name="pump_short_lab.html",
+        context={
             "request": request,
             "initial": bybit_pump_short_lab.status(),
             "static_version": STATIC_VERSION,
@@ -483,8 +489,9 @@ async def pump_short_lab_page(request: Request) -> HTMLResponse:
 @app.get("/pump-short", response_class=HTMLResponse)
 async def pump_short_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
-        "pump_short.html",
-        {
+        request=request,
+        name="pump_short.html",
+        context={
             "request": request,
             "initial": bybit_pump_short_lab.pump_dashboard_status(),
             "static_version": STATIC_VERSION,
@@ -495,8 +502,9 @@ async def pump_short_page(request: Request) -> HTMLResponse:
 @app.get("/pump-short-strategies", response_class=HTMLResponse)
 async def pump_short_strategies_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(
-        "pump_short_strategies.html",
-        {
+        request=request,
+        name="pump_short_strategies.html",
+        context={
             "request": request,
             "initial": bybit_pump_short_lab.strategy_monitor_status(),
             "static_version": STATIC_VERSION,
@@ -508,8 +516,9 @@ async def pump_short_strategies_page(request: Request) -> HTMLResponse:
 async def manual_page(request: Request) -> HTMLResponse:
     settings = settings_manager.as_dict()
     return templates.TemplateResponse(
-        "manual.html",
-        {
+        request=request,
+        name="manual.html",
+        context={
             "request": request,
             "settings": settings,
             "static_version": STATIC_VERSION,
@@ -526,8 +535,9 @@ async def auto_arbitrage_page(request: Request) -> HTMLResponse:
         if enabled
     ]
     return templates.TemplateResponse(
-        "auto_arbitrage.html",
-        {
+        request=request,
+        name="auto_arbitrage.html",
+        context={
             "request": request,
             "initial": {
                 "exchanges": exchanges,
@@ -542,8 +552,9 @@ async def auto_arbitrage_page(request: Request) -> HTMLResponse:
 async def manual_tests_page(request: Request) -> HTMLResponse:
     settings = settings_manager.as_dict()
     return templates.TemplateResponse(
-        "manual_tests.html",
-        {
+        request=request,
+        name="manual_tests.html",
+        context={
             "request": request,
             "settings": settings,
             "static_version": STATIC_VERSION,
@@ -554,8 +565,9 @@ async def manual_tests_page(request: Request) -> HTMLResponse:
 async def spread_monitor_page(request: Request) -> HTMLResponse:
     settings = settings_manager.as_dict()
     return templates.TemplateResponse(
-        "spread_monitor.html",
-        {
+        request=request,
+        name="spread_monitor.html",
+        context={
             "request": request,
             "settings": settings,
             "static_version": STATIC_VERSION,
