@@ -176,3 +176,55 @@ class PumpStateMachine:
             }
         )
         return {"start_monitor": True}
+
+    @staticmethod
+    def advance_monitor_health(
+        state: dict[str, Any],
+        *,
+        recovery_cycles: int,
+    ) -> dict[str, Any]:
+        """Advance transient recovery before close-recovery reconciliation."""
+
+        recovery_pending = bool(
+            state.get("transient_recovery_pending")
+            and state.get("blocked_reason") == "monitor_cycle_transient_error"
+            and not state.get("portfolio_risk_freeze_active")
+        )
+        recovered = False
+        if recovery_pending:
+            healthy = int(state.get("healthy_recovery_cycles") or 0) + 1
+            state["healthy_recovery_cycles"] = healthy
+            if healthy >= recovery_cycles:
+                state["entry_armed"] = True
+                state["transient_recovery_pending"] = False
+                state["healthy_recovery_cycles"] = 0
+                state["blocked_reason"] = None
+                recovered = True
+        return {
+            "recovery_pending": recovery_pending,
+            "recovered": recovered,
+        }
+
+    @staticmethod
+    def finalize_monitor_success(
+        state: dict[str, Any],
+        *,
+        recovery_pending: bool,
+        recovered: bool,
+        close_recovered: bool,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Finalize a healthy cycle after close-recovery reconciliation."""
+
+        if state.get("monitor_enabled") and not recovery_pending:
+            state["status"] = "armed" if state.get("entry_armed") else "monitoring"
+        elif state.get("monitor_enabled"):
+            state["status"] = "recovering_monitor"
+        if recovered or close_recovered:
+            state["status"] = "armed"
+        state["last_error"] = None
+        state["updated_at_ms"] = now_ms
+        return {
+            "emit_monitor_recovered": recovered,
+            "emit_close_recovered": close_recovered,
+        }

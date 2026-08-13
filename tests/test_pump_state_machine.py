@@ -313,3 +313,72 @@ def test_arm_success_reducer_matches_legacy_golden_cases() -> None:
         for key, value in case["expected"].items():
             source = actual_result if key in actual_result else machine_state
             assert source[key] == value, f"{case['name']}:{key}"
+
+
+def _legacy_reduce_monitor_success(
+    state: dict[str, Any],
+    *,
+    close_recovered: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    recovery_pending = bool(
+        state.get("transient_recovery_pending")
+        and state.get("blocked_reason") == "monitor_cycle_transient_error"
+        and not state.get("portfolio_risk_freeze_active")
+    )
+    recovered = False
+    if recovery_pending:
+        healthy = int(state.get("healthy_recovery_cycles") or 0) + 1
+        state["healthy_recovery_cycles"] = healthy
+        if healthy >= 2:
+            state["entry_armed"] = True
+            state["transient_recovery_pending"] = False
+            state["healthy_recovery_cycles"] = 0
+            state["blocked_reason"] = None
+            recovered = True
+    progress = {"recovery_pending": recovery_pending, "recovered": recovered}
+    if state.get("monitor_enabled") and not recovery_pending:
+        state["status"] = "armed" if state.get("entry_armed") else "monitoring"
+    elif state.get("monitor_enabled"):
+        state["status"] = "recovering_monitor"
+    if recovered or close_recovered:
+        state["status"] = "armed"
+    state["last_error"] = None
+    state["updated_at_ms"] = NOW_MS
+    final = {
+        "emit_monitor_recovered": recovered,
+        "emit_close_recovered": close_recovered,
+    }
+    return progress, final
+
+
+def test_monitor_success_reducers_match_legacy_golden_cases() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent / "fixtures" / "pump_monitor_success_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = PumpStateMachine()
+    for case in cases:
+        legacy_state = deepcopy(case["state"])
+        machine_state = deepcopy(case["state"])
+        expected_progress, expected_final = _legacy_reduce_monitor_success(
+            legacy_state,
+            close_recovered=case["close_recovered"],
+        )
+        actual_progress = machine.advance_monitor_health(
+            machine_state,
+            recovery_cycles=2,
+        )
+        actual_final = machine.finalize_monitor_success(
+            machine_state,
+            **actual_progress,
+            close_recovered=case["close_recovered"],
+            now_ms=NOW_MS,
+        )
+        assert machine_state == legacy_state, case["name"]
+        assert actual_progress == expected_progress, case["name"]
+        assert actual_final == expected_final, case["name"]
+        assert machine_state["last_error"] is None
+        for key, value in case["expected"].items():
+            source = actual_progress if key in actual_progress else machine_state
+            assert source[key] == value, f"{case['name']}:{key}"

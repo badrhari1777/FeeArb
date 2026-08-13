@@ -1,0 +1,26 @@
+[
+  {
+    "name": "ordinary_armed_cycle_stays_armed",
+    "close_recovered": false,
+    "state": {"status": "armed", "monitor_enabled": true, "entry_armed": true, "last_error": "old", "transient_recovery_pending": false, "healthy_recovery_cycles": 0, "blocked_reason": null, "portfolio_risk_freeze_active": false},
+    "expected": {"status": "armed", "recovery_pending": false, "recovered": false}
+  },
+  {
+    "name": "first_transient_healthy_cycle_keeps_recovering",
+    "close_recovered": false,
+    "state": {"status": "recovering_monitor", "monitor_enabled": true, "entry_armed": false, "last_error": "timeout", "transient_recovery_pending": true, "healthy_recovery_cycles": 0, "blocked_reason": "monitor_cycle_transient_error", "portfolio_risk_freeze_active": false},
+    "expected": {"status": "recovering_monitor", "recovery_pending": true, "recovered": false, "healthy_recovery_cycles": 1}
+  },
+  {
+    "name": "second_transient_healthy_cycle_rearms",
+    "close_recovered": false,
+    "state": {"status": "recovering_monitor", "monitor_enabled": true, "entry_armed": false, "last_error": "timeout", "transient_recovery_pending": true, "healthy_recovery_cycles": 1, "blocked_reason": "monitor_cycle_transient_error", "portfolio_risk_freeze_active": false},
+    "expected": {"status": "armed", "recovery_pending": true, "recovered": true, "healthy_recovery_cycles": 0, "entry_armed": true, "blocked_reason": null}
+  },
+  {
+    "name": "confirmed_close_recovery_forces_armed_status",
+    "close_recovered": true,
+    "state": {"status": "monitoring", "monitor_enabled": true, "entry_armed": true, "last_error": "position absent", "transient_recovery_pending": false, "healthy_recovery_cycles": 0, "blocked_reason": null, "portfolio_risk_freeze_active": false},
+    "expected": {"status": "armed", "recovery_pending": false, "recovered": false}
+  }
+]
