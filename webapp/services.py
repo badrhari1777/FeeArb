@@ -2006,12 +2006,11 @@ class DataService:
                 exclude_rule_id=rule_id,
             )
             if live_grid_conflict is not None:
-                rule["status"] = "blocked_conflict"
-                rule["blocked_reason"] = (
-                    f"matching_live_grid_rule:{live_grid_conflict.get('id')}"
+                self._grid_machine.reduce_transition_admission(
+                    rule,
+                    kind="live_rule_conflict",
+                    conflict_rule_id=str(live_grid_conflict.get("id") or ""),
                 )
-                rule["pending_action"] = None
-                rule["pending_samples"] = 0
                 rule["updated_at"] = datetime.now(timezone.utc).isoformat()
                 self._save_auto_arb_config()
                 return
@@ -2020,12 +2019,11 @@ class DataService:
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
                 if isinstance(current, dict):
-                    current["status"] = "blocked_conflict"
-                    current["blocked_reason"] = (
-                        f"execution_running:{running.get('execution_id')}"
+                    self._grid_machine.reduce_transition_admission(
+                        current,
+                        kind="manual_worker_conflict",
+                        execution_id=str(running.get("execution_id") or ""),
                     )
-                    current["pending_action"] = None
-                    current["pending_samples"] = 0
                     current["updated_at"] = datetime.now(timezone.utc).isoformat()
                     self._save_auto_arb_config()
             return
@@ -2207,13 +2205,17 @@ class DataService:
                 != int(rule_copy.get("generation") or 0)
             ):
                 if isinstance(current, dict) and not current.get("enabled"):
-                    current["status"] = "paused"
-                    current["pending_action"] = None
-                    current["pending_samples"] = 0
+                    self._grid_machine.reduce_transition_admission(
+                        current,
+                        kind="paused_before_submit",
+                    )
                     current["updated_at"] = datetime.now(timezone.utc).isoformat()
                     self._save_auto_arb_config()
                 return
-            current["transition_starting"] = True
+            self._grid_machine.reduce_transition_admission(
+                current,
+                kind="reserve_submission",
+            )
         try:
             result = (
                 await self.manual_enter(payload)
@@ -2224,7 +2226,10 @@ class DataService:
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
                 if isinstance(current, dict):
-                    current.pop("transition_starting", None)
+                    self._grid_machine.reduce_transition_admission(
+                        current,
+                        kind="submission_exception",
+                    )
             raise
         now_iso = datetime.now(timezone.utc).isoformat()
         worker_event: dict[str, Any] = {}
