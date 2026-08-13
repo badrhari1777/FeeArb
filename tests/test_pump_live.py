@@ -16,6 +16,7 @@ from execution.pump_live import (
     BybitPumpLiveGateway,
     CAPITAL_SET_CONFIRMATION,
     CAPITAL_PROMOTE_CONFIRMATION,
+    EMERGENCY_CONFIRMATION,
     PREFUND_NEXT_LADDER_CONFIRMATION_PREFIX,
     MARGIN_MANAGER_V2_CURRENT,
     MARGIN_MANAGER_V3_SHARED,
@@ -5191,6 +5192,8 @@ def test_arm_resume_rejects_unknown_exchange_position(tmp_path: Path) -> None:
         assert "pump_live_resume_unknown_exchange_state" in str(exc)
     else:  # pragma: no cover - regression guard
         raise AssertionError("resume unexpectedly accepted an unknown position")
+
+
 def test_stop_monitor_delegation_blocks_open_position_without_mutation(
     tmp_path: Path,
 ) -> None:
@@ -5236,3 +5239,34 @@ def test_stop_monitor_delegation_stops_flat_controller(tmp_path: Path) -> None:
     assert status["monitor_enabled"] is False
     assert controller._stop.is_set() is True  # pylint: disable=protected-access
     assert controller._wake.is_set() is True  # pylint: disable=protected-access
+
+
+def test_emergency_request_delegation_preserves_confirmation_and_io_order(
+    tmp_path: Path,
+) -> None:
+    env_path = tmp_path / "pump_live.env"
+    write_env(env_path)
+    controller = PumpLiveController(
+        gateway=FakePumpGateway(),
+        state_dir=tmp_path / "state",
+        env_path=env_path,
+        start_recovery_monitor=False,
+        background_monitor=False,
+    )
+    before = json.loads(json.dumps(controller._state))  # pylint: disable=protected-access
+    with pytest.raises(
+        ValueError,
+        match="pump_live_emergency_confirmation_invalid",
+    ):
+        controller.emergency_close_all("invalid")
+    assert controller._state == before  # pylint: disable=protected-access
+
+    status = controller.emergency_close_all(EMERGENCY_CONFIRMATION)
+
+    assert status["status"] == "emergency_closing"
+    assert status["entry_armed"] is False
+    assert status["monitor_enabled"] is True
+    assert status["emergency_close_requested"] is True
+    assert controller._wake.is_set() is True  # pylint: disable=protected-access
+    events = controller.events_path.read_text(encoding="utf-8")
+    assert '"event": "emergency_close_requested"' in events

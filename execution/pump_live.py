@@ -2219,19 +2219,10 @@ class PumpLiveController:
         if confirmation != EMERGENCY_CONFIRMATION:
             raise ValueError("pump_live_emergency_confirmation_invalid")
         with self._lock:
-            self._state["entry_armed"] = False
-            self._state["monitor_enabled"] = True
-            self._state["emergency_close_requested"] = True
-            self._state["status"] = "emergency_closing"
-            self._state["transient_recovery_pending"] = False
-            self._state["healthy_recovery_cycles"] = 0
-            self._state["portfolio_risk_freeze_active"] = False
-            self._state["portfolio_risk_freeze_reason"] = None
-            self._state["portfolio_risk_freeze_symbol"] = None
-            self._state["portfolio_risk_freeze_buffer_pct"] = None
-            self._state["portfolio_risk_restore_armed"] = False
-            self._state["portfolio_risk_recovery_cycles"] = 0
-            self._state["updated_at_ms"] = _now_ms()
+            self._state_machine.reduce_emergency_request(
+                self._state,
+                now_ms=_now_ms(),
+            )
             self._save_state_locked()
         self._event("emergency_close_requested", {})
         self.start_monitor()
