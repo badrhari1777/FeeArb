@@ -1,0 +1,76 @@
+[
+  {
+    "name": "idle_flat_waits_entry",
+    "rule": {"id": "grid-idle", "pending_action": "enter", "pending_samples": 1},
+    "decision": {"action": "none", "target_level": 0},
+    "mode": "live",
+    "current_level": 0,
+    "pending_transition": null,
+    "now_ts": 100.0,
+    "expected_rule": {
+      "status": "waiting_entry",
+      "pending_action": null,
+      "pending_samples": 0,
+      "blocked_reason": null
+    },
+    "expected_result": {"action": "none", "live_transition": null, "transition_event": null}
+  },
+  {
+    "name": "partial_exit_waits_frontier_trigger",
+    "rule": {"id": "grid-partial", "pending_action": "exit", "pending_samples": 1},
+    "decision": {"action": "none", "target_level": 1},
+    "mode": "live",
+    "current_level": 2,
+    "pending_transition": {"action": "exit", "from_level": 2, "to_level": 1},
+    "now_ts": 100.0,
+    "expected_rule": {
+      "status": "partial_exit_waiting_trigger",
+      "pending_action": null,
+      "pending_samples": 0,
+      "blocked_reason": null
+    },
+    "expected_result": {"action": "none", "live_transition": null, "transition_event": null}
+  },
+  {
+    "name": "confirmed_live_enter_is_only_queued",
+    "rule": {"id": "grid-live", "confirm_samples": 1, "levels": [{"cumulative_qty": 100.0}]},
+    "decision": {"action": "enter", "target_level": 1},
+    "mode": "live",
+    "current_level": 0,
+    "pending_transition": null,
+    "now_ts": 100.0,
+    "expected_rule": {
+      "status": "queued_enter",
+      "pending_action": "enter",
+      "pending_samples": 1,
+      "blocked_reason": null
+    },
+    "expected_result": {
+      "action": "enter",
+      "live_transition": ["grid-live", "enter", 0, 1],
+      "transition_event": null
+    }
+  },
+  {
+    "name": "entry_risk_cooldown_is_fail_closed",
+    "rule": {
+      "id": "grid-risk",
+      "entry_next_eligible_ts": 200.0,
+      "entry_blocked_reason": "risk limit",
+      "pending_action": "enter",
+      "pending_samples": 1
+    },
+    "decision": {"action": "enter", "target_level": 1},
+    "mode": "live",
+    "current_level": 0,
+    "pending_transition": null,
+    "now_ts": 100.0,
+    "expected_rule": {
+      "status": "blocked_risk_limit",
+      "pending_action": null,
+      "pending_samples": 0,
+      "blocked_reason": "risk limit"
+    },
+    "expected_result": {"action": "enter", "live_transition": null, "transition_event": null}
+  }
+]

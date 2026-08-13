@@ -412,3 +412,95 @@ def grid_level_count_for_existing_qty(
             item["level_count"],
         ),
     )
+
+
+def apply_grid_decision_confirmation(
+    rule: dict[str, Any],
+    *,
+    decision: dict[str, Any],
+    mode: str,
+    current_level: int,
+    pending_transition: dict[str, Any] | None,
+    entry_spread_pct: float,
+    exit_spread_pct: float,
+    now_iso: str,
+    now_ts: float,
+) -> dict[str, Any]:
+    """Pure state reducer after spread/partial-transition decision calculation."""
+    action = str(decision.get("action") or "none")
+    rule["last_decision"] = decision
+    rule["blocked_reason"] = None
+    live_transition: tuple[str, str, int, int] | None = None
+    transition_event: dict[str, Any] | None = None
+    entry_risk_cooldown = (
+        action == "enter"
+        and now_ts < float(rule.get("entry_next_eligible_ts") or 0.0)
+    )
+    if entry_risk_cooldown:
+        rule["pending_action"] = None
+        rule["pending_samples"] = 0
+        rule["status"] = "blocked_risk_limit"
+        rule["blocked_reason"] = str(
+            rule.get("entry_blocked_reason")
+            or "KuCoin entry risk-limit preflight is cooling down"
+        )
+    elif action == "none":
+        rule["pending_action"] = None
+        rule["pending_samples"] = 0
+        rule["status"] = (
+            f"partial_{pending_transition.get('action')}_waiting_trigger"
+            if pending_transition
+            else ("waiting_entry" if not current_level else "monitoring")
+        )
+    else:
+        if rule.get("pending_action") == action:
+            rule["pending_samples"] = int(rule.get("pending_samples") or 0) + 1
+        else:
+            rule["pending_action"] = action
+            rule["pending_samples"] = 1
+        rule["status"] = f"confirming_{action}"
+        required = max(1, int(rule.get("confirm_samples") or 2))
+        if int(rule["pending_samples"]) >= required:
+            previous_level = (
+                int(pending_transition.get("from_level") or current_level)
+                if pending_transition
+                else current_level
+            )
+            new_level = int(
+                pending_transition.get("to_level")
+                if pending_transition
+                else decision["target_level"]
+            )
+            if mode == "live":
+                rule["status"] = f"queued_{action}"
+                live_transition = (str(rule.get("id") or ""), action, previous_level, new_level)
+            else:
+                rule["shadow_level"] = new_level
+                levels = rule.get("levels") or []
+                rule["shadow_qty"] = (
+                    float(levels[new_level - 1].get("cumulative_qty") or 0.0)
+                    if new_level > 0 and new_level <= len(levels)
+                    else 0.0
+                )
+                rule["status"] = f"shadow_{action}"
+                rule["pending_action"] = None
+                rule["pending_samples"] = 0
+                transition_event = {
+                    "event": f"shadow_{action}",
+                    "rule_id": rule.get("id"),
+                    "generation": rule.get("generation"),
+                    "symbol": rule.get("symbol"),
+                    "long_exchange": rule.get("long_exchange"),
+                    "short_exchange": rule.get("short_exchange"),
+                    "from_level": previous_level,
+                    "to_level": new_level,
+                    "shadow_qty": rule.get("shadow_qty"),
+                    "entry_spread_pct": entry_spread_pct,
+                    "exit_spread_pct": exit_spread_pct,
+                    "ts": now_iso,
+                }
+    return {
+        "action": action,
+        "live_transition": live_transition,
+        "transition_event": transition_event,
+    }

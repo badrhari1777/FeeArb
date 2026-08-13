@@ -40,6 +40,7 @@ from execution.auto_arb_grid import (
     MAX_LEVELS,
     MIN_LEVELS,
     build_grid_levels,
+    apply_grid_decision_confirmation,
     decide_grid_transition,
     grid_completion_tolerance,
     grid_dust_only_errors,
@@ -3159,77 +3160,24 @@ class DataService:
                             current_level=current_level,
                             max_levels_per_cycle=current.get("max_levels_per_cycle") or 1,
                         )
-                    action = decision["action"]
-                    current["last_decision"] = decision
-                    current["blocked_reason"] = None
-                    entry_risk_cooldown = (
-                        action == "enter"
-                        and time.time()
-                        < float(current.get("entry_next_eligible_ts") or 0.0)
+                    reduced = apply_grid_decision_confirmation(
+                        current,
+                        decision=decision,
+                        mode=mode,
+                        current_level=current_level,
+                        pending_transition=(
+                            dict(pending_transition) if pending_transition else None
+                        ),
+                        entry_spread_pct=entry_spread,
+                        exit_spread_pct=exit_spread,
+                        now_iso=now_iso,
+                        now_ts=time.time(),
                     )
-                    if entry_risk_cooldown:
-                        current["pending_action"] = None
-                        current["pending_samples"] = 0
-                        current["status"] = "blocked_risk_limit"
-                        current["blocked_reason"] = str(
-                            current.get("entry_blocked_reason")
-                            or "KuCoin entry risk-limit preflight is cooling down"
-                        )
-                    elif action == "none":
-                        current["pending_action"] = None
-                        current["pending_samples"] = 0
-                        current["status"] = (
-                            f"partial_{pending_transition.get('action')}_waiting_trigger"
-                            if pending_transition
-                            else ("waiting_entry" if not current_level else "monitoring")
-                        )
-                    else:
-                        if current.get("pending_action") == action:
-                            current["pending_samples"] = int(current.get("pending_samples") or 0) + 1
-                        else:
-                            current["pending_action"] = action
-                            current["pending_samples"] = 1
-                        current["status"] = f"confirming_{action}"
-                        required = max(1, int(current.get("confirm_samples") or 2))
-                        if int(current["pending_samples"]) >= required:
-                            previous_level = (
-                                int(pending_transition.get("from_level") or current_level)
-                                if pending_transition
-                                else current_level
-                            )
-                            new_level = int(
-                                pending_transition.get("to_level")
-                                if pending_transition
-                                else decision["target_level"]
-                            )
-                            if mode == "live":
-                                current["status"] = f"queued_{action}"
-                                live_transition = (rule_id, action, previous_level, new_level)
-                            else:
-                                current["shadow_level"] = new_level
-                                levels = current.get("levels") or []
-                                current["shadow_qty"] = (
-                                    float(levels[new_level - 1].get("cumulative_qty") or 0.0)
-                                    if new_level > 0 and new_level <= len(levels)
-                                    else 0.0
-                                )
-                                current["status"] = f"shadow_{action}"
-                                current["pending_action"] = None
-                                current["pending_samples"] = 0
-                                transition_event = {
-                                    "event": f"shadow_{action}",
-                                    "rule_id": current.get("id"),
-                                    "generation": current.get("generation"),
-                                    "symbol": current.get("symbol"),
-                                    "long_exchange": current.get("long_exchange"),
-                                    "short_exchange": current.get("short_exchange"),
-                                    "from_level": previous_level,
-                                    "to_level": new_level,
-                                    "shadow_qty": current.get("shadow_qty"),
-                                    "entry_spread_pct": entry_spread,
-                                    "exit_spread_pct": exit_spread,
-                                    "ts": now_iso,
-                                }
+                    action = str(reduced["action"])
+                    if reduced.get("live_transition"):
+                        live_transition = tuple(reduced["live_transition"])
+                    if reduced.get("transition_event"):
+                        transition_event = dict(reduced["transition_event"])
                 current["updated_at"] = now_iso
                 self._save_auto_arb_config()
             if transition_event:

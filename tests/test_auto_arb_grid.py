@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import unittest
 
 from execution.auto_arb_grid import (
+    apply_grid_decision_confirmation,
     build_grid_levels,
     decide_grid_transition,
     grid_completion_tolerance,
@@ -14,6 +17,37 @@ from execution.auto_arb_grid import (
 
 
 class AutoArbGridTestCase(unittest.TestCase):
+    def test_confirmation_reducer_matches_golden_fixtures(self) -> None:
+        fixture_path = Path(__file__).parent / "fixtures" / "grid_transition_confirmation_v1.json"
+        cases = json.loads(fixture_path.read_text(encoding="utf-8"))
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                rule = dict(case["rule"])
+                result = apply_grid_decision_confirmation(
+                    rule,
+                    decision=dict(case["decision"]),
+                    mode=case["mode"],
+                    current_level=case["current_level"],
+                    pending_transition=(
+                        dict(case["pending_transition"])
+                        if case["pending_transition"] is not None
+                        else None
+                    ),
+                    entry_spread_pct=-2.0,
+                    exit_spread_pct=-1.9,
+                    now_iso="2026-08-13T00:00:00+00:00",
+                    now_ts=case["now_ts"],
+                )
+                for key, expected in case["expected_rule"].items():
+                    self.assertEqual(rule.get(key), expected, key)
+                normalized_result = dict(result)
+                if isinstance(normalized_result.get("live_transition"), tuple):
+                    normalized_result["live_transition"] = list(
+                        normalized_result["live_transition"]
+                    )
+                for key, expected in case["expected_result"].items():
+                    self.assertEqual(normalized_result.get(key), expected, key)
+
     def test_builds_inclusive_negative_spread_levels(self) -> None:
         levels = build_grid_levels(
             range_start_pct=-2,
@@ -126,6 +160,84 @@ class AutoArbGridTestCase(unittest.TestCase):
         self.assertEqual(fit["level_count"], 5)
         self.assertEqual(fit["level"], 1)
         self.assertAlmostEqual(grid_completion_tolerance({"chunk_qty": 2_000}), 20.0)
+
+    def test_confirmation_reducer_matches_two_sample_shadow_transition(self) -> None:
+        rule = {
+            "id": "grid-1",
+            "generation": 3,
+            "symbol": "TUTUSDT",
+            "long_exchange": "kucoin",
+            "short_exchange": "bybit",
+            "confirm_samples": 2,
+            "pending_action": "enter",
+            "pending_samples": 1,
+            "levels": [{"cumulative_qty": 100.0}],
+        }
+        result = apply_grid_decision_confirmation(
+            rule,
+            decision={"action": "enter", "target_level": 1},
+            mode="shadow",
+            current_level=0,
+            pending_transition=None,
+            entry_spread_pct=-2.1,
+            exit_spread_pct=-1.8,
+            now_iso="2026-08-13T00:00:00+00:00",
+            now_ts=100.0,
+        )
+
+        self.assertEqual(rule["status"], "shadow_enter")
+        self.assertEqual(rule["shadow_level"], 1)
+        self.assertEqual(rule["shadow_qty"], 100.0)
+        self.assertIsNone(rule["pending_action"])
+        self.assertEqual(result["transition_event"]["event"], "shadow_enter")
+        self.assertIsNone(result["live_transition"])
+
+    def test_confirmation_reducer_queues_live_transition_without_executing(self) -> None:
+        rule = {
+            "id": "grid-live",
+            "confirm_samples": 1,
+            "levels": [{"cumulative_qty": 100.0}],
+        }
+        result = apply_grid_decision_confirmation(
+            rule,
+            decision={"action": "enter", "target_level": 1},
+            mode="live",
+            current_level=0,
+            pending_transition=None,
+            entry_spread_pct=-2.0,
+            exit_spread_pct=-1.9,
+            now_iso="2026-08-13T00:00:00+00:00",
+            now_ts=100.0,
+        )
+
+        self.assertEqual(rule["status"], "queued_enter")
+        self.assertEqual(result["live_transition"], ("grid-live", "enter", 0, 1))
+        self.assertIsNone(result["transition_event"])
+
+    def test_confirmation_reducer_blocks_entry_during_risk_cooldown(self) -> None:
+        rule = {
+            "id": "grid-live",
+            "entry_next_eligible_ts": 200.0,
+            "entry_blocked_reason": "risk limit",
+            "pending_action": "enter",
+            "pending_samples": 1,
+        }
+        result = apply_grid_decision_confirmation(
+            rule,
+            decision={"action": "enter", "target_level": 1},
+            mode="live",
+            current_level=0,
+            pending_transition=None,
+            entry_spread_pct=-2.0,
+            exit_spread_pct=-1.9,
+            now_iso="2026-08-13T00:00:00+00:00",
+            now_ts=100.0,
+        )
+
+        self.assertEqual(rule["status"], "blocked_risk_limit")
+        self.assertEqual(rule["blocked_reason"], "risk limit")
+        self.assertIsNone(rule["pending_action"])
+        self.assertIsNone(result["live_transition"])
 
 
 if __name__ == "__main__":

@@ -82,3 +82,7 @@ reconciliation finishes.
 Before moving either state machine, tests must cover valid restart, repeated
 restart, corrupt/unknown state, duplicate ownership, missing in-memory execution,
 partial execution and protection uncertainty.
+
+Grid reducer golden cases live in
+`tests/fixtures/grid_transition_confirmation_v1.json`. They freeze the output for
+idle, partial-frontier wait, confirmed Live queue and entry-risk cooldown states.
