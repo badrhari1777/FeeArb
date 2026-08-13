@@ -2146,21 +2146,11 @@ class PumpLiveController:
 
     def disarm(self, reason: str = "operator_disarm") -> dict[str, Any]:
         with self._lock:
-            has_open_positions = bool(self._open_positions(self._state))
-            self._state["entry_armed"] = False
-            self._state["monitor_enabled"] = has_open_positions
-            self._state["status"] = "monitoring" if has_open_positions else "disarmed"
-            self._state["blocked_reason"] = reason
-            self._state["transient_recovery_pending"] = False
-            self._state["healthy_recovery_cycles"] = 0
-            self._state["portfolio_risk_freeze_active"] = False
-            self._state["portfolio_risk_freeze_reason"] = None
-            self._state["portfolio_risk_freeze_symbol"] = None
-            self._state["portfolio_risk_freeze_buffer_pct"] = None
-            self._state["portfolio_risk_restore_armed"] = False
-            self._state["portfolio_risk_recovery_cycles"] = 0
-            self._state["updated_at_ms"] = _now_ms()
-            self._state["pending_signals"] = []
+            self._state_machine.reduce_disarm(
+                self._state,
+                reason=reason,
+                now_ms=_now_ms(),
+            )
             self._save_state_locked()
         self._event("disarmed", {"reason": reason})
         self._wake.set()
