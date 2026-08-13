@@ -1910,14 +1910,13 @@ class DataService:
             }:
                 return
             rule_copy = dict(rule)
-        long_qty = float(quantities.get("long_qty") or 0.0)
-        short_qty = float(quantities.get("short_qty") or 0.0)
-        imbalance_qty = abs(long_qty - short_qty)
-        tolerance = self._auto_arb_hedge_imbalance_tolerance(
+        repair_intent = self._grid_machine.plan_hedge_repair_start(
             rule_copy,
-            hedged_qty=float(quantities.get("hedged_qty") or 0.0),
+            quantities=quantities,
         )
-        if imbalance_qty <= tolerance:
+        imbalance_qty = float(repair_intent["imbalance_qty"])
+        tolerance = float(repair_intent["tolerance_qty"])
+        if repair_intent["kind"] == "settle_within_tolerance":
             now_iso = datetime.now(timezone.utc).isoformat()
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
@@ -1992,27 +1991,21 @@ class DataService:
                 }
             )
             return
-        cleanup_long = long_qty > short_qty
-        cleanup_exchange = (
-            rule_copy.get("long_exchange")
-            if cleanup_long
-            else rule_copy.get("short_exchange")
-        )
-        cleanup_side = "long" if cleanup_long else "short"
-        close_side = "sell" if cleanup_side == "long" else "buy"
+        cleanup_exchange = repair_intent["cleanup_exchange"]
+        cleanup_side = str(repair_intent["cleanup_side"] or "")
+        analysis_request = dict(repair_intent["analysis_request"] or {})
         preflight: dict[str, Any] = {}
         try:
-            preflight = await self._manual.analyze_rebalance(
-                exchange=str(cleanup_exchange or ""),
-                symbol=str(rule_copy.get("symbol") or ""),
-                side=close_side,
-                qty_base=imbalance_qty,
-                max_slippage_bps=float(rule_copy.get("max_slippage_bps") or 8.0),
-            )
+            preflight = await self._manual.analyze_rebalance(**analysis_request)
         except Exception as exc:  # pylint: disable=broad-except
             preflight = {"errors": [str(exc)]}
-        min_required = _safe_float(preflight.get("min_qty_required"))
-        if min_required and imbalance_qty < min_required:
+        repair_intent = self._grid_machine.plan_hedge_repair_start(
+            rule_copy,
+            quantities=quantities,
+            preflight=preflight,
+        )
+        min_required = repair_intent["min_qty_required"]
+        if repair_intent["kind"] == "settle_non_closeable_dust":
             now_iso = datetime.now(timezone.utc).isoformat()
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
@@ -2054,24 +2047,7 @@ class DataService:
                 }
             )
             return
-        payload = {
-            "symbol": rule_copy.get("symbol"),
-            "qty": imbalance_qty,
-            "cleanup_exchange": cleanup_exchange,
-            "cleanup_position_side": cleanup_side,
-            "panic_cleanup_mode": False,
-            "max_slippage_bps": float(rule_copy.get("max_slippage_bps") or 8.0),
-            "max_runtime_sec": 120,
-            "reprice_sec": 4.0,
-            "use_orderbook_check": True,
-            "fallback_to_market": False,
-            "async_run": True,
-            "dry_run": False,
-            "margin_mode": "isolated",
-            "auto_arb_agent": True,
-            "auto_arb_rule_id": rule_id,
-            "auto_arb_rule_generation": int(rule_copy.get("generation") or 0),
-        }
+        payload = dict(repair_intent["cleanup_payload"] or {})
         result = await self.manual_orphan_cleanup(payload)
         exec_id = str((result or {}).get("execution_id") or "")
         now_iso = datetime.now(timezone.utc).isoformat()

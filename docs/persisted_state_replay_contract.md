@@ -192,4 +192,10 @@ exchange-minimum non-closeable remainder, and a submit-ready cleanup. It returns
 the exact analysis request or existing reduce-only cleanup payload without
 mutating rule, quantities, or preflight. Five golden cases cover long and short
 surpluses in `tests/fixtures/grid_hedge_repair_start_intent_v1.json`. Production
-repair start is not wired to this planner yet.
+repair start was not wired in the initial parity-only checkpoint.
+
+Production hedge-repair start now consumes the planner once before Manual
+analysis and again with its preflight result. The existing in-lock settle/dust
+mutations, `analyze_rebalance`, `manual_orphan_cleanup`, state save, history, and
+worker ownership remain in `DataService`; the state machine only supplies routing
+and exact I/O payloads.
