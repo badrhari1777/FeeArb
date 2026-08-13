@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping, Protocol
 from uuid import uuid4
 
 from config import BASE_DIR
+from execution.pump_state_machine import PumpStateMachine
 from execution.state_replay_contract import audit_pump_state
 
 try:
@@ -1329,23 +1330,13 @@ class PumpLiveController:
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._accounting_thread: threading.Thread | None = None
+        self._state_machine = PumpStateMachine()
         self._state = self._load_state()
-        self._state["entry_armed"] = False
-        self._state["transient_recovery_pending"] = False
-        self._state["healthy_recovery_cycles"] = 0
-        self._state["portfolio_risk_restore_armed"] = False
-        self._state["portfolio_risk_recovery_cycles"] = 0
-        if self._open_positions(self._state):
-            self._state["monitor_enabled"] = True
-            self._state["status"] = "recovery_monitoring"
+        restart = self._state_machine.reduce_cold_restart(self._state)
+        if restart["save_state"]:
             self._save_state_locked()
-            if start_recovery_monitor:
-                self.start_monitor()
-        elif self._state.get("status") not in {"disabled", "stopped"}:
-            self._state["monitor_enabled"] = False
-            self._state["status"] = "disarmed_after_restart"
-            self._state["blocked_reason"] = "backend_restart"
-            self._save_state_locked()
+        if restart["start_recovery_monitor"] and start_recovery_monitor:
+            self.start_monitor()
         if (
             self._background_monitor
             and start_recovery_monitor
