@@ -41,8 +41,6 @@ from execution.auto_arb_grid import (
     MAX_LEVELS,
     MIN_LEVELS,
     build_grid_levels,
-    reduce_grid_transition_execution,
-    reduce_grid_hedge_repair_execution,
     reduce_missing_grid_execution,
     grid_completion_tolerance,
     grid_dust_only_errors,
@@ -1872,111 +1870,22 @@ class DataService:
             current = (self._auto_arb.get("rules") or {}).get(rule_id)
             if not isinstance(current, dict):
                 return False
-            terminal_intent = self._grid_machine.plan_execution_reconcile_io(
-                current,
-                run=run,
-            )
-            reconcile_reducer = terminal_intent.get("reducer")
-            active_action = str(current.get("active_action") or "")
-            current["active_execution_id"] = None
-            current["active_action"] = None
-            current["active_from_level"] = None
-            current["active_to_level"] = None
-            current["active_target_qty"] = None
-            start_hedged_qty = _safe_float(current.get("active_start_hedged_qty"))
-            current["active_start_hedged_qty"] = None
-            if quantities is not None:
-                hedged_qty = float(quantities.get("hedged_qty") or 0.0)
-                imbalance_qty = float(quantities.get("imbalance_qty") or 0.0)
-                transition = dict(current.get("pending_transition") or {})
-                total_transition_qty = max(
-                    0.0,
-                    float(transition.get("target_qty") or 0.0),
-                )
-                hedge_tolerance = self._auto_arb_hedge_imbalance_tolerance(
+            reconcile_reduced = (
+                self._grid_machine.reduce_execution_reconcile_after_refresh(
                     current,
-                    transition_qty=total_transition_qty or None,
-                    hedged_qty=hedged_qty,
+                    run=run,
+                    quantities=quantities,
+                    reconcile_error=reconcile_error,
+                    active_snapshot=rule_copy,
+                    now_iso=now_iso,
+                    now_ts=time.time(),
+                    retry_sec=AUTO_ARB_RETRY_SEC,
                 )
-                current["actual_hedged_qty"] = hedged_qty
-                current["last_execution"] = {
-                    "execution_id": exec_id,
-                    "status": status,
-                    "error": run.get("error"),
-                    "result": run.get("result"),
-                    "observed_hedged_qty": hedged_qty,
-                    "observed_imbalance_qty": imbalance_qty,
-                    "reconciled_at": now_iso,
-                }
-                if reconcile_reducer == "hedge_repair_execution":
-                    repair_reduced = reduce_grid_hedge_repair_execution(
-                        current,
-                        transition=transition,
-                        execution_status=status,
-                        execution_error=run.get("error"),
-                        execution_result=run.get("result"),
-                        hedged_qty=hedged_qty,
-                        imbalance_qty=imbalance_qty,
-                        hedge_tolerance=hedge_tolerance,
-                        now_ts=time.time(),
-                        retry_sec=AUTO_ARB_RETRY_SEC,
-                    )
-                    event.update(repair_reduced["event"])
-                    if repair_reduced["retry_repair"]:
-                        repair_quantities = dict(quantities)
-                    completed = bool(repair_reduced["completed"])
-                elif reconcile_reducer == "transition_execution":
-                    transition_reduced = reduce_grid_transition_execution(
-                        current,
-                        transition=transition,
-                        active_action=active_action,
-                        execution_id=exec_id,
-                        execution_status=status,
-                        execution_error=run.get("error"),
-                        execution_result=run.get("result"),
-                        hedged_qty=hedged_qty,
-                        imbalance_qty=imbalance_qty,
-                        start_hedged_qty=start_hedged_qty,
-                        now_iso=now_iso,
-                        now_ts=time.time(),
-                        retry_sec=AUTO_ARB_RETRY_SEC,
-                    )
-                    event.update(transition_reduced["event"])
-                    if transition_reduced["repair_required"]:
-                        repair_quantities = dict(quantities)
-                    completed = bool(transition_reduced["completed"])
-                else:
-                    current["actual_hedged_qty"] = hedged_qty
-                    current["status"] = "monitoring"
-                    current["blocked_reason"] = None
-                    completed = True
-                if (
-                    not current.get("enabled")
-                    and imbalance_qty <= hedge_tolerance
-                    and repair_quantities is None
-                ):
-                    current["status"] = "paused"
-                    current["blocked_reason"] = None
-                    current["next_eligible_ts"] = 0.0
-            else:
-                current["active_execution_id"] = exec_id
-                current["active_action"] = rule_copy.get("active_action")
-                current["active_from_level"] = rule_copy.get("active_from_level")
-                current["active_to_level"] = rule_copy.get("active_to_level")
-                current["active_target_qty"] = rule_copy.get("active_target_qty")
-                current["active_start_hedged_qty"] = rule_copy.get(
-                    "active_start_hedged_qty"
-                )
-                current["status"] = "waiting_reconcile"
-                current["blocked_reason"] = (
-                    f"position_refresh_failed: {reconcile_error}"
-                    if reconcile_error
-                    else f"execution_{status or 'unknown'}"
-                )
-                current["next_eligible_ts"] = time.time() + 30.0
-                event["event"] = "live_reconcile_deferred"
-                event["error"] = reconcile_error or run.get("error")
-                event["result"] = run.get("result")
+            )
+            event.update(reconcile_reduced["event"])
+            if reconcile_reduced["repair_required"] and quantities is not None:
+                repair_quantities = dict(quantities)
+            completed = bool(reconcile_reduced["completed"])
             current["updated_at"] = now_iso
             self._save_auto_arb_config()
         self._auto_arb_history_store.append(event)

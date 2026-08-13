@@ -176,4 +176,11 @@ and returns only the event fragment plus completion/repair intent. It performs n
 exchange read, persistence, history append, or repair launch. Seven trajectories
 in `tests/fixtures/grid_execution_reconcile_after_refresh_v1.json` compare the
 entire mutated rule and result with the preserved production sequence, including
-position-refresh failure. Production is not wired to this facade yet.
+position-refresh failure. The initial parity-only checkpoint did not wire
+production to this facade.
+
+Production reconcile now delegates only its in-lock post-refresh reduction to
+that facade. `DataService` still owns the Manual run lookup, exchange position
+refresh, event envelope, lock, durable save, history append, and any later hedge
+repair launch. This keeps I/O ordering and failure boundaries outside the pure
+state machine.
