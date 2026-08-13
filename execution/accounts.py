@@ -1048,6 +1048,11 @@ class AccountMonitor:
             else None
         )
         self._lock = asyncio.Lock()
+        # Periodic, operator and protective refreshes can coincide. Keep the
+        # private account sweep single-flight so they do not multiply API load.
+        self._refresh_lock = asyncio.Lock()
+        self._refresh_generation = 0
+        self._last_refresh_forced_env = False
         self._balances: list[dict[str, Any]] = []
         self._positions: list[dict[str, Any]] = []
         self._status: list[dict[str, Any]] = []
@@ -1127,6 +1132,7 @@ class AccountMonitor:
             enforce_margin=False,
             evaluate_alerts=False,
             send_summary=False,
+            coalesce=False,
         )
 
     def update_interval(self, seconds: int) -> None:
@@ -1246,23 +1252,39 @@ class AccountMonitor:
         enforce_margin: bool = True,
         evaluate_alerts: bool = True,
         send_summary: bool = True,
+        coalesce: bool = True,
     ) -> None:
-        balances, positions, status, refreshed = await self._collect_all(
-            force_env=force_env
-        )
-        if enforce_margin:
-            await self._maybe_enforce_margin_settings(positions)
-        margin_events: list[dict[str, Any]] = []
-        if evaluate_alerts:
-            margin_events = await self._maybe_send_alerts(balances, positions)
-        if send_summary:
-            await self._maybe_send_summary(balances, positions, refreshed)
-        async with self._lock:
-            self._balances = balances
-            self._positions = positions
-            self._status = status
-            if refreshed:
-                self._last_updated = refreshed
+        observed_generation = self._refresh_generation
+        async with self._refresh_lock:
+            # A compatible refresh completed while this caller was waiting.
+            # Its new account snapshot satisfies this routine request. A
+            # protective post-action verification explicitly opts out.
+            if (
+                coalesce
+                and observed_generation != self._refresh_generation
+                and (not force_env or self._last_refresh_forced_env)
+            ):
+                return
+            balances, positions, status, refreshed = await self._collect_all(
+                force_env=force_env
+            )
+            if enforce_margin:
+                await self._maybe_enforce_margin_settings(positions)
+            margin_events: list[dict[str, Any]] = []
+            if evaluate_alerts:
+                margin_events = await self._maybe_send_alerts(balances, positions)
+            if send_summary:
+                await self._maybe_send_summary(balances, positions, refreshed)
+            async with self._lock:
+                self._balances = balances
+                self._positions = positions
+                self._status = status
+                if refreshed:
+                    self._last_updated = refreshed
+            self._refresh_generation += 1
+            self._last_refresh_forced_env = bool(force_env)
+        # A margin-adjust callback deliberately requests a verification refresh.
+        # It must run after releasing the lock to avoid re-entrant deadlock.
         if evaluate_alerts and margin_events and self._on_margin_adjust:
             try:
                 maybe_awaitable = self._on_margin_adjust(list(margin_events))

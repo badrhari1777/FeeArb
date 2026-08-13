@@ -193,6 +193,82 @@ class AccountMonitorPartialCollectTestCase(unittest.IsolatedAsyncioTestCase):
             refresh_mock.assert_not_awaited()
             await monitor.stop()
 
+    async def test_concurrent_refreshes_are_single_flight(self) -> None:
+        monitor = AccountMonitor(refresh_interval=60, summary_interval=60)
+        active = 0
+        peak_active = 0
+        collect_calls = 0
+
+        async def _collect_all(*, force_env: bool = False):  # noqa: ARG001
+            nonlocal active, peak_active, collect_calls
+            collect_calls += 1
+            active += 1
+            peak_active = max(peak_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return [], [], [], datetime.now(timezone.utc).isoformat()
+
+        monitor._collect_all = _collect_all  # type: ignore[method-assign]
+        monitor._maybe_enforce_margin_settings = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        monitor._maybe_send_alerts = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        monitor._maybe_send_summary = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        await asyncio.gather(
+            monitor.refresh_now(force_env=True),
+            monitor.refresh_now(force_env=True),
+        )
+
+        self.assertEqual(peak_active, 1)
+        self.assertEqual(collect_calls, 1)
+
+    async def test_margin_callback_can_request_verification_refresh(self) -> None:
+        monitor = AccountMonitor(refresh_interval=60, summary_interval=60)
+        collect_calls = 0
+
+        async def _collect_all(*, force_env: bool = False):  # noqa: ARG001
+            nonlocal collect_calls
+            collect_calls += 1
+            return [], [], [], datetime.now(timezone.utc).isoformat()
+
+        async def _on_margin_adjust(_events: list[dict]) -> None:
+            await monitor.refresh_now_for_protective(force_env=True)
+
+        monitor._collect_all = _collect_all  # type: ignore[method-assign]
+        monitor._maybe_enforce_margin_settings = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        monitor._maybe_send_alerts = AsyncMock(return_value=[{"action": "margin_add"}])  # type: ignore[method-assign]
+        monitor._maybe_send_summary = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        monitor._on_margin_adjust = _on_margin_adjust
+
+        await asyncio.wait_for(monitor.refresh_now(force_env=True), timeout=0.5)
+
+        self.assertEqual(collect_calls, 2)
+
+    async def test_forced_env_refresh_is_not_satisfied_by_routine_refresh(self) -> None:
+        monitor = AccountMonitor(refresh_interval=60, summary_interval=60)
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        force_flags: list[bool] = []
+
+        async def _collect_all(*, force_env: bool = False):
+            force_flags.append(force_env)
+            if len(force_flags) == 1:
+                first_started.set()
+                await release_first.wait()
+            return [], [], [], datetime.now(timezone.utc).isoformat()
+
+        monitor._collect_all = _collect_all  # type: ignore[method-assign]
+        monitor._maybe_enforce_margin_settings = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        monitor._maybe_send_alerts = AsyncMock(return_value=[])  # type: ignore[method-assign]
+        monitor._maybe_send_summary = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        routine = asyncio.create_task(monitor.refresh_now(force_env=False))
+        await first_started.wait()
+        forced = asyncio.create_task(monitor.refresh_now(force_env=True))
+        release_first.set()
+        await asyncio.gather(routine, forced)
+
+        self.assertEqual(force_flags, [False, True])
+
     async def test_balance_error_does_not_drop_positions(self) -> None:
         monitor = AccountMonitor(refresh_interval=60, summary_interval=60)
         monitor._gateways = {"bitget": _PartialCollectGateway()}  # type: ignore[assignment]

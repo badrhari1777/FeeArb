@@ -1375,6 +1375,8 @@ class DataService:
         self._positions_market_diffs: list[dict[str, Any]] = []
         self._positions_market_last_account_update: str | None = None
         self._positions_market_task: Optional[asyncio.Task] = None
+        self._settings_refresh_task: Optional[asyncio.Task] = None
+        self._settings_refresh_pending = False
         self._positions_market_sem = asyncio.Semaphore(POSITIONS_MARKET_CONCURRENCY)
         self._risk_config: RiskConfig = self._risk_config_from_settings()
         self._protective_manager = ProtectiveOrderManager(self._risk_config, notifier=self._notifier)
@@ -1672,6 +1674,14 @@ class DataService:
         await self._telemetry.start()
 
     async def shutdown(self) -> None:
+        if self._settings_refresh_task:
+            self._settings_refresh_task.cancel()
+            try:
+                await self._settings_refresh_task
+            except asyncio.CancelledError:
+                pass
+            self._settings_refresh_task = None
+            self._settings_refresh_pending = False
         if self._positions_market_task:
             self._positions_market_task.cancel()
             try:
@@ -1767,9 +1777,26 @@ class DataService:
         self._accounts.update_interval(self._account_interval)
         self._accounts.update_summary_interval(self._summary_interval)
         self._accounts.update_enabled_exchanges(self._account_monitor_enabled_exchanges())
-        # Kick an async refresh so UI sees new cadence sooner.
-        asyncio.create_task(self._accounts.refresh_now(force_env=True))
-        asyncio.create_task(self._refresh_positions_market_snapshots(force=True))
+        # Build the public position-market universe from the newly refreshed
+        # account snapshot. Quick repeated saves coalesce into one follow-up.
+        self._settings_refresh_pending = True
+        if self._settings_refresh_task is None or self._settings_refresh_task.done():
+            self._settings_refresh_task = asyncio.create_task(
+                self._refresh_operational_state_after_settings()
+            )
+
+    async def _refresh_operational_state_after_settings(self) -> None:
+        try:
+            while self._settings_refresh_pending:
+                self._settings_refresh_pending = False
+                await self._accounts.refresh_now(force_env=True)
+                await self._refresh_positions_market_snapshots(force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Post-settings operational refresh failed: %s", exc)
+        finally:
+            self._settings_refresh_task = None
 
     def _account_monitor_enabled_exchanges(self) -> set[str]:
         """Use both venue selectors so disabling a venue everywhere stops private polling."""

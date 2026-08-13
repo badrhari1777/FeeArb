@@ -172,6 +172,24 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         await service._maybe_sync_protective_orders()
         self.assertFalse(service._protective_manager.called)  # type: ignore[attr-defined]
 
+    async def test_settings_refreshes_accounts_before_position_markets(self) -> None:
+        service = DataService(settings_manager=self.manager)
+        calls: list[str] = []
+
+        async def _refresh_accounts(*, force_env: bool = False) -> None:  # noqa: ARG001
+            calls.append("accounts")
+
+        async def _refresh_markets(*, force: bool = False) -> None:  # noqa: ARG001
+            calls.append("markets")
+
+        service._accounts.refresh_now = _refresh_accounts  # type: ignore[method-assign]
+        service._refresh_positions_market_snapshots = _refresh_markets  # type: ignore[method-assign]
+        service._settings_refresh_pending = True
+
+        await service._refresh_operational_state_after_settings()
+
+        self.assertEqual(calls, ["accounts", "markets"])
+
 
 
     def test_protective_issue_kind_detects_auth_errors(self) -> None:
