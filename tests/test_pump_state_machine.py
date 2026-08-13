@@ -382,3 +382,55 @@ def test_monitor_success_reducers_match_legacy_golden_cases() -> None:
         for key, value in case["expected"].items():
             source = actual_progress if key in actual_progress else machine_state
             assert source[key] == value, f"{case['name']}:{key}"
+
+
+def _legacy_reduce_close_recovery(
+    state: dict[str, Any],
+    *,
+    evidence_ready: bool,
+) -> dict[str, Any]:
+    if not state.get("close_recovery_pending"):
+        return {"recovered": False}
+    if state.get("blocked_reason") != "position_absent_unconfirmed":
+        state["close_recovery_pending"] = False
+        state["close_recovery_healthy_cycles"] = 0
+        return {"recovered": False}
+    if not evidence_ready:
+        return {"recovered": False}
+    healthy = int(state.get("close_recovery_healthy_cycles") or 0) + 1
+    state["close_recovery_healthy_cycles"] = healthy
+    if healthy < 2:
+        return {"recovered": False}
+    state["entry_armed"] = True
+    state["monitor_enabled"] = True
+    state["blocked_reason"] = None
+    state["close_recovery_pending"] = False
+    state["close_recovery_symbol"] = None
+    state["close_recovery_healthy_cycles"] = 0
+    return {"recovered": True}
+
+
+def test_close_recovery_reducer_matches_legacy_golden_cases() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent / "fixtures" / "pump_close_recovery_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = PumpStateMachine()
+    for case in cases:
+        legacy_state = deepcopy(case["state"])
+        machine_state = deepcopy(case["state"])
+        expected_result = _legacy_reduce_close_recovery(
+            legacy_state,
+            evidence_ready=case["evidence_ready"],
+        )
+        actual_result = machine.reduce_close_recovery(
+            machine_state,
+            evidence_ready=case["evidence_ready"],
+            recovery_cycles=2,
+        )
+        assert machine_state == legacy_state, case["name"]
+        assert actual_result == expected_result, case["name"]
+        for key, value in case["expected"].items():
+            source = actual_result if key in actual_result else machine_state
+            assert source.get(key) == value, f"{case['name']}:{key}"

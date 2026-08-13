@@ -228,3 +228,32 @@ class PumpStateMachine:
             "emit_monitor_recovered": recovered,
             "emit_close_recovered": close_recovered,
         }
+
+    @staticmethod
+    def reduce_close_recovery(
+        state: dict[str, Any],
+        *,
+        evidence_ready: bool,
+        recovery_cycles: int,
+    ) -> dict[str, Any]:
+        """Advance close recovery from controller-supplied exchange evidence."""
+
+        if not state.get("close_recovery_pending"):
+            return {"recovered": False}
+        if state.get("blocked_reason") != "position_absent_unconfirmed":
+            state["close_recovery_pending"] = False
+            state["close_recovery_healthy_cycles"] = 0
+            return {"recovered": False}
+        if not evidence_ready:
+            return {"recovered": False}
+        healthy = int(state.get("close_recovery_healthy_cycles") or 0) + 1
+        state["close_recovery_healthy_cycles"] = healthy
+        if healthy < recovery_cycles:
+            return {"recovered": False}
+        state["entry_armed"] = True
+        state["monitor_enabled"] = True
+        state["blocked_reason"] = None
+        state["close_recovery_pending"] = False
+        state["close_recovery_symbol"] = None
+        state["close_recovery_healthy_cycles"] = 0
+        return {"recovered": True}

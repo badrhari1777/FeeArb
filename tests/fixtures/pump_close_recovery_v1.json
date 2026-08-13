@@ -1,0 +1,32 @@
+[
+  {
+    "name": "no_pending_recovery_is_noop",
+    "evidence_ready": true,
+    "state": {"close_recovery_pending": false, "close_recovery_healthy_cycles": 0},
+    "expected": {"recovered": false}
+  },
+  {
+    "name": "unrelated_block_cancels_auto_recovery",
+    "evidence_ready": true,
+    "state": {"close_recovery_pending": true, "close_recovery_symbol": "ACEUSDT", "close_recovery_healthy_cycles": 1, "blocked_reason": "operator_disarm"},
+    "expected": {"recovered": false, "close_recovery_pending": false, "close_recovery_healthy_cycles": 0}
+  },
+  {
+    "name": "incomplete_exchange_evidence_holds_cycle",
+    "evidence_ready": false,
+    "state": {"close_recovery_pending": true, "close_recovery_symbol": "ACEUSDT", "close_recovery_healthy_cycles": 1, "blocked_reason": "position_absent_unconfirmed"},
+    "expected": {"recovered": false, "close_recovery_pending": true, "close_recovery_healthy_cycles": 1}
+  },
+  {
+    "name": "first_healthy_scan_advances",
+    "evidence_ready": true,
+    "state": {"close_recovery_pending": true, "close_recovery_symbol": "ACEUSDT", "close_recovery_healthy_cycles": 0, "blocked_reason": "position_absent_unconfirmed", "entry_armed": false, "monitor_enabled": true},
+    "expected": {"recovered": false, "close_recovery_pending": true, "close_recovery_healthy_cycles": 1}
+  },
+  {
+    "name": "second_healthy_scan_rearms",
+    "evidence_ready": true,
+    "state": {"close_recovery_pending": true, "close_recovery_symbol": "ACEUSDT", "close_recovery_healthy_cycles": 1, "blocked_reason": "position_absent_unconfirmed", "entry_armed": false, "monitor_enabled": false},
+    "expected": {"recovered": true, "close_recovery_pending": false, "close_recovery_symbol": null, "close_recovery_healthy_cycles": 0, "blocked_reason": null, "entry_armed": true, "monitor_enabled": true}
+  }
+]
