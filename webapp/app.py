@@ -89,14 +89,6 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def _ui_state_payload() -> dict[str, object]:
-    return with_pump_account_balances(
-        service.state_payload(),
-        bybit_pump_short_lab.pump_live_status(),
-        accounts_key="accounts",
-    )
-
-
 def _dashboard_payload() -> dict[str, object]:
     pump_status = bybit_pump_short_lab.pump_live_status()
     return build_dashboard_payload(
@@ -284,17 +276,6 @@ class AutoArbRulePayload(BaseModel):
 
 class AutoArbLivePayload(BaseModel):
     confirmation: str
-
-
-class AutoStrategyPayload(BaseModel):
-    id: Optional[str] = None
-    name: Optional[str] = None
-    type: str
-    symbol: str
-    long_exchange: str
-    short_exchange: str
-    enabled: bool = True
-    steps: list[Dict[str, object]]
 
 
 class ManualTestPayload(BaseModel):
@@ -530,32 +511,6 @@ async def strategy_lab_observatory_page(request: Request) -> HTMLResponse:
     )
 
 
-@app.get("/coin/{symbol}", response_class=HTMLResponse)
-async def coin_analysis_page(
-    request: Request,
-    symbol: str,
-    window_minutes: int = 4320,
-    funding_points: int = 120,
-) -> HTMLResponse:
-    settings = settings_manager.as_dict()
-    symbol_session = None
-    try:
-        symbol_session = await service.bootstrap_symbol_session(symbol)
-    except ValueError:
-        symbol_session = None
-    return templates.TemplateResponse(
-        "coin.html",
-        {
-            "request": request,
-            "symbol": symbol,
-            "window_minutes": window_minutes,
-            "funding_points": funding_points,
-            "static_version": STATIC_VERSION,
-            "settings": settings,
-            "symbol_session": symbol_session,
-        },
-    )
-
 @app.get("/funding-history", response_class=HTMLResponse)
 async def funding_history_page(
     request: Request,
@@ -655,27 +610,6 @@ async def auto_arbitrage_page(request: Request) -> HTMLResponse:
     )
 
 
-@app.get("/strategies", response_class=HTMLResponse)
-async def strategies_page(request: Request) -> HTMLResponse:
-    settings = settings_manager.as_dict()
-    exchanges = [
-        name
-        for name, enabled in (settings.get("analysis_exchanges") or {}).items()
-        if enabled
-    ]
-    return templates.TemplateResponse(
-        "strategies.html",
-        {
-            "request": request,
-            "initial": {
-                "exchanges": exchanges,
-                "payload": service.auto_strategy_payload(),
-            },
-            "static_version": STATIC_VERSION,
-        },
-    )
-
-
 @app.get("/manual-tests", response_class=HTMLResponse)
 async def manual_tests_page(request: Request) -> HTMLResponse:
     settings = settings_manager.as_dict()
@@ -699,11 +633,6 @@ async def spread_monitor_page(request: Request) -> HTMLResponse:
             "static_version": STATIC_VERSION,
         },
     )
-
-@app.get("/api/snapshot")
-async def snapshot_api() -> JSONResponse:
-    return JSONResponse(jsonable_encoder(_ui_state_payload()))
-
 
 @app.get("/api/dashboard")
 async def dashboard_api() -> JSONResponse:
@@ -752,7 +681,7 @@ async def strategy_lab_observatory_feed_probe_api(
 @app.get("/api/positions/overview")
 async def positions_overview_api() -> JSONResponse:
     payload = build_positions_overview(
-        service.mobile_positions_payload(),
+        service.mobile_positions_payload(include_auto_exit=False),
         bybit_pump_short_lab.pump_live_status(),
     )
     return JSONResponse(jsonable_encoder(payload))
@@ -1482,11 +1411,6 @@ async def coin_paper_action_api(payload: CoinPaperActionPayload) -> JSONResponse
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return JSONResponse(jsonable_encoder(result))
 
-@app.post("/api/refresh")
-async def refresh_snapshot() -> JSONResponse:
-    result = await service.refresh_snapshot(force_accounts=True)
-    return JSONResponse({"status": result, "state": _ui_state_payload()})
-
 @app.get("/api/settings")
 async def get_settings() -> JSONResponse:
     return JSONResponse({"settings": settings_manager.as_dict()})
@@ -1541,56 +1465,6 @@ async def get_auto_exit() -> JSONResponse:
 @app.get("/api/auto-arb")
 async def get_auto_arb() -> JSONResponse:
     return JSONResponse(jsonable_encoder(service.auto_arb_payload()))
-
-
-@app.get("/api/strategies")
-async def get_auto_strategies() -> JSONResponse:
-    return JSONResponse(jsonable_encoder(service.auto_strategy_payload()))
-
-
-@app.post("/api/strategies/preflight")
-async def preflight_auto_strategy(payload: AutoStrategyPayload) -> JSONResponse:
-    try:
-        result = await service.analyze_auto_strategy(payload.dict(exclude_none=True))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return JSONResponse(jsonable_encoder(result))
-
-
-@app.post("/api/strategies")
-async def upsert_auto_strategy(payload: AutoStrategyPayload) -> JSONResponse:
-    try:
-        result = await service.upsert_auto_strategy(payload.dict(exclude_none=True))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return JSONResponse(jsonable_encoder(result))
-
-
-@app.post("/api/strategies/{strategy_id}/pause")
-async def pause_auto_strategy(strategy_id: str) -> JSONResponse:
-    try:
-        result = await service.set_auto_strategy_enabled(strategy_id, False)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return JSONResponse(jsonable_encoder(result))
-
-
-@app.post("/api/strategies/{strategy_id}/resume")
-async def resume_auto_strategy(strategy_id: str) -> JSONResponse:
-    try:
-        result = await service.set_auto_strategy_enabled(strategy_id, True)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return JSONResponse(jsonable_encoder(result))
-
-
-@app.delete("/api/strategies/{strategy_id}")
-async def delete_auto_strategy(strategy_id: str) -> JSONResponse:
-    try:
-        result = await service.delete_auto_strategy(strategy_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return JSONResponse(jsonable_encoder(result))
 
 
 @app.post("/api/auto-arb/analyze")
@@ -1792,7 +1666,6 @@ async def update_settings(payload: SettingsPayload) -> JSONResponse:
     return JSONResponse(
         {
             "settings": settings_manager.as_dict(),
-            "state": _ui_state_payload(),
         }
     )
 

@@ -123,13 +123,12 @@ def test_web_accounts_payload_keeps_other_account_state() -> None:
     )
 
 
-def test_web_account_normalizer_preserves_balance_summary() -> None:
-    app_js = (PROJECT_ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
-    normalizer = app_js.split("function normalizeAccounts(accounts)", maxsplit=1)[1].split(
-        "function normalizeAutoExit(config)", maxsplit=1
-    )[0]
+def test_compact_dashboard_renders_balance_summary_without_recomputing_it() -> None:
+    dashboard_js = (PROJECT_ROOT / "webapp" / "static" / "dashboard.js").read_text(
+        encoding="utf-8"
+    )
 
-    assert "balance_summary: {}" in app_js
-    assert "accounts.balance_summary && typeof accounts.balance_summary === 'object'" in normalizer
-    assert "normalized.balance_summary = clone(accounts.balance_summary) || {};" in normalizer
-    assert "balance-summary-bybit-pump-temporary" in app_js
+    assert "accounts.balance_summary || {}" in dashboard_js
+    assert "summaries.bybit_main || {}" in dashboard_js
+    assert "summaries.bybit_pump || {}" in dashboard_js
+    assert "pumpBalance.available" in dashboard_js

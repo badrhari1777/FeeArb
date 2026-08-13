@@ -116,14 +116,13 @@
       return;
     }
     if (!positions.length) {
-      body.innerHTML = '<tr><td colspan="10" class="muted">No open positions in the main module.</td></tr>';
+      body.innerHTML = '<tr><td colspan="9" class="muted">No open positions in the main module.</td></tr>';
       return;
     }
     body.innerHTML = positions.map(function (card) {
       var pnl = Number(card.net_pnl || 0);
       var pnlClass = pnl > 0 ? 'value-positive' : (pnl < 0 ? 'value-negative' : '');
       var summary = card.position_summary || {};
-      var autoExit = card.auto_exit || {};
       var exchanges = (card.long_exchange || '-') + ' long / ' + (card.short_exchange || '-') + ' short';
       return '<tr>' +
         '<td><strong>' + esc(card.symbol || '-') + '</strong><span class="cell-note">' + esc(card.pair_label || '-') + '</span></td>' +
@@ -134,7 +133,6 @@
         '<td>' + (card.live_spread_pct === null || card.live_spread_pct === undefined ? '-' : number(card.live_spread_pct, 3) + '%') + '</td>' +
         '<td>' + (card.liq_distance_pct === null || card.liq_distance_pct === undefined ? '-' : number(card.liq_distance_pct, 2) + '%') + '</td>' +
         '<td>' + esc(protectionText(card)) + '</td>' +
-        '<td>' + esc(autoExit.status || (autoExit.spread_enabled ? 'enabled' : 'off')) + '</td>' +
         '<td>' + riskBadge(card.risk_level) + '</td>' +
       '</tr>';
     }).join('');

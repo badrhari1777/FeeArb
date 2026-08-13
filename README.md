@@ -49,8 +49,9 @@ Exchange adapters ┘ ─> collect_snapshot_async -> DataSnapshot -> .. -> Execu
 |   |-- app.py                   # FastAPI routes + WebSocket endpoint
 |   |-- services.py              # Data service (async scheduler, telemetry bridge)
 |   |-- realtime.py              # WebSocket connection manager
-|   |-- templates/index.html     # Dashboard
-|   `-- static/app.js            # Vanilla JS frontend (polling + websocket)
+|   |-- dashboard.py             # Compact dashboard read-model builder
+|   |-- templates/index.html     # Operational dashboard
+|   `-- static/dashboard.js      # Compact cached-state dashboard client
 |-- tests/                       # pytest/unittest suite (async-friendly)
 |-- project_settings.py          # JSON-backed settings manager
 |-- requirements.txt             # Runtime dependencies
@@ -75,7 +76,10 @@ cp .env.example .env  # customise if private endpoints/keys needed later
 ```
 
 ## Configuration
-`data/settings.json` is created on first run. Toggle sources/exchanges or adjust refresh timers via the dashboard's **Configuration** panel or by editing the file manually.
+`data/settings.json` is created on first run. Current monitoring and protection
+settings are available in the collapsed settings block at the bottom of the
+dashboard. Legacy candidate sources are owned by Strategy Lab and are not
+controlled from the main page.
 
 - `parser_refresh_seconds`: cadence for external scrapers (ArbitrageScanner, Coinglass, symbol universe).
 - `exchange_refresh_seconds`: frequency of exchange adapter polling (reuses the latest scraper data).

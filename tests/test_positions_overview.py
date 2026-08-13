@@ -192,10 +192,13 @@ class PositionsOverviewApiTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Position Control Center", body)
         self.assertIn("/static/positions.js", body)
         self.assertIn("/pump-short-strategies", body)
+        self.assertIn("/manual", body)
         self.assertIn("pp-pump-margin-manager", body)
         self.assertIn("pp-pump-entry-headroom", body)
         self.assertIn("pp-pump-stress-headroom", body)
         self.assertNotIn("Emergency close all", body)
+        self.assertNotIn("/strategies", body)
+        self.assertNotIn("Auto exit", body)
 
     async def test_main_page_exposes_compact_operational_dashboard(self) -> None:
         request = Request(

@@ -88,6 +88,16 @@ def test_dashboard_is_compact_and_keeps_main_and_pump_balances() -> None:
 
 
 class DashboardApiTestCase(unittest.IsolatedAsyncioTestCase):
+    def test_retired_html_and_auto_strategy_api_routes_are_absent(self) -> None:
+        paths = {getattr(route, "path", None) for route in webapp_app.app.routes}
+
+        assert "/strategies" not in paths
+        assert "/coin/{symbol}" not in paths
+        assert "/api/strategies" not in paths
+        assert "/api/strategies/preflight" not in paths
+        assert "/api/snapshot" not in paths
+        assert "/api/refresh" not in paths
+
     async def test_dashboard_api_uses_one_pump_snapshot_and_compact_sources(self) -> None:
         with (
             patch.object(

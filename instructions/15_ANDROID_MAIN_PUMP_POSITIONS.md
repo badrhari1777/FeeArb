@@ -109,7 +109,7 @@ The same account labels and aggregates are returned under `accounts` for the
 desktop main-page balance table. This view is display-only: it does not change
 Pump sizing, margin management, order placement, or transfers.
 
-The desktop account-state normalizer must preserve `accounts.balance_summary`.
-If the API and server-rendered HTML contain totals but the four summary cards
-show `-`, verify this field in `webapp/static/app.js` and refresh the cache-busted
-static bundle before investigating exchange balances.
+The desktop `/api/dashboard` contract must preserve `accounts.balance_summary`.
+If the API contains totals but the summary cards show `-`, verify rendering in
+`webapp/static/dashboard.js` and refresh the cache-busted static bundle before
+investigating exchange balances.
