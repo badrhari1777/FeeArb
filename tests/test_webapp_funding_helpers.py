@@ -103,7 +103,7 @@ class FundingHistoryAnalysisTestCase(unittest.IsolatedAsyncioTestCase):
         with patch(
             "webapp.services.get_adapter_cached",
             side_effect=lambda exchange: _FakeAdapter(exchange),
-        ), patch.object(service, "_persist_coin_funding_history", return_value=0):
+        ):
             payload = await service.analyze_funding_history(
                 "LABUSDT",
                 exchanges=["binance", "kucoin"],
@@ -147,7 +147,7 @@ class FundingHistoryAnalysisTestCase(unittest.IsolatedAsyncioTestCase):
         with patch(
             "webapp.services.get_adapter_cached",
             side_effect=lambda exchange: _FakeAdapter(exchange),
-        ), patch.object(service, "_persist_coin_funding_history", return_value=0):
+        ):
             payload = await service.analyze_funding_history(
                 "LABUSDT",
                 funding_points=24,

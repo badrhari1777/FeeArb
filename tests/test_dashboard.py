@@ -103,6 +103,8 @@ class DashboardApiTestCase(unittest.IsolatedAsyncioTestCase):
         assert "/api/hedge-clusters/rule" not in paths
         assert "/api/snapshot" not in paths
         assert "/api/refresh" not in paths
+        assert not any(path and path.startswith("/api/coin/") for path in paths)
+        assert "/api/manual/test/coin-analysis" not in paths
 
     async def test_dashboard_api_uses_one_pump_snapshot_and_compact_sources(self) -> None:
         with (

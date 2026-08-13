@@ -221,45 +221,6 @@
     </section>
 
     <section class="panel">
-      <h2>Coin analysis test</h2>
-      <p class="settings-note">Run candidate analysis (Binance + OKX core) with on-demand 72h history pull.</p>
-      <form id="coin-analysis-test-form" class="analysis-form">
-        <label>
-          Symbol
-          <input type="text" id="coin-analysis-symbol" placeholder="BTC or BTCUSDT" autocomplete="off" />
-        </label>
-        <label>
-          Window (minutes)
-          <input type="number" id="coin-analysis-window" min="60" max="4320" step="60" value="4320" />
-        </label>
-        <label>
-          Funding points
-          <input type="number" id="coin-analysis-funding-points" min="24" max="200" step="1" value="120" />
-        </label>
-        <label class="settings-checkbox">
-          <input type="checkbox" id="coin-analysis-include-series" />
-          Include full candles series
-        </label>
-        <div class="settings-intervals">
-          <button type="button" class="button" id="coin-analysis-fetch">Run analysis</button>
-          <span class="settings-status" id="coin-analysis-status" aria-live="polite"></span>
-        </div>
-      </form>
-      <div class="panel-muted">
-        <div class="settings-note">Summary</div>
-        <pre id="coin-analysis-summary" class="code-block"></pre>
-      </div>
-      <div class="panel-muted">
-        <div class="settings-note">Payload</div>
-        <pre id="coin-analysis-raw" class="code-block"></pre>
-      </div>
-      <div class="panel-muted">
-        <div class="settings-note">Script log</div>
-        <pre id="coin-analysis-log" class="code-block"></pre>
-      </div>
-    </section>
-
-    <section class="panel">
       <h2>WebSocket spread test</h2>
       <form id="ws-test-form" class="analysis-form">
         <label>

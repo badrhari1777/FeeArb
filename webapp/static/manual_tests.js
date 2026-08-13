@@ -1034,123 +1034,6 @@
     });
   }
 
-  function bindCoinAnalysisTests() {
-    var symbolEl = document.getElementById('coin-analysis-symbol');
-    var windowEl = document.getElementById('coin-analysis-window');
-    var fundingPointsEl = document.getElementById('coin-analysis-funding-points');
-    var includeSeriesEl = document.getElementById('coin-analysis-include-series');
-    var statusEl = document.getElementById('coin-analysis-status');
-    var summaryEl = document.getElementById('coin-analysis-summary');
-    var rawEl = document.getElementById('coin-analysis-raw');
-    var logEl = document.getElementById('coin-analysis-log');
-    var fetchBtn = document.getElementById('coin-analysis-fetch');
-    if (!fetchBtn) {
-      return;
-    }
-
-    var log = createScriptLogger(logEl);
-
-    function readSymbol() {
-      return normalizeInputSymbol(symbolEl ? symbolEl.value : '');
-    }
-
-    function readWindow() {
-      var value = parseOptionalNumber(windowEl ? windowEl.value : null);
-      var minutes = value ? Math.round(value) : 4320;
-      if (minutes < 60) {
-        minutes = 60;
-      }
-      if (minutes > 4320) {
-        minutes = 4320;
-      }
-      return minutes;
-    }
-
-    function readFundingPoints() {
-      var value = parseOptionalNumber(fundingPointsEl ? fundingPointsEl.value : null);
-      var points = value ? Math.round(value) : 120;
-      if (points < 24) {
-        points = 24;
-      }
-      if (points > 200) {
-        points = 200;
-      }
-      return points;
-    }
-
-    function buildSummary(data) {
-      var payload = data || {};
-      var analysis = payload.analysis || {};
-      var exchanges = analysis.exchanges || [];
-      var exchangeRows = exchanges.map(function (row) {
-        var quality = row && row.data_quality ? row.data_quality : {};
-        return {
-          exchange: row ? row.exchange : null,
-          status: row ? row.status : null,
-          funding_interval_hours: row ? row.funding_interval_hours_resolved : null,
-          latest_funding_rate: row ? row.latest_funding_rate : null,
-          candles_1m_count: row ? row.candles_1m_count : null,
-          candles_coverage_pct: quality ? quality.candles_coverage_pct : null,
-          oi_points_received: quality ? quality.oi_points_received : null,
-          warnings: row ? row.warnings : null,
-          errors: row ? row.errors : null
-        };
-      });
-      return {
-        symbol: payload.symbol || analysis.symbol || null,
-        window_minutes: payload.window_minutes,
-        funding_points: payload.funding_points,
-        include_series: payload.include_series,
-        summary: payload.summary || null,
-        analysis_warnings: analysis.warnings || null,
-        exchange_rows: exchangeRows
-      };
-    }
-
-    function runAnalysis() {
-      var symbol = readSymbol();
-      if (!symbol) {
-        setStatus(statusEl, 'Symbol required', 'error');
-        return;
-      }
-      var payload = {
-        symbol: symbol,
-        window_minutes: readWindow(),
-        funding_points: readFundingPoints(),
-        include_series: !!(includeSeriesEl && includeSeriesEl.checked)
-      };
-      setStatus(statusEl, 'Running analysis...', 'info');
-      log('coin analysis requested', payload);
-      request('POST', '/api/manual/test/coin-analysis', payload, function (err, data) {
-        if (err) {
-          setStatus(statusEl, err.message, 'error');
-          if (summaryEl) {
-            summaryEl.textContent = pretty({ error: err.message });
-          }
-          if (rawEl) {
-            rawEl.textContent = pretty({ error: err.message });
-          }
-          return;
-        }
-        if (summaryEl) {
-          summaryEl.textContent = pretty(buildSummary(data));
-        }
-        if (rawEl) {
-          rawEl.textContent = pretty(data || {});
-        }
-        if (data && data.errors && data.errors.length) {
-          setStatus(statusEl, 'Completed with errors', 'error');
-        } else {
-          setStatus(statusEl, 'Completed', 'success');
-        }
-      });
-    }
-
-    fetchBtn.addEventListener('click', function () {
-      runAnalysis();
-    });
-  }
-
   function bindWsTest() {
     var statusEl = document.getElementById('ws-status');
     var liveEl = document.getElementById('ws-live');
@@ -3589,7 +3472,6 @@
     bind();
     bindMarginTests();
     bindFundingTests();
-    bindCoinAnalysisTests();
     bindWsTest();
     bindWsTradeRaw();
     bindWsTradePrivateRaw();
