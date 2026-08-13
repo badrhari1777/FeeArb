@@ -58,6 +58,8 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
                 "protective": {
                     "auto_derisk_enabled": True,
                     "derisk_confirm_cycles": 5,
+                    "auto_rebalance_enabled": True,
+                    "rebalance_delta_pct": 0.2,
                     "auto_protect_enabled": True,
                 },
                 "manual": {
@@ -69,6 +71,8 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("auto_derisk_enabled", self.manager.current.protective)
         self.assertNotIn("derisk_confirm_cycles", self.manager.current.protective)
+        self.assertNotIn("auto_rebalance_enabled", self.manager.current.protective)
+        self.assertNotIn("rebalance_delta_pct", self.manager.current.protective)
         self.assertTrue(self.manager.current.protective["auto_protect_enabled"])
         self.assertNotIn("auto_exit_policy", self.manager.current.manual)
         self.assertEqual(self.manager.current.manual["enter_live_depth"], 7)
@@ -962,44 +966,6 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0]["event"], "margin_reduce_candidate")
         self.assertEqual(events[0]["symbol"], "BTCUSDT")
         self.assertGreater(float(events[0]["planned_reduce_usd"]), 0.0)
-
-    async def test_rebalance_disabled_persists_shadow_candidate(self) -> None:
-        self.manager.update(
-            {
-                "protective": {
-                    "auto_rebalance_enabled": False,
-                    "rebalance_delta_pct": 0.2,
-                }
-            }
-        )
-        service = DataService(settings_manager=self.manager)
-        service._rebalance_prev_positions = {  # type: ignore[attr-defined]
-            ("BTC", "binance", "long"): 10.0,
-            ("BTC", "okx", "short"): 10.0,
-        }
-        await service._maybe_rebalance_positions(  # type: ignore[attr-defined]
-            [
-                {
-                    "exchange": "binance",
-                    "symbol": "BTC/USDT:USDT",
-                    "side": "long",
-                    "coin_qty": 5.0,
-                },
-                {
-                    "exchange": "okx",
-                    "symbol": "BTCUSDT",
-                    "side": "short",
-                    "coin_qty": 10.0,
-                },
-            ]
-        )
-        events = service._protective_shadow_events  # type: ignore[attr-defined]
-        candidate = next(
-            item for item in events if item.get("event") == "rebalance_candidate"
-        )
-        self.assertEqual(candidate["symbol"], "BTC")
-        self.assertEqual(candidate["reduce_side"], "short")
-        self.assertAlmostEqual(float(candidate["planned_qty"]), 5.0)
 
     async def test_automation_worker_runs_only_grid(self) -> None:
         service = DataService(settings_manager=self.manager)

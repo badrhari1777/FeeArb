@@ -1747,9 +1747,6 @@ class DataService:
         self._protective_orphan_sweep_interval_sec = 15 * 60
         self._protective_orphan_sweep_last_ts = 0.0
         self._protective_orphan_sweep_inflight = False
-        self._rebalance_prev_positions: dict[tuple[str, str, str], float] = {}
-        self._rebalance_last: dict[tuple[str, str], float] = {}
-        self._rebalance_blocked_exchanges: set[str] = {"mexc"}
         self._protective_shadow_history_store = RotatingJsonlEventStore(
             PROTECTIVE_SHADOW_HISTORY_PATH,
             max_bytes=PROTECTIVE_SHADOW_HISTORY_MAX_BYTES,
@@ -8604,223 +8601,6 @@ class DataService:
 
 
 
-    def _rebalance_position_qty(self, position: Mapping[str, Any]) -> float | None:
-        qty = _safe_float(position.get("coin_qty"))
-        if qty is None or qty == 0:
-            qty = _safe_float(position.get("contracts"))
-        if qty is None or qty == 0:
-            qty = _safe_float(position.get("amount"))
-        return qty
-
-    def _rebalance_position_side(
-        self,
-        position: Mapping[str, Any],
-        qty_hint: float | None,
-    ) -> str | None:
-        raw_side = str(position.get("side") or "").lower()
-        if raw_side in ("long", "short"):
-            return raw_side
-        if raw_side == "buy":
-            return "long"
-        if raw_side == "sell":
-            return "short"
-        if qty_hint is None:
-            return None
-        if qty_hint < 0:
-            return "short"
-        if qty_hint > 0:
-            return "long"
-        return None
-
-    def _rebalance_positions_snapshot(
-        self,
-        positions: list[dict[str, Any]],
-    ) -> dict[tuple[str, str, str], float]:
-        snapshot: dict[tuple[str, str, str], float] = {}
-        for position in positions or []:
-            exchange = normalize_exchange_name(str(position.get("exchange") or ""))
-            if not exchange:
-                continue
-            raw_symbol = (
-                position.get("symbol")
-                or position.get("symbol_normalized")
-                or position.get("exchange_symbol")
-            )
-            symbol_norm = _strip_settle(normalize_symbol(str(raw_symbol or "")))
-            if not symbol_norm:
-                continue
-            qty_raw = self._rebalance_position_qty(position)
-            side = self._rebalance_position_side(position, qty_raw)
-            if not side or qty_raw is None:
-                continue
-            qty = abs(qty_raw)
-            if qty <= 0:
-                continue
-            key = (symbol_norm, exchange, side)
-            snapshot[key] = snapshot.get(key, 0.0) + qty
-        return snapshot
-
-    async def _maybe_rebalance_positions(self, positions: list[dict[str, Any]]) -> None:
-        settings = self._settings_manager.current
-        protective = getattr(settings, "protective", {}) or {}
-        auto_rebalance = bool(protective.get("auto_rebalance_enabled", False))
-        current = self._rebalance_positions_snapshot(positions)
-        if not self._rebalance_prev_positions:
-            self._rebalance_prev_positions = current
-            return
-        delta_pct = _safe_float(protective.get("rebalance_delta_pct"))
-        delta_pct = 0.2 if delta_pct is None else max(0.0, min(delta_pct, 1.0))
-        cooldown = int(protective.get("rebalance_cooldown_sec", 120) or 0)
-        limit_timeout = int(protective.get("rebalance_limit_timeout_sec", 10) or 10)
-        limit_offset_bps = _safe_float(protective.get("rebalance_limit_offset_bps")) or 0.0
-        max_slippage_bps = _safe_float(protective.get("rebalance_max_slippage_bps")) or 0.0
-        now_ts = time.time()
-        reductions: dict[tuple[str, str], float] = {}
-        reduction_sources: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for key, prev_qty in self._rebalance_prev_positions.items():
-            if prev_qty <= 0:
-                continue
-            current_qty = current.get(key, 0.0)
-            drop = prev_qty - current_qty
-            if drop <= 0:
-                continue
-            if drop < prev_qty * delta_pct:
-                continue
-            symbol, _exchange, side = key
-            reduce_side = "long" if side == "short" else "short"
-            reductions[(symbol, reduce_side)] = reductions.get((symbol, reduce_side), 0.0) + drop
-            reduction_sources.setdefault((symbol, reduce_side), []).append(
-                {
-                    "exchange": _exchange,
-                    "side": side,
-                    "previous_qty": prev_qty,
-                    "current_qty": current_qty,
-                    "drop_qty": drop,
-                    "drop_pct": (drop / prev_qty) * 100.0,
-                }
-            )
-        if not auto_rebalance:
-            for (symbol, reduce_side), drop_qty in reductions.items():
-                opposite_legs = [
-                    {
-                        "exchange": exchange,
-                        "side": side,
-                        "qty": qty,
-                    }
-                    for (leg_symbol, exchange, side), qty in current.items()
-                    if leg_symbol == symbol and side == reduce_side
-                ]
-                available_qty = sum(float(item["qty"]) for item in opposite_legs)
-                self._protective_shadow_event(
-                    "rebalance_candidate",
-                    {
-                        "symbol": symbol,
-                        "reduce_side": reduce_side,
-                        "drop_qty": drop_qty,
-                        "planned_qty": min(drop_qty, available_qty),
-                        "available_opposite_qty": available_qty,
-                        "sources": reduction_sources.get((symbol, reduce_side), []),
-                        "opposite_legs": opposite_legs,
-                        "delta_threshold_pct": delta_pct * 100.0,
-                        "live_enabled": False,
-                    },
-                    identity=f"{symbol}|{reduce_side}",
-                )
-            self._rebalance_prev_positions = current
-            return
-        actions: list[dict[str, Any]] = []
-        for (symbol, reduce_side), drop_qty in reductions.items():
-            cooldown_key = (symbol, reduce_side)
-            last_ts = self._rebalance_last.get(cooldown_key)
-            if last_ts is not None and cooldown > 0 and now_ts - last_ts < cooldown:
-                continue
-            symbol_actions: list[dict[str, Any]] = []
-            legs: list[dict[str, Any]] = []
-            for position in positions or []:
-                exchange = normalize_exchange_name(str(position.get("exchange") or ""))
-                if not exchange or exchange in self._rebalance_blocked_exchanges:
-                    continue
-                raw_symbol = (
-                    position.get("symbol")
-                    or position.get("symbol_normalized")
-                    or position.get("exchange_symbol")
-                )
-                normalized_symbol = normalize_symbol(str(raw_symbol or ""))
-                symbol_norm = _strip_settle(normalized_symbol)
-                if symbol_norm != symbol:
-                    continue
-                symbol_trade = _dedupe_settle(normalized_symbol)
-                qty_raw = self._rebalance_position_qty(position)
-                side = self._rebalance_position_side(position, qty_raw)
-                if not side or side != reduce_side or qty_raw is None:
-                    continue
-                qty = abs(qty_raw)
-                if qty <= 0:
-                    continue
-                legs.append(
-                    {
-                        "exchange": exchange,
-                        "symbol": symbol_trade,
-                        "qty": qty,
-                        "margin_mode": position.get("margin_mode"),
-                    }
-                )
-            total_qty = sum(leg["qty"] for leg in legs)
-            if total_qty <= 0:
-                continue
-            target_qty = min(drop_qty, total_qty)
-            remaining = target_qty
-            order_side = "sell" if reduce_side == "long" else "buy"
-            for leg in sorted(legs, key=lambda item: item["qty"], reverse=True):
-                if remaining <= 0:
-                    break
-                leg_qty = min(remaining, leg["qty"])
-                try:
-                    result = await self._manual.agent_rebalance(
-                        exchange=leg["exchange"],
-                        symbol=leg.get("symbol") or symbol,
-                        side=order_side,
-                        qty_base=leg_qty,
-                        margin_mode=leg.get("margin_mode"),
-                        limit_timeout_sec=limit_timeout,
-                        limit_offset_bps=limit_offset_bps,
-                        max_slippage_bps=max_slippage_bps,
-                    )
-                except Exception as exc:  # pylint: disable=broad-except
-                    result = {
-                        "exchange": leg["exchange"],
-                        "status": "error",
-                        "error": str(exc),
-                        "requested_qty": leg_qty,
-                    }
-                actions.append(
-                    {
-                        "symbol": symbol,
-                        "symbol_trade": leg.get("symbol") or symbol,
-                        "side": reduce_side,
-                        "exchange": leg["exchange"],
-                        "requested_qty": leg_qty,
-                        "result": result,
-                    }
-                )
-                symbol_actions.append(actions[-1])
-                filled_qty = _safe_float(result.get("filled_qty")) or 0.0
-                if filled_qty <= 0 and result.get("status") == "filled":
-                    filled_qty = leg_qty
-                remaining = max(0.0, remaining - filled_qty)
-            if symbol_actions:
-                self._rebalance_last[cooldown_key] = now_ts
-        if actions:
-            self._record_event(
-                "protective:rebalance",
-                {
-                    "message": "Auto rebalance executed",
-                    "count": len(actions),
-                    "actions": actions,
-                },
-            )
-        self._rebalance_prev_positions = current
-
     async def _on_margin_adjust_events(self, events: list[dict[str, Any]]) -> None:
         if not events:
             return
@@ -9045,8 +8825,7 @@ class DataService:
         protective = getattr(settings, "protective", {}) or {}
         auto_protect = bool(protective.get("auto_protect_enabled", True))
         auto_take = bool(protective.get("auto_take_enabled", True))
-        auto_rebalance = bool(protective.get("auto_rebalance_enabled", False))
-        if not auto_protect and not auto_take and not auto_rebalance:
+        if not auto_protect and not auto_take:
             return
         snapshot = self._accounts.snapshot()
         positions = snapshot.get("positions") or []
@@ -9212,11 +8991,6 @@ class DataService:
                                     )
             except Exception as exc:  # pylint: disable=broad-except
                 logger.warning("Protective sync failed: %s", exc)
-        if auto_rebalance:
-            try:
-                await self._maybe_rebalance_positions(positions)
-            except Exception as exc:  # pylint: disable=broad-except
-                logger.warning("Protective rebalance failed: %s", exc)
         if not target_exchanges and not target_symbols and reason == "scheduler":
             try:
                 await self._maybe_sweep_orphan_protective_orders(
