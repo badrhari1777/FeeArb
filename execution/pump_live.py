@@ -2344,24 +2344,13 @@ class PumpLiveController:
             transient = _is_transient_monitor_error(exc)
             logger.exception("Pump live monitor cycle failed: %s", error)
             with self._lock:
-                recovery_pending = bool(
-                    transient
-                    and (
-                        self._state.get("entry_armed")
-                        or self._state.get("transient_recovery_pending")
-                    )
+                error_reduced = self._state_machine.reduce_monitor_error(
+                    self._state,
+                    error=error,
+                    transient=transient,
+                    now_ms=_now_ms(),
                 )
-                self._state["last_error"] = error
-                self._state["entry_armed"] = False
-                self._state["transient_recovery_pending"] = recovery_pending
-                self._state["healthy_recovery_cycles"] = 0
-                if recovery_pending:
-                    self._state["status"] = "recovering_monitor"
-                    self._state["blocked_reason"] = "monitor_cycle_transient_error"
-                else:
-                    self._state["status"] = "error_monitoring"
-                    self._state["blocked_reason"] = "monitor_cycle_error"
-                self._state["updated_at_ms"] = _now_ms()
+                recovery_pending = bool(error_reduced["recovery_pending"])
                 self._save_state_locked()
             self._event(
                 "monitor_error",
