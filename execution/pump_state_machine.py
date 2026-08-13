@@ -71,3 +71,26 @@ class PumpStateMachine:
         state["updated_at_ms"] = now_ms
         state["pending_signals"] = []
         return {"has_open_positions": has_open_positions}
+
+    @staticmethod
+    def reduce_stop_monitor(
+        state: dict[str, Any],
+        *,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Stop a flat controller, but never abandon an owned position."""
+
+        positions = state.get("positions") or []
+        has_open_positions = any(
+            isinstance(item, Mapping) and item.get("status") != "closed"
+            for item in positions
+        )
+        if has_open_positions:
+            raise RuntimeError("pump_live_monitor_required_while_positions_open")
+        state["entry_armed"] = False
+        state["monitor_enabled"] = False
+        state["status"] = "stopped"
+        state["transient_recovery_pending"] = False
+        state["healthy_recovery_cycles"] = 0
+        state["updated_at_ms"] = now_ms
+        return {"stop_thread": True}

@@ -1,0 +1,34 @@
+[
+  {
+    "name": "open_position_blocks_monitor_stop",
+    "state": {
+      "status": "monitoring",
+      "entry_armed": false,
+      "monitor_enabled": true,
+      "transient_recovery_pending": false,
+      "healthy_recovery_cycles": 0,
+      "positions": [{"live_id": "live-1", "status": "open"}]
+    },
+    "expected_error": "pump_live_monitor_required_while_positions_open"
+  },
+  {
+    "name": "flat_controller_stops",
+    "state": {
+      "status": "disarmed",
+      "entry_armed": true,
+      "monitor_enabled": true,
+      "transient_recovery_pending": true,
+      "healthy_recovery_cycles": 2,
+      "positions": [{"live_id": "closed-1", "status": "closed"}]
+    },
+    "expected": {
+      "status": "stopped",
+      "entry_armed": false,
+      "monitor_enabled": false,
+      "transient_recovery_pending": false,
+      "healthy_recovery_cycles": 0,
+      "updated_at_ms": 1786650000000,
+      "stop_thread": true
+    }
+  }
+]

@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+import pytest
+
 from execution.pump_state_machine import PumpStateMachine
 
 
@@ -128,3 +130,54 @@ def test_disarm_reducer_matches_legacy_golden_cases() -> None:
         assert machine_state["blocked_reason"] == case["reason"]
         assert machine_state["pending_signals"] == []
         assert machine_state["portfolio_risk_freeze_active"] is False
+
+
+def _legacy_reduce_stop_monitor(state: dict[str, Any]) -> dict[str, Any]:
+    has_open_positions = any(
+        isinstance(item, Mapping) and item.get("status") != "closed"
+        for item in state.get("positions") or []
+    )
+    if has_open_positions:
+        raise RuntimeError("pump_live_monitor_required_while_positions_open")
+    state["entry_armed"] = False
+    state["monitor_enabled"] = False
+    state["status"] = "stopped"
+    state["transient_recovery_pending"] = False
+    state["healthy_recovery_cycles"] = 0
+    state["updated_at_ms"] = NOW_MS
+    return {"stop_thread": True}
+
+
+def test_stop_monitor_reducer_matches_legacy_golden_cases() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent / "fixtures" / "pump_stop_monitor_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = PumpStateMachine()
+    for case in cases:
+        legacy_state = deepcopy(case["state"])
+        machine_state = deepcopy(case["state"])
+        if case.get("expected_error"):
+            with pytest.raises(RuntimeError, match=case["expected_error"]):
+                _legacy_reduce_stop_monitor(legacy_state)
+            with pytest.raises(RuntimeError, match=case["expected_error"]):
+                machine.reduce_stop_monitor(machine_state, now_ms=NOW_MS)
+            assert machine_state == legacy_state == case["state"], case["name"]
+            continue
+
+        expected_result = _legacy_reduce_stop_monitor(legacy_state)
+        actual_result = machine.reduce_stop_monitor(machine_state, now_ms=NOW_MS)
+        assert machine_state == legacy_state, case["name"]
+        assert actual_result == expected_result, case["name"]
+        expected = case["expected"]
+        for key in (
+            "status",
+            "entry_armed",
+            "monitor_enabled",
+            "transient_recovery_pending",
+            "healthy_recovery_cycles",
+            "updated_at_ms",
+        ):
+            assert machine_state[key] == expected[key], f"{case['name']}:{key}"
+        assert actual_result["stop_thread"] is expected["stop_thread"]
