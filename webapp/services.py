@@ -45,6 +45,7 @@ from execution.auto_arb_grid import (
     complete_pending_grid_transition,
     decide_grid_transition,
     reduce_grid_transition_execution,
+    reduce_missing_grid_execution,
     reduce_partial_grid_transition,
     grid_completion_tolerance,
     grid_dust_only_errors,
@@ -1823,73 +1824,18 @@ class DataService:
             async with self._auto_arb_lock:
                 current = (self._auto_arb.get("rules") or {}).get(rule_id)
                 if isinstance(current, dict):
-                    if quantities is not None:
-                        hedged_qty = float(quantities.get("hedged_qty") or 0.0)
-                        imbalance_qty = float(quantities.get("imbalance_qty") or 0.0)
-                        tolerance = self._auto_arb_hedge_imbalance_tolerance(
-                            current,
-                            hedged_qty=hedged_qty,
-                        )
-                        current["active_execution_id"] = None
-                        current["active_action"] = None
-                        current["active_from_level"] = None
-                        current["active_to_level"] = None
-                        current["active_target_qty"] = None
-                        current["active_start_hedged_qty"] = None
-                        current["actual_hedged_qty"] = hedged_qty
-                        current["last_execution"] = {
-                            "execution_id": exec_id,
-                            "status": "missing_after_restart",
-                            "error": "active_execution_state_missing",
-                            "result": None,
-                            "observed_hedged_qty": hedged_qty,
-                            "observed_imbalance_qty": imbalance_qty,
-                            "reconciled_at": now_iso,
-                        }
-                        if imbalance_qty <= tolerance:
-                            transition = dict(current.get("pending_transition") or {})
-                            flat_repair_reset = self._auto_arb_reset_after_flat_repair(
-                                current,
-                                hedged_qty,
-                            )
-                            if not current.get("enabled"):
-                                current["status"] = "paused"
-                            elif flat_repair_reset:
-                                current["status"] = "waiting_entry"
-                            else:
-                                current["status"] = (
-                                    f"partial_{transition.get('action')}"
-                                    if transition
-                                    else (
-                                        "waiting_entry"
-                                        if not current.get("live_level")
-                                        else "monitoring"
-                                    )
-                                )
-                            current["blocked_reason"] = None
-                            current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
-                            event["event"] = "live_execution_missing_but_balanced"
-                            event["flat_repair_reset"] = flat_repair_reset
-                        else:
-                            current["status"] = "hedge_repair_required"
-                            current["blocked_reason"] = "active_execution_state_missing"
-                            current["next_eligible_ts"] = time.time()
-                            repair_quantities = dict(quantities)
-                            event["event"] = "live_hedge_repair_missing_retry"
-                        event["actual_hedged_qty"] = hedged_qty
-                        event["imbalance_qty"] = imbalance_qty
-                    elif reconcile_error:
-                        current["status"] = "waiting_reconcile"
-                        current["blocked_reason"] = (
-                            f"position_refresh_failed: {reconcile_error}"
-                        )
-                        current["next_eligible_ts"] = time.time() + 30.0
-                        event["event"] = "live_execution_state_missing_reconcile_deferred"
-                        event["error"] = reconcile_error
-                    else:
-                        current["enabled"] = False
-                        current["status"] = "error"
-                        current["blocked_reason"] = "active_execution_state_missing"
+                    missing_reduced = reduce_missing_grid_execution(
+                        current,
+                        execution_id=exec_id,
+                        quantities=quantities,
+                        reconcile_error=reconcile_error,
+                        now_iso=now_iso,
+                        now_ts=time.time(),
+                        retry_sec=AUTO_ARB_RETRY_SEC,
+                    )
+                    event = dict(missing_reduced["event"])
+                    if missing_reduced["repair_required"] and quantities is not None:
+                        repair_quantities = dict(quantities)
                     current["updated_at"] = now_iso
                     self._save_auto_arb_config()
             self._auto_arb_history_store.append(event)

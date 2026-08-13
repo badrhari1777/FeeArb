@@ -1,0 +1,50 @@
+[
+  {
+    "name": "balanced_partial_survives_restart",
+    "rule": {
+      "id": "missing-balanced",
+      "enabled": true,
+      "chunk_qty": 100.0,
+      "live_level": 1,
+      "active_execution_id": "old-worker",
+      "active_action": "enter",
+      "pending_transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 40.0, "remaining_qty": 60.0}
+    },
+    "quantities": {"hedged_qty": 140.0, "imbalance_qty": 0.0},
+    "expected_result": {"reconciled": true, "repair_required": false},
+    "expected_rule": {"active_execution_id": null, "active_action": null, "actual_hedged_qty": 140.0, "status": "partial_enter", "blocked_reason": null, "next_eligible_ts": 102.0},
+    "expected_event": {"event": "live_execution_missing_but_balanced", "actual_hedged_qty": 140.0, "imbalance_qty": 0.0, "flat_repair_reset": false}
+  },
+  {
+    "name": "flat_balanced_repair_resets_grid",
+    "rule": {
+      "id": "missing-flat",
+      "enabled": true,
+      "chunk_qty": 100.0,
+      "live_level": 1,
+      "active_execution_id": "old-repair",
+      "active_action": "repair",
+      "pending_transition": {"action": "exit", "from_level": 1, "to_level": 0, "target_qty": 100.0, "filled_qty": 90.0, "remaining_qty": 10.0}
+    },
+    "quantities": {"hedged_qty": 0.0, "imbalance_qty": 0.0},
+    "expected_result": {"reconciled": true, "repair_required": false},
+    "expected_rule": {"active_execution_id": null, "live_level": 0, "pending_transition": null, "status": "waiting_entry", "blocked_reason": null},
+    "expected_event": {"event": "live_execution_missing_but_balanced", "flat_repair_reset": true}
+  },
+  {
+    "name": "imbalanced_restart_requires_reduce_only_repair",
+    "rule": {"id": "missing-imbalanced", "enabled": true, "chunk_qty": 100.0, "live_level": 1, "active_execution_id": "old-worker", "active_action": "enter"},
+    "quantities": {"hedged_qty": 150.0, "imbalance_qty": 5.0},
+    "expected_result": {"reconciled": true, "repair_required": true},
+    "expected_rule": {"active_execution_id": null, "actual_hedged_qty": 150.0, "status": "hedge_repair_required", "blocked_reason": "active_execution_state_missing", "next_eligible_ts": 100.0},
+    "expected_event": {"event": "live_hedge_repair_missing_retry", "actual_hedged_qty": 150.0, "imbalance_qty": 5.0}
+  },
+  {
+    "name": "refresh_failure_preserves_execution_for_retry",
+    "rule": {"id": "missing-deferred", "enabled": true, "chunk_qty": 100.0, "live_level": 1, "active_execution_id": "old-worker", "active_action": "exit"},
+    "reconcile_error": "positions unavailable",
+    "expected_result": {"reconciled": false, "repair_required": false},
+    "expected_rule": {"active_execution_id": "old-worker", "active_action": "exit", "status": "waiting_reconcile", "blocked_reason": "position_refresh_failed: positions unavailable", "next_eligible_ts": 130.0},
+    "expected_event": {"event": "live_execution_state_missing_reconcile_deferred", "error": "positions unavailable"}
+  }
+]

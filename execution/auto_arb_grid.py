@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, Mapping
 
 
 MIN_LEVELS = 2
@@ -804,6 +804,88 @@ def reduce_grid_transition_execution(
         "repair_required": repair_required,
         "event": event,
         "transition": current_transition,
+    }
+
+
+def reduce_missing_grid_execution(
+    rule: dict[str, Any],
+    *,
+    execution_id: str,
+    quantities: Mapping[str, Any] | None,
+    reconcile_error: str | None,
+    now_iso: str,
+    now_ts: float,
+    retry_sec: float,
+) -> dict[str, Any]:
+    """Reconcile a persisted execution whose process-local worker is missing."""
+    event: dict[str, Any] = {
+        "event": "live_execution_state_missing",
+        "rule_id": rule.get("id"),
+        "execution_id": execution_id,
+        "action": rule.get("active_action"),
+        "ts": now_iso,
+    }
+    if quantities is None:
+        if reconcile_error:
+            rule["status"] = "waiting_reconcile"
+            rule["blocked_reason"] = f"position_refresh_failed: {reconcile_error}"
+            rule["next_eligible_ts"] = now_ts + 30.0
+            event["event"] = "live_execution_state_missing_reconcile_deferred"
+            event["error"] = reconcile_error
+        else:
+            rule["enabled"] = False
+            rule["status"] = "error"
+            rule["blocked_reason"] = "active_execution_state_missing"
+        return {"event": event, "repair_required": False, "reconciled": False}
+
+    hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+    imbalance_qty = float(quantities.get("imbalance_qty") or 0.0)
+    tolerance = grid_hedge_imbalance_tolerance(rule, hedged_qty=hedged_qty)
+    rule["active_execution_id"] = None
+    rule["active_action"] = None
+    rule["active_from_level"] = None
+    rule["active_to_level"] = None
+    rule["active_target_qty"] = None
+    rule["active_start_hedged_qty"] = None
+    rule["actual_hedged_qty"] = hedged_qty
+    rule["last_execution"] = {
+        "execution_id": execution_id,
+        "status": "missing_after_restart",
+        "error": "active_execution_state_missing",
+        "result": None,
+        "observed_hedged_qty": hedged_qty,
+        "observed_imbalance_qty": imbalance_qty,
+        "reconciled_at": now_iso,
+    }
+    repair_required = imbalance_qty > tolerance
+    if not repair_required:
+        transition = dict(rule.get("pending_transition") or {})
+        flat_repair_reset = grid_reset_after_flat_repair(rule, hedged_qty)
+        if not rule.get("enabled"):
+            rule["status"] = "paused"
+        elif flat_repair_reset:
+            rule["status"] = "waiting_entry"
+        else:
+            rule["status"] = (
+                f"partial_{transition.get('action')}"
+                if transition
+                else ("waiting_entry" if not rule.get("live_level") else "monitoring")
+            )
+        rule["blocked_reason"] = None
+        rule["next_eligible_ts"] = now_ts + retry_sec
+        event["event"] = "live_execution_missing_but_balanced"
+        event["flat_repair_reset"] = flat_repair_reset
+    else:
+        rule["status"] = "hedge_repair_required"
+        rule["blocked_reason"] = "active_execution_state_missing"
+        rule["next_eligible_ts"] = now_ts
+        event["event"] = "live_hedge_repair_missing_retry"
+    event["actual_hedged_qty"] = hedged_qty
+    event["imbalance_qty"] = imbalance_qty
+    return {
+        "event": event,
+        "repair_required": repair_required,
+        "reconciled": True,
     }
 
 

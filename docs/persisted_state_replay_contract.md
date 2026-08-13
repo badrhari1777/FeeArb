@@ -112,3 +112,11 @@ imbalance outcomes. A persisted worker result never supplies position quantity:
 fill progress and repair need are derived from fresh hedged/imbalance quantities.
 The reducer returns a repair request as data; `DataService` remains the only
 owner of the asynchronous reduce-only hedge-repair action.
+
+When `active_execution_id` survives but its process-local worker does not,
+`reduce_missing_grid_execution` accepts only the persisted rule plus fresh
+exchange quantities. Balanced quantities clear the stale worker reference and
+resume partial/monitoring state; a material leg imbalance requests hedge repair;
+a failed refresh preserves the active reference in `waiting_reconcile`.
+`tests/fixtures/grid_missing_execution_v1.json` freezes these restart outcomes,
+including a flat repair that clears stale level/transition state.
