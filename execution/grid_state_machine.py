@@ -602,6 +602,66 @@ class GridStateMachine:
             }
         }
 
+    def reduce_transition_worker_start(
+        self,
+        rule: dict[str, Any],
+        *,
+        result: Mapping[str, Any] | None,
+        transition: Mapping[str, Any],
+        quantities: Mapping[str, Any],
+        action: str,
+        from_level: int,
+        to_level: int,
+        position_target_qty: float,
+        submit_qty: float,
+        now_iso: str,
+        now_ts: float,
+        retry_sec: float,
+    ) -> dict[str, Any]:
+        """Reduce transition worker ownership after the caller submits Manual I/O."""
+        worker_result = result if isinstance(result, Mapping) else {}
+        execution_id = str(worker_result.get("execution_id") or "")
+        current_transition = dict(transition)
+        rule.pop("transition_starting", None)
+        rule["pending_action"] = None
+        rule["pending_samples"] = 0
+        if execution_id:
+            start_hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+            current_transition["last_start_hedged_qty"] = start_hedged_qty
+            current_transition["updated_at"] = now_iso
+            rule["pending_transition"] = current_transition
+            rule["active_execution_id"] = execution_id
+            rule["active_action"] = action
+            rule["active_from_level"] = from_level
+            rule["active_to_level"] = to_level
+            rule["active_target_qty"] = position_target_qty
+            rule["active_start_hedged_qty"] = start_hedged_qty
+            rule["status"] = f"executing_{action}"
+            rule["blocked_reason"] = None
+        else:
+            rule["pending_transition"] = current_transition
+            rule["status"] = "blocked_conflict"
+            rule["blocked_reason"] = str(
+                worker_result.get("error") or "execution_worker_busy"
+            )
+            rule["next_eligible_ts"] = now_ts + retry_sec
+        return {
+            "event": {
+                "event": (
+                    f"live_{action}_started"
+                    if execution_id
+                    else "live_start_failed"
+                ),
+                "execution_id": execution_id or None,
+                "from_level": from_level,
+                "to_level": to_level,
+                "qty": submit_qty,
+                "liquidity_chunking": True,
+                "result": result,
+            },
+            "transition": current_transition,
+        }
+
     @staticmethod
     def _optional_float(value: Any) -> float | None:
         try:

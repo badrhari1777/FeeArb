@@ -1,0 +1,54 @@
+[
+  {
+    "name": "enter_worker_acquires_transition_ownership",
+    "rule": {"id": "enter-started", "status": "pending_enter", "pending_action": "enter", "pending_samples": 2, "transition_starting": true, "blocked_reason": "old"},
+    "result": {"execution_id": "exec-enter-1", "status": "running"},
+    "transition": {"action": "enter", "from_level": 0, "to_level": 1, "target_qty": 100.0, "remaining_qty": 100.0},
+    "quantities": {"hedged_qty": 0.0},
+    "action": "enter",
+    "from_level": 0,
+    "to_level": 1,
+    "position_target_qty": 100.0,
+    "submit_qty": 100.0,
+    "expected": {"status": "executing_enter", "blocked_reason": null, "active_execution_id": "exec-enter-1", "active_action": "enter", "active_from_level": 0, "active_to_level": 1, "active_target_qty": 100.0, "active_start_hedged_qty": 0.0, "event": "live_enter_started", "execution_id": "exec-enter-1"}
+  },
+  {
+    "name": "exit_worker_acquires_actual_start_quantity",
+    "rule": {"id": "exit-started", "status": "pending_exit", "pending_action": "exit", "pending_samples": 3, "transition_starting": true},
+    "result": {"execution_id": "exec-exit-1"},
+    "transition": {"action": "exit", "from_level": 2, "to_level": 1, "target_qty": 100.0, "remaining_qty": 100.0},
+    "quantities": {"hedged_qty": 210.0},
+    "action": "exit",
+    "from_level": 2,
+    "to_level": 1,
+    "position_target_qty": 100.0,
+    "submit_qty": 110.0,
+    "expected": {"status": "executing_exit", "blocked_reason": null, "active_execution_id": "exec-exit-1", "active_action": "exit", "active_from_level": 2, "active_to_level": 1, "active_target_qty": 100.0, "active_start_hedged_qty": 210.0, "event": "live_exit_started", "execution_id": "exec-exit-1"}
+  },
+  {
+    "name": "explicit_worker_error_preserves_transition_for_retry",
+    "rule": {"id": "start-error", "status": "pending_enter", "pending_action": "enter", "pending_samples": 2, "transition_starting": true},
+    "result": {"error": "another execution is running"},
+    "transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "remaining_qty": 50.0},
+    "quantities": {"hedged_qty": 150.0},
+    "action": "enter",
+    "from_level": 1,
+    "to_level": 2,
+    "position_target_qty": 200.0,
+    "submit_qty": 50.0,
+    "expected": {"status": "blocked_conflict", "blocked_reason": "another execution is running", "next_eligible_ts": 102.0, "event": "live_start_failed", "execution_id": null}
+  },
+  {
+    "name": "empty_worker_result_uses_busy_fallback",
+    "rule": {"id": "start-busy", "status": "pending_exit", "pending_action": "exit", "pending_samples": 2, "transition_starting": true},
+    "result": null,
+    "transition": {"action": "exit", "from_level": 1, "to_level": 0, "target_qty": 100.0, "remaining_qty": 100.0},
+    "quantities": {"hedged_qty": 100.0},
+    "action": "exit",
+    "from_level": 1,
+    "to_level": 0,
+    "position_target_qty": 0.0,
+    "submit_qty": 100.0,
+    "expected": {"status": "blocked_conflict", "blocked_reason": "execution_worker_busy", "next_eligible_ts": 102.0, "event": "live_start_failed", "execution_id": null}
+  }
+]

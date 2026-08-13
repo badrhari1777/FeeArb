@@ -227,3 +227,11 @@ The initial parity-only checkpoint did not wire production to this reducer.
 Production now calls the reducer inside the existing lock only after the same
 `manual_orphan_cleanup` call returns. `DataService` still owns submission,
 `updated_at`, durable save, rule/timestamp event envelope and history append.
+
+`GridStateMachine.reduce_transition_worker_start` now freezes the dormant state
+boundary after `manual_enter` or `manual_exit` returns. A real execution ID owns
+the pending transition and records its fresh start quantity; an explicit error or
+empty result preserves the transition and schedules the existing conflict retry.
+It also clears the transient `transition_starting` marker and returns the history
+event fragment. Four golden cases compare the full rule, transition and event.
+Production is not wired to this reducer yet.

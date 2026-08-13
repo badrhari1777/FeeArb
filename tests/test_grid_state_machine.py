@@ -588,3 +588,113 @@ def test_hedge_repair_worker_start_matches_legacy_golden_cases() -> None:
         assert (
             actual_result["event"]["execution_id"] == expected["execution_id"]
         ), case["name"]
+
+
+def _legacy_reduce_transition_worker_start(
+    rule,
+    *,
+    result,
+    transition,
+    quantities,
+    action,
+    from_level,
+    to_level,
+    position_target_qty,
+    submit_qty,
+):
+    worker_result = result or {}
+    execution_id = str(worker_result.get("execution_id") or "")
+    current_transition = dict(transition)
+    rule.pop("transition_starting", None)
+    rule["pending_action"] = None
+    rule["pending_samples"] = 0
+    if execution_id:
+        start_hedged_qty = float(quantities.get("hedged_qty") or 0.0)
+        current_transition["last_start_hedged_qty"] = start_hedged_qty
+        current_transition["updated_at"] = NOW_ISO
+        rule["pending_transition"] = current_transition
+        rule["active_execution_id"] = execution_id
+        rule["active_action"] = action
+        rule["active_from_level"] = from_level
+        rule["active_to_level"] = to_level
+        rule["active_target_qty"] = position_target_qty
+        rule["active_start_hedged_qty"] = start_hedged_qty
+        rule["status"] = f"executing_{action}"
+        rule["blocked_reason"] = None
+    else:
+        rule["pending_transition"] = current_transition
+        rule["status"] = "blocked_conflict"
+        rule["blocked_reason"] = str(
+            worker_result.get("error") or "execution_worker_busy"
+        )
+        rule["next_eligible_ts"] = NOW_TS + RETRY_SEC
+    return {
+        "event": {
+            "event": (
+                f"live_{action}_started" if execution_id else "live_start_failed"
+            ),
+            "execution_id": execution_id or None,
+            "from_level": from_level,
+            "to_level": to_level,
+            "qty": submit_qty,
+            "liquidity_chunking": True,
+            "result": result,
+        },
+        "transition": current_transition,
+    }
+
+
+def test_transition_worker_start_matches_legacy_golden_cases() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "grid_transition_worker_start_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = GridStateMachine()
+    for case in cases:
+        legacy_rule = deepcopy(case["rule"])
+        machine_rule = deepcopy(case["rule"])
+        kwargs = {
+            "result": deepcopy(case.get("result")),
+            "transition": deepcopy(case["transition"]),
+            "quantities": deepcopy(case["quantities"]),
+            "action": case["action"],
+            "from_level": case["from_level"],
+            "to_level": case["to_level"],
+            "position_target_qty": case["position_target_qty"],
+            "submit_qty": case["submit_qty"],
+        }
+        expected_result = _legacy_reduce_transition_worker_start(
+            legacy_rule,
+            **deepcopy(kwargs),
+        )
+        actual_result = machine.reduce_transition_worker_start(
+            machine_rule,
+            **deepcopy(kwargs),
+            now_iso=NOW_ISO,
+            now_ts=NOW_TS,
+            retry_sec=RETRY_SEC,
+        )
+        assert machine_rule == legacy_rule, case["name"]
+        assert actual_result == expected_result, case["name"]
+        expected = case["expected"]
+        for key in (
+            "status",
+            "blocked_reason",
+            "active_execution_id",
+            "active_action",
+            "active_from_level",
+            "active_to_level",
+            "active_target_qty",
+            "active_start_hedged_qty",
+            "next_eligible_ts",
+        ):
+            if key in expected:
+                assert machine_rule.get(key) == expected[key], f"{case['name']}:{key}"
+        assert actual_result["event"]["event"] == expected["event"], case["name"]
+        assert (
+            actual_result["event"]["execution_id"] == expected["execution_id"]
+        ), case["name"]
+        assert "transition_starting" not in machine_rule, case["name"]
