@@ -8,14 +8,11 @@ import math
 from pathlib import Path
 import time
 import traceback
-from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from pipeline import (
-    DataSnapshot,
-)
 from orchestrator.models import MarketSnapshot
 from project_settings import SettingsManager
 from execution.manual import (
@@ -90,8 +87,6 @@ FUNDING_HISTORY_DEFAULT_EXCHANGES: tuple[str, ...] = (
 )
 FUNDING_HISTORY_WINDOWS_HOURS: tuple[int, ...] = (4, 12, 24, 72)
 FUNDING_HISTORY_MAX_POINTS = 200
-
-RefreshResult = Literal["completed", "in_progress", "failed"]
 
 logger = logging.getLogger(__name__)
 DEFAULT_MANUAL_LEVERAGE = 3.0
@@ -1343,20 +1338,15 @@ class DataService:
     ) -> None:
         self._settings_manager = settings_manager or SettingsManager()
         self._runtime_modules = runtime_modules
-        self._parser_interval = self._settings_manager.current.parser_refresh_seconds
-        self._exchange_interval = self._settings_manager.current.exchange_refresh_seconds
         self._account_interval = self._settings_manager.current.account_refresh_seconds
         self._positions_market_interval = self._settings_manager.current.positions_market_refresh_seconds
         self._summary_interval = self._settings_manager.current.summary_refresh_seconds
-        self._snapshot: Optional[DataSnapshot] = None
         self._lock = asyncio.Lock()
         self._status: str = "idle"
         self._last_error: Optional[str] = None
-        self._last_refreshed: Optional[datetime] = None
         self._in_progress: bool = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._events: List[dict[str, Any]] = []
-        self._exchange_status: Dict[str, dict[str, Any]] = {}
         self._funding_cache: dict[tuple[str, str], tuple[float | None, str | None, float | None, float]] = {}
         self._exec_settings_manager = ExecutionSettingsManager()
         self._execution_settings: ExecutionSettings = self._exec_settings_manager.current
@@ -1420,8 +1410,6 @@ class DataService:
         self._margin_logic_state: dict[str, str] = {}
         self._margin_logic_log: list[dict[str, Any]] = []
         self._margin_logic_log_limit = 80
-        self._snapshot_dict_cache_key: int | None = None
-        self._snapshot_dict_cache: dict[str, object] | None = None
         self._account_state_cache_key: tuple[Any, ...] | None = None
         self._account_state_cache: dict[str, object] | None = None
         self._apply_alert_settings()
@@ -1664,8 +1652,6 @@ class DataService:
         purge_expired()
         async with self._lock:
             self._status = "pending"
-            self._parser_interval = self._settings_manager.current.parser_refresh_seconds
-            self._exchange_interval = self._settings_manager.current.exchange_refresh_seconds
             self._account_interval = self._settings_manager.current.account_refresh_seconds
         await self._accounts.start()
         # Do an immediate balance/positions pull before other work.
@@ -1765,25 +1751,9 @@ class DataService:
         self._positions_market_task = asyncio.create_task(self._positions_market_scheduler())
 
 
-    async def refresh_markets(self, *, force_sources: bool = True) -> RefreshResult:
-        del force_sources
-        self._record_event(
-            "legacy_discovery:disabled",
-            {
-                "message": "Legacy main-dashboard discovery is disabled; use Strategy Lab Observatory",
-            },
-        )
-        async with self._lock:
-            self._status = "ready"
-            self._last_error = None
-            self._in_progress = False
-        return "completed"
-
     async def on_settings_updated(self) -> None:
         async with self._lock:
             current = self._settings_manager.current
-            self._parser_interval = current.parser_refresh_seconds
-            self._exchange_interval = current.exchange_refresh_seconds
             self._account_interval = current.account_refresh_seconds
             self._positions_market_interval = current.positions_market_refresh_seconds
             self._summary_interval = current.summary_refresh_seconds
@@ -6032,24 +6002,6 @@ class DataService:
         ]
         for key in expired:
             self._manual_runs.pop(key, None)
-    def latest_snapshot(self) -> Optional[DataSnapshot]:
-        return self._snapshot
-
-    def _latest_snapshot_dict_cached(self) -> dict[str, object] | None:
-        snapshot = self._snapshot
-        if snapshot is None:
-            self._snapshot_dict_cache_key = None
-            self._snapshot_dict_cache = None
-            return None
-        cache_key = id(snapshot)
-        if self._snapshot_dict_cache_key != cache_key or self._snapshot_dict_cache is None:
-            self._snapshot_dict_cache = snapshot.as_dict()
-            self._snapshot_dict_cache_key = cache_key
-        return self._snapshot_dict_cache
-
-    def latest_snapshot_dict(self) -> dict[str, object] | None:
-        return self._latest_snapshot_dict_cached()
-
     def _account_state_cache_token(self, payload: Mapping[str, Any]) -> tuple[Any, ...]:
         return (
             payload.get("last_updated"),
@@ -6066,79 +6018,27 @@ class DataService:
             int(self._positions_market_interval or 0),
         )
 
-    def state_payload(self) -> dict[str, object]:
-        snapshot_dict = self._latest_snapshot_dict_cached()
-        status = self._status
-        if status == "idle" and snapshot_dict:
-            status = "ready"
-        settings_payload = self._settings_manager.as_dict()
-        parser_interval = int(
-            settings_payload.get("parser_refresh_seconds", self._parser_interval)
-        )
-        table_interval = int(
-            settings_payload.get("table_refresh_seconds", parser_interval)
-        )
-        exchange_interval = int(
-            settings_payload.get("exchange_refresh_seconds", self._exchange_interval)
-        )
-        account_interval = int(
-            settings_payload.get("account_refresh_seconds", self._account_interval)
-        )
-        positions_market_interval = int(
-            settings_payload.get(
-                "positions_market_refresh_seconds",
-                self._positions_market_interval,
-            )
-        )
-        summary_interval = int(
-            settings_payload.get("summary_refresh_seconds", getattr(self, "_summary_interval", 1800))
-        )
-        return {
-            "status": status,
-            "refresh_interval": table_interval,
-            "parser_refresh_interval": parser_interval,
-            "exchange_refresh_interval": exchange_interval,
-            "account_refresh_interval": account_interval,
-            "positions_market_refresh_interval": positions_market_interval,
-            "summary_refresh_interval": summary_interval,
-            "last_error": self._last_error,
-            "last_updated": (
-                self._last_refreshed.isoformat() if self._last_refreshed else None
-            ),
-            "snapshot": snapshot_dict,
-            "refresh_in_progress": self._in_progress,
-            "events": list(self._events),
-            "exchange_status": list(self._exchange_status.values()),
-            "settings": settings_payload,
-            "runtime_modules": self._runtime_modules.to_dict(),
-            "auto_arb": self.auto_arb_payload(),
-            "execution": self._execution_state(),
-            "accounts": self._account_state(),
-        }
-
     def dashboard_runtime_payload(self) -> dict[str, object]:
         """Return compact cached runtime state for the main dashboard.
 
-        Unlike ``state_payload`` this intentionally skips all retired decision
-        modules and the expanded account diagnostics tree. The companion
-        ``mobile_positions_payload`` supplies the whitelisted position cards.
+        This intentionally skips retired decision modules and the expanded
+        account diagnostics tree. The companion ``mobile_positions_payload``
+        supplies the whitelisted position cards.
         """
 
-        snapshot_dict = self._latest_snapshot_dict_cached()
+        accounts_snapshot = self._accounts.snapshot()
         status = self._status
-        if status == "idle" and snapshot_dict:
+        if status == "idle" and accounts_snapshot.get("last_updated"):
             status = "ready"
         settings_payload = self._settings_manager.as_dict()
         return {
             "status": status,
             "last_error": self._last_error,
-            "last_updated": (
-                self._last_refreshed.isoformat() if self._last_refreshed else None
-            ),
+            "last_updated": accounts_snapshot.get("last_updated"),
             "refresh_in_progress": self._in_progress,
             "refresh_intervals": {
                 "dashboard_sec": int(
-                    settings_payload.get("table_refresh_seconds", self._parser_interval)
+                    settings_payload.get("table_refresh_seconds", 60)
                 ),
                 "accounts_sec": int(
                     settings_payload.get("account_refresh_seconds", self._account_interval)
@@ -6157,7 +6057,7 @@ class DataService:
                 ),
             },
             "events": list(self._events)[-20:],
-            "exchange_status": list(self._exchange_status.values()),
+            "exchange_status": list(accounts_snapshot.get("status") or []),
             "settings": settings_payload,
             "runtime_modules": self._runtime_modules.to_dict(),
             "grid": self.auto_arb_payload(),
@@ -6354,8 +6254,8 @@ class DataService:
             )
         )
         return {
-            "status": self._status if self._status != "idle" else ("ready" if self._snapshot else "idle"),
-            "last_updated": self._last_refreshed.isoformat() if self._last_refreshed else None,
+            "status": self._status if self._status != "idle" else ("ready" if accounts_snapshot.get("last_updated") else "idle"),
+            "last_updated": accounts_snapshot.get("last_updated"),
             "account_last_updated": accounts_snapshot.get("last_updated"),
             "balances": balances,
             "cards": cards,
@@ -6580,6 +6480,7 @@ class DataService:
 
     def mobile_manual_defaults_payload(self) -> dict[str, Any]:
         settings_payload = self._settings_manager.as_dict()
+        accounts_snapshot = self._accounts.snapshot()
         analysis_exchanges = settings_payload.get("analysis_exchanges") or {}
         enabled_exchanges = [
             normalize_exchange_name(str(name))
@@ -6594,8 +6495,8 @@ class DataService:
         enabled_exchanges = [name for name in enabled_exchanges if name]
         manual_settings = getattr(self._settings_manager.current, "manual", {}) or {}
         return {
-            "status": self._status if self._status != "idle" else ("ready" if self._snapshot else "idle"),
-            "last_updated": self._last_refreshed.isoformat() if self._last_refreshed else None,
+            "status": self._status if self._status != "idle" else ("ready" if accounts_snapshot.get("last_updated") else "idle"),
+            "last_updated": accounts_snapshot.get("last_updated"),
             "exchanges": enabled_exchanges,
             "actions": ["enter", "exit", "roll"],
             "main_modes": [
@@ -7985,60 +7886,6 @@ class DataService:
             "short_exchange": short_exchange,
         }
 
-    def _market_snapshot_lookup(self) -> dict[tuple[str, str], MarketSnapshot]:
-        if not self._snapshot or not self._snapshot.market_snapshots:
-            return {}
-        lookup: dict[tuple[str, str], MarketSnapshot] = {}
-        for exchange, mapping in self._snapshot.market_snapshots.items():
-            for snapshot in mapping.values():
-                if isinstance(snapshot, MarketSnapshot):
-                    key = (exchange.lower(), normalize_symbol(snapshot.symbol))
-                    lookup[key] = snapshot
-                elif isinstance(snapshot, dict):
-                    symbol = snapshot.get("symbol")
-                    funding = snapshot.get("funding_rate")
-                    next_funding = snapshot.get("next_funding_time")
-                    mark_price = snapshot.get("mark_price")
-                    key = (exchange.lower(), normalize_symbol(symbol))
-                    lookup[key] = MarketSnapshot(
-                        exchange=exchange,
-                        symbol=symbol or "",
-                        exchange_symbol=snapshot.get("exchange_symbol") or "",
-                        funding_rate=funding,
-                        next_funding_time=(
-                            datetime.fromisoformat(next_funding)
-                            if isinstance(next_funding, str)
-                            else None
-                        ),
-                        mark_price=mark_price,
-                        bid=snapshot.get("bid"),
-                        ask=snapshot.get("ask"),
-                        raw={},
-                        bid_size=snapshot.get("bid_size"),
-                        ask_size=snapshot.get("ask_size"),
-                        funding_interval_hours=snapshot.get("funding_interval_hours"),
-                    )
-        return lookup
-
-
-    def _make_progress_callback(
-        self, loop: asyncio.AbstractEventLoop
-    ) -> Callable[[str, dict[str, Any] | None], None]:
-        def _callback(event: str, payload: dict[str, Any] | None = None) -> None:
-            data = dict(payload or {})
-            loop.call_soon_threadsafe(self._record_event, event, data)
-            if event.startswith("exchange:") and data:
-                exchange = data.get("exchange")
-                if exchange:
-                    loop.call_soon_threadsafe(
-                        self._update_exchange_status,
-                        exchange,
-                        event,
-                        data,
-                    )
-
-        return _callback
-
     def _record_event(self, event: str, payload: dict[str, Any]) -> None:
         entry = {
             "event": event,
@@ -8048,26 +7895,6 @@ class DataService:
         self._events.append(entry)
         if len(self._events) > 200:
             del self._events[:-200]
-
-    def _update_exchange_status(
-        self, exchange: str, event: str, payload: dict[str, Any]
-    ) -> None:
-        status_map = {
-            "exchange:success": "ok",
-            "exchange:error": "failed",
-            "exchange:missing": "missing",
-            "exchange:start": "pending",
-        }
-        status = status_map.get(event, payload.get("status"))
-        entry = {
-            "exchange": exchange,
-            "status": status or payload.get("status") or "unknown",
-            "message": payload.get("message"),
-            "count": payload.get("count"),
-            "error": payload.get("error"),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self._exchange_status[exchange] = entry
 
     async def _handle_telemetry_event(self, entry: dict[str, Any]) -> None:
         self._telemetry_events.append(entry)
@@ -8646,12 +8473,6 @@ class DataService:
             except Exception as exc:  # pylint: disable=broad-except
                 logger.warning("Protective orphan sweep failed: %s", exc)
 
-
-    async def refresh_snapshot(self, *, force_accounts: bool = False) -> RefreshResult:
-        """Compatibility wrapper used by the HTTP API."""
-        if force_accounts:
-            await self._accounts.refresh_now(force_env=True)
-        return await self.refresh_markets(force_sources=True)
 
     async def _handle_mexc_protective_alerts(self, actions: list[dict[str, Any]]) -> None:
         """Send reminder alerts for MEXC legs where stops cannot be auto-placed."""

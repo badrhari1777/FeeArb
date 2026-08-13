@@ -17,13 +17,6 @@ from config import BASE_DIR, SUPPORTED_EXCHANGES
 
 _DEFAULT_SETTINGS_PATH: Final[Path] = BASE_DIR / "data" / "settings.json"
 
-DEFAULT_SOURCES: Final[Dict[str, bool]] = {
-    # Legacy main-dashboard discovery is retired. Strategy Lab owns external
-    # candidate intake and has an independent, research-only configuration.
-    "arbitragescanner": False,
-    "coinglass": False,
-}
-
 DEFAULT_EXCHANGES: Final[Dict[str, bool]] = {
     "binance": True,
     "okx": True,
@@ -72,17 +65,12 @@ def _normalise_bool_map(
 class AppSettings:
     """In-memory representation of persisted application settings."""
 
-    sources: Dict[str, bool] = field(
-        default_factory=lambda: dict(DEFAULT_SOURCES)
-    )
     exchanges: Dict[str, bool] = field(
         default_factory=lambda: dict(DEFAULT_EXCHANGES)
     )
     analysis_exchanges: Dict[str, bool] = field(
         default_factory=lambda: dict(DEFAULT_ANALYSIS_EXCHANGES)
     )
-    parser_refresh_seconds: int = 1200  # 20 minutes
-    exchange_refresh_seconds: int = 300  # Funding Opportunities refresh (5 minutes)
     table_refresh_seconds: int = 60  # Page refresh
     account_refresh_seconds: int = 60  # Account/positions refresh (1 minute)
     positions_market_refresh_seconds: int = 60  # Positions market snapshot refresh
@@ -178,14 +166,6 @@ class AppSettings:
     def with_updates(self, payload: Mapping[str, object]) -> "AppSettings":
         """Return a new settings instance with the provided updates applied."""
         updated = replace(self)
-        if "sources" in payload:
-            updated.sources = _normalise_bool_map(
-                DEFAULT_SOURCES, payload["sources"]
-            )
-        else:
-            updated.sources = _normalise_bool_map(
-                DEFAULT_SOURCES, self.sources, allow_new_keys=True
-            )
         if "exchanges" in payload:
             updated.exchanges = _normalise_bool_map(
                 _default_exchanges(), payload["exchanges"]
@@ -202,15 +182,6 @@ class AppSettings:
             updated.analysis_exchanges = _normalise_bool_map(
                 DEFAULT_ANALYSIS_EXCHANGES, self.analysis_exchanges, allow_new_keys=True
             )
-        updated.parser_refresh_seconds = int(
-            payload.get("parser_refresh_seconds", self.parser_refresh_seconds)
-        )
-        updated.exchange_refresh_seconds = int(
-            payload.get(
-                "exchange_refresh_seconds",
-                self.exchange_refresh_seconds,
-            )
-        )
         updated.table_refresh_seconds = int(
             payload.get("table_refresh_seconds", self.table_refresh_seconds)
         )
@@ -240,9 +211,6 @@ class AppSettings:
 
     def normalised(self) -> "AppSettings":
         """Ensure the settings align with the latest defaults."""
-        # Do not allow an old settings.json or the compatibility API to revive
-        # the retired main-dashboard collectors.
-        self.sources = dict(DEFAULT_SOURCES)
         self.exchanges = _normalise_bool_map(
             _default_exchanges(), self.exchanges
         )
@@ -366,9 +334,7 @@ class AppSettings:
         if not any(self.analysis_exchanges.values()):
             raise ValueError("At least one analysis exchange must remain enabled.")
         if (
-            self.parser_refresh_seconds < MIN_REFRESH_SECONDS
-            or self.table_refresh_seconds < MIN_REFRESH_SECONDS
-            or self.exchange_refresh_seconds < MIN_REFRESH_SECONDS
+            self.table_refresh_seconds < MIN_REFRESH_SECONDS
             or self.account_refresh_seconds < MIN_REFRESH_SECONDS
             or self.positions_market_refresh_seconds < MIN_REFRESH_SECONDS
             or self.summary_refresh_seconds < MIN_REFRESH_SECONDS
@@ -377,9 +343,7 @@ class AppSettings:
                 f"Refresh intervals must be >= {MIN_REFRESH_SECONDS} seconds."
             )
         if (
-            self.parser_refresh_seconds > MAX_REFRESH_SECONDS
-            or self.table_refresh_seconds > MAX_REFRESH_SECONDS
-            or self.exchange_refresh_seconds > MAX_REFRESH_SECONDS
+            self.table_refresh_seconds > MAX_REFRESH_SECONDS
             or self.account_refresh_seconds > MAX_REFRESH_SECONDS
             or self.positions_market_refresh_seconds > MAX_REFRESH_SECONDS
             or self.summary_refresh_seconds > MAX_REFRESH_SECONDS
@@ -408,11 +372,8 @@ class AppSettings:
             raise ValueError(f"Invalid protective settings: {exc}") from exc
     def to_dict(self) -> Dict[str, object]:
         return {
-            "sources": dict(self.sources),
             "exchanges": dict(self.exchanges),
             "analysis_exchanges": dict(self.analysis_exchanges),
-            "parser_refresh_seconds": self.parser_refresh_seconds,
-            "exchange_refresh_seconds": self.exchange_refresh_seconds,
             "table_refresh_seconds": self.table_refresh_seconds,
             "account_refresh_seconds": self.account_refresh_seconds,
             "positions_market_refresh_seconds": self.positions_market_refresh_seconds,
@@ -478,9 +439,6 @@ class SettingsManager:
     def reload(self) -> AppSettings:
         self._settings = self._load()
         return self._settings
-
-    def enabled_sources(self) -> Dict[str, bool]:
-        return dict(self._settings.sources)
 
     def enabled_exchanges(self) -> Dict[str, bool]:
         return dict(self._settings.exchanges)

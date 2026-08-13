@@ -1,35 +1,21 @@
 from __future__ import annotations
 
-import asyncio
 import importlib
 from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
-from project_settings import AppSettings, SettingsManager
-from webapp.services import DataService
+from project_settings import AppSettings
 
 webapp_app = importlib.import_module("webapp.app")
 
 
-def test_legacy_main_sources_cannot_be_reenabled() -> None:
+def test_legacy_main_sources_are_not_part_of_app_settings() -> None:
     settings = AppSettings().with_updates(
         {"sources": {"coinglass": True, "arbitragescanner": True}}
     )
     settings.validate()
-    assert settings.sources == {"coinglass": False, "arbitragescanner": False}
-
-
-def test_legacy_market_refresh_is_a_noop(tmp_path) -> None:
-    service = DataService(SettingsManager(tmp_path / "settings.json"))
-
-    result = asyncio.run(service.refresh_markets(force_sources=True))
-    state = service.state_payload()
-
-    assert result == "completed"
-    assert state["status"] == "ready"
-    assert state["snapshot"] is None
-    assert state["events"][-1]["event"] == "legacy_discovery:disabled"
+    assert "sources" not in settings.to_dict()
 
 
 def test_main_page_hides_legacy_candidate_discovery() -> None:

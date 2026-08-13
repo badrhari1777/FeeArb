@@ -20,7 +20,6 @@ if TYPE_CHECKING:  # pragma: no cover
     from aiohttp import ClientSession
 
 from config import PARSE_CACHE_TTL_SECONDS, SUPPORTED_EXCHANGES
-from project_settings import DEFAULT_SOURCES
 from exchanges import get_adapter_cached, normalize_exchange_name
 from orchestrator.models import FundingOpportunity, MarketSnapshot
 from orchestrator.opportunities import (
@@ -33,6 +32,10 @@ from utils import load_cache, save_cache
 
 logger = logging.getLogger(__name__)
 FRESH_CACHE_SECONDS = 1200  # 20 minutes
+LEGACY_SOURCE_DEFAULTS: dict[str, bool] = {
+    "arbitragescanner": False,
+    "coinglass": False,
+}
 
 
 @dataclass
@@ -559,8 +562,8 @@ def _build_symbol_universe(
 
 def _effective_sources(settings: Mapping[str, bool] | None) -> dict[str, bool]:
     if not settings:
-        return dict(DEFAULT_SOURCES)
-    result = dict(DEFAULT_SOURCES)
+        return dict(LEGACY_SOURCE_DEFAULTS)
+    result = dict(LEGACY_SOURCE_DEFAULTS)
     for key, value in settings.items():
         result[key] = bool(value)
     return result

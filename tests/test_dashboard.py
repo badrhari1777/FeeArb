@@ -26,11 +26,8 @@ def runtime_payload() -> dict:
             "summary_sec": 1800,
         },
         "settings": {
-            "sources": {"coinglass": False},
             "exchanges": {"binance": True},
             "analysis_exchanges": {"binance": True, "bybit": True},
-            "parser_refresh_seconds": 1200,
-            "exchange_refresh_seconds": 300,
             "table_refresh_seconds": 30,
             "account_refresh_seconds": 60,
             "positions_market_refresh_seconds": 60,

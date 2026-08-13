@@ -184,29 +184,6 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 
-    def test_latest_snapshot_dict_caches_serialization(self) -> None:
-        service = DataService(settings_manager=self.manager)
-
-        class _FakeSnapshot:
-            def __init__(self, marker: str) -> None:
-                self.marker = marker
-                self.calls = 0
-
-            def as_dict(self) -> dict[str, object]:
-                self.calls += 1
-                return {"marker": self.marker}
-
-        first = _FakeSnapshot("first")
-        service._snapshot = first  # type: ignore[attr-defined]
-        self.assertEqual(service.latest_snapshot_dict(), {"marker": "first"})
-        self.assertEqual(service.latest_snapshot_dict(), {"marker": "first"})
-        self.assertEqual(first.calls, 1)
-
-        second = _FakeSnapshot("second")
-        service._snapshot = second  # type: ignore[attr-defined]
-        self.assertEqual(service.latest_snapshot_dict(), {"marker": "second"})
-        self.assertEqual(second.calls, 1)
-
     def test_mobile_manual_defaults_payload_exposes_enabled_exchanges(self) -> None:
         analysis_map = {
             "binance": True,
@@ -235,7 +212,6 @@ class ProjectSettingsTestCase(unittest.IsolatedAsyncioTestCase):
     def test_mobile_positions_payload_builds_cards(self) -> None:
         service = DataService(settings_manager=self.manager)
         next_funding = (datetime.now(timezone.utc) + timedelta(minutes=45)).isoformat()
-        service._last_refreshed = datetime.now(timezone.utc)  # type: ignore[attr-defined]
         service._accounts = type(  # type: ignore[attr-defined]
             "X",
             (),

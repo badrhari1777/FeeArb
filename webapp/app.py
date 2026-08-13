@@ -109,11 +109,8 @@ async def require_cloudflare_remote_token(request: Request, call_next):
     return await call_next(request)
 
 class SettingsPayload(BaseModel):
-    sources: Dict[str, bool]
     exchanges: Dict[str, bool]
     analysis_exchanges: Dict[str, bool]
-    parser_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
-    exchange_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
     table_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
     account_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
     positions_market_refresh_seconds: int = Field(..., ge=MIN_REFRESH_SECONDS, le=MAX_REFRESH_SECONDS)
