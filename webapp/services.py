@@ -36,18 +36,15 @@ from execution.lifecycle import LifecycleController
 from execution.settings import ExecutionSettings
 from execution.storage import RotatingJsonlEventStore
 from execution.grid_state import GridStateRepository
+from execution.grid_state_machine import GridStateMachine
 from execution.auto_arb_grid import (
     MAX_LEVELS,
     MIN_LEVELS,
     build_grid_levels,
     build_grid_pending_transition,
-    apply_grid_decision_confirmation,
-    complete_pending_grid_transition,
-    decide_grid_transition,
     reduce_grid_transition_execution,
     reduce_grid_hedge_repair_execution,
     reduce_missing_grid_execution,
-    reduce_partial_grid_transition,
     grid_completion_tolerance,
     grid_dust_only_errors,
     grid_hedge_imbalance_tolerance,
@@ -665,6 +662,7 @@ class DataService:
         self._auto_arb_history_store = self._grid_state.history
         self._auto_arb = self._grid_state.state
         self._auto_arb_lock = self._grid_state.lock
+        self._grid_machine = GridStateMachine()
         self._auto_arb_task: Optional[asyncio.Task] = None
         self._auto_arb_poll_sec = 3.0
         self._automation_task: Optional[asyncio.Task] = None
@@ -2536,106 +2534,18 @@ class DataService:
                 current["live_entry_spread_pct"] = entry_spread
                 current["live_exit_spread_pct"] = exit_spread
                 current["last_quote_at"] = now_iso
-                if entry_spread is None or exit_spread is None:
-                    current["status"] = "waiting_data"
-                    current["blocked_reason"] = "entry_or_exit_spread_unavailable"
-                    current["pending_action"] = None
-                    current["pending_samples"] = 0
-                else:
-                    mode = str(current.get("mode") or "shadow")
-                    current_level = (
-                        int(current.get("live_level") or 0)
-                        if mode == "live"
-                        else int(current.get("shadow_level") or 0)
-                    )
-                    pending_transition = (
-                        dict(current.get("pending_transition") or {})
-                        if mode == "live"
-                        else {}
-                    )
-                    if pending_transition:
-                        pending_remaining = max(
-                            0.0,
-                            float(pending_transition.get("remaining_qty") or 0.0),
-                        )
-                        pending_tolerance = self._auto_arb_transition_completion_tolerance(
-                            current,
-                            float(pending_transition.get("target_qty") or 0.0) or None,
-                        )
-                        pending_filled = max(
-                            0.0,
-                            float(pending_transition.get("filled_qty") or 0.0),
-                        )
-                        last_execution = current.get("last_execution")
-                        last_result = (
-                            last_execution.get("result")
-                            if isinstance(last_execution, Mapping)
-                            else None
-                        )
-                        completed_transition = complete_pending_grid_transition(
-                            current,
-                            pending_transition=pending_transition,
-                            current_level=current_level,
-                            last_result=(
-                                last_result if isinstance(last_result, Mapping) else None
-                            ),
-                            now_iso=now_iso,
-                            now_ts=time.time(),
-                            retry_sec=AUTO_ARB_RETRY_SEC,
-                        )
-                        if completed_transition:
-                            current_level = int(completed_transition["current_level"])
-                            decision = dict(completed_transition["decision"])
-                            transition_event = dict(
-                                completed_transition["transition_event"]
-                            )
-                            pending_transition = dict(
-                                completed_transition["pending_transition"]
-                            )
-                        else:
-                            partial_reduced = reduce_partial_grid_transition(
-                                current,
-                                pending_transition=pending_transition,
-                                current_level=current_level,
-                                entry_spread_pct=entry_spread,
-                                exit_spread_pct=exit_spread,
-                                now_iso=now_iso,
-                            )
-                            decision = dict(partial_reduced["decision"])
-                            transition_event = (
-                                dict(partial_reduced["transition_event"])
-                                if partial_reduced.get("transition_event")
-                                else None
-                            )
-                            pending_transition = dict(
-                                partial_reduced["pending_transition"]
-                            )
-                    else:
-                        decision = decide_grid_transition(
-                            entry_spread_pct=entry_spread,
-                            exit_spread_pct=exit_spread,
-                            levels=current.get("levels") or [],
-                            current_level=current_level,
-                            max_levels_per_cycle=current.get("max_levels_per_cycle") or 1,
-                        )
-                    reduced = apply_grid_decision_confirmation(
-                        current,
-                        decision=decision,
-                        mode=mode,
-                        current_level=current_level,
-                        pending_transition=(
-                            dict(pending_transition) if pending_transition else None
-                        ),
-                        entry_spread_pct=entry_spread,
-                        exit_spread_pct=exit_spread,
-                        now_iso=now_iso,
-                        now_ts=time.time(),
-                    )
-                    action = str(reduced["action"])
-                    if reduced.get("live_transition"):
-                        live_transition = tuple(reduced["live_transition"])
-                    if reduced.get("transition_event"):
-                        transition_event = dict(reduced["transition_event"])
+                cycle_reduced = self._grid_machine.reduce_quote_cycle(
+                    current,
+                    entry_spread_pct=entry_spread,
+                    exit_spread_pct=exit_spread,
+                    now_iso=now_iso,
+                    now_ts=time.time(),
+                    retry_sec=AUTO_ARB_RETRY_SEC,
+                )
+                if cycle_reduced.get("live_transition"):
+                    live_transition = tuple(cycle_reduced["live_transition"])
+                if cycle_reduced.get("transition_event"):
+                    transition_event = dict(cycle_reduced["transition_event"])
                 current["updated_at"] = now_iso
                 self._save_auto_arb_config()
             if transition_event:

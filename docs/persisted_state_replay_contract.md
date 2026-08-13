@@ -128,3 +128,11 @@ or reset a flat Grid; a remaining imbalance either requests another cleanup or
 retains an explicit execution error for a later retry. Golden cases live in
 `tests/fixtures/grid_hedge_repair_result_v1.json`; the reducer never submits the
 next cleanup itself.
+
+`execution/grid_state_machine.py::GridStateMachine` now composes the pure quote
+cycle reducers behind one deterministic facade. It accepts a rule, two already
+observed spreads and a clock; it returns only a decision event and an optional
+Live transition intent. `tests/fixtures/grid_quote_cycle_v1.json` and the legacy
+reference sequence prove parity for missing data, shadow apply, Live queue,
+pending completion, frontier wait and partial reversal. Exchange reads, risk
+preflight, history persistence and order execution remain `DataService` ports.

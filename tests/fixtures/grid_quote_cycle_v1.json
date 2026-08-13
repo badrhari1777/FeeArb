@@ -1,0 +1,38 @@
+[
+  {
+    "name": "missing_spread_waits_data",
+    "rule": {"id": "waiting", "mode": "live", "live_level": 0, "pending_action": "enter", "pending_samples": 1},
+    "entry_spread_pct": null,
+    "exit_spread_pct": -1.0
+  },
+  {
+    "name": "shadow_entry_applies_after_confirmation",
+    "rule": {"id": "shadow", "mode": "shadow", "shadow_level": 0, "confirm_samples": 1, "levels": [{"entry_spread_pct": -2.0, "exit_spread_pct": -1.5, "cumulative_qty": 100.0}]},
+    "entry_spread_pct": -2.1,
+    "exit_spread_pct": -1.8
+  },
+  {
+    "name": "live_entry_is_only_queued",
+    "rule": {"id": "live", "mode": "live", "live_level": 0, "confirm_samples": 1, "levels": [{"entry_spread_pct": -2.0, "exit_spread_pct": -1.5, "cumulative_qty": 100.0}]},
+    "entry_spread_pct": -2.1,
+    "exit_spread_pct": -1.8
+  },
+  {
+    "name": "pending_transition_completes_before_new_decision",
+    "rule": {"id": "complete", "mode": "live", "live_level": 1, "chunk_qty": 100.0, "levels": [{"entry_spread_pct": -2.0, "exit_spread_pct": -1.5, "cumulative_qty": 100.0}, {"entry_spread_pct": -4.0, "exit_spread_pct": -3.5, "cumulative_qty": 200.0}], "pending_transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 99.5, "remaining_qty": 0.5}},
+    "entry_spread_pct": -3.8,
+    "exit_spread_pct": -3.8
+  },
+  {
+    "name": "partial_enter_waits_frontier",
+    "rule": {"id": "partial-wait", "mode": "live", "live_level": 1, "chunk_qty": 100.0, "actual_hedged_qty": 140.0, "levels": [{"entry_spread_pct": -2.0, "exit_spread_pct": -1.5, "cumulative_qty": 100.0}, {"entry_spread_pct": -4.0, "exit_spread_pct": -3.5, "cumulative_qty": 200.0}], "pending_transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 40.0, "remaining_qty": 60.0, "origin_hedged_qty": 100.0}},
+    "entry_spread_pct": -3.8,
+    "exit_spread_pct": -3.8
+  },
+  {
+    "name": "partial_exit_reversal_queues_enter",
+    "rule": {"id": "reverse", "mode": "live", "live_level": 2, "confirm_samples": 1, "chunk_qty": 100.0, "actual_hedged_qty": 160.0, "levels": [{"entry_spread_pct": -2.0, "exit_spread_pct": -1.5, "cumulative_qty": 100.0}, {"entry_spread_pct": -4.0, "exit_spread_pct": -3.5, "cumulative_qty": 200.0}], "pending_transition": {"action": "exit", "from_level": 2, "to_level": 1, "target_qty": 100.0, "filled_qty": 40.0, "remaining_qty": 60.0, "origin_hedged_qty": 200.0}},
+    "entry_spread_pct": -4.1,
+    "exit_spread_pct": -3.8
+  }
+]
