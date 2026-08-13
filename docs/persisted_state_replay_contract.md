@@ -103,3 +103,12 @@ exact continuation from a different transition, derives missing origin quantity,
 preserves material remainder, and consumes `rebase_from_positions` only against
 fresh hedged quantity. It does not validate exchange risk, place an order or
 interpret an execution result.
+
+Finished transition workers are reduced by
+`reduce_grid_transition_execution` after a fresh two-leg quantity snapshot.
+`tests/fixtures/grid_execution_result_v1.json` freezes completion, material
+partial fill, non-closeable dust, balance block, generic execution retry and leg
+imbalance outcomes. A persisted worker result never supplies position quantity:
+fill progress and repair need are derived from fresh hedged/imbalance quantities.
+The reducer returns a repair request as data; `DataService` remains the only
+owner of the asynchronous reduce-only hedge-repair action.

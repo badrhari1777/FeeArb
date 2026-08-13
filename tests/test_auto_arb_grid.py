@@ -10,6 +10,7 @@ from execution.auto_arb_grid import (
     build_grid_levels,
     build_grid_pending_transition,
     decide_grid_transition,
+    reduce_grid_transition_execution,
     reduce_partial_grid_transition,
     grid_completion_tolerance,
     grid_level_count_for_existing_qty,
@@ -20,6 +21,36 @@ from execution.auto_arb_grid import (
 
 
 class AutoArbGridTestCase(unittest.TestCase):
+    def test_execution_result_reducer_matches_golden_fixtures(self) -> None:
+        fixture_path = Path(__file__).parent / "fixtures" / "grid_execution_result_v1.json"
+        cases = json.loads(fixture_path.read_text(encoding="utf-8"))
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                rule = dict(case["rule"])
+                result = reduce_grid_transition_execution(
+                    rule,
+                    transition=dict(case["transition"]),
+                    active_action=case["active_action"],
+                    execution_id="exec-golden",
+                    execution_status=case.get("execution_status", "completed"),
+                    execution_error=case.get("execution_error"),
+                    execution_result=case.get("execution_result"),
+                    hedged_qty=case["hedged_qty"],
+                    imbalance_qty=case["imbalance_qty"],
+                    start_hedged_qty=case.get("start_hedged_qty"),
+                    now_iso="2026-08-13T00:00:00+00:00",
+                    now_ts=100.0,
+                    retry_sec=2.0,
+                )
+                for key, expected in case["expected_result"].items():
+                    self.assertEqual(result.get(key), expected, key)
+                for key, expected in case["expected_rule"].items():
+                    self.assertEqual(rule.get(key), expected, key)
+                for key, expected in case["expected_event"].items():
+                    self.assertEqual(result["event"].get(key), expected, key)
+                for key, expected in case.get("expected_transition", {}).items():
+                    self.assertEqual(result["transition"].get(key), expected, key)
+
     def test_pending_transition_builder_matches_golden_fixtures(self) -> None:
         fixture_path = Path(__file__).parent / "fixtures" / "grid_pending_transition_v1.json"
         cases = json.loads(fixture_path.read_text(encoding="utf-8"))

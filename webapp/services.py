@@ -44,6 +44,7 @@ from execution.auto_arb_grid import (
     apply_grid_decision_confirmation,
     complete_pending_grid_transition,
     decide_grid_transition,
+    reduce_grid_transition_execution,
     reduce_partial_grid_transition,
     grid_completion_tolerance,
     grid_dust_only_errors,
@@ -1939,10 +1940,6 @@ class DataService:
                     0.0,
                     float(transition.get("target_qty") or 0.0),
                 )
-                transition_tolerance = self._auto_arb_transition_completion_tolerance(
-                    current,
-                    total_transition_qty or None,
-                )
                 hedge_tolerance = self._auto_arb_hedge_imbalance_tolerance(
                     current,
                     transition_qty=total_transition_qty or None,
@@ -2003,100 +2000,25 @@ class DataService:
                         if repair_error:
                             event["error"] = repair_error
                 elif transition:
-                    transition_action = str(transition.get("action") or active_action)
-                    if start_hedged_qty is None:
-                        start_hedged_qty = float(
-                            transition.get("last_start_hedged_qty") or hedged_qty
-                        )
-                    observed_run_fill = (
-                        max(0.0, hedged_qty - float(start_hedged_qty))
-                        if transition_action == "enter"
-                        else max(0.0, float(start_hedged_qty) - hedged_qty)
+                    transition_reduced = reduce_grid_transition_execution(
+                        current,
+                        transition=transition,
+                        active_action=active_action,
+                        execution_id=exec_id,
+                        execution_status=status,
+                        execution_error=run.get("error"),
+                        execution_result=run.get("result"),
+                        hedged_qty=hedged_qty,
+                        imbalance_qty=imbalance_qty,
+                        start_hedged_qty=start_hedged_qty,
+                        now_iso=now_iso,
+                        now_ts=time.time(),
+                        retry_sec=AUTO_ARB_RETRY_SEC,
                     )
-                    previous_filled = max(0.0, float(transition.get("filled_qty") or 0.0))
-                    filled_qty = min(
-                        total_transition_qty,
-                        previous_filled + observed_run_fill,
-                    )
-                    remaining_qty = max(0.0, total_transition_qty - filled_qty)
-                    transition.update(
-                        {
-                            "filled_qty": filled_qty,
-                            "remaining_qty": remaining_qty,
-                            "last_execution_id": exec_id,
-                            "last_execution_status": status,
-                            "last_observed_fill_qty": observed_run_fill,
-                            "updated_at": now_iso,
-                        }
-                    )
-                    event.update(
-                        {
-                            "filled_qty": filled_qty,
-                            "remaining_qty": remaining_qty,
-                            "completion_tolerance_qty": transition_tolerance,
-                            "hedge_imbalance_tolerance_qty": hedge_tolerance,
-                            "actual_hedged_qty": hedged_qty,
-                            "imbalance_qty": imbalance_qty,
-                        }
-                    )
-                    run_result = run.get("result")
-                    non_closeable_dust = (
-                        filled_qty > 0
-                        and remaining_qty > 0
-                        and self._auto_arb_non_closeable_dust(
-                            run_result if isinstance(run_result, Mapping) else None,
-                            remaining_qty,
-                        )
-                    )
-                    if imbalance_qty > hedge_tolerance:
-                        current["pending_transition"] = transition
-                        current["status"] = "hedge_repair_required"
-                        current["blocked_reason"] = "hedge_imbalance_above_tolerance"
-                        current["next_eligible_ts"] = time.time()
+                    event.update(transition_reduced["event"])
+                    if transition_reduced["repair_required"]:
                         repair_quantities = dict(quantities)
-                        event["event"] = "live_hedge_repair_required"
-                    elif remaining_qty <= transition_tolerance or non_closeable_dust:
-                        target_level = int(transition.get("to_level") or 0)
-                        current["live_level"] = target_level
-                        current["pending_transition"] = None
-                        current["status"] = "waiting_entry" if target_level == 0 else "monitoring"
-                        current["blocked_reason"] = None
-                        current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
-                        event["event"] = f"live_{transition_action}"
-                        event["live_level"] = target_level
-                        event["dust_completed"] = remaining_qty > 1e-9
-                        event["non_closeable_dust_completed"] = bool(non_closeable_dust)
-                        completed = True
-                    else:
-                        current["pending_transition"] = transition
-                        result_errors = []
-                        if isinstance(run_result, Mapping):
-                            result_errors = [
-                                str(item) for item in (run_result.get("errors") or [])
-                            ]
-                        if run.get("error"):
-                            result_errors.append(str(run.get("error")))
-                        if observed_run_fill <= 0 and result_errors:
-                            joined_errors = " ".join(result_errors).lower()
-                            balance_blocked = "balance" in joined_errors or "margin" in joined_errors
-                            current["status"] = (
-                                "blocked_balance"
-                                if balance_blocked
-                                else "retry_execution_error"
-                            )
-                            current["blocked_reason"] = "; ".join(result_errors)
-                            current["next_eligible_ts"] = time.time() + (
-                                60.0 if balance_blocked else 30.0
-                            )
-                            event["event"] = "live_transition_retry_deferred"
-                            event["errors"] = result_errors
-                        else:
-                            current["status"] = f"partial_{transition_action}"
-                            current["blocked_reason"] = None
-                            current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
-                            event["event"] = f"live_{transition_action}_partial"
-                        current["pending_action"] = None
-                        current["pending_samples"] = 0
+                    completed = bool(transition_reduced["completed"])
                 else:
                     current["actual_hedged_qty"] = hedged_qty
                     current["status"] = "monitoring"

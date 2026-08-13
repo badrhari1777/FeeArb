@@ -1,0 +1,79 @@
+[
+  {
+    "name": "partial_enter_preserves_material_remainder",
+    "rule": {"id": "partial-enter", "chunk_qty": 100.0, "live_level": 1},
+    "transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 0.0, "remaining_qty": 100.0},
+    "active_action": "enter",
+    "hedged_qty": 160.0,
+    "imbalance_qty": 0.0,
+    "start_hedged_qty": 100.0,
+    "expected_result": {"completed": false, "repair_required": false},
+    "expected_rule": {"status": "partial_enter", "live_level": 1, "blocked_reason": null, "next_eligible_ts": 102.0},
+    "expected_event": {"event": "live_enter_partial", "filled_qty": 60.0, "remaining_qty": 40.0},
+    "expected_transition": {"filled_qty": 60.0, "remaining_qty": 40.0, "last_observed_fill_qty": 60.0}
+  },
+  {
+    "name": "enter_completes_within_quantity_tolerance",
+    "rule": {"id": "complete-enter", "chunk_qty": 100.0, "live_level": 1},
+    "transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 0.0, "remaining_qty": 100.0},
+    "active_action": "enter",
+    "hedged_qty": 199.5,
+    "imbalance_qty": 0.0,
+    "start_hedged_qty": 100.0,
+    "expected_result": {"completed": true, "repair_required": false},
+    "expected_rule": {"status": "monitoring", "live_level": 2, "pending_transition": null, "blocked_reason": null, "next_eligible_ts": 102.0},
+    "expected_event": {"event": "live_enter", "filled_qty": 99.5, "remaining_qty": 0.5, "live_level": 2, "dust_completed": true, "non_closeable_dust_completed": false}
+  },
+  {
+    "name": "non_closeable_exit_dust_is_terminal",
+    "rule": {"id": "dust-exit", "chunk_qty": 100.0, "live_level": 1},
+    "transition": {"action": "exit", "from_level": 1, "to_level": 0, "target_qty": 100.0, "filled_qty": 90.0, "remaining_qty": 10.0},
+    "active_action": "exit",
+    "execution_status": "completed_with_errors",
+    "execution_result": {"errors": ["qty 10 below min qty 20"], "warnings": ["non-closeable dust"]},
+    "hedged_qty": 100.0,
+    "imbalance_qty": 0.0,
+    "start_hedged_qty": 100.0,
+    "expected_result": {"completed": true, "repair_required": false},
+    "expected_rule": {"status": "waiting_entry", "live_level": 0, "pending_transition": null, "blocked_reason": null},
+    "expected_event": {"event": "live_exit", "filled_qty": 90.0, "remaining_qty": 10.0, "dust_completed": true, "non_closeable_dust_completed": true}
+  },
+  {
+    "name": "zero_fill_balance_error_uses_longer_retry",
+    "rule": {"id": "balance-block", "chunk_qty": 100.0, "live_level": 1},
+    "transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 0.0, "remaining_qty": 100.0},
+    "active_action": "enter",
+    "execution_result": {"errors": ["insufficient available balance"]},
+    "hedged_qty": 100.0,
+    "imbalance_qty": 0.0,
+    "start_hedged_qty": 100.0,
+    "expected_result": {"completed": false, "repair_required": false},
+    "expected_rule": {"status": "blocked_balance", "blocked_reason": "insufficient available balance", "next_eligible_ts": 160.0},
+    "expected_event": {"event": "live_transition_retry_deferred", "filled_qty": 0.0, "remaining_qty": 100.0, "errors": ["insufficient available balance"]}
+  },
+  {
+    "name": "zero_fill_execution_error_uses_normal_retry",
+    "rule": {"id": "execution-error", "chunk_qty": 100.0, "live_level": 1},
+    "transition": {"action": "exit", "from_level": 1, "to_level": 0, "target_qty": 100.0, "filled_qty": 0.0, "remaining_qty": 100.0},
+    "active_action": "exit",
+    "execution_error": "order rejected",
+    "hedged_qty": 100.0,
+    "imbalance_qty": 0.0,
+    "start_hedged_qty": 100.0,
+    "expected_result": {"completed": false, "repair_required": false},
+    "expected_rule": {"status": "retry_execution_error", "blocked_reason": "order rejected", "next_eligible_ts": 130.0},
+    "expected_event": {"event": "live_transition_retry_deferred", "errors": ["order rejected"]}
+  },
+  {
+    "name": "leg_imbalance_requires_repair_before_completion",
+    "rule": {"id": "repair-required", "chunk_qty": 100.0, "live_level": 1},
+    "transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 0.0, "remaining_qty": 100.0},
+    "active_action": "enter",
+    "hedged_qty": 150.0,
+    "imbalance_qty": 5.0,
+    "start_hedged_qty": 100.0,
+    "expected_result": {"completed": false, "repair_required": true},
+    "expected_rule": {"status": "hedge_repair_required", "blocked_reason": "hedge_imbalance_above_tolerance", "next_eligible_ts": 100.0},
+    "expected_event": {"event": "live_hedge_repair_required", "filled_qty": 50.0, "remaining_qty": 50.0, "imbalance_qty": 5.0}
+  }
+]

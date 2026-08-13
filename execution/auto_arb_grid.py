@@ -675,6 +675,138 @@ def build_grid_pending_transition(
     }
 
 
+def reduce_grid_transition_execution(
+    rule: dict[str, Any],
+    *,
+    transition: dict[str, Any],
+    active_action: str,
+    execution_id: str,
+    execution_status: str,
+    execution_error: Any,
+    execution_result: Any,
+    hedged_qty: float,
+    imbalance_qty: float,
+    start_hedged_qty: float | None,
+    now_iso: str,
+    now_ts: float,
+    retry_sec: float,
+) -> dict[str, Any]:
+    """Reduce a finished transition worker result using fresh exchange quantities."""
+    current_transition = dict(transition)
+    total_transition_qty = max(
+        0.0,
+        float(current_transition.get("target_qty") or 0.0),
+    )
+    transition_tolerance = grid_transition_completion_tolerance(
+        rule,
+        total_transition_qty or None,
+    )
+    hedge_tolerance = grid_hedge_imbalance_tolerance(
+        rule,
+        transition_qty=total_transition_qty or None,
+        hedged_qty=hedged_qty,
+    )
+    transition_action = str(current_transition.get("action") or active_action)
+    observed_start_qty = _optional_float(start_hedged_qty)
+    if observed_start_qty is None:
+        observed_start_qty = _optional_float(
+            current_transition.get("last_start_hedged_qty")
+        )
+    if observed_start_qty is None:
+        observed_start_qty = hedged_qty
+    observed_run_fill = (
+        max(0.0, hedged_qty - observed_start_qty)
+        if transition_action == "enter"
+        else max(0.0, observed_start_qty - hedged_qty)
+    )
+    previous_filled = max(
+        0.0,
+        float(current_transition.get("filled_qty") or 0.0),
+    )
+    filled_qty = min(
+        total_transition_qty,
+        previous_filled + observed_run_fill,
+    )
+    remaining_qty = max(0.0, total_transition_qty - filled_qty)
+    current_transition.update(
+        {
+            "filled_qty": filled_qty,
+            "remaining_qty": remaining_qty,
+            "last_execution_id": execution_id,
+            "last_execution_status": execution_status,
+            "last_observed_fill_qty": observed_run_fill,
+            "updated_at": now_iso,
+        }
+    )
+    event = {
+        "filled_qty": filled_qty,
+        "remaining_qty": remaining_qty,
+        "completion_tolerance_qty": transition_tolerance,
+        "hedge_imbalance_tolerance_qty": hedge_tolerance,
+        "actual_hedged_qty": hedged_qty,
+        "imbalance_qty": imbalance_qty,
+    }
+    non_closeable_dust = (
+        filled_qty > 0
+        and remaining_qty > 0
+        and grid_non_closeable_dust(execution_result, remaining_qty)
+    )
+    rule["actual_hedged_qty"] = hedged_qty
+    completed = False
+    repair_required = False
+    if imbalance_qty > hedge_tolerance:
+        rule["pending_transition"] = current_transition
+        rule["status"] = "hedge_repair_required"
+        rule["blocked_reason"] = "hedge_imbalance_above_tolerance"
+        rule["next_eligible_ts"] = now_ts
+        event["event"] = "live_hedge_repair_required"
+        repair_required = True
+    elif remaining_qty <= transition_tolerance or non_closeable_dust:
+        target_level = int(current_transition.get("to_level") or 0)
+        rule["live_level"] = target_level
+        rule["pending_transition"] = None
+        rule["status"] = "waiting_entry" if target_level == 0 else "monitoring"
+        rule["blocked_reason"] = None
+        rule["next_eligible_ts"] = now_ts + retry_sec
+        event["event"] = f"live_{transition_action}"
+        event["live_level"] = target_level
+        event["dust_completed"] = remaining_qty > 1e-9
+        event["non_closeable_dust_completed"] = bool(non_closeable_dust)
+        completed = True
+    else:
+        rule["pending_transition"] = current_transition
+        result_errors = []
+        if hasattr(execution_result, "get"):
+            result_errors = [
+                str(item) for item in (execution_result.get("errors") or [])
+            ]
+        if execution_error:
+            result_errors.append(str(execution_error))
+        if observed_run_fill <= 0 and result_errors:
+            joined_errors = " ".join(result_errors).lower()
+            balance_blocked = "balance" in joined_errors or "margin" in joined_errors
+            rule["status"] = (
+                "blocked_balance" if balance_blocked else "retry_execution_error"
+            )
+            rule["blocked_reason"] = "; ".join(result_errors)
+            rule["next_eligible_ts"] = now_ts + (60.0 if balance_blocked else 30.0)
+            event["event"] = "live_transition_retry_deferred"
+            event["errors"] = result_errors
+        else:
+            rule["status"] = f"partial_{transition_action}"
+            rule["blocked_reason"] = None
+            rule["next_eligible_ts"] = now_ts + retry_sec
+            event["event"] = f"live_{transition_action}_partial"
+        rule["pending_action"] = None
+        rule["pending_samples"] = 0
+    return {
+        "completed": completed,
+        "repair_required": repair_required,
+        "event": event,
+        "transition": current_transition,
+    }
+
+
 def reduce_partial_grid_transition(
     rule: dict[str, Any],
     *,
