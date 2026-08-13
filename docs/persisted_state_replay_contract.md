@@ -136,3 +136,11 @@ Live transition intent. `tests/fixtures/grid_quote_cycle_v1.json` and the legacy
 reference sequence prove parity for missing data, shadow apply, Live queue,
 pending completion, frontier wait and partial reversal. Exchange reads, risk
 preflight, history persistence and order execution remain `DataService` ports.
+
+The facade also exposes a dormant `plan_transition_start` method. It converts a
+fresh hedged quantity plus a queued level transition into an explicit I/O intent:
+submit quantity, persisted transition, position target, entry risk target and
+completion tolerance. `tests/fixtures/grid_transition_start_intent_v1.json`
+freezes new enter/exit, material continuation, fresh-position rebase and
+already-complete outcomes. Production start execution is intentionally not wired
+to this planner yet.

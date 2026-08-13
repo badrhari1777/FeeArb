@@ -1,0 +1,42 @@
+[
+  {
+    "name": "new_enter_from_flat",
+    "rule": {"chunk_qty": 100.0, "levels": [{"qty": 100.0, "cumulative_qty": 100.0}]},
+    "action": "enter",
+    "from_level": 0,
+    "to_level": 1,
+    "current_hedged_qty": 0.0
+  },
+  {
+    "name": "new_exit_uses_actual_quantity_delta",
+    "rule": {"chunk_qty": 100.0, "levels": [{"qty": 100.0, "cumulative_qty": 100.0}, {"qty": 100.0, "cumulative_qty": 200.0}]},
+    "action": "exit",
+    "from_level": 2,
+    "to_level": 1,
+    "current_hedged_qty": 210.0
+  },
+  {
+    "name": "partial_continuation_keeps_remainder",
+    "rule": {"chunk_qty": 100.0, "levels": [{"qty": 100.0, "cumulative_qty": 100.0}, {"qty": 100.0, "cumulative_qty": 200.0}], "pending_transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 40.0, "remaining_qty": 60.0, "origin_hedged_qty": 100.0, "position_target_qty": 200.0}},
+    "action": "enter",
+    "from_level": 1,
+    "to_level": 2,
+    "current_hedged_qty": 140.0
+  },
+  {
+    "name": "reversal_rebases_from_fresh_position",
+    "rule": {"chunk_qty": 100.0, "levels": [{"qty": 100.0, "cumulative_qty": 100.0}, {"qty": 100.0, "cumulative_qty": 200.0}], "pending_transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 40.0, "filled_qty": 0.0, "remaining_qty": 40.0, "origin_hedged_qty": 160.0, "position_target_qty": 200.0, "rebase_from_positions": true}},
+    "action": "enter",
+    "from_level": 1,
+    "to_level": 2,
+    "current_hedged_qty": 170.0
+  },
+  {
+    "name": "tolerance_avoids_empty_order",
+    "rule": {"chunk_qty": 100.0, "levels": [{"qty": 100.0, "cumulative_qty": 100.0}, {"qty": 100.0, "cumulative_qty": 200.0}], "pending_transition": {"action": "enter", "from_level": 1, "to_level": 2, "target_qty": 100.0, "filled_qty": 99.5, "remaining_qty": 0.5, "origin_hedged_qty": 100.0, "position_target_qty": 200.0}},
+    "action": "enter",
+    "from_level": 1,
+    "to_level": 2,
+    "current_hedged_qty": 199.5
+  }
+]

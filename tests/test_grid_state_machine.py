@@ -6,8 +6,10 @@ from pathlib import Path
 
 from execution.auto_arb_grid import (
     apply_grid_decision_confirmation,
+    build_grid_pending_transition,
     complete_pending_grid_transition,
     decide_grid_transition,
+    grid_transition_completion_tolerance,
     reduce_partial_grid_transition,
 )
 from execution.grid_state_machine import GridStateMachine
@@ -88,3 +90,45 @@ def test_grid_state_machine_matches_legacy_cycle_golden_cases() -> None:
         )
         assert machine_rule == legacy_rule, case["name"]
         assert machine_result == legacy_result, case["name"]
+
+
+def _legacy_plan_transition_start(rule, action, from_level, to_level, current_hedged_qty):
+    levels = rule.get("levels") or []
+    level_index = to_level - 1 if action == "enter" else from_level - 1
+    if level_index < 0 or level_index >= len(levels):
+        raise ValueError("Grid transition level is outside the configured range.")
+    level_qty = float(levels[level_index].get("qty") or 0.0)
+    level_target_qty = float(levels[to_level - 1].get("cumulative_qty") or 0.0) if to_level > 0 else 0.0
+    built = build_grid_pending_transition(
+        existing_transition=rule.get("pending_transition") or {}, action=action,
+        from_level=from_level, to_level=to_level, level_qty=level_qty,
+        level_target_qty=level_target_qty, current_hedged_qty=current_hedged_qty,
+        now_iso=NOW_ISO,
+    )
+    qty = float(built["qty"])
+    total = float(built["total_transition_qty"])
+    tolerance = grid_transition_completion_tolerance(rule, total)
+    return {
+        "kind": "transition_complete" if qty <= tolerance else "submit_transition",
+        "action": action, "from_level": from_level, "to_level": to_level,
+        "qty": qty, "transition": dict(built["transition"]),
+        "position_target_qty": float(built["position_target_qty"]),
+        "entry_risk_target_qty": current_hedged_qty + qty if action == "enter" else None,
+        "completion_tolerance_qty": tolerance,
+    }
+
+
+def test_transition_start_intent_matches_legacy_planning() -> None:
+    cases = json.loads((Path(__file__).parent / "fixtures" / "grid_transition_start_intent_v1.json").read_text(encoding="utf-8"))
+    machine = GridStateMachine()
+    for case in cases:
+        expected = _legacy_plan_transition_start(
+            case["rule"], case["action"], case["from_level"], case["to_level"],
+            case["current_hedged_qty"],
+        )
+        actual = machine.plan_transition_start(
+            case["rule"], action=case["action"], from_level=case["from_level"],
+            to_level=case["to_level"], current_hedged_qty=case["current_hedged_qty"],
+            now_iso=NOW_ISO,
+        )
+        assert actual == expected, case["name"]

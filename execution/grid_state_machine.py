@@ -4,8 +4,10 @@ from typing import Any, Mapping
 
 from .auto_arb_grid import (
     apply_grid_decision_confirmation,
+    build_grid_pending_transition,
     complete_pending_grid_transition,
     decide_grid_transition,
+    grid_transition_completion_tolerance,
     reduce_partial_grid_transition,
 )
 
@@ -111,4 +113,55 @@ class GridStateMachine:
             "decision": decision,
             "transition_event": transition_event,
             "live_transition": live_transition,
+        }
+
+    def plan_transition_start(
+        self,
+        rule: Mapping[str, Any],
+        *,
+        action: str,
+        from_level: int,
+        to_level: int,
+        current_hedged_qty: float,
+        now_iso: str,
+    ) -> dict[str, Any]:
+        """Plan a transition I/O intent without refreshing or submitting orders."""
+        levels = rule.get("levels") or []
+        level_index = to_level - 1 if action == "enter" else from_level - 1
+        if level_index < 0 or level_index >= len(levels):
+            raise ValueError("Grid transition level is outside the configured range.")
+        level_qty = float(levels[level_index].get("qty") or 0.0)
+        level_target_qty = (
+            float(levels[to_level - 1].get("cumulative_qty") or 0.0)
+            if to_level > 0
+            else 0.0
+        )
+        built = build_grid_pending_transition(
+            existing_transition=rule.get("pending_transition") or {},
+            action=action,
+            from_level=from_level,
+            to_level=to_level,
+            level_qty=level_qty,
+            level_target_qty=level_target_qty,
+            current_hedged_qty=current_hedged_qty,
+            now_iso=now_iso,
+        )
+        qty = float(built["qty"])
+        total_transition_qty = float(built["total_transition_qty"])
+        tolerance = grid_transition_completion_tolerance(
+            rule,
+            total_transition_qty,
+        )
+        return {
+            "kind": "transition_complete" if qty <= tolerance else "submit_transition",
+            "action": action,
+            "from_level": from_level,
+            "to_level": to_level,
+            "qty": qty,
+            "transition": dict(built["transition"]),
+            "position_target_qty": float(built["position_target_qty"]),
+            "entry_risk_target_qty": (
+                current_hedged_qty + qty if action == "enter" else None
+            ),
+            "completion_tolerance_qty": tolerance,
         }
