@@ -1803,7 +1803,11 @@ class DataService:
                 return True
             rule_copy = dict(rule)
         run = self._manual_runs.get(exec_id)
-        if not isinstance(run, Mapping):
+        reconcile_intent = self._grid_machine.plan_execution_reconcile_io(
+            rule_copy,
+            run=(run if isinstance(run, Mapping) else None),
+        )
+        if reconcile_intent["kind"] == "missing_execution":
             repair_quantities: dict[str, float] | None = None
             reconcile_error = None
             quantities: dict[str, float] | None = None
@@ -1840,8 +1844,8 @@ class DataService:
             if repair_quantities is not None:
                 await self._start_auto_arb_hedge_repair(rule_id, repair_quantities)
             return False
-        status = str(run.get("status") or "")
-        if status == "running":
+        status = str(reconcile_intent.get("execution_status") or "")
+        if reconcile_intent["kind"] == "execution_running":
             return False
 
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -1868,6 +1872,11 @@ class DataService:
             current = (self._auto_arb.get("rules") or {}).get(rule_id)
             if not isinstance(current, dict):
                 return False
+            terminal_intent = self._grid_machine.plan_execution_reconcile_io(
+                current,
+                run=run,
+            )
+            reconcile_reducer = terminal_intent.get("reducer")
             active_action = str(current.get("active_action") or "")
             current["active_execution_id"] = None
             current["active_action"] = None
@@ -1899,7 +1908,7 @@ class DataService:
                     "observed_imbalance_qty": imbalance_qty,
                     "reconciled_at": now_iso,
                 }
-                if active_action == "repair":
+                if reconcile_reducer == "hedge_repair_execution":
                     repair_reduced = reduce_grid_hedge_repair_execution(
                         current,
                         transition=transition,
@@ -1916,7 +1925,7 @@ class DataService:
                     if repair_reduced["retry_repair"]:
                         repair_quantities = dict(quantities)
                     completed = bool(repair_reduced["completed"])
-                elif transition:
+                elif reconcile_reducer == "transition_execution":
                     transition_reduced = reduce_grid_transition_execution(
                         current,
                         transition=transition,

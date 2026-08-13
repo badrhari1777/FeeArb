@@ -158,5 +158,12 @@ routes the future result to `missing_execution`, `transition_execution`,
 `hedge_repair_execution`, or `settle_without_transition`. It performs no I/O and
 does not mutate either input. Six cases in
 `tests/fixtures/grid_execution_reconcile_io_v1.json` freeze restart-missing,
-running and terminal routing. Production reconcile is not wired to this planner
-yet; exchange refresh, state persistence and repair launch remain unchanged.
+running and terminal routing. The initial parity-only checkpoint did not wire
+production reconcile; exchange refresh, persistence and repair launch stayed
+unchanged.
+
+The production reconcile path now consumes the planner for its top-level
+missing/running/terminal routing and repeats terminal reducer selection from the
+fresh in-lock rule. The planner does not receive exchange quantities and does not
+apply reducer output. Fresh position reads, active-field cleanup, reducers,
+state lock/save, history append and repair launch all remain in `DataService`.
