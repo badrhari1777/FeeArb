@@ -6,6 +6,7 @@ import unittest
 
 from execution.auto_arb_grid import (
     apply_grid_decision_confirmation,
+    complete_pending_grid_transition,
     build_grid_levels,
     decide_grid_transition,
     grid_completion_tolerance,
@@ -238,6 +239,65 @@ class AutoArbGridTestCase(unittest.TestCase):
         self.assertEqual(rule["blocked_reason"], "risk limit")
         self.assertIsNone(rule["pending_action"])
         self.assertIsNone(result["live_transition"])
+
+    def test_pending_transition_completes_within_tolerance(self) -> None:
+        rule = {
+            "id": "grid-partial",
+            "generation": 2,
+            "symbol": "TUTUSDT",
+            "long_exchange": "kucoin",
+            "short_exchange": "bybit",
+            "chunk_qty": 100.0,
+            "live_level": 2,
+            "pending_action": "exit",
+            "pending_samples": 2,
+        }
+        result = complete_pending_grid_transition(
+            rule,
+            pending_transition={
+                "action": "exit",
+                "from_level": 2,
+                "to_level": 1,
+                "target_qty": 100.0,
+                "filled_qty": 99.5,
+                "remaining_qty": 0.5,
+            },
+            current_level=2,
+            last_result=None,
+            now_iso="2026-08-13T00:00:00+00:00",
+            now_ts=100.0,
+            retry_sec=2.0,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(rule["live_level"], 1)
+        self.assertEqual(rule["status"], "monitoring")
+        self.assertIsNone(rule["pending_transition"])
+        self.assertEqual(rule["next_eligible_ts"], 102.0)
+        self.assertEqual(result["transition_event"]["event"], "live_exit")
+
+    def test_pending_transition_does_not_complete_material_remainder(self) -> None:
+        rule = {"id": "grid-partial", "chunk_qty": 100.0, "live_level": 2}
+
+        result = complete_pending_grid_transition(
+            rule,
+            pending_transition={
+                "action": "exit",
+                "from_level": 2,
+                "to_level": 1,
+                "target_qty": 100.0,
+                "filled_qty": 80.0,
+                "remaining_qty": 20.0,
+            },
+            current_level=2,
+            last_result={"errors": []},
+            now_iso="2026-08-13T00:00:00+00:00",
+            now_ts=100.0,
+            retry_sec=2.0,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(rule["live_level"], 2)
 
 
 if __name__ == "__main__":

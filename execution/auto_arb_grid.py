@@ -504,3 +504,69 @@ def apply_grid_decision_confirmation(
         "live_transition": live_transition,
         "transition_event": transition_event,
     }
+
+
+def complete_pending_grid_transition(
+    rule: dict[str, Any],
+    *,
+    pending_transition: dict[str, Any],
+    current_level: int,
+    last_result: Any,
+    now_iso: str,
+    now_ts: float,
+    retry_sec: float,
+) -> dict[str, Any] | None:
+    """Finalize a filled or non-closeable-dust partial transition, otherwise no-op."""
+    remaining = max(0.0, float(pending_transition.get("remaining_qty") or 0.0))
+    tolerance = grid_transition_completion_tolerance(
+        rule,
+        float(pending_transition.get("target_qty") or 0.0) or None,
+    )
+    filled = max(0.0, float(pending_transition.get("filled_qty") or 0.0))
+    dust_terminal = filled > 0 and grid_non_closeable_dust(last_result, remaining)
+    if remaining > tolerance and not dust_terminal:
+        return None
+    action = str(pending_transition.get("action") or "")
+    from_level = int(pending_transition.get("from_level") or current_level)
+    to_level = int(pending_transition.get("to_level") or current_level)
+    rule["live_level"] = to_level
+    rule["pending_transition"] = None
+    rule["pending_action"] = None
+    rule["pending_samples"] = 0
+    rule["blocked_reason"] = None
+    rule["next_eligible_ts"] = now_ts + retry_sec
+    rule["status"] = "waiting_entry" if to_level == 0 else "monitoring"
+    decision = {
+        "action": "none",
+        "current_level": to_level,
+        "target_level": to_level,
+        "entry_target_level": None,
+        "exit_target_level": None,
+        "levels_delta": to_level - from_level,
+        "continuation": True,
+        "remaining_qty": remaining,
+        "dust_completed": remaining > 1e-9,
+        "non_closeable_dust_completed": remaining > tolerance,
+    }
+    event = {
+        "event": f"live_{action}",
+        "rule_id": rule.get("id"),
+        "generation": rule.get("generation"),
+        "symbol": rule.get("symbol"),
+        "long_exchange": rule.get("long_exchange"),
+        "short_exchange": rule.get("short_exchange"),
+        "from_level": from_level,
+        "to_level": to_level,
+        "live_level": to_level,
+        "remaining_qty": remaining,
+        "completion_tolerance_qty": tolerance,
+        "dust_completed": remaining > 1e-9,
+        "non_closeable_dust_completed": remaining > tolerance,
+        "ts": now_iso,
+    }
+    return {
+        "current_level": to_level,
+        "decision": decision,
+        "transition_event": event,
+        "pending_transition": {},
+    }

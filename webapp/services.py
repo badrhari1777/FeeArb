@@ -41,6 +41,7 @@ from execution.auto_arb_grid import (
     MIN_LEVELS,
     build_grid_levels,
     apply_grid_decision_confirmation,
+    complete_pending_grid_transition,
     decide_grid_transition,
     grid_completion_tolerance,
     grid_dust_only_errors,
@@ -2799,62 +2800,26 @@ class DataService:
                             if isinstance(last_execution, Mapping)
                             else None
                         )
-                        if (
-                            pending_remaining <= pending_tolerance
-                            or (
-                                pending_filled > 0
-                                and self._auto_arb_non_closeable_dust(
-                                    last_result if isinstance(last_result, Mapping) else None,
-                                    pending_remaining,
-                                )
+                        completed_transition = complete_pending_grid_transition(
+                            current,
+                            pending_transition=pending_transition,
+                            current_level=current_level,
+                            last_result=(
+                                last_result if isinstance(last_result, Mapping) else None
+                            ),
+                            now_iso=now_iso,
+                            now_ts=time.time(),
+                            retry_sec=AUTO_ARB_RETRY_SEC,
+                        )
+                        if completed_transition:
+                            current_level = int(completed_transition["current_level"])
+                            decision = dict(completed_transition["decision"])
+                            transition_event = dict(
+                                completed_transition["transition_event"]
                             )
-                        ):
-                            pending_action = str(pending_transition.get("action") or "")
-                            from_level = int(
-                                pending_transition.get("from_level") or current_level
+                            pending_transition = dict(
+                                completed_transition["pending_transition"]
                             )
-                            to_level = int(
-                                pending_transition.get("to_level") or current_level
-                            )
-                            current_level = to_level
-                            current["live_level"] = to_level
-                            current["pending_transition"] = None
-                            current["pending_action"] = None
-                            current["pending_samples"] = 0
-                            current["blocked_reason"] = None
-                            current["next_eligible_ts"] = time.time() + AUTO_ARB_RETRY_SEC
-                            current["status"] = (
-                                "waiting_entry" if to_level == 0 else "monitoring"
-                            )
-                            decision = {
-                                "action": "none",
-                                "current_level": to_level,
-                                "target_level": to_level,
-                                "entry_target_level": None,
-                                "exit_target_level": None,
-                                "levels_delta": to_level - from_level,
-                                "continuation": True,
-                                "remaining_qty": pending_remaining,
-                                "dust_completed": pending_remaining > 1e-9,
-                                "non_closeable_dust_completed": pending_remaining > pending_tolerance,
-                            }
-                            transition_event = {
-                                "event": f"live_{pending_action}",
-                                "rule_id": current.get("id"),
-                                "generation": current.get("generation"),
-                                "symbol": current.get("symbol"),
-                                "long_exchange": current.get("long_exchange"),
-                                "short_exchange": current.get("short_exchange"),
-                                "from_level": from_level,
-                                "to_level": to_level,
-                                "live_level": to_level,
-                                "remaining_qty": pending_remaining,
-                                "completion_tolerance_qty": pending_tolerance,
-                                "dust_completed": pending_remaining > 1e-9,
-                                "non_closeable_dust_completed": pending_remaining > pending_tolerance,
-                                "ts": now_iso,
-                            }
-                            pending_transition = {}
                         else:
                             pending_action = str(pending_transition.get("action") or "")
                             from_level = int(
