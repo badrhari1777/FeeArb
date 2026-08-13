@@ -181,3 +181,42 @@ def test_stop_monitor_reducer_matches_legacy_golden_cases() -> None:
         ):
             assert machine_state[key] == expected[key], f"{case['name']}:{key}"
         assert actual_result["stop_thread"] is expected["stop_thread"]
+
+
+def _legacy_reduce_emergency_request(state: dict[str, Any]) -> dict[str, Any]:
+    state["entry_armed"] = False
+    state["monitor_enabled"] = True
+    state["emergency_close_requested"] = True
+    state["status"] = "emergency_closing"
+    state["transient_recovery_pending"] = False
+    state["healthy_recovery_cycles"] = 0
+    state["portfolio_risk_freeze_active"] = False
+    state["portfolio_risk_freeze_reason"] = None
+    state["portfolio_risk_freeze_symbol"] = None
+    state["portfolio_risk_freeze_buffer_pct"] = None
+    state["portfolio_risk_restore_armed"] = False
+    state["portfolio_risk_recovery_cycles"] = 0
+    state["updated_at_ms"] = NOW_MS
+    return {"start_monitor": True, "wake_monitor": True}
+
+
+def test_emergency_request_reducer_matches_legacy_golden_cases() -> None:
+    cases = json.loads(
+        (
+            Path(__file__).parent / "fixtures" / "pump_emergency_request_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    machine = PumpStateMachine()
+    for case in cases:
+        legacy_state = deepcopy(case["state"])
+        machine_state = deepcopy(case["state"])
+        expected_result = _legacy_reduce_emergency_request(legacy_state)
+        actual_result = machine.reduce_emergency_request(
+            machine_state,
+            now_ms=NOW_MS,
+        )
+        assert machine_state == legacy_state, case["name"]
+        assert actual_result == expected_result, case["name"]
+        for key, value in case["expected"].items():
+            source = actual_result if key in actual_result else machine_state
+            assert source[key] == value, f"{case['name']}:{key}"

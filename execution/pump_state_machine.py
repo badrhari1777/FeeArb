@@ -94,3 +94,26 @@ class PumpStateMachine:
         state["healthy_recovery_cycles"] = 0
         state["updated_at_ms"] = now_ms
         return {"stop_thread": True}
+
+    @staticmethod
+    def reduce_emergency_request(
+        state: dict[str, Any],
+        *,
+        now_ms: int,
+    ) -> dict[str, Any]:
+        """Freeze entries and request emergency processing by the monitor."""
+
+        state["entry_armed"] = False
+        state["monitor_enabled"] = True
+        state["emergency_close_requested"] = True
+        state["status"] = "emergency_closing"
+        state["transient_recovery_pending"] = False
+        state["healthy_recovery_cycles"] = 0
+        state["portfolio_risk_freeze_active"] = False
+        state["portfolio_risk_freeze_reason"] = None
+        state["portfolio_risk_freeze_symbol"] = None
+        state["portfolio_risk_freeze_buffer_pct"] = None
+        state["portfolio_risk_restore_armed"] = False
+        state["portfolio_risk_recovery_cycles"] = 0
+        state["updated_at_ms"] = now_ms
+        return {"start_monitor": True, "wake_monitor": True}

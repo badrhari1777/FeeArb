@@ -1,0 +1,36 @@
+[
+  {
+    "name": "armed_state_becomes_emergency_closing",
+    "state": {
+      "status": "armed",
+      "entry_armed": true,
+      "monitor_enabled": false,
+      "emergency_close_requested": false,
+      "transient_recovery_pending": true,
+      "healthy_recovery_cycles": 2,
+      "portfolio_risk_freeze_active": true,
+      "portfolio_risk_freeze_reason": "warning",
+      "portfolio_risk_freeze_symbol": "ACEUSDT",
+      "portfolio_risk_freeze_buffer_pct": 8.0,
+      "portfolio_risk_restore_armed": true,
+      "portfolio_risk_recovery_cycles": 2
+    },
+    "expected": {
+      "status": "emergency_closing",
+      "entry_armed": false,
+      "monitor_enabled": true,
+      "emergency_close_requested": true,
+      "transient_recovery_pending": false,
+      "healthy_recovery_cycles": 0,
+      "portfolio_risk_freeze_active": false,
+      "portfolio_risk_freeze_reason": null,
+      "portfolio_risk_freeze_symbol": null,
+      "portfolio_risk_freeze_buffer_pct": null,
+      "portfolio_risk_restore_armed": false,
+      "portfolio_risk_recovery_cycles": 0,
+      "updated_at_ms": 1786650000000,
+      "start_monitor": true,
+      "wake_monitor": true
+    }
+  }
+]
