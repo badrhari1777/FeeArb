@@ -1965,25 +1965,7 @@ class PumpLiveController:
             event = "armed"
         with self._lock:
             now = _now_ms()
-            self._state.update(
-                {
-                    "status": "armed",
-                    "monitor_enabled": True,
-                    "entry_armed": True,
-                    "armed_at_ms": now,
-                    "updated_at_ms": now,
-                    "blocked_reason": None,
-                    "pending_signals": [],
-                    "transient_recovery_pending": False,
-                    "healthy_recovery_cycles": 0,
-                    "portfolio_risk_freeze_active": False,
-                    "portfolio_risk_freeze_reason": None,
-                    "portfolio_risk_freeze_symbol": None,
-                    "portfolio_risk_freeze_buffer_pct": None,
-                    "portfolio_risk_restore_armed": False,
-                    "portfolio_risk_recovery_cycles": 0,
-                }
-            )
+            self._state_machine.reduce_arm_success(self._state, now_ms=now)
             self._save_state_locked()
         self._event(event, {"entry_cap": self.config().entry_cap, "positions": len(open_items)})
         self.start_monitor()
