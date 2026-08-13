@@ -648,8 +648,7 @@ class DataService:
             state_path=AUTO_ARB_STATE_PATH,
             history_path=AUTO_ARB_HISTORY_PATH,
         )
-        # Compatibility aliases keep the transition migration incremental.
-        self._auto_arb_store = self._grid_state.store
+        # Compatibility aliases keep test hooks and the lock/save envelope stable.
         self._auto_arb_history_store = self._grid_state.history
         self._auto_arb = self._grid_state.state
         self._auto_arb_lock = self._grid_state.lock
